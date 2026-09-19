@@ -9,12 +9,15 @@ build-type:     Simple
 
 library
     hs-source-dirs:   src
-    exposed-modules:  ChuSQL.Syntax.Ast
-                      ChuSQL.Syntax.Parser
+    exposed-modules:  ChuSQL.Algebra.Eval
+                      ChuSQL.Algebra.Op
+                      ChuSQL.Algebra.Planner
                       ChuSQL.Model
-                      ChuSQL.Eval.Expr
-                      ChuSQL.Eval.Sort
-                      ChuSQL.Eval.Executor
+                      ChuSQL.SQLSyntax.AST
+                      ChuSQL.SQLSyntax.Executor
+                      ChuSQL.SQLSyntax.Expr
+                      ChuSQL.SQLSyntax.Parser
+                      ChuSQL.SQLSyntax.Sort
     build-depends:    base >= 4.14 && < 5
                     , megaparsec
                     , parser-combinators

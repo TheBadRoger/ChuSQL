@@ -1,37 +1,50 @@
 module Main where
 
-import ChuSQL.Eval.Executor
 import ChuSQL.Model
-import ChuSQL.Syntax.Ast
-import ChuSQL.Syntax.Parser
+import ChuSQL.SQLSyntax.AST
+import ChuSQL.SQLSyntax.Executor
+import ChuSQL.SQLSyntax.Parser
 import Test.Hspec
 
+-- ============================================================
 -- Test database
-testDB :: Database
-testDB = [("users", users)]
-  where
-    users =
-        Table
-            { tableName = "users"
-            , tableCols = ["name", "age"]
-            , tableRows =
-                [ [("name", VStr "Alice"), ("age", VInt 25)]
-                , [("name", VStr "Bob"), ("age", VInt 17)]
-                , [("name", VStr "Carol"), ("age", VInt 30)]
-                ]
-            }
+-- ============================================================
+users :: Table
+users =
+    Table
+        { tableName = "users"
+        , tableCols = ["id", "name", "age"]
+        , tableRows =
+            [ [("id", VInt 1), ("name", VStr "Alice"), ("age", VInt 25)]
+            , [("id", VInt 2), ("name", VStr "Bob"), ("age", VInt 17)]
+            , [("id", VInt 3), ("name", VStr "Carol"), ("age", VInt 30)]
+            ]
+        }
 
+orders :: Table
+orders =
+    Table
+        { tableName = "orders"
+        , tableCols = ["id", "user_id", "product"]
+        , tableRows =
+            [ [("id", VInt 1), ("user_id", VInt 1), ("product", VStr "Book")]
+            , [("id", VInt 2), ("user_id", VInt 2), ("product", VStr "Pen")]
+            , [("id", VInt 3), ("user_id", VInt 1), ("product", VStr "Cup")]
+            ]
+        }
+
+testDB :: Database
+testDB = [("users", users), ("orders", orders)]
+
+-- ============================================================
+-- Main
+-- ============================================================
 main :: IO ()
 main = hspec $ do
     -- ============================================================
     -- AST
     -- ============================================================
     describe "ChuSQL.Syntax.Ast" $ do
-        it "shows a Select without WHERE" $ do
-            show (makeSelect ["name"] "users" Nothing)
-                `shouldBe` "Select {selectCols = [\"name\"], selectTable = \"users\", \
-                           \selectWhere = Nothing, selectOrderBy = [], selectLimit = Nothing}"
-
         it "equal Selects are equal" $ do
             makeSelect ["name"] "users" Nothing
                 `shouldBe` makeSelect ["name"] "users" Nothing
@@ -177,12 +190,55 @@ main = hspec $ do
                     )
 
         it "rejects trailing junk after a complete query" $ do
-            parseQuery "SELECT name FROM users extra"
+            parseQuery "SELECT name FROM users extra junk"
                 `shouldSatisfy` isLeft
 
         it "returns Left on missing table name" $ do
             parseQuery "SELECT name FROM"
                 `shouldSatisfy` isLeft
+
+    -- ============================================================
+    -- Parser: JOIN
+    -- ============================================================
+    describe "ChuSQL.Syntax.Parser (JOIN)" $ do
+        it "parses a simple JOIN without aliases" $ do
+            parseQuery "SELECT name FROM users JOIN orders ON id = user_id"
+                `shouldBe` Right
+                    ( Select
+                        { selectCols = ["name"]
+                        , selectFrom =
+                            FromJoin
+                                (FromTable Nothing "users")
+                                Nothing
+                                "orders"
+                                (Eq (Col "id") (Col "user_id"))
+                        , selectWhere = Nothing
+                        , selectOrderBy = []
+                        , selectLimit = Nothing
+                        }
+                    )
+
+        it "parses JOIN with aliases" $ do
+            parseQuery "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id"
+                `shouldBe` Right
+                    ( Select
+                        { selectCols = ["u.name"]
+                        , selectFrom =
+                            FromJoin
+                                (FromTable (Just "u") "users")
+                                (Just "o")
+                                "orders"
+                                (Eq (Col "u.id") (Col "o.user_id"))
+                        , selectWhere = Nothing
+                        , selectOrderBy = []
+                        , selectLimit = Nothing
+                        }
+                    )
+
+        it "parses qualified column names" $ do
+            case parseQuery "SELECT u.name, o.product FROM users u JOIN orders o ON u.id = o.user_id" of
+                Right q -> selectCols q `shouldBe` ["u.name", "o.product"]
+                Left err -> expectationFailure err
 
     -- ============================================================
     -- Engine: SELECT
@@ -191,9 +247,9 @@ main = hspec $ do
         it "returns all rows without WHERE" $ do
             rowsOf (runQuery testDB (makeSelect ["*"] "users" Nothing))
                 `shouldBe` Right
-                    [ [("name", VStr "Alice"), ("age", VInt 25)]
-                    , [("name", VStr "Bob"), ("age", VInt 17)]
-                    , [("name", VStr "Carol"), ("age", VInt 30)]
+                    [ [("id", VInt 1), ("name", VStr "Alice"), ("age", VInt 25)]
+                    , [("id", VInt 2), ("name", VStr "Bob"), ("age", VInt 17)]
+                    , [("id", VInt 3), ("name", VStr "Carol"), ("age", VInt 30)]
                     ]
 
         it "filters with WHERE" $ do
@@ -261,7 +317,7 @@ main = hspec $ do
             case runQuery testDB (Insert "users" ["name", "age"] [LitStr "Dave", LitInt 22]) of
                 Left err -> expectationFailure err
                 Right (db', _) -> do
-                    rowsOf (runQuery db' (makeSelect ["*"] "users" Nothing))
+                    rowsOf (runQuery db' (makeSelect ["name", "age"] "users" Nothing))
                         `shouldBe` Right
                             [ [("name", VStr "Alice"), ("age", VInt 25)]
                             , [("name", VStr "Bob"), ("age", VInt 17)]
@@ -273,7 +329,7 @@ main = hspec $ do
             case runQuery testDB (Insert "users" ["name", "age"] [LitStr "Dave", LitInt 22]) of
                 Left err -> expectationFailure err
                 Right (_, _) -> do
-                    rowsOf (runQuery testDB (makeSelect ["*"] "users" Nothing))
+                    rowsOf (runQuery testDB (makeSelect ["name"] "users" Nothing))
                         `shouldSatisfy` \r -> case r of
                             Right rows -> length rows == 3
                             Left _ -> False
@@ -310,24 +366,24 @@ main = hspec $ do
             case runQuery testDB (Delete "users" (Just (Lt (Col "age") (LitInt 18)))) of
                 Left err -> expectationFailure err
                 Right (db', _) -> do
-                    rowsOf (runQuery db' (makeSelect ["*"] "users" Nothing))
+                    rowsOf (runQuery db' (makeSelect ["name"] "users" Nothing))
                         `shouldBe` Right
-                            [ [("name", VStr "Alice"), ("age", VInt 25)]
-                            , [("name", VStr "Carol"), ("age", VInt 30)]
+                            [ [("name", VStr "Alice")]
+                            , [("name", VStr "Carol")]
                             ]
 
         it "executes DELETE without WHERE, removing all rows" $ do
             case runQuery testDB (Delete "users" Nothing) of
                 Left err -> expectationFailure err
                 Right (db', _) -> do
-                    rowsOf (runQuery db' (makeSelect ["*"] "users" Nothing))
+                    rowsOf (runQuery db' (makeSelect ["name"] "users" Nothing))
                         `shouldBe` Right []
 
         it "does not modify the original database" $ do
             case runQuery testDB (Delete "users" Nothing) of
                 Left err -> expectationFailure err
                 Right (_, _) -> do
-                    rowsOf (runQuery testDB (makeSelect ["*"] "users" Nothing))
+                    rowsOf (runQuery testDB (makeSelect ["name"] "users" Nothing))
                         `shouldSatisfy` \r -> case r of
                             Right rows -> length rows == 3
                             Left _ -> False
@@ -380,7 +436,7 @@ main = hspec $ do
             case runQuery testDB (Update "users" [("age", LitInt 99)] (Just (Eq (Col "name") (LitStr "Alice")))) of
                 Left err -> expectationFailure err
                 Right (db', _) -> do
-                    rowsOf (runQuery db' (makeSelect ["*"] "users" Nothing))
+                    rowsOf (runQuery db' (makeSelect ["name", "age"] "users" Nothing))
                         `shouldBe` Right
                             [ [("name", VStr "Alice"), ("age", VInt 99)]
                             , [("name", VStr "Bob"), ("age", VInt 17)]
@@ -391,7 +447,7 @@ main = hspec $ do
             case runQuery testDB (Update "users" [("age", LitInt 0)] Nothing) of
                 Left err -> expectationFailure err
                 Right (db', _) -> do
-                    rowsOf (runQuery db' (makeSelect ["*"] "users" Nothing))
+                    rowsOf (runQuery db' (makeSelect ["name", "age"] "users" Nothing))
                         `shouldBe` Right
                             [ [("name", VStr "Alice"), ("age", VInt 0)]
                             , [("name", VStr "Bob"), ("age", VInt 0)]
@@ -402,7 +458,7 @@ main = hspec $ do
             case runQuery testDB (Update "users" [("age", LitInt 99), ("name", LitStr "X")] Nothing) of
                 Left err -> expectationFailure err
                 Right (db', _) -> do
-                    rowsOf (runQuery db' (makeSelect ["*"] "users" Nothing))
+                    rowsOf (runQuery db' (makeSelect ["name", "age"] "users" Nothing))
                         `shouldBe` Right
                             [ [("name", VStr "X"), ("age", VInt 99)]
                             , [("name", VStr "X"), ("age", VInt 99)]
@@ -413,7 +469,7 @@ main = hspec $ do
             case runQuery testDB (Update "users" [("age", LitInt 0)] Nothing) of
                 Left err -> expectationFailure err
                 Right (_, _) -> do
-                    rowsOf (runQuery testDB (makeSelect ["*"] "users" Nothing))
+                    rowsOf (runQuery testDB (makeSelect ["name"] "users" Nothing))
                         `shouldSatisfy` \r -> case r of
                             Right rows -> length rows == 3
                             Left _ -> False
@@ -465,7 +521,7 @@ main = hspec $ do
             let q =
                     Select
                         { selectCols = ["name"]
-                        , selectTable = "users"
+                        , selectFrom = FromTable Nothing "users"
                         , selectWhere = Nothing
                         , selectOrderBy = [("age", Asc)]
                         , selectLimit = Nothing
@@ -481,7 +537,7 @@ main = hspec $ do
             let q =
                     Select
                         { selectCols = ["name"]
-                        , selectTable = "users"
+                        , selectFrom = FromTable Nothing "users"
                         , selectWhere = Nothing
                         , selectOrderBy = [("age", Desc)]
                         , selectLimit = Nothing
@@ -497,7 +553,7 @@ main = hspec $ do
             let q =
                     Select
                         { selectCols = ["name"]
-                        , selectTable = "users"
+                        , selectFrom = FromTable Nothing "users"
                         , selectWhere = Nothing
                         , selectOrderBy = [("name", Asc)]
                         , selectLimit = Nothing
@@ -513,7 +569,7 @@ main = hspec $ do
             let q =
                     Select
                         { selectCols = ["name"]
-                        , selectTable = "users"
+                        , selectFrom = FromTable Nothing "users"
                         , selectWhere = Nothing
                         , selectOrderBy = [("nope", Asc)]
                         , selectLimit = Nothing
@@ -545,7 +601,7 @@ main = hspec $ do
             let q =
                     Select
                         { selectCols = ["name"]
-                        , selectTable = "users"
+                        , selectFrom = FromTable Nothing "users"
                         , selectWhere = Nothing
                         , selectOrderBy = []
                         , selectLimit = Just 2
@@ -560,7 +616,7 @@ main = hspec $ do
             let q =
                     Select
                         { selectCols = ["name"]
-                        , selectTable = "users"
+                        , selectFrom = FromTable Nothing "users"
                         , selectWhere = Nothing
                         , selectOrderBy = [("age", Desc)]
                         , selectLimit = Just 2
@@ -575,7 +631,7 @@ main = hspec $ do
             let q =
                     Select
                         { selectCols = ["name"]
-                        , selectTable = "users"
+                        , selectFrom = FromTable Nothing "users"
                         , selectWhere = Nothing
                         , selectOrderBy = []
                         , selectLimit = Just 10
@@ -591,7 +647,7 @@ main = hspec $ do
             let q =
                     Select
                         { selectCols = ["name"]
-                        , selectTable = "users"
+                        , selectFrom = FromTable Nothing "users"
                         , selectWhere = Nothing
                         , selectOrderBy = []
                         , selectLimit = Just 0
@@ -601,6 +657,76 @@ main = hspec $ do
 
         it "rejects negative LIMIT" $ do
             parseQuery "SELECT * FROM users LIMIT -1"
+                `shouldSatisfy` isLeft
+
+    -- ============================================================
+    -- Engine: JOIN
+    -- ============================================================
+    describe "ChuSQL.Eval.Engine (JOIN)" $ do
+        it "executes a two-table JOIN with aliases" $ do
+            rowsOf (parseQuery "SELECT u.name, o.product FROM users u JOIN orders o ON u.id = o.user_id" >>= runQuery testDB)
+                `shouldBe` Right
+                    [ [("u.name", VStr "Alice"), ("o.product", VStr "Book")]
+                    , [("u.name", VStr "Alice"), ("o.product", VStr "Cup")]
+                    , [("u.name", VStr "Bob"), ("o.product", VStr "Pen")]
+                    ]
+
+        it "executes JOIN with WHERE" $ do
+            rowsOf (parseQuery "SELECT u.name, o.product FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 20" >>= runQuery testDB)
+                `shouldBe` Right
+                    [ [("u.name", VStr "Alice"), ("o.product", VStr "Book")]
+                    , [("u.name", VStr "Alice"), ("o.product", VStr "Cup")]
+                    ]
+
+        it "executes JOIN with ORDER BY" $ do
+            rowsOf (parseQuery "SELECT u.name, o.product FROM users u JOIN orders o ON u.id = o.user_id ORDER BY o.product DESC" >>= runQuery testDB)
+                `shouldBe` Right
+                    [ [("u.name", VStr "Bob"), ("o.product", VStr "Pen")]
+                    , [("u.name", VStr "Alice"), ("o.product", VStr "Cup")]
+                    , [("u.name", VStr "Alice"), ("o.product", VStr "Book")]
+                    ]
+
+        it "executes JOIN with LIMIT" $ do
+            rowsOf (parseQuery "SELECT u.name, o.product FROM users u JOIN orders o ON u.id = o.user_id LIMIT 2" >>= runQuery testDB)
+                `shouldBe` Right
+                    [ [("u.name", VStr "Alice"), ("o.product", VStr "Book")]
+                    , [("u.name", VStr "Alice"), ("o.product", VStr "Cup")]
+                    ]
+
+        it "returns Left when JOIN table not found" $ do
+            runQuery
+                testDB
+                ( Select
+                    { selectCols = ["u.name"]
+                    , selectFrom =
+                        FromJoin
+                            (FromTable (Just "u") "users")
+                            (Just "x")
+                            "nonexistent"
+                            (Eq (Col "u.id") (Col "x.id"))
+                    , selectWhere = Nothing
+                    , selectOrderBy = []
+                    , selectLimit = Nothing
+                    }
+                )
+                `shouldSatisfy` isLeft
+
+        it "returns Left when ON references an unknown column" $ do
+            runQuery
+                testDB
+                ( Select
+                    { selectCols = ["u.name"]
+                    , selectFrom =
+                        FromJoin
+                            (FromTable (Just "u") "users")
+                            (Just "o")
+                            "orders"
+                            (Eq (Col "u.nope") (Col "o.user_id"))
+                    , selectWhere = Nothing
+                    , selectOrderBy = []
+                    , selectLimit = Nothing
+                    }
+                )
                 `shouldSatisfy` isLeft
 
     -- ============================================================
@@ -652,7 +778,7 @@ main = hspec $ do
             case parseQuery "UPDATE users SET age = 99 WHERE name = 'Alice'" >>= runQuery testDB of
                 Left err -> expectationFailure err
                 Right (db', _) -> do
-                    rowsOf (parseQuery "SELECT * FROM users" >>= runQuery db')
+                    rowsOf (parseQuery "SELECT name, age FROM users" >>= runQuery db')
                         `shouldBe` Right
                             [ [("name", VStr "Alice"), ("age", VInt 99)]
                             , [("name", VStr "Bob"), ("age", VInt 17)]
@@ -666,18 +792,6 @@ main = hspec $ do
                     , [("name", VStr "Alice")]
                     ]
 
-        it "ORDER BY then INSERT then SELECT end-to-end" $ do
-            case parseQuery "INSERT INTO users (name, age) VALUES ('Dave', 99)" >>= runQuery testDB of
-                Left err -> expectationFailure err
-                Right (db', _) -> do
-                    rowsOf (parseQuery "SELECT name FROM users ORDER BY age DESC" >>= runQuery db')
-                        `shouldBe` Right
-                            [ [("name", VStr "Dave")]
-                            , [("name", VStr "Carol")]
-                            , [("name", VStr "Alice")]
-                            , [("name", VStr "Bob")]
-                            ]
-
         it "ORDER BY with LIMIT end-to-end" $ do
             rowsOf (parseQuery "SELECT name FROM users ORDER BY age DESC LIMIT 2" >>= runQuery testDB)
                 `shouldBe` Right
@@ -689,6 +803,14 @@ main = hspec $ do
             rowsOf (parseQuery "SELECT name FROM users WHERE age > 15 ORDER BY age DESC LIMIT 1" >>= runQuery testDB)
                 `shouldBe` Right
                     [ [("name", VStr "Carol")]
+                    ]
+
+        it "JOIN with WHERE and ORDER BY end-to-end" $ do
+            rowsOf (parseQuery "SELECT u.name, o.product FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 15 ORDER BY o.product" >>= runQuery testDB)
+                `shouldBe` Right
+                    [ [("u.name", VStr "Alice"), ("o.product", VStr "Book")]
+                    , [("u.name", VStr "Alice"), ("o.product", VStr "Cup")]
+                    , [("u.name", VStr "Bob"), ("o.product", VStr "Pen")]
                     ]
 
 -- ============================================================

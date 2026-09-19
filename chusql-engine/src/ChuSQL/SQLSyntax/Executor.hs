@@ -1,15 +1,11 @@
-module ChuSQL.Eval.Executor where
+module ChuSQL.SQLSyntax.Executor where
 
-import ChuSQL.Eval.Expr
-import ChuSQL.Eval.Sort
+import ChuSQL.Algebra.Eval (evalRelOp)
+import ChuSQL.Algebra.Planner (translate)
 import ChuSQL.Model
-import ChuSQL.Syntax.Ast
+import ChuSQL.SQLSyntax.AST
+import ChuSQL.SQLSyntax.Expr (evalCondForRow, evalExpr)
 import Control.Monad (filterM)
-
--- | 带限制的排序
-applyLimit :: Maybe Int -> [Row] -> [Row]
-applyLimit Nothing rows = rows
-applyLimit (Just n) rows = take n rows
 
 -- 表里加新行
 updateTable :: String -> (Table -> Table) -> Database -> Either String Database
@@ -30,28 +26,10 @@ applyUpdates ((col, e) : rest) row = do
 
 -- 处理查询
 runQuery :: Database -> Query -> Either String (Database, [Row])
-runQuery
-    db
-    Select
-        { selectCols = cols
-        , selectTable = tbl
-        , selectWhere = mWhere
-        , selectOrderBy = orderBy
-        , selectLimit = mLimit
-        } = do
-        table <- maybe (Left ("unknown table: " ++ tbl)) Right (lookup tbl db)
-        _ <- checkColumns (tableCols table) cols
-        _ <- checkColumns (tableCols table) (map fst orderBy)
-        rows <- case mWhere of
-            Nothing -> Right (tableRows table)
-            Just e -> filterM (evalCondForRow e) (tableRows table)
-        let sorted = sortRows orderBy rows
-            limited = applyLimit mLimit sorted
-        Right (db, map (project cols) limited)
-      where
-        project :: [String] -> Row -> Row
-        project ["*"] row = row
-        project cs row = [(c, v) | (c, v) <- row, c `elem` cs]
+runQuery db q@Select{} = do
+    relOp <- translate db q
+    rows <- evalRelOp db relOp
+    Right (db, rows)
 
 -- 处理插入
 runQuery db (Insert tbl cols vals) = do
@@ -95,10 +73,3 @@ runQuery db (Update tbl assigns mWhere) = do
         if keep
             then applyUpdates asgns row
             else Right row
-
--- 显式请求的列必须存在（@*@ 表示全部列），避免静默返回一堆空行
-checkColumns :: [String] -> [String] -> Either String ()
-checkColumns available requested =
-    case [c | c <- requested, c /= "*", c `notElem` available] of
-        [] -> Right ()
-        (c : _) -> Left ("unknown column: " ++ c)

@@ -1,11 +1,11 @@
 {-# LANGUAGE ImportQualifiedPost #-}
 
-{- | SQL 语法分析器：把 SQL 文本解析为 'ChuSQL.Syntax.Ast.Query'。
+{- | SQL 语法分析器：把 SQL 文本解析为 'ChuSQL.SQLSyntax.AST.Query'。
 
 词法层负责空白、关键字、标识符、字面量与符号；语法层按
 优先级 比较 &gt; AND &gt; OR 自底向上组装表达式。
 -}
-module ChuSQL.Syntax.Parser (
+module ChuSQL.SQLSyntax.Parser (
     Parser,
     parseQuery,
     expr,
@@ -14,9 +14,10 @@ module ChuSQL.Syntax.Parser (
     stringLit,
 ) where
 
-import ChuSQL.Syntax.Ast
+import ChuSQL.SQLSyntax.AST
 import Control.Monad.Combinators.Expr (Operator (..), makeExprParser)
-import Data.Char (isAlpha, isAlphaNum)
+import Data.Char (isAlpha, isAlphaNum, toLower)
+import Data.List (intercalate)
 import Data.Maybe (fromMaybe)
 import Data.Void (Void)
 import Text.Megaparsec
@@ -88,6 +89,13 @@ limitClause = do
     keyword "limit"
     integer
 
+-- | 解析JOIN和限定列名
+qualifiedName :: Parser String
+qualifiedName = do
+    first <- identifier
+    rest <- many (symbol "." *> identifier)
+    return (intercalate "." (first : rest))
+
 -- * 表达式层
 
 -- | 表达式入口，最低优先级。
@@ -114,7 +122,7 @@ atom =
     choice
         [ LitInt <$> integer
         , LitStr <$> stringLit
-        , Col <$> identifier
+        , Col <$> qualifiedName
         , between (symbol "(") (symbol ")") expr
         ]
 
@@ -123,7 +131,7 @@ atom =
 -- | 显式指定排序的语句
 orderItem :: Parser (String, SortDir)
 orderItem = do
-    col <- identifier
+    col <- qualifiedName
     dir <- sortDir
     return (col, dir)
 
@@ -140,28 +148,82 @@ assignment = do
     e <- expr
     return (col, e)
 
+-- | 从句语法
+
+-- | SQL 保留字，不能用作表别名
+reservedWords :: [String]
+reservedWords =
+    [ "select"
+    , "from"
+    , "where"
+    , "order"
+    , "by"
+    , "limit"
+    , "join"
+    , "on"
+    , "and"
+    , "or"
+    , "asc"
+    , "desc"
+    , "insert"
+    , "into"
+    , "values"
+    , "delete"
+    , "update"
+    , "set"
+    ]
+
+{- | 表别名。别名不能是保留字：否则 @FROM users WHERE age > 18@ 会把 @WHERE@
+当成 @users@ 的别名吃掉，后面真正的 WHERE 子句就再也解析不到。
+用 'try' 包住，一旦命中保留字就整体回溯，让 'optional' 正常返回 'Nothing'。
+-}
+aliasName :: Parser String
+aliasName = try $ do
+    name <- identifier
+    if map toLower name `elem` reservedWords then empty else return name
+
+tableRef :: Parser (Maybe String, String)
+tableRef = do
+    tbl <- identifier
+    mAlias <- optional aliasName
+    return (mAlias, tbl)
+
+joinClause :: Parser (Maybe String, String, Expr)
+joinClause = do
+    keyword "join"
+    (mAlias, tbl) <- tableRef
+    keyword "on"
+    cond <- expr
+    return (mAlias, tbl, cond)
+
+fromClause :: Parser FromClause
+fromClause = do
+    (mAlias, tbl) <- tableRef
+    joins <- many joinClause
+    return (foldl (\acc (a, t, c) -> FromJoin acc a t c) (FromTable mAlias tbl) joins)
+
 -- | 选择列表：@*@ 或逗号分隔的列名。
 selectList :: Parser [String]
 selectList =
     choice
         [ ["*"] <$ symbol "*"
-        , (:) <$> identifier <*> many (symbol "," *> identifier)
+        , (:) <$> qualifiedName <*> many (symbol "," *> qualifiedName)
         ]
 
 -- | @SELECT ... FROM ... [WHERE ...]@。
 selectQuery :: Parser Query
 selectQuery = do
-    _ <- keyword "select"
+    keyword "select"
     cols <- selectList
-    _ <- keyword "from"
-    tableName <- identifier
+    keyword "from"
+    fromC <- fromClause
     mWhere <- optional (keyword "where" *> expr)
     orderBy <- fromMaybe [] <$> optional orderByClause
     mLimit <- optional limitClause
     return
         Select
             { selectCols = cols
-            , selectTable = tableName
+            , selectFrom = fromC
             , selectWhere = mWhere
             , selectOrderBy = orderBy
             , selectLimit = mLimit

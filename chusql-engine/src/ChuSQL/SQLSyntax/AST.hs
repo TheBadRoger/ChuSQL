@@ -1,10 +1,10 @@
-module ChuSQL.Syntax.Ast where
+module ChuSQL.SQLSyntax.AST where
 
 -- 查询语句
 data Query
     = Select
         { selectCols :: [String]
-        , selectTable :: String
+        , selectFrom :: FromClause
         , selectWhere :: Maybe Expr
         , selectOrderBy :: [(String, SortDir)]
         , selectLimit :: Maybe Int
@@ -12,6 +12,12 @@ data Query
     | Insert String [String] [Expr]
     | Delete String (Maybe Expr)
     | Update String [(String, Expr)] (Maybe Expr)
+    deriving (Show, Eq)
+
+-- 从句
+data FromClause
+    = FromTable (Maybe String) String
+    | FromJoin FromClause (Maybe String) String Expr
     deriving (Show, Eq)
 
 -- 条件表达式
@@ -35,7 +41,7 @@ makeSelect :: [String] -> String -> Maybe Expr -> Query
 makeSelect cols tbl w =
     Select
         { selectCols = cols
-        , selectTable = tbl
+        , selectFrom = FromTable Nothing tbl
         , selectWhere = w
         , selectOrderBy = []
         , selectLimit = Nothing

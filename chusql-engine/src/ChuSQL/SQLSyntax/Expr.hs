@@ -1,7 +1,7 @@
-module ChuSQL.Eval.Expr where
+module ChuSQL.SQLSyntax.Expr where
 
 import ChuSQL.Model
-import ChuSQL.Syntax.Ast
+import ChuSQL.SQLSyntax.AST
 import Control.Monad (join)
 
 -- 表达式求值

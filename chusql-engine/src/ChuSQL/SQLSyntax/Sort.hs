@@ -1,7 +1,7 @@
-module ChuSQL.Eval.Sort where
+module ChuSQL.SQLSyntax.Sort where
 
 import ChuSQL.Model
-import ChuSQL.Syntax.Ast
+import ChuSQL.SQLSyntax.AST
 import Data.List (sortBy)
 
 -- | 反向排序

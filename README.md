@@ -10,8 +10,6 @@
 | `chusql-storage/` | Rust    | 存储引擎：磁盘IO、B+树、缓冲池、WAL、崩溃恢复、并发控制           |
 | `chusql-web/`     | 前端    | 浏览器端管理客户端                                                |
 
-详细架构、模块职责与构建目标见 [ARCHITECTURE.md](ARCHITECTURE.md)。
-
 # 架构分层
 
 ## Haskell部分

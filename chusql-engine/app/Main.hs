@@ -1,9 +1,9 @@
 module Main where
 
-import ChuSQL.Eval.Executor
+import ChuSQL.SQLSyntax.Executor
 import ChuSQL.Model
-import ChuSQL.Syntax.Ast
-import ChuSQL.Syntax.Parser
+import ChuSQL.SQLSyntax.AST
+import ChuSQL.SQLSyntax.Parser
 
 users :: Table
 users =

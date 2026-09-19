@@ -6,7 +6,7 @@
 
 ### 词法分析
 
-词法层与语法层同处 `chusql-engine/src/ChuSQL/Syntax/Parser.hs`，基于 **megaparsec** 实现。解析器类型为
+词法层与语法层同处 `chusql-engine/src/ChuSQL/SQLSyntax/Parser.hs`，基于 **megaparsec** 实现。解析器类型为
 
 ```haskell
 type Parser = Parsec Void String
