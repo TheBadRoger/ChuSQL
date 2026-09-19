@@ -1,0 +1,34 @@
+[
+    {
+        "label": "stack: build",
+        "command": "stack build",
+        "cwd": "$ZED_WORKTREE_ROOT/chusql-engine",
+        "reveal": "always",
+        "hide": "on_success",
+        "save": "all",
+    },
+    {
+        "label": "stack: run",
+        "command": "stack run",
+        "cwd": "$ZED_WORKTREE_ROOT/chusql-engine",
+        "reveal": "always",
+        "hide": "never",
+        "save": "all",
+    },
+    {
+        "label": "stack: test",
+        "command": "stack test",
+        "cwd": "$ZED_WORKTREE_ROOT/chusql-engine",
+        "reveal": "always",
+        "hide": "never",
+        "save": "all",
+    },
+    {
+        "label": "stack: repl",
+        "command": "stack ghci",
+        "cwd": "$ZED_WORKTREE_ROOT/chusql-engine",
+        "reveal": "always",
+        "hide": "never",
+        "save": "all",
+    },
+]
