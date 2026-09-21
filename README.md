@@ -40,3 +40,34 @@
 > Rust和Haskell部分的通信通过管道实现，后期跨平台到Linux后使用Unix Domain Socket
 
 > 如果找到了较好的Rust+Haskell集成方法也会及时替换
+
+# 代码规模
+
+| 语言 / 类别     | 文件数 |     行数 | 说明                                                            |
+| --------------- | -----: | -------: | --------------------------------------------------------------- |
+| Haskell（引擎） |     11 |      902 | `chusql-engine/src/` 10 个模块 + `app/Main.hs`                  |
+| Haskell（测试） |      1 |     1058 | `test/Spec.hs`，124 条用例                                      |
+| Haskell（基准） |      1 |      118 | `benchmark/chusql-engine/src/Main.hs`                           |
+| Rust            |      0 |        0 | `chusql-storage/` 尚未开工                                      |
+| 前端            |      0 |        0 | `chusql-web/` 尚未开工                                          |
+| Markdown 文档   |      6 |     1456 | `README.md` + `docs/` 3 篇 + `benchmark/` 2 篇                  |
+| 构建 / 配置     |      9 |      231 | cabal、`stack.yaml(.lock)`、`tasks.json`、`.gitignore`、LICENSE |
+| 项目计划        |      1 |      368 | `chusql-engine/projectplan.txt`                                 |
+| **合计**        | **29** | **4133** | 另有 3 个 `.gitkeep` 占位文件未计入                             |
+
+> 最近更新：2026-09-19
+
+# 性能基准
+
+**测试环境**：Windows / GHC 9.10.3 / `-O2`
+**数据规模**：`users`、`orders` 各 500 行，两表配对共 25 万对
+**计时方式**：CPU 时间，自适应批量（累计超过 0.3 秒后折算成单次耗时）
+
+| 查询                                       | 结果行数 |   未优化 |      优化后 |      加速 |
+| ------------------------------------------ | -------: | -------: | ----------: | --------: |
+| `JOIN` + `WHERE u.age > 90`                |       45 | 125.0 ms |  **7.1 ms** | **17.7x** |
+| `JOIN`（无 WHERE，只有投影）               |      500 | 132.8 ms |    105.5 ms |      1.3x |
+| `JOIN` + `WHERE` + `ORDER BY` + `LIMIT 10` |       10 | 171.9 ms | **10.3 ms** | **16.8x** |
+| 单表 `WHERE age > 90`（对照组）            |       45 | 0.111 ms |    0.153 ms |      0.7x |
+
+> 最近更新：2026-09-19

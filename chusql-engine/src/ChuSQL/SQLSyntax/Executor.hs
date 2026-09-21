@@ -1,6 +1,7 @@
 module ChuSQL.SQLSyntax.Executor where
 
 import ChuSQL.Algebra.Eval (evalRelOp)
+import ChuSQL.Algebra.Optimize (optimize)
 import ChuSQL.Algebra.Planner (translate)
 import ChuSQL.Model
 import ChuSQL.SQLSyntax.AST
@@ -28,7 +29,7 @@ applyUpdates ((col, e) : rest) row = do
 runQuery :: Database -> Query -> Either String (Database, [Row])
 runQuery db q@Select{} = do
     relOp <- translate db q
-    rows <- evalRelOp db relOp
+    rows <- evalRelOp db (optimize db relOp)
     Right (db, rows)
 
 -- 处理插入

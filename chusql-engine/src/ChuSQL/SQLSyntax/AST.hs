@@ -25,6 +25,7 @@ data Expr
     = Col String
     | LitInt Int
     | LitStr String
+    | LitBool Bool
     | Gt Expr Expr
     | Lt Expr Expr
     | Eq Expr Expr

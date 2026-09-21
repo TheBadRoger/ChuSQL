@@ -11,6 +11,7 @@ library
     hs-source-dirs:   src
     exposed-modules:  ChuSQL.Algebra.Eval
                       ChuSQL.Algebra.Op
+                      ChuSQL.Algebra.Optimize
                       ChuSQL.Algebra.Planner
                       ChuSQL.Model
                       ChuSQL.SQLSyntax.AST

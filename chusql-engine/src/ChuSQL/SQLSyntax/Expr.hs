@@ -10,6 +10,7 @@ evalExpr (Col name) row =
     maybe (Left ("unknown column: " ++ name)) Right (lookup name row)
 evalExpr (LitInt n) _ = Right (VInt n)
 evalExpr (LitStr s) _ = Right (VStr s)
+evalExpr (LitBool b) _ = Right (VBool b)
 evalExpr (Gt a b) row = liftBinOp (intOp (>)) a b row
 evalExpr (Lt a b) row = liftBinOp (intOp (<)) a b row
 evalExpr (Eq a b) row = liftBinOp eqOp a b row

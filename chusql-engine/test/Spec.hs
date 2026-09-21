@@ -1,5 +1,9 @@
 module Main where
 
+import ChuSQL.Algebra.Eval (evalRelOp)
+import ChuSQL.Algebra.Op (RelOp (..))
+import ChuSQL.Algebra.Optimize (optimize, pushProject)
+import ChuSQL.Algebra.Planner (translate)
 import ChuSQL.Model
 import ChuSQL.SQLSyntax.AST
 import ChuSQL.SQLSyntax.Executor
@@ -813,6 +817,169 @@ main = hspec $ do
                     , [("u.name", VStr "Bob"), ("o.product", VStr "Pen")]
                     ]
 
+    describe "ChuSQL.Algebra.Optimize" $ do
+        it "keeps single-table WHERE results identical" $ do
+            sameResultAsUnoptimized "SELECT name FROM users WHERE age > 18"
+
+        it "keeps JOIN with WHERE results identical" $ do
+            sameResultAsUnoptimized "SELECT u.name, o.product FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 20"
+
+        it "keeps JOIN with WHERE, ORDER BY and LIMIT results identical" $ do
+            sameResultAsUnoptimized "SELECT u.name, o.product FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 15 ORDER BY o.product DESC LIMIT 2"
+
+        it "keeps SELECT * results identical" $ do
+            sameResultAsUnoptimized "SELECT * FROM users"
+
+        it "pushes a single-side predicate into the left side of a JOIN" $ do
+            case parseQuery "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 20" of
+                Left err -> expectationFailure err
+                Right q ->
+                    case translate testDB q of
+                        Left err -> expectationFailure err
+                        Right relOp ->
+                            filterPushedIntoLeft (optimize testDB relOp) `shouldBe` True
+
+        it "removes a redundant SELECT * projection" $ do
+            case parseQuery "SELECT * FROM users" of
+                Left err -> expectationFailure err
+                Right q ->
+                    case translate testDB q of
+                        Left err -> expectationFailure err
+                        Right relOp ->
+                            optimize testDB relOp `shouldBe` Scan Nothing "users"
+
+        it "does not push a filter through LIMIT" $ do
+            let cond = Gt (Col "age") (LitInt 18)
+                relOp = Filter cond (Limit 2 (Scan Nothing "users"))
+            optimize testDB relOp `shouldBe` relOp
+
+        it "is idempotent after reaching a fixed point" $ do
+            case parseQuery "SELECT u.name, o.product FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 20" of
+                Left err -> expectationFailure err
+                Right q ->
+                    case translate testDB q of
+                        Left err -> expectationFailure err
+                        Right relOp ->
+                            optimize testDB (optimize testDB relOp) `shouldBe` optimize testDB relOp
+
+        it "folds a constant-false predicate into LitBool False" $ do
+            fmap firstFilterCond (optimizedPlan "SELECT name FROM users WHERE 1 > 2")
+                `shouldBe` Right (Just (LitBool False))
+
+        it "removes a filter whose predicate folds to true" $ do
+            fmap anyFilter (optimizedPlan "SELECT name FROM users WHERE 1 = 1")
+                `shouldBe` Right False
+
+        it "removes a constant-true filter sitting above a join" $ do
+            fmap anyFilter (optimizedPlan "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id WHERE 1 = 1")
+                `shouldBe` Right False
+
+        it "leaves a predicate that mentions a column untouched" $ do
+            fmap firstFilterCond (optimizedPlan "SELECT name FROM users WHERE age > 18")
+                `shouldBe` Right (Just (Gt (Col "age") (LitInt 18)))
+
+        it "folds the constant part of a predicate that cannot fold as a whole" $ do
+            fmap firstFilterCond (optimizedPlan "SELECT name FROM users WHERE age > 18 AND 1 = 1")
+                `shouldBe` Right (Just (And (Gt (Col "age") (LitInt 18)) (LitBool True)))
+
+        it "keeps a constant predicate that fails to evaluate" $ do
+            fmap firstFilterCond (optimizedPlan "SELECT name FROM users WHERE 'abc' > 1")
+                `shouldBe` Right (Just (Gt (LitStr "abc") (LitInt 1)))
+
+        it "keeps constant-false results identical" $ do
+            sameResultAsUnoptimized "SELECT name FROM users WHERE 1 > 2"
+
+        it "keeps constant-true results identical" $ do
+            sameResultAsUnoptimized "SELECT name FROM users WHERE 1 = 1"
+
+        it "keeps mixed constant and column predicates identical" $ do
+            sameResultAsUnoptimized "SELECT name FROM users WHERE age > 18 AND 1 = 1"
+
+        it "keeps a failing constant predicate identical" $ do
+            sameResultAsUnoptimized "SELECT name FROM users WHERE 'abc' > 1"
+
+        it "returns no rows for a constant-false predicate" $ do
+            rowsOf (parseQuery "SELECT name FROM users WHERE 1 > 2" >>= runQuery testDB)
+                `shouldBe` Right []
+
+        it "returns every row for a constant-true predicate" $ do
+            rowsOf (parseQuery "SELECT name FROM users WHERE 1 = 1" >>= runQuery testDB)
+                `shouldBe` Right
+                    [ [("name", VStr "Alice")]
+                    , [("name", VStr "Bob")]
+                    , [("name", VStr "Carol")]
+                    ]
+
+        it "keeps the LIMIT node while pushing projection past it" $ do
+            let plan = Project ["name"] (Limit 2 (Scan Nothing "users"))
+            stripProjects (pushProject testDB ["*"] plan) `shouldBe` stripProjects plan
+
+        it "keeps the sort keys while pushing projection past a sort" $ do
+            let plan = Project ["name"] (Sort [("age", Desc)] (Scan Nothing "users"))
+            stripProjects (pushProject testDB ["*"] plan) `shouldBe` stripProjects plan
+
+        it "keeps both sides of a join" $ do
+            let plan =
+                    Project
+                        ["u.name"]
+                        ( Join
+                            (Scan (Just "u") "users")
+                            (Scan (Just "o") "orders")
+                            (Eq (Col "u.id") (Col "o.user_id"))
+                        )
+            stripProjects (pushProject testDB ["*"] plan) `shouldBe` stripProjects plan
+
+        it "keeps nested projections in place" $ do
+            let plan = Project ["name"] (Project ["name", "age"] (Scan Nothing "users"))
+            stripProjects (pushProject testDB ["*"] plan) `shouldBe` stripProjects plan
+
+        it "keeps the whole spine of a full pipeline" $ do
+            let plan =
+                    Project
+                        ["name"]
+                        ( Limit 2
+                            ( Sort
+                                [("age", Desc)]
+                                (Filter (Gt (Col "age") (LitInt 18)) (Scan Nothing "users"))
+                            )
+                        )
+            stripProjects (pushProject testDB ["*"] plan) `shouldBe` stripProjects plan
+
+        it "merges two predicates pushed into the same side into one filter" $ do
+            fmap leftSideFilters (optimizedPlan "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 20 AND u.name = 'Alice'")
+                `shouldBe` Right (Just 1)
+
+        it "pushes projection into a single-table scan as one layer" $ do
+            optimizedPlan "SELECT name FROM users"
+                `shouldBe` Right (Project ["name"] (Scan Nothing "users"))
+
+        it "does not add a projection when the scan already supplies every column" $ do
+            optimizedPlan "SELECT id, name, age FROM users"
+                `shouldBe` Right (Project ["id", "name", "age"] (Scan Nothing "users"))
+
+        it "prunes the columns nobody needs on each side of a join" $ do
+            fmap joinSideCols (projectedPlan "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id")
+                `shouldBe` Right (Just ["u.name", "u.id"], Just ["o.user_id"])
+
+        it "does not prune anything when every column is taken" $ do
+            fmap joinSideCols (projectedPlan "SELECT * FROM users u JOIN orders o ON u.id = o.user_id")
+                `shouldBe` Right (Nothing, Nothing)
+
+        it "activates projection pushdown inside optimize" $ do
+            fmap joinSideCols (optimizedPlan "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id")
+                `shouldBe` Right (Just ["u.name", "u.id"], Just ["o.user_id"])
+
+        it "keeps projection pushdown idempotent" $ do
+            case projectedPlan "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id" of
+                Left err -> expectationFailure err
+                Right plan -> pushProject testDB ["*"] plan `shouldBe` plan
+
+        it "keeps a join without WHERE results identical" $ do
+            sameResultAsUnoptimized "SELECT u.name, o.product FROM users u JOIN orders o ON u.id = o.user_id"
+
+        it "keeps projection with ORDER BY and LIMIT results identical" $ do
+            sameResultAsUnoptimized "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id ORDER BY o.product DESC LIMIT 2"
+
 -- ============================================================
 -- Helpers
 -- ============================================================
@@ -822,3 +989,70 @@ isLeft (Right _) = False
 
 rowsOf :: Either String (Database, [Row]) -> Either String [Row]
 rowsOf = fmap snd
+
+sameResultAsUnoptimized :: String -> Expectation
+sameResultAsUnoptimized sql =
+    case parseQuery sql of
+        Left err -> expectationFailure err
+        Right q ->
+            case translate testDB q of
+                Left err -> expectationFailure err
+                Right relOp ->
+                    evalRelOp testDB (optimize testDB relOp) `shouldBe` evalRelOp testDB relOp
+
+filterPushedIntoLeft :: RelOp -> Bool
+filterPushedIntoLeft (Project _ (Join (Filter _ _) _ _)) = True
+filterPushedIntoLeft _ = False
+
+optimizedPlan :: String -> Either String RelOp
+optimizedPlan sql = do
+    q <- parseQuery sql
+    optimize testDB <$> translate testDB q
+
+firstFilterCond :: RelOp -> Maybe Expr
+firstFilterCond (Filter p _) = Just p
+firstFilterCond (Project _ x) = firstFilterCond x
+firstFilterCond (Sort _ x) = firstFilterCond x
+firstFilterCond (Limit _ x) = firstFilterCond x
+firstFilterCond (Join l r _) = case firstFilterCond l of
+    Just p -> Just p
+    Nothing -> firstFilterCond r
+firstFilterCond (Scan _ _) = Nothing
+
+anyFilter :: RelOp -> Bool
+anyFilter (Filter _ _) = True
+anyFilter (Project _ x) = anyFilter x
+anyFilter (Sort _ x) = anyFilter x
+anyFilter (Limit _ x) = anyFilter x
+anyFilter (Join l r _) = anyFilter l || anyFilter r
+anyFilter (Scan _ _) = False
+
+stripProjects :: RelOp -> RelOp
+stripProjects (Project _ x) = stripProjects x
+stripProjects (Filter p x) = Filter p (stripProjects x)
+stripProjects (Sort spec x) = Sort spec (stripProjects x)
+stripProjects (Limit n x) = Limit n (stripProjects x)
+stripProjects (Join l r c) = Join (stripProjects l) (stripProjects r) c
+stripProjects (Scan a t) = Scan a t
+
+projectedPlan :: String -> Either String RelOp
+projectedPlan sql = do
+    q <- parseQuery sql
+    plan <- translate testDB q
+    Right (pushProject testDB ["*"] plan)
+
+sideCols :: RelOp -> Maybe [String]
+sideCols (Project cols _) = Just cols
+sideCols _ = Nothing
+
+joinSideCols :: RelOp -> (Maybe [String], Maybe [String])
+joinSideCols (Project _ (Join l r _)) = (sideCols l, sideCols r)
+joinSideCols _ = (Nothing, Nothing)
+
+countFilters :: RelOp -> Int
+countFilters (Filter _ x) = 1 + countFilters x
+countFilters _ = 0
+
+leftSideFilters :: RelOp -> Maybe Int
+leftSideFilters (Project _ (Join l _ _)) = Just (countFilters l)
+leftSideFilters _ = Nothing

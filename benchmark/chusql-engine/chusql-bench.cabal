@@ -1,0 +1,14 @@
+cabal-version: 2.4
+
+name:           chusql-bench
+version:        1.0.0
+synopsis:       ChuSQL 查询优化基准测试（对比开/关优化器）
+build-type:     Simple
+
+executable chusql-bench
+    main-is:          Main.hs
+    hs-source-dirs:   src
+    build-depends:    base >= 4.14 && < 5
+                    , chusql-engine
+    default-language: Haskell2010
+    ghc-options:      -O2 -Wall
