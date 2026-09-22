@@ -1,7 +1,7 @@
-module ChuSQL.SQLSyntax.Expr where
+module ChuSQL.Algebra.Expr (evalExpr, evalCondForRow, colsInExpr) where
 
 import ChuSQL.Model
-import ChuSQL.SQLSyntax.AST
+import ChuSQL.Syntax.AST
 import Control.Monad (join)
 
 -- 表达式求值
@@ -16,6 +16,16 @@ evalExpr (Lt a b) row = liftBinOp (intOp (<)) a b row
 evalExpr (Eq a b) row = liftBinOp eqOp a b row
 evalExpr (And a b) row = liftBinOp (boolOp (&&)) a b row
 evalExpr (Or a b) row = liftBinOp (boolOp (||)) a b row
+
+-- | 收集表达式里用到的列名
+colsInExpr :: Expr -> [String]
+colsInExpr (Col c) = [c]
+colsInExpr (Gt a b) = colsInExpr a ++ colsInExpr b
+colsInExpr (Lt a b) = colsInExpr a ++ colsInExpr b
+colsInExpr (Eq a b) = colsInExpr a ++ colsInExpr b
+colsInExpr (And a b) = colsInExpr a ++ colsInExpr b
+colsInExpr (Or a b) = colsInExpr a ++ colsInExpr b
+colsInExpr _ = []
 
 -- 对行计算条件语句
 evalCondForRow :: Expr -> Row -> Either String Bool

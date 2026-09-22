@@ -1,4 +1,4 @@
-module ChuSQL.SQLSyntax.AST where
+module ChuSQL.Syntax.AST (Query (..), FromClause (..), Expr (..), SortDir (..), makeSelect) where
 
 -- 查询语句
 data Query

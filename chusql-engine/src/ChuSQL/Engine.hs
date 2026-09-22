@@ -1,19 +1,27 @@
-module ChuSQL.SQLSyntax.Executor where
+module ChuSQL.Engine (runQuery, rowsOf) where
 
 import ChuSQL.Algebra.Eval (evalRelOp)
+import ChuSQL.Algebra.Expr (evalCondForRow, evalExpr)
 import ChuSQL.Algebra.Optimize (optimize)
 import ChuSQL.Algebra.Planner (translate)
 import ChuSQL.Model
-import ChuSQL.SQLSyntax.AST
-import ChuSQL.SQLSyntax.Expr (evalCondForRow, evalExpr)
+import ChuSQL.Semantic (check)
+import ChuSQL.Syntax.AST
 import Control.Monad (filterM)
 
--- 表里加新行
-updateTable :: String -> (Table -> Table) -> Database -> Either String Database
-updateTable name f db = do
-    table <- maybe (Left ("unknown table: " ++ name)) Right (lookup name db)
-    let table' = f table
-    Right (map (\(n, t) -> if n == name then (n, table') else (n, t)) db)
+-- | 带检查的查询入口：先做语义检查，再交给下面的执行
+runQuery :: Database -> Query -> Either String (Database, [Row])
+runQuery db q = do
+    _ <- check db q
+    runQueryUnchecked db q
+
+-- | 只要结果行（丢掉更新后的数据库），给演示和测试用
+rowsOf :: Either String (Database, [Row]) -> Either String [Row]
+rowsOf = fmap snd
+
+-- 把表整体换掉（调用方已经查过，表一定存在）
+replaceTable :: String -> Table -> Database -> Database
+replaceTable name table = map (\(n, t) -> if n == name then (n, table) else (n, t))
 
 -- 修改表
 applyUpdates :: [(String, Expr)] -> Row -> Either String Row
@@ -25,46 +33,40 @@ applyUpdates ((col, e) : rest) row = do
   where
     setColumn c v r = map (\(k, val) -> if k == c then (k, v) else (k, val)) r
 
--- 处理查询
-runQuery :: Database -> Query -> Either String (Database, [Row])
-runQuery db q@Select{} = do
-    relOp <- translate db q
+-- 实际执行（调用方请确保已过 check）
+runQueryUnchecked :: Database -> Query -> Either String (Database, [Row])
+runQueryUnchecked db q@Select{} = do
+    relOp <- translate q
     rows <- evalRelOp db (optimize db relOp)
     Right (db, rows)
 
 -- 处理插入
-runQuery db (Insert tbl cols vals) = do
+runQueryUnchecked db (Insert tbl cols vals) = do
     values <- mapM (\e -> evalExpr e []) vals
     if length cols /= length values
         then Left "column count does not match value count"
         else do
+            table <- lookupTable db tbl
             let newRow = zip cols values
-            db' <-
-                updateTable
-                    tbl
-                    (\t -> t{tableRows = tableRows t ++ [newRow]})
-                    db
-            Right (db', [])
+            Right (replaceTable tbl table{tableRows = tableRows table ++ [newRow]} db, [])
 
 -- 处理删除
-runQuery db (Delete tbl mWhere) = do
-    table <- maybe (Left ("unknown table: " ++ tbl)) Right (lookup tbl db)
+runQueryUnchecked db (Delete tbl mWhere) = do
+    table <- lookupTable db tbl
     rows <- case mWhere of
         Nothing -> Right []
         Just e -> filterM (shouldKeep e) (tableRows table)
-    db' <- updateTable tbl (\t -> t{tableRows = rows}) db
-    Right (db', [])
+    Right (replaceTable tbl table{tableRows = rows} db, [])
   where
     -- 保留 = 条件不成立
     shouldKeep :: Expr -> Row -> Either String Bool
     shouldKeep e row = not <$> evalCondForRow e row
 
 -- 处理表更新
-runQuery db (Update tbl assigns mWhere) = do
-    table <- maybe (Left ("unknown table: " ++ tbl)) Right (lookup tbl db)
+runQueryUnchecked db (Update tbl assigns mWhere) = do
+    table <- lookupTable db tbl
     rows <- mapM (updateRow mWhere assigns) (tableRows table)
-    db' <- updateTable tbl (\t -> t{tableRows = rows}) db
-    Right (db', [])
+    Right (replaceTable tbl table{tableRows = rows} db, [])
   where
     updateRow :: Maybe Expr -> [(String, Expr)] -> Row -> Either String Row
     updateRow cond asgns row = do

@@ -1,13 +1,13 @@
 module Main where
 
 import ChuSQL.Algebra.Eval (evalRelOp)
-import ChuSQL.Algebra.Op (RelOp (..))
+import ChuSQL.Algebra.Op (RelOp (..), renderPlan)
 import ChuSQL.Algebra.Optimize (optimize, pushProject)
 import ChuSQL.Algebra.Planner (translate)
 import ChuSQL.Model
-import ChuSQL.SQLSyntax.AST
-import ChuSQL.SQLSyntax.Executor
-import ChuSQL.SQLSyntax.Parser
+import ChuSQL.Syntax.AST
+import ChuSQL.Engine
+import ChuSQL.Syntax.Parser
 import Test.Hspec
 
 -- ============================================================
@@ -17,7 +17,7 @@ users :: Table
 users =
     Table
         { tableName = "users"
-        , tableCols = ["id", "name", "age"]
+        , tableCols = [("id", TInt), ("name", TStr), ("age", TInt)]
         , tableRows =
             [ [("id", VInt 1), ("name", VStr "Alice"), ("age", VInt 25)]
             , [("id", VInt 2), ("name", VStr "Bob"), ("age", VInt 17)]
@@ -29,7 +29,7 @@ orders :: Table
 orders =
     Table
         { tableName = "orders"
-        , tableCols = ["id", "user_id", "product"]
+        , tableCols = [("id", TInt), ("user_id", TInt), ("product", TStr)]
         , tableRows =
             [ [("id", VInt 1), ("user_id", VInt 1), ("product", VStr "Book")]
             , [("id", VInt 2), ("user_id", VInt 2), ("product", VStr "Pen")]
@@ -48,7 +48,7 @@ main = hspec $ do
     -- ============================================================
     -- AST
     -- ============================================================
-    describe "ChuSQL.Syntax.Ast" $ do
+    describe "ChuSQL.Syntax.AST" $ do
         it "equal Selects are equal" $ do
             makeSelect ["name"] "users" Nothing
                 `shouldBe` makeSelect ["name"] "users" Nothing
@@ -247,7 +247,7 @@ main = hspec $ do
     -- ============================================================
     -- Engine: SELECT
     -- ============================================================
-    describe "ChuSQL.Eval.Engine (SELECT)" $ do
+    describe "ChuSQL.Engine (SELECT)" $ do
         it "returns all rows without WHERE" $ do
             rowsOf (runQuery testDB (makeSelect ["*"] "users" Nothing))
                 `shouldBe` Right
@@ -304,7 +304,7 @@ main = hspec $ do
     -- ============================================================
     -- Engine: INSERT
     -- ============================================================
-    describe "ChuSQL.Eval.Engine (INSERT)" $ do
+    describe "ChuSQL.Engine (INSERT)" $ do
         it "parses a simple INSERT" $ do
             parseQuery "INSERT INTO users (name, age) VALUES ('Dave', 22)"
                 `shouldBe` Right (Insert "users" ["name", "age"] [LitStr "Dave", LitInt 22])
@@ -353,7 +353,7 @@ main = hspec $ do
     -- ============================================================
     -- Engine: DELETE
     -- ============================================================
-    describe "ChuSQL.Eval.Engine (DELETE)" $ do
+    describe "ChuSQL.Engine (DELETE)" $ do
         it "parses DELETE with WHERE" $ do
             parseQuery "DELETE FROM users WHERE age < 18"
                 `shouldBe` Right (Delete "users" (Just (Lt (Col "age") (LitInt 18))))
@@ -403,7 +403,7 @@ main = hspec $ do
     -- ============================================================
     -- Engine: UPDATE
     -- ============================================================
-    describe "ChuSQL.Eval.Engine (UPDATE)" $ do
+    describe "ChuSQL.Engine (UPDATE)" $ do
         it "parses UPDATE with WHERE" $ do
             parseQuery "UPDATE users SET age = 26 WHERE name = 'Alice'"
                 `shouldBe` Right
@@ -495,7 +495,7 @@ main = hspec $ do
     -- ============================================================
     -- Engine: ORDER BY
     -- ============================================================
-    describe "ChuSQL.Eval.Engine (ORDER BY)" $ do
+    describe "ChuSQL.Engine (ORDER BY)" $ do
         it "parses ORDER BY ASC" $ do
             case parseQuery "SELECT name FROM users ORDER BY age ASC" of
                 Right q -> selectOrderBy q `shouldBe` [("age", Asc)]
@@ -583,7 +583,7 @@ main = hspec $ do
     -- ============================================================
     -- Engine: LIMIT
     -- ============================================================
-    describe "ChuSQL.Eval.Engine (LIMIT)" $ do
+    describe "ChuSQL.Engine (LIMIT)" $ do
         it "parses LIMIT" $ do
             case parseQuery "SELECT * FROM users LIMIT 2" of
                 Right q -> selectLimit q `shouldBe` Just 2
@@ -666,7 +666,7 @@ main = hspec $ do
     -- ============================================================
     -- Engine: JOIN
     -- ============================================================
-    describe "ChuSQL.Eval.Engine (JOIN)" $ do
+    describe "ChuSQL.Engine (JOIN)" $ do
         it "executes a two-table JOIN with aliases" $ do
             rowsOf (parseQuery "SELECT u.name, o.product FROM users u JOIN orders o ON u.id = o.user_id" >>= runQuery testDB)
                 `shouldBe` Right
@@ -834,7 +834,7 @@ main = hspec $ do
             case parseQuery "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 20" of
                 Left err -> expectationFailure err
                 Right q ->
-                    case translate testDB q of
+                    case translate q of
                         Left err -> expectationFailure err
                         Right relOp ->
                             filterPushedIntoLeft (optimize testDB relOp) `shouldBe` True
@@ -843,7 +843,7 @@ main = hspec $ do
             case parseQuery "SELECT * FROM users" of
                 Left err -> expectationFailure err
                 Right q ->
-                    case translate testDB q of
+                    case translate q of
                         Left err -> expectationFailure err
                         Right relOp ->
                             optimize testDB relOp `shouldBe` Scan Nothing "users"
@@ -857,7 +857,7 @@ main = hspec $ do
             case parseQuery "SELECT u.name, o.product FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 20" of
                 Left err -> expectationFailure err
                 Right q ->
-                    case translate testDB q of
+                    case translate q of
                         Left err -> expectationFailure err
                         Right relOp ->
                             optimize testDB (optimize testDB relOp) `shouldBe` optimize testDB relOp
@@ -980,6 +980,154 @@ main = hspec $ do
         it "keeps projection with ORDER BY and LIMIT results identical" $ do
             sameResultAsUnoptimized "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id ORDER BY o.product DESC LIMIT 2"
 
+    -- ============================================================
+    -- Semantic
+    -- ============================================================
+    describe "ChuSQL.Semantic" $ do
+        it "rejects an unknown column in WHERE" $ do
+            (parseQuery "SELECT name FROM users WHERE nope > 18" >>= runQuery testDB)
+                `shouldSatisfy` isLeft
+
+        it "rejects an unknown column in WHERE even when the table is empty" $ do
+            (parseQuery "SELECT name FROM users WHERE nope > 18" >>= runQuery emptyDB)
+                `shouldSatisfy` isLeft
+
+        it "rejects an unknown column in an ON condition" $ do
+            (parseQuery "SELECT u.name FROM users u JOIN orders o ON u.nope = o.user_id" >>= runQuery testDB)
+                `shouldSatisfy` isLeft
+
+        it "rejects a type mismatch inside a comparison" $ do
+            (parseQuery "SELECT name FROM users WHERE name > 18" >>= runQuery testDB)
+                `shouldSatisfy` isLeft
+
+        it "rejects a type mismatch even when the table is empty" $ do
+            (parseQuery "SELECT name FROM users WHERE name > 18" >>= runQuery emptyDB)
+                `shouldSatisfy` isLeft
+
+        it "rejects a WHERE clause that is not a condition" $ do
+            (parseQuery "SELECT name FROM users WHERE age" >>= runQuery testDB)
+                `shouldSatisfy` isLeft
+
+        it "rejects a non-boolean WHERE even when the table is empty" $ do
+            (parseQuery "SELECT name FROM users WHERE age" >>= runQuery emptyDB)
+                `shouldSatisfy` isLeft
+
+        it "rejects comparing two different types with =" $ do
+            (parseQuery "SELECT name FROM users WHERE name = 18" >>= runQuery testDB)
+                `shouldSatisfy` isLeft
+
+        it "rejects an unknown column in INSERT" $ do
+            (parseQuery "INSERT INTO users (nickname) VALUES (1)" >>= runQuery testDB)
+                `shouldSatisfy` isLeft
+
+        it "rejects a value whose type does not match the column" $ do
+            (parseQuery "INSERT INTO users (name, age) VALUES ('Dave', 'abc')" >>= runQuery testDB)
+                `shouldSatisfy` isLeft
+
+        it "rejects an unknown column in UPDATE SET" $ do
+            (parseQuery "UPDATE users SET nope = 1" >>= runQuery testDB)
+                `shouldSatisfy` isLeft
+
+        it "rejects an unknown column in DELETE WHERE" $ do
+            (parseQuery "DELETE FROM users WHERE nope > 1" >>= runQuery testDB)
+                `shouldSatisfy` isLeft
+
+        it "still accepts a valid query" $ do
+            rowsOf (parseQuery "SELECT name FROM users WHERE age > 18" >>= runQuery testDB)
+                `shouldBe` Right
+                    [ [("name", VStr "Alice")]
+                    , [("name", VStr "Carol")]
+                    ]
+
+        it "rejects an UPDATE whose value has the wrong type" $ do
+            (parseQuery "UPDATE users SET age = 'abc'" >>= runQuery testDB)
+                `shouldSatisfy` isLeft
+
+        it "rejects a type mismatch in an ON condition" $ do
+            (parseQuery "SELECT u.name FROM users u JOIN orders o ON u.name = o.user_id" >>= runQuery testDB)
+                `shouldSatisfy` isLeft
+
+        it "rejects an unknown column in DELETE WHERE even when the table is empty" $ do
+            (parseQuery "DELETE FROM users WHERE nope > 1" >>= runQuery emptyDB)
+                `shouldSatisfy` isLeft
+
+        it "rejects an unknown column in UPDATE SET even when the table is empty" $ do
+            (parseQuery "UPDATE users SET nope = 1" >>= runQuery emptyDB)
+                `shouldSatisfy` isLeft
+
+        it "currently allows an INSERT that leaves a column out (known gap)" $ do
+            (parseQuery "INSERT INTO users (name) VALUES ('Eve')" >>= runQuery testDB)
+                `shouldSatisfy` isRight
+
+        it "says which clause is wrong and which columns are available" $ do
+            case parseQuery "SELECT name FROM users WHERE nope > 18" >>= runQuery testDB of
+                Right _ -> expectationFailure "expected a Left"
+                Left err -> do
+                    err `shouldContain` "unknown column in WHERE"
+                    err `shouldContain` "available: id, name, age"
+
+        it "names INSERT when a target column does not exist" $ do
+            case parseQuery "INSERT INTO users (nickname) VALUES (1)" >>= runQuery testDB of
+                Right _ -> expectationFailure "expected a Left"
+                Left err -> err `shouldContain` "unknown column in INSERT"
+
+        it "names ORDER BY when a sort key does not exist" $ do
+            case parseQuery "SELECT name FROM users ORDER BY nope" >>= runQuery testDB of
+                Right _ -> expectationFailure "expected a Left"
+                Left err -> err `shouldContain` "unknown column in ORDER BY"
+
+        it "names ON and both types when a join condition mismatches" $ do
+            case parseQuery "SELECT u.name FROM users u JOIN orders o ON u.name = o.user_id" >>= runQuery testDB of
+                Right _ -> expectationFailure "expected a Left"
+                Left err -> do
+                    err `shouldContain` "ON: both sides of ="
+                    err `shouldContain` "TStr and TInt"
+
+        it "names the column and the expected type when an assignment has the wrong type" $ do
+            case parseQuery "UPDATE users SET age = 'abc'" >>= runQuery testDB of
+                Right _ -> expectationFailure "expected a Left"
+                Left err -> err `shouldContain` "UPDATE: column age needs TInt, got TStr"
+
+        it "accepts SELECT * across a join (the sentinel is not a column)" $ do
+            (parseQuery "SELECT * FROM users u JOIN orders o ON u.id = o.user_id" >>= runQuery testDB)
+                `shouldSatisfy` isRight
+
+    -- ============================================================
+    -- Op
+    -- ============================================================
+    describe "ChuSQL.Algebra.Op" $ do
+        it "renders a plan as indented text" $ do
+            case parseQuery "SELECT name FROM users WHERE age > 18" >>= translate of
+                Left err -> expectationFailure err
+                Right plan ->
+                    renderPlan plan
+                        `shouldBe` "Project [\"name\"]\n  Filter Gt (Col \"age\") (LitInt 18)\n    Scan Nothing \"users\""
+
+        it "renders a join plan with indentation" $ do
+            case parseQuery "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id" >>= translate of
+                Left err -> expectationFailure err
+                Right plan ->
+                    lines (renderPlan plan)
+                        `shouldBe` [ "Project [\"u.name\"]"
+                                   , "  Join on Eq (Col \"u.id\") (Col \"o.user_id\")"
+                                   , "    Scan Just \"u\" \"users\""
+                                   , "    Scan Just \"o\" \"orders\""
+                                   ]
+
+        it "renders a sort and limit plan" $ do
+            case parseQuery "SELECT name FROM users ORDER BY age DESC LIMIT 2" >>= translate of
+                Left err -> expectationFailure err
+                Right plan ->
+                    lines (renderPlan plan)
+                        `shouldBe` [ "Project [\"name\"]"
+                                   , "  Limit 2"
+                                   , "    Sort [(\"age\",Desc)]"
+                                   , "      Scan Nothing \"users\""
+                                   ]
+
+emptyDB :: Database
+emptyDB = [(n, t {tableRows = []}) | (n, t) <- testDB]
+
 -- ============================================================
 -- Helpers
 -- ============================================================
@@ -987,15 +1135,16 @@ isLeft :: Either a b -> Bool
 isLeft (Left _) = True
 isLeft (Right _) = False
 
-rowsOf :: Either String (Database, [Row]) -> Either String [Row]
-rowsOf = fmap snd
+isRight :: Either a b -> Bool
+isRight (Right _) = True
+isRight (Left _) = False
 
 sameResultAsUnoptimized :: String -> Expectation
 sameResultAsUnoptimized sql =
     case parseQuery sql of
         Left err -> expectationFailure err
         Right q ->
-            case translate testDB q of
+            case translate q of
                 Left err -> expectationFailure err
                 Right relOp ->
                     evalRelOp testDB (optimize testDB relOp) `shouldBe` evalRelOp testDB relOp
@@ -1007,7 +1156,7 @@ filterPushedIntoLeft _ = False
 optimizedPlan :: String -> Either String RelOp
 optimizedPlan sql = do
     q <- parseQuery sql
-    optimize testDB <$> translate testDB q
+    optimize testDB <$> translate q
 
 firstFilterCond :: RelOp -> Maybe Expr
 firstFilterCond (Filter p _) = Just p
@@ -1038,7 +1187,7 @@ stripProjects (Scan a t) = Scan a t
 projectedPlan :: String -> Either String RelOp
 projectedPlan sql = do
     q <- parseQuery sql
-    plan <- translate testDB q
+    plan <- translate q
     Right (pushProject testDB ["*"] plan)
 
 sideCols :: RelOp -> Maybe [String]

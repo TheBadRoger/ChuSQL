@@ -4,8 +4,9 @@ import ChuSQL.Algebra.Eval (evalRelOp)
 import ChuSQL.Algebra.Optimize (optimize)
 import ChuSQL.Algebra.Planner (translate)
 import ChuSQL.Model
-import ChuSQL.SQLSyntax.Parser (parseQuery)
+import ChuSQL.Syntax.Parser (parseQuery)
 import Control.Exception (evaluate)
+import Data.IORef (IORef, newIORef, readIORef)
 import System.CPUTime (getCPUTime)
 import System.Environment (getArgs)
 import Text.Printf (printf)
@@ -14,7 +15,7 @@ mkUsers :: Int -> Table
 mkUsers n =
     Table
         { tableName = "users"
-        , tableCols = ["id", "name", "age"]
+        , tableCols = [("id", TInt), ("name", TStr), ("age", TInt)]
         , tableRows =
             [ [("id", VInt i), ("name", VStr ("user" ++ show i)), ("age", VInt (i `mod` 100))]
             | i <- [1 .. n]
@@ -25,7 +26,7 @@ mkOrders :: Int -> Int -> Table
 mkOrders n m =
     Table
         { tableName = "orders"
-        , tableCols = ["id", "user_id", "product"]
+        , tableCols = [("id", TInt), ("user_id", TInt), ("product", TStr)]
         , tableRows =
             [ [("id", VInt j), ("user_id", VInt (1 + (j - 1) `mod` n)), ("product", VStr ("item" ++ show (j `mod` 50)))]
             | j <- [1 .. m]
@@ -43,17 +44,21 @@ rowCount :: Either String [Row] -> Int
 rowCount (Left _) = -1
 rowCount (Right rows) = length rows
 
-runOnce :: Database -> String -> Bool -> IO Int
-runOnce db sql useOpt = do
-    let result = case parseQuery sql >>= translate db of
+-- salt 是从 IORef 里读出来的：有了这个"IO 里来的"依赖，GHC 就没法把整段纯计算
+-- 提到循环外只算一次 —— 否则批量计时会把 1 次的开销除以 k，测出 0.000 ms 这种假数据
+runOnce :: IORef String -> Database -> String -> Bool -> IO Int
+runOnce saltRef db sql useOpt = do
+    salt <- readIORef saltRef
+    let result = case parseQuery (sql ++ salt) >>= translate of
             Left e -> Left e
             Right plan -> evalRelOp db (if useOpt then optimize db plan else plan)
     forced <- evaluate (checksum result)
     return forced
 
-resultRows :: Database -> String -> Bool -> IO Int
-resultRows db sql useOpt = do
-    let result = case parseQuery sql >>= translate db of
+resultRows :: IORef String -> Database -> String -> Bool -> IO Int
+resultRows saltRef db sql useOpt = do
+    salt <- readIORef saltRef
+    let result = case parseQuery (sql ++ salt) >>= translate of
             Left e -> Left e
             Right plan -> evalRelOp db (if useOpt then optimize db plan else plan)
     _ <- evaluate (checksum result)
@@ -73,12 +78,12 @@ benchOp target act = loop 1
         t <- timed (mapM_ (const act) [1 .. k])
         if t < target then loop (k * 2) else return (t / fromIntegral k, k)
 
-report :: Database -> Double -> String -> IO ()
-report db target sql = do
-    nUn <- resultRows db sql False
-    nOp <- resultRows db sql True
-    (tUn, kUn) <- benchOp target (runOnce db sql False)
-    (tOp, kOp) <- benchOp target (runOnce db sql True)
+report :: IORef String -> Database -> Double -> String -> IO ()
+report saltRef db target sql = do
+    nUn <- resultRows saltRef db sql False
+    nOp <- resultRows saltRef db sql True
+    (tUn, kUn) <- benchOp target (runOnce saltRef db sql False)
+    (tOp, kOp) <- benchOp target (runOnce saltRef db sql True)
     let speedup = if tOp <= 0 then 0 else tUn / tOp
         mismatch = if nUn == nOp then "" else "   <<< 结果不一致！"
     printf "%s\n" sql
@@ -113,6 +118,7 @@ main = do
     printf "数据规模：users = %d 行，orders = %d 行\n" n m
     printf "计时方式：CPU 时间；每个用例自动加倍批量次数，直到一批累计耗时超过 %.2f 秒，再折算成单次耗时\n" target
     printf "（先跑一遍预热，避免把首次构造数据的开销算进去）\n\n"
-    _ <- runOnce db warmupSql False
-    _ <- runOnce db warmupSql True
-    mapM_ (report db target) queries
+    saltRef <- newIORef ""
+    _ <- runOnce saltRef db warmupSql False
+    _ <- runOnce saltRef db warmupSql True
+    mapM_ (report saltRef db target) queries

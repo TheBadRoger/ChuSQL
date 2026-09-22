@@ -1,21 +1,11 @@
-module ChuSQL.Algebra.Optimize where
+module ChuSQL.Algebra.Optimize (optimize, pushProject) where
 
 import ChuSQL.Algebra.Op (RelOp (..))
 import ChuSQL.Model
-import ChuSQL.SQLSyntax.AST (Expr (..))
-import ChuSQL.SQLSyntax.Expr (evalExpr)
+import ChuSQL.Syntax.AST (Expr (..))
+import ChuSQL.Algebra.Expr (colsInExpr, evalExpr)
 
 -- * 谓词下推
-
--- | 收集表达式里用到的列名；谓词下推判断条件归属、常量折叠判断能否求值，都要用它
-colsInExpr :: Expr -> [String]
-colsInExpr (Col c) = [c]
-colsInExpr (Gt a b) = colsInExpr a ++ colsInExpr b
-colsInExpr (Lt a b) = colsInExpr a ++ colsInExpr b
-colsInExpr (Eq a b) = colsInExpr a ++ colsInExpr b
-colsInExpr (And a b) = colsInExpr a ++ colsInExpr b
-colsInExpr (Or a b) = colsInExpr a ++ colsInExpr b
-colsInExpr _ = []
 
 -- | 一个算子会产出哪些列；返回 ["*"] 表示"全部列，不用挑"
 relOpCols :: Database -> RelOp -> [String]
@@ -28,7 +18,7 @@ relOpCols db (Join l r _) = relOpCols db l ++ relOpCols db r
 relOpCols db (Scan mAlias tbl) =
     case lookup tbl db of
         Nothing -> []
-        Just t -> map (prefix ++) (tableCols t)
+        Just t -> map (prefix ++) (colNames t)
   where
     prefix = maybe "" (++ ".") mAlias
 
@@ -85,7 +75,7 @@ pushOne _ op = op
 
 -- | 工具函数
 needsAll :: [String] -> Bool
-needsAll = elem "*"
+needsAll = elem allColumns
 
 pushProject :: Database -> [String] -> RelOp -> RelOp
 pushProject db _ (Project cols x) = case pushProject db cols x of

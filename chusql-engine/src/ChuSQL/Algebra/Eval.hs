@@ -1,9 +1,9 @@
-module ChuSQL.Algebra.Eval where
+module ChuSQL.Algebra.Eval (evalRelOp) where
 
+import ChuSQL.Algebra.Expr (evalCondForRow)
 import ChuSQL.Algebra.Op
+import ChuSQL.Algebra.Sort (sortRows)
 import ChuSQL.Model
-import ChuSQL.SQLSyntax.Expr (evalCondForRow)
-import ChuSQL.SQLSyntax.Sort (sortRows)
 import Control.Monad (filterM)
 
 -- 投影
@@ -17,7 +17,7 @@ addPrefix prefix = map (\(k, v) -> (prefix ++ k, v))
 
 evalRelOp :: Database -> RelOp -> Either String [Row]
 evalRelOp db (Scan mAlias tbl) = do
-    table <- maybe (Left ("unknown table: " ++ tbl)) Right (lookup tbl db)
+    table <- lookupTable db tbl
     let prefix = maybe "" (++ ".") mAlias
     Right (map (addPrefix prefix) (tableRows table))
 evalRelOp db (Filter e op) = do

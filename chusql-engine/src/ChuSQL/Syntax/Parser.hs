@@ -1,20 +1,13 @@
 {-# LANGUAGE ImportQualifiedPost #-}
 
-{- | SQL 语法分析器：把 SQL 文本解析为 'ChuSQL.SQLSyntax.AST.Query'。
+{- | SQL 语法分析器：把 SQL 文本解析为 'ChuSQL.Syntax.AST.Query'。
 
 词法层负责空白、关键字、标识符、字面量与符号；语法层按
 优先级 比较 &gt; AND &gt; OR 自底向上组装表达式。
 -}
-module ChuSQL.SQLSyntax.Parser (
-    Parser,
-    parseQuery,
-    expr,
-    identifier,
-    integer,
-    stringLit,
-) where
+module ChuSQL.Syntax.Parser (parseQuery) where
 
-import ChuSQL.SQLSyntax.AST
+import ChuSQL.Syntax.AST
 import Control.Monad.Combinators.Expr (Operator (..), makeExprParser)
 import Data.Char (isAlpha, isAlphaNum, toLower)
 import Data.List (intercalate)

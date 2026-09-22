@@ -1,7 +1,7 @@
-module ChuSQL.SQLSyntax.Sort where
+module ChuSQL.Algebra.Sort (sortRows) where
 
 import ChuSQL.Model
-import ChuSQL.SQLSyntax.AST
+import ChuSQL.Syntax.AST
 import Data.List (sortBy)
 
 -- | 反向排序
