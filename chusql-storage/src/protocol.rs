@@ -43,6 +43,7 @@ pub enum Request {
         columns: Vec<SchemaColumn>,
     },
     DropTable { table: String },
+    ListCatalog
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -59,4 +60,13 @@ pub enum Response {
     },
     Ok,
     Error { message: String },
+    Catalog { schemas: Vec<TableSchemaWire> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableSchemaWire {
+    pub table: String,
+    pub columns: Vec<SchemaColumn>,
+    #[serde(default)]
+    pub row_count: u64,
 }

@@ -5,6 +5,7 @@ import ChuSQL.Model (Column (..))
 -- 语法树：语句、数据来源、条件表达式、排序方向。
 
 -- * 语句
+
 -- | 一条语句：查 / 加 / 删 / 改 / 建表 / 删表
 data Statement
     = Select
@@ -28,6 +29,7 @@ data FromClause
     deriving (Show, Eq)
 
 -- * 表达式
+
 -- | 条件表达式
 data Expr
     = Col String
@@ -42,6 +44,7 @@ data Expr
     deriving (Show, Eq)
 
 -- * 排序
+
 -- | 排序方向
 data SortDir
     = Asc
@@ -49,6 +52,7 @@ data SortDir
     deriving (Show, Eq)
 
 -- * 构造
+
 -- | 造一个最简单的 SELECT
 makeSelect :: [String] -> String -> Maybe Expr -> Statement
 makeSelect cols tbl w =

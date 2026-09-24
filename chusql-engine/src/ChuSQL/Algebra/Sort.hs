@@ -19,21 +19,26 @@ compareValue (VStr a) (VStr b) = compare a b
 compareValue (VBool a) (VBool b) = compare a b
 compareValue _ _ = EQ
 
--- | 按排序要求比较两行
-compareRows :: [(String, SortDir)] -> Row -> Row -> Ordering
-compareRows [] _ _ = EQ
-compareRows ((col, dir) : rest) r1 r2 =
-    case (lookup col r1, lookup col r2) of
+-- | 取出排序键（按 spec 顺序，每行只查一次）
+sortKey :: [(String, SortDir)] -> Row -> [Maybe Value]
+sortKey spec row = [lookup col row | (col, _) <- spec]
+
+-- | 比较两个排序键
+compareKeys :: [(String, SortDir)] -> [Maybe Value] -> [Maybe Value] -> Ordering
+compareKeys [] _ _ = EQ
+compareKeys ((_, dir) : rest) (a : as) (b : bs) =
+    case (a, b) of
         (Just v1, Just v2) ->
             case compareValue v1 v2 of
-                EQ -> compareRows rest r1 r2
-                o ->
-                    if dir == Desc
-                        then flipOrdering o
-                        else o
-        _ -> compareRows rest r1 r2
+                EQ -> compareKeys rest as bs
+                o -> if dir == Desc then flipOrdering o else o
+        _ -> compareKeys rest as bs
+compareKeys _ _ _ = EQ
 
--- | 排序若干行
+-- | 排序若干行（先取键再排，避免每次比较都查列）
 sortRows :: [(String, SortDir)] -> [Row] -> [Row]
 sortRows [] rows = rows
-sortRows spec rows = sortBy (compareRows spec) rows
+sortRows spec rows = map snd (sortBy cmp (map decorate rows))
+  where
+    decorate row = (sortKey spec row, row)
+    cmp (k1, _) (k2, _) = compareKeys spec k1 k2

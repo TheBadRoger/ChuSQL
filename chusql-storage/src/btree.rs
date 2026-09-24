@@ -250,16 +250,14 @@ impl DiskBTree {
 
     /// 读根页号
     fn root(&mut self) -> io::Result<Option<PageId>> {
-        let meta = self.file.read_page(META_PAGE)?;
-        let r = read_u64(&meta, OFF_META_ROOT);
+        let r = self.file.with_page(META_PAGE, |p| read_u64(p, OFF_META_ROOT))?;
         Ok(if r == 0 { None } else { Some(r) })
     }
 
     /// 写根页号
     fn set_root(&mut self, r: Option<PageId>) -> io::Result<()> {
-        let mut meta = self.file.read_page(META_PAGE)?;
-        write_u64(&mut meta, OFF_META_ROOT, r.unwrap_or(0));
-        self.file.write_page(&meta)
+        self.file
+            .update_page(META_PAGE, |p| write_u64(p, OFF_META_ROOT, r.unwrap_or(0)))
     }
 
     /// 分配新页
@@ -292,8 +290,8 @@ impl DiskBTree {
 
     /// 递归查找
     fn get_rec(&mut self, page_id: PageId, key: i64) -> io::Result<Option<u64>> {
-        let p = self.file.read_page(page_id)?;
-        match read_node(&p, self.order) {
+        let order = self.order;
+        match self.file.with_page(page_id, |p| read_node(p, order))? {
             NodeData::Leaf { keys, values, .. } => {
                 Ok(keys.binary_search(&key).ok().map(|i| values[i]))
             }
@@ -345,9 +343,10 @@ impl DiskBTree {
         key: i64,
         value: u64,
     ) -> io::Result<(PageId, Option<(i64, PageId)>)> {
-        let p = self.file.read_page(page_id)?;
-        let limit = max_keys(self.order);
-        match read_node(&p, self.order) {
+        let order = self.order;
+        let node = self.file.with_page(page_id, |p| read_node(p, order))?;
+        let limit = max_keys(order);
+        match node {
             NodeData::Leaf { mut keys, mut values, next } => {
                 match keys.binary_search(&key) {
                     Ok(i) => values[i] = value,
@@ -357,9 +356,9 @@ impl DiskBTree {
                     }
                 }
                 if keys.len() <= limit {
-                    let mut p2 = self.new_page(page_id);
-                    write_node(&mut p2, &NodeData::Leaf { keys, values, next }, self.order);
-                    self.file.write_page(&p2)?;
+                    self.file.update_page(page_id, |p| {
+                        write_node(p, &NodeData::Leaf { keys, values, next }, order)
+                    })?;
                     Ok((page_id, None))
                 } else {
                     let mid = keys.len() / 2;
@@ -372,17 +371,13 @@ impl DiskBTree {
                     write_node(
                         &mut rp,
                         &NodeData::Leaf { keys: rkeys, values: rvalues, next },
-                        self.order,
+                        order,
                     );
                     self.file.write_page(&rp)?;
 
-                    let mut lp = self.new_page(page_id);
-                    write_node(
-                        &mut lp,
-                        &NodeData::Leaf { keys, values, next: right_id },
-                        self.order,
-                    );
-                    self.file.write_page(&lp)?;
+                    self.file.update_page(page_id, |p| {
+                        write_node(p, &NodeData::Leaf { keys, values, next: right_id }, order)
+                    })?;
 
                     Ok((page_id, Some((sep, right_id))))
                 }
@@ -394,22 +389,18 @@ impl DiskBTree {
                 children[i] = new_child;
                 match split {
                     None => {
-                        let mut p2 = self.new_page(page_id);
-                        write_node(&mut p2, &NodeData::Internal { keys, children }, self.order);
-                        self.file.write_page(&p2)?;
+                        self.file.update_page(page_id, |p| {
+                            write_node(p, &NodeData::Internal { keys, children }, order)
+                        })?;
                         Ok((page_id, None))
                     }
                     Some((sep, right_id)) => {
                         keys.insert(i, sep);
                         children.insert(i + 1, right_id);
                         if keys.len() <= limit {
-                            let mut p2 = self.new_page(page_id);
-                            write_node(
-                                &mut p2,
-                                &NodeData::Internal { keys, children },
-                                self.order,
-                            );
-                            self.file.write_page(&p2)?;
+                            self.file.update_page(page_id, |p| {
+                                write_node(p, &NodeData::Internal { keys, children }, order)
+                            })?;
                             Ok((page_id, None))
                         } else {
                             let mid = keys.len() / 2;
@@ -423,17 +414,13 @@ impl DiskBTree {
                             write_node(
                                 &mut rp,
                                 &NodeData::Internal { keys: rkeys, children: rchildren },
-                                self.order,
+                                order,
                             );
                             self.file.write_page(&rp)?;
 
-                            let mut lp = self.new_page(page_id);
-                            write_node(
-                                &mut lp,
-                                &NodeData::Internal { keys, children },
-                                self.order,
-                            );
-                            self.file.write_page(&lp)?;
+                            self.file.update_page(page_id, |p| {
+                                write_node(p, &NodeData::Internal { keys, children }, order)
+                            })?;
 
                             Ok((page_id, Some((up, right_id))))
                         }
@@ -454,8 +441,8 @@ impl DiskBTree {
 
     /// 中序遍历
     fn walk(&mut self, page_id: PageId, out: &mut Vec<(i64, u64)>) -> io::Result<()> {
-        let p = self.file.read_page(page_id)?;
-        match read_node(&p, self.order) {
+        let order = self.order;
+        match self.file.with_page(page_id, |p| read_node(p, order))? {
             NodeData::Leaf { keys, values, .. } => {
                 for i in 0..keys.len() {
                     out.push((keys[i], values[i]));

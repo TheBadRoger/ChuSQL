@@ -6,11 +6,12 @@ import ChuSQL.Algebra.Sort (sortRows)
 import ChuSQL.Model
 import ChuSQL.Storage (MonadStorage (..))
 import ChuSQL.Syntax.AST (Expr (..))
-import Control.Monad (filterM)
+import Control.Monad (filterM, foldM)
 
 -- 执行：按算子树算出结果行（Scan 阶段会加别名前缀）。
 
 -- * 工具
+
 -- | 只保留清单里的列
 project :: [String] -> Row -> Row
 project ["*"] row = row
@@ -31,7 +32,21 @@ evalScan db mAlias tbl = do
     let prefix = maybe "" (++ ".") mAlias
     Right (map (addPrefix prefix) (tableRows table))
 
+-- | 把两边的行按条件配对（边配边筛，不先建整张积表）
+filterPairs :: (Row -> Either String Bool) -> [Row] -> [Row] -> Either String [Row]
+filterPairs cond lrows rrows = go lrows []
+  where
+    go [] acc = Right (reverse acc)
+    go (l : ls) acc = do
+        acc' <- foldM (keep l) acc rrows
+        go ls acc'
+    keep l acc r = do
+        let row = l ++ r
+        ok <- cond row
+        pure (if ok then row : acc else acc)
+
 -- * 求值
+
 -- | 纯求值（不需要存储）
 evalRelOp :: Database -> RelOp -> Either String [Row]
 evalRelOp db (Scan mAlias tbl) = evalScan db mAlias tbl
@@ -53,37 +68,41 @@ evalRelOp db (Limit n op) = do
 evalRelOp db (Join left right cond) = do
     lrows <- evalRelOp db left
     rrows <- evalRelOp db right
-    let cross = [l ++ r | l <- lrows, r <- rrows]
-    filterM (evalCondForRow cond) cross
+    filterPairs (evalCondForRow cond) lrows rrows
 
 -- | 单子求值：Lookup 问存储
-evalRelOpM :: (MonadStorage m) => Database -> RelOp -> m (Either String [Row])
-evalRelOpM db (Scan a t) = pure (evalScan db a t)
-evalRelOpM _ (Lookup t k) = do
+evalRelOpM :: (MonadStorage m) => RelOp -> m (Either String [Row])
+evalRelOpM (Scan mAlias t) = do
+    result <- scan t
+    pure $ do
+        rows <- result
+        case mAlias of
+            Nothing -> Right rows
+            Just a -> Right (map (addPrefix (a ++ ".")) rows)
+evalRelOpM (Lookup t k) = do
     result <- lookupByKey t k
     pure $ case result of
         Left e -> Left e
         Right Nothing -> Right []
-        Right (Just r) -> Right [r]
-evalRelOpM db (Filter p x) = do
-    result <- evalRelOpM db x
+        Right (Just row) -> Right [row]
+evalRelOpM (Filter p x) = do
+    result <- evalRelOpM x
     pure $ do
         rows <- result
         filterM (evalCondForRow p) rows
-evalRelOpM db (Project cols x) = do
-    result <- evalRelOpM db x
-    pure (map (project cols) <$> result)
-evalRelOpM db (Sort specs x) = do
-    result <- evalRelOpM db x
-    pure (sortRows specs <$> result)
-evalRelOpM db (Limit n x) = do
-    result <- evalRelOpM db x
-    pure (take n <$> result)
-evalRelOpM db (Join l r c) = do
-    ls <- evalRelOpM db l
-    rs <- evalRelOpM db r
+evalRelOpM (Project cols x) = do
+    result <- evalRelOpM x
+    pure (fmap (map (project cols)) result)
+evalRelOpM (Sort spec x) = do
+    result <- evalRelOpM x
+    pure (fmap (sortRows spec) result)
+evalRelOpM (Limit n x) = do
+    result <- evalRelOpM x
+    pure (fmap (take n) result)
+evalRelOpM (Join l r cond) = do
+    ls <- evalRelOpM l
+    rs <- evalRelOpM r
     pure $ do
-        leftRows <- ls
-        rightRows <- rs
-        let cross = [x ++ y | x <- leftRows, y <- rightRows]
-        filterM (evalCondForRow c) cross
+        left <- ls
+        right <- rs
+        filterPairs (evalCondForRow cond) left right

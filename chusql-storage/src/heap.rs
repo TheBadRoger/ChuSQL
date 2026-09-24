@@ -177,10 +177,12 @@ impl HeapTable {
         let n = self.file.num_pages()?;
         if n > 0 {
             let last_id = n - 1;
-            let mut p = self.file.read_page(last_id)?;
-            if let Some(slot) = HeapPage::insert_tuple(&mut p, &tuple) {
-                self.file.write_page(&p)?;
-                return Ok((last_id, slot));
+            let mut slot = None;
+            self.file.update_page(last_id, |p| {
+                slot = HeapPage::insert_tuple(p, &tuple);
+            })?;
+            if let Some(s) = slot {
+                return Ok((last_id, s));
             }
         }
 
@@ -215,8 +217,8 @@ impl HeapTable {
 
     /// 按位置读一行
     pub fn read_at(&mut self, page_id: PageId, slot: u16) -> io::Result<Option<Row>> {
-        let p = self.file.read_page(page_id)?;
-        match HeapPage::get_tuple(&p, slot) {
+        let bytes = self.file.with_page(page_id, |p| HeapPage::get_tuple(p, slot))?;
+        match bytes {
             None => Ok(None),
             Some(bytes) => {
                 let row: Row = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
@@ -230,13 +232,18 @@ impl HeapTable {
         let n = self.file.num_pages()?;
         let mut rows = Vec::new();
         for i in 0..n {
-            let p = self.file.read_page(i)?;
-            for slot in HeapPage::iter_slots(&p) {
-                if let Some(bytes) = HeapPage::get_tuple(&p, slot) {
-                    let row: Row = serde_json::from_slice(&bytes)
-                        .map_err(io::Error::other)?;
-                    rows.push(row);
+            let tuples = self.file.with_page(i, |p| {
+                let mut out = Vec::new();
+                for slot in HeapPage::iter_slots(p) {
+                    if let Some(bytes) = HeapPage::get_tuple(p, slot) {
+                        out.push(bytes);
+                    }
                 }
+                out
+            })?;
+            for bytes in tuples {
+                let row: Row = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+                rows.push(row);
             }
         }
         Ok(rows)

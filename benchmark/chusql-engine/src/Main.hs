@@ -7,6 +7,7 @@ import ChuSQL.Model
 import ChuSQL.Syntax.Parser (parseStatement)
 import Control.Exception (evaluate)
 import Data.IORef (IORef, newIORef, readIORef)
+import Data.List (sort)
 import System.CPUTime (getCPUTime)
 import System.Environment (getArgs)
 import Text.Printf (printf)
@@ -79,14 +80,33 @@ timed act = do
     t1 <- getCPUTime
     return (fromIntegral (t1 - t0) / 1e12)
 
--- | 加倍批量次数再折算单次
+-- | 每批至少跑几次（减少 CPU 时钟量化误差）
+minBatch :: Int
+minBatch = 8
+
+-- | 取几批中位数
+rounds :: Int
+rounds = 3
+
+-- | 跑一批 k 次，返回总耗时
+timeBatch :: Int -> IO Int -> IO Double
+timeBatch k act = timed (mapM_ (const act) [1 .. k])
+
+-- | 中位数
+median :: [Double] -> Double
+median xs = sort xs !! (length xs `div` 2)
+
+-- | 自适应批量（够长且至少 8 次），取 3 批中位数
 benchOp :: Double -> IO Int -> IO (Double, Int)
-benchOp target act = loop 1
+benchOp target act = do
+    k <- pickBatch 1
+    ts <- mapM (const (timeBatch k act)) [1 .. rounds]
+    return (median ts / fromIntegral k, k)
   where
-    -- \| 批次翻倍直到超过目标
-    loop k = do
-        t <- timed (mapM_ (const act) [1 .. k])
-        if t < target then loop (k * 2) else return (t / fromIntegral k, k)
+    -- \| 批次翻倍直到累计超过目标
+    pickBatch k = do
+        t <- timeBatch k act
+        if t < target || k < minBatch then pickBatch (k * 2) else return k
 
 -- | 打印一个用例的对比
 report :: IORef String -> Database -> Double -> String -> IO ()
@@ -105,7 +125,12 @@ report saltRef db target sql = do
         (tOp * 1000)
         speedup
         mismatch
-    printf "    （实测批次：未优化 %d 次/批，优化后 %d 次/批）\n\n" kUn kOp
+    printf
+        "    （%d 次/批 × %d 批取中位数：未优化 %d 次/批，优化后 %d 次/批）\n\n"
+        minBatch
+        rounds
+        kUn
+        kOp
 
 queries :: [String]
 queries =
@@ -128,7 +153,7 @@ main = do
         target = pick 2 (0.3 :: Double)
         db = [("users", mkUsers n), ("orders", mkOrders n m)]
     printf "数据规模：users = %d 行，orders = %d 行\n" n m
-    printf "计时方式：CPU 时间；每个用例自动加倍批量次数，直到一批累计耗时超过 %.2f 秒，再折算成单次耗时\n" target
+    printf "计时方式：CPU 时间；每批至少 %d 次迭代、累计超过 %.2f 秒后固定批次，取 %d 批中位数\n" minBatch target rounds
     printf "（先跑一遍预热，避免把首次构造数据的开销算进去）\n\n"
     saltRef <- newIORef ""
     _ <- runOnce saltRef db warmupSql False

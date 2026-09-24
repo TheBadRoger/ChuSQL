@@ -9,7 +9,7 @@ use chusql_storage::catalog::Catalog;
 use chusql_storage::config::{self, Config, Loaded};
 use chusql_storage::heap::HeapTable;
 use chusql_storage::log;
-use chusql_storage::protocol::{Request, Response, SchemaColumn};
+use chusql_storage::protocol::{Request, Response, SchemaColumn, TableSchemaWire};
 use chusql_storage::wal::{Wal, WalOp};
 use chusql_storage::{log_debug, log_error, log_info, log_warn};
 use interprocess::local_socket::{
@@ -28,19 +28,21 @@ struct Server {
     cfg: Config,
     tables: Mutex<HashMap<String, Arc<Mutex<HeapTable>>>>,
     write_lock: Mutex<()>,
+    catalog: Mutex<Catalog>,
 }
 
 impl Server {
     /// 新建服务器状态
     fn new(cfg: Config) -> std::io::Result<Self> {
         std::fs::create_dir_all(&cfg.data_dir)?;
+        let catalog = Catalog::load(cfg.data_dir.join("catalog.json"))?;
         Ok(Server {
             cfg,
             tables: Mutex::new(HashMap::new()),
             write_lock: Mutex::new(()),
+            catalog: Mutex::new(catalog),
         })
     }
-
 
 // 路径
     /// 表名 -> 数据文件
@@ -125,7 +127,9 @@ impl Server {
         table: &str,
         f: impl FnOnce(&mut HeapTable) -> std::io::Result<R>,
     ) -> std::io::Result<R> {
-        if !self.table_exists(table) {
+        // 已经在缓存里的表不用再查磁盘（省一次 metadata 系统调用）
+        let cached = self.tables.lock().unwrap().contains_key(table);
+        if !cached && !self.table_exists(table) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("unknown table: {}", table),
@@ -143,19 +147,21 @@ impl Server {
                     None => self.with_table(table, |t| t.insert(row))?,
                     Some(k) => self.with_indexed_table(table, |t| t.insert_keyed(row, *k))?,
                 }
-                let mut c = Catalog::load(self.catalog_path())?;
                 let row: chusql_storage::protocol::Row = row.clone().into_iter().collect();
-                c.record_insert(table, &row);
-                c.save(self.catalog_path())?;
+                let mut c = self.catalog.lock().unwrap();
+                if c.record_insert(table, &row) {
+                    c.save(self.catalog_path())?;
+                }
                 Ok(())
             }
             WalOp::ReplaceAll { table, rows } => {
                 self.with_indexed_table(table, |t| t.replace_all(rows))?;
-                let mut c = Catalog::load(self.catalog_path())?;
                 let rows: Vec<chusql_storage::protocol::Row> =
                     rows.iter().map(|r| r.clone().into_iter().collect()).collect();
-                c.record_replace_all(table, &rows);
-                c.save(self.catalog_path())?;
+                let mut c = self.catalog.lock().unwrap();
+                if c.record_replace_all(table, &rows) {
+                    c.save(self.catalog_path())?;
+                }
                 Ok(())
             }
         }
@@ -298,6 +304,21 @@ impl Server {
                 }
             }
 
+            Request::ListCatalog => {
+                log_debug!(pipe, "list_catalog");
+                let c = self.catalog.lock().unwrap();
+                let schemas: Vec<TableSchemaWire> = c
+                    .all_tables()
+                    .into_iter()
+                    .map(|(name, ts)| TableSchemaWire {
+                        table: name.to_string(),
+                        columns: ts.columns.clone(),
+                        row_count: ts.row_count,
+                    })
+                    .collect();
+                Response::Catalog { schemas }
+            }
+
             Request::DescribeTable { table } => {
                 log_debug!(pipe, "describe_table table={}", table);
                 match self.describe_table(&table) {
@@ -317,18 +338,13 @@ impl Server {
             Request::CreateTable { table, columns } => {
                 log_debug!(pipe, "create_table table={} cols={}", table, columns.len());
 
-                let mut c = match Catalog::load(self.catalog_path()) {
-                    Ok(c) => c,
-                    Err(e) => {
+                {
+                    let c = self.catalog.lock().unwrap();
+                    if c.describe(&table).is_some() {
                         return Response::Error {
-                            message: format!("create_table {}: catalog: {}", table, e),
-                        }
+                            message: format!("create_table {}: table already exists", table),
+                        };
                     }
-                };
-                if c.describe(&table).is_some() {
-                    return Response::Error {
-                        message: format!("create_table {}: table already exists", table),
-                    };
                 }
 
                 if let Err(e) = self.with_table(&table, |_t| Ok(())) {
@@ -337,6 +353,7 @@ impl Server {
                     };
                 }
 
+                let mut c = self.catalog.lock().unwrap();
                 if let Err(e) = c.create_table(&table, columns) {
                     return Response::Error {
                         message: format!("create_table {}: {}", table, e),
@@ -347,31 +364,27 @@ impl Server {
                         message: format!("create_table {}: catalog save: {}", table, e),
                     };
                 }
-
                 Response::Ok
             }
+
             Request::DropTable { table } => {
                 log_debug!(pipe, "drop_table table={}", table);
 
-                let mut c = match Catalog::load(self.catalog_path()) {
-                    Ok(c) => c,
-                    Err(e) => return Response::Error {
-                        message: format!("drop_table {}: catalog: {}", table, e),
-                    },
-                };
-                if let Err(e) = c.drop_table(&table) {
-                    return Response::Error {
-                        message: format!("drop_table {}: {}", table, e),
-                    };
-                }
-                if let Err(e) = c.save(self.catalog_path()) {
-                    return Response::Error {
-                        message: format!("drop_table {}: catalog save: {}", table, e),
-                    };
+                {
+                    let mut c = self.catalog.lock().unwrap();
+                    if let Err(e) = c.drop_table(&table) {
+                        return Response::Error {
+                            message: format!("drop_table {}: {}", table, e),
+                        };
+                    }
+                    if let Err(e) = c.save(self.catalog_path()) {
+                        return Response::Error {
+                            message: format!("drop_table {}: catalog save: {}", table, e),
+                        };
+                    }
                 }
 
                 self.tables.lock().unwrap().remove(&table);
-
                 let _ = std::fs::remove_file(self.table_path(&table));
                 let _ = std::fs::remove_file(self.index_path(&table));
 
@@ -384,12 +397,12 @@ impl Server {
     /// 表名：catalog 与目录取并集
     fn list_tables(&self) -> std::io::Result<Vec<String>> {
         let mut names = BTreeSet::new();
-
-        let c = Catalog::load(self.catalog_path())?;
-        for t in c.table_names() {
-            names.insert(t);
+        {
+            let c = self.catalog.lock().unwrap();
+            for t in c.table_names() {
+                names.insert(t);
+            }
         }
-
         let dir = &self.cfg.data_dir;
         if dir.exists() {
             for entry in std::fs::read_dir(dir)? {
@@ -400,25 +413,31 @@ impl Server {
                 }
             }
         }
-
         Ok(names.into_iter().collect())
     }
 
     /// 查一张表的 schema
     fn describe_table(&self, table: &str) -> std::io::Result<(Vec<SchemaColumn>, u64)> {
-        let c = Catalog::load(self.catalog_path())?;
+        let c = self.catalog.lock().unwrap();
         if let Some(schema) = c.describe(table) {
             return Ok((schema.columns.clone(), schema.row_count));
         }
-        if self.tables.lock().unwrap().contains_key(table)
-            || std::fs::metadata(self.table_path(table)).is_ok()
-        {
+        drop(c);
+        if std::fs::metadata(self.table_path(table)).is_ok() {
             return Ok((Vec::new(), 0));
         }
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("unknown table: {}", table),
         ))
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        if let Ok(c) = self.catalog.lock() {
+            let _ = c.save(self.catalog_path());
+        }
     }
 }
 

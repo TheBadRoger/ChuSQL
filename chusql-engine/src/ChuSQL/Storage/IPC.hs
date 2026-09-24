@@ -7,17 +7,19 @@ module ChuSQL.Storage.IPC (
     Response (..),
     SchemaColumn (..),
     sendRequest,
+    closeConnection,
     doListTables,
     doLookupByKey,
-    doInsertKeyed,
+    doInsertWith,
     doDescribeTable,
-    doCreateTable,
     doDropTable,
+    doListCatalog,
 ) where
 
 import ChuSQL.Model
 import ChuSQL.Storage
-import Control.Exception (IOException, bracket, try)
+import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar)
+import Control.Exception (IOException, try)
 import Data.Aeson (FromJSON (..), ToJSON (..), eitherDecodeStrict, encode, object, withObject, (.:), (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as K
@@ -25,15 +27,16 @@ import Data.Aeson.KeyMap qualified as KM
 import Data.Aeson.Types (Parser)
 import Data.ByteString.Char8 qualified as BSC
 import Data.ByteString.Lazy qualified as BL
-import Data.List (nub)
 import Data.Scientific (floatingOrInteger)
 import Data.Text qualified as T
 import System.Environment (lookupEnv)
 import System.IO
+import System.IO.Unsafe (unsafePerformIO)
 
 -- IPC 存储实现：每个存储方法翻成管道上的一条 JSON 请求。
 
 -- * 存储实现
+
 -- | 命名管道上的存储
 newtype IPCStorage a = IPCStorage
     { runIPCStorage :: IO a
@@ -54,45 +57,80 @@ instance Monad IPCStorage where
         a <- m
         runIPCStorage (k a)
 
+-- * 全局连接缓存
+
+-- | 全局句柄缓存：按管道路径缓存，路径变了就换连接。
+{-# NOINLINE connectionRef #-}
+connectionRef :: MVar (Maybe (FilePath, Handle))
+connectionRef = unsafePerformIO (newMVar Nothing)
+
+-- | 打开管道
+openPipe :: FilePath -> IO Handle
+openPipe path = do
+    h <- openFile path ReadWriteMode
+    hSetBuffering h LineBuffering
+    hSetNewlineMode h noNewlineTranslation
+    pure h
+
+-- | 关掉缓存里的句柄（没有就什么都不做）
+closeCached :: Maybe (FilePath, Handle) -> IO ()
+closeCached Nothing = pure ()
+closeCached (Just (_, h)) = hClose h
+
+-- | 拿一个可用句柄；路径没变就复用，变了就换。
+getConnection :: FilePath -> IO Handle
+getConnection path = modifyMVar connectionRef $ \cached -> case cached of
+    Just (p, h)
+        | p == path -> pure (Just (p, h), h)
+    _ -> do
+        _ <- try (closeCached cached) :: IO (Either IOException ())
+        h <- openPipe path
+        pure (Just (path, h), h)
+
+-- | 丢掉缓存的连接（出错后调用，下次会重连）
+dropConnection :: IO ()
+dropConnection = modifyMVar_ connectionRef $ \cached -> do
+    _ <- try (closeCached cached) :: IO (Either IOException ())
+    pure Nothing
+
+-- | 关闭并清空连接。可选，进程退出前调用。
+closeConnection :: IO ()
+closeConnection = dropConnection
+
 -- * 管道
+
 -- | 管道路径
 pipePath :: IO String
 pipePath = do
     name <- maybe "chusql-storage" id <$> lookupEnv "CHUSQL_PIPE"
     pure ("\\\\.\\pipe\\" ++ name)
 
--- | 开管道跑闭包
-withPipe :: (Handle -> IO a) -> IO a
-withPipe = bracket openPipe hClose
-  where
-    -- \| 打开管道句柄
-    openPipe = do
-        path <- pipePath
-        h <- openFile path ReadWriteMode
-        hSetBuffering h LineBuffering
-        hSetNewlineMode h noNewlineTranslation
-        pure h
-
--- | 发一条请求读一条响应
+-- | 发一条请求读一条响应；管道不通就回 RespError，并丢掉缓存等下次重连。
 sendRequest :: Request -> IO Response
 sendRequest req = do
-    result <- try (withPipe roundTrip) :: IO (Either IOException Response)
-    pure $ case result of
-        Left e -> RespError ("pipe error: " ++ show e)
-        Right r -> r
-  where
-    roundTrip h = do
-        BL.hPutStr h (encode req)
-        BSC.hPutStr h "\n"
-        hFlush h
-        line <- BSC.hGetLine h
-        let cleaned = BSC.dropWhileEnd (== '\r') line
-        case eitherDecodeStrict cleaned of
-            Left err -> pure (RespError ("decode: " ++ err))
-            Right r -> pure r
+    path <- pipePath
+    result <- try (roundTrip req path) :: IO (Either IOException Response)
+    case result of
+        Left e -> do
+            dropConnection
+            pure (RespError ("pipe error: " ++ show e))
+        Right r -> pure r
 
+-- | 一条请求-响应往返（复用缓存里的句柄）
+roundTrip :: Request -> FilePath -> IO Response
+roundTrip req path = do
+    h <- getConnection path
+    BL.hPutStr h (encode req)
+    BSC.hPutStr h "\n"
+    hFlush h
+    line <- BSC.hGetLine h
+    let cleaned = BSC.dropWhileEnd (== '\r') line
+    case eitherDecodeStrict cleaned of
+        Left err -> pure (RespError ("decode: " ++ err))
+        Right r -> pure r
 
 -- * 编解码
+
 -- | 一列的 schema
 data SchemaColumn = SchemaColumn
     { scName :: String
@@ -112,6 +150,7 @@ instance FromJSON SchemaColumn where
         pure (SchemaColumn n t)
 
 -- * 请求
+
 -- | 请求类型
 data Request
     = ReqPing
@@ -123,6 +162,7 @@ data Request
     | ReqDescribeTable String
     | ReqCreateTable String [SchemaColumn]
     | ReqDropTable String
+    | ReqListCatalog
 
 -- | 请求编码
 instance ToJSON Request where
@@ -163,7 +203,7 @@ instance ToJSON Request where
             ]
     toJSON (ReqDropTable t) =
         object ["method" .= ("drop_table" :: T.Text), "table" .= t]
-
+    toJSON ReqListCatalog = object ["method" .= ("list_catalog" :: T.Text)]
 
 -- | 响应类型
 data Response
@@ -173,6 +213,7 @@ data Response
     | RespSchema [SchemaColumn] Int
     | RespOk
     | RespError String
+    | RespCatalog [(String, [SchemaColumn], Int)]
 
 -- | 响应解码
 instance FromJSON Response where
@@ -188,7 +229,18 @@ instance FromJSON Response where
                 cols <- o .: "columns"
                 cnt <- o .: "row_count"
                 pure (RespSchema cols cnt)
+            "catalog" -> do
+                xs <- o .: "schemas"
+                parsed <- mapM parseTableSchema xs
+                pure (RespCatalog parsed)
             other -> fail ("unknown status: " ++ T.unpack other)
+      where
+        -- \| 解析一条 list_catalog 记录。
+        parseTableSchema = withObject "TableSchema" $ \o -> do
+            t <- o .: "table"
+            cols <- o .: "columns"
+            cnt <- o .: "row_count"
+            pure (t, cols, cnt)
 
 -- | 值编码成 JSON
 valueToJSON :: Value -> A.Value
@@ -221,8 +273,8 @@ rowFromJSON (A.Object o) = mapM toPair (KM.toList o)
         pure (K.toString k, val)
 rowFromJSON _ = fail "row must be a JSON object"
 
-
 -- * 内部封装
+
 -- | 发 Scan
 doScan :: String -> IO (Either String [Row])
 doScan t = do
@@ -232,25 +284,10 @@ doScan t = do
         RespError e -> Left e
         _ -> Left "unexpected response to scan"
 
--- | 发 Insert（带 id 键）
-doInsert :: String -> Row -> IO (Either String ())
-doInsert t r = do
-    resp <- sendRequest (ReqInsert t r (rowKey r))
-    pure $ case resp of
-        RespOk -> Right ()
-        RespError e -> Left e
-        _ -> Left "unexpected response to insert"
-
--- | 取行里的 id 作索引键
-rowKey :: Row -> Maybe Int
-rowKey r = case lookup "id" r of
-    Just (VInt k) -> Just k
-    _ -> Nothing
-
--- | 发 Insert（指定键）
-doInsertKeyed :: String -> Row -> Int -> IO (Either String ())
-doInsertKeyed t r k = do
-    resp <- sendRequest (ReqInsert t r (Just k))
+-- | 发 Insert，可带索引键。
+doInsertWith :: String -> Row -> Maybe Int -> IO (Either String ())
+doInsertWith t r mk = do
+    resp <- sendRequest (ReqInsert t r mk)
     pure $ case resp of
         RespOk -> Right ()
         RespError e -> Left e
@@ -273,6 +310,15 @@ doListTables = do
         RespTables ts -> Right ts
         RespError e -> Left e
         _ -> Left "unexpected response to list_tables"
+
+-- | 一次拿全库 schema（表名 + 列 + 行数）。
+doListCatalog :: IO (Either String [(String, [SchemaColumn], Int)])
+doListCatalog = do
+    resp <- sendRequest ReqListCatalog
+    pure $ case resp of
+        RespCatalog xs -> Right xs
+        RespError e -> Left e
+        _ -> Left "unexpected response to list_catalog"
 
 -- | 发 LookupByIndex
 doLookupByKey :: String -> Int -> IO (Either String (Maybe Row))
@@ -312,6 +358,7 @@ doDropTable t = do
         _ -> Left "unexpected response to drop_table"
 
 -- * 表结构
+
 -- | 线上 schema 转本地列
 schemaToColumns :: [SchemaColumn] -> [(String, Column)]
 schemaToColumns = map go
@@ -321,45 +368,15 @@ schemaToColumns = map go
     go (SchemaColumn n "bool") = (n, TBool)
     go (SchemaColumn n _) = (n, TStr)
 
--- | 从行推断列和类型
-inferColumns :: [Row] -> [(String, Column)]
-inferColumns rows = [(n, inferType n) | n <- names]
-  where
-    -- \| 出现过的列名
-    names = nub (concatMap (map fst) rows)
-
-    -- \| 按第一个值推断类型
-    inferType n = case [v | r <- rows, Just v <- [lookup n r]] of
-        (VInt _ : _) -> TInt
-        (VStr _ : _) -> TStr
-        (VBool _ : _) -> TBool
-        [] -> TStr
-
--- | 扫一张表拼成 Table
-loadTable :: String -> IO Table
-loadTable t = do
-    schemaR <- doDescribeTable t
-    case schemaR of
-        Right (cols, _n) -> do
-            rowsR <- doScan t
-            case rowsR of
-                Right rows -> pure (Table t (schemaToColumns cols) rows)
-                Left _ -> pure (Table t (schemaToColumns cols) [])
-        Left _ -> do
-            rowsR <- doScan t
-            case rowsR of
-                Right rows -> pure (Table t (inferColumns rows) rows)
-                Left _ -> pure (Table t [] [])
-
-
 -- * MonadStorage 实例
+
 -- | 存储方法全走管道
 instance MonadStorage IPCStorage where
     -- \| 发 Scan
     scan t = IPCStorage (doScan t)
 
     -- \| 发 Insert
-    insert t r = IPCStorage (doInsert t r)
+    insert t r mk = IPCStorage (doInsertWith t r mk)
 
     -- \| 发 ReplaceAll
     replaceAll t rs = IPCStorage (doReplaceAll t rs)
@@ -380,12 +397,12 @@ instance MonadStorage IPCStorage where
 
     -- \| 列表 + 逐表扫描拼库
     snapshot = IPCStorage $ do
-        result <- doListTables
+        result <- doListCatalog
         case result of
             Left _ -> pure []
-            Right ts -> mapM loadDbEntry ts
+            Right xs -> mapM loadEntry xs
       where
-        -- \| 加载一个 (表名, 表) 对
-        loadDbEntry t = do
-            tbl <- loadTable t
-            pure (t, tbl)
+        -- \| 加载一张表（schema 来自 catalog，行来自 scan）
+        loadEntry (t, cols, _n) = do
+            rows <- doScan t
+            pure (t, Table t (schemaToColumns cols) (either (const []) id rows))

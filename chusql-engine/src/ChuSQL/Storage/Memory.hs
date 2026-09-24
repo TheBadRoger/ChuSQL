@@ -2,10 +2,12 @@ module ChuSQL.Storage.Memory (MemoryStorage (runMemoryStorage)) where
 
 import ChuSQL.Model
 import ChuSQL.Storage
+import Data.List (find)
 
 -- 内存实现：状态是 Database，错误通道是 Either String。
 
 -- * 实例
+
 -- | 内存存储：Database 上的状态
 newtype MemoryStorage a = MemoryStorage {runMemoryStorage :: Database -> Either String (a, Database)}
 
@@ -37,7 +39,7 @@ instance MonadStorage MemoryStorage where
         Right (Right (tableRows tbl), db)
 
     -- \| 追加一行
-    insert t r = MemoryStorage $ \db -> do
+    insert t r _ = MemoryStorage $ \db -> do
         tbl <- lookupTable db t
         Right (Right (), replaceTable t tbl{tableRows = tableRows tbl ++ [r]} db)
 
@@ -67,11 +69,10 @@ instance MonadStorage MemoryStorage where
     snapshot = MemoryStorage $ \db -> Right (db, db)
 
 -- * 工具
+
 -- | 按 id 列找一行
 findRow :: Table -> Int -> Maybe Row
-findRow tbl k = case filter matches (tableRows tbl) of
-    (r : _) -> Just r
-    [] -> Nothing
+findRow tbl k = find matches (tableRows tbl)
   where
     -- \| 这行的 id 是否等于 k
     matches r = lookup "id" r == Just (VInt k)

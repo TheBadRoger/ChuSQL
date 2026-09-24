@@ -63,7 +63,7 @@ impl Wal {
             .append(true)
             .open(&self.path)?;
         f.write_all(&bytes)?;
-        f.sync_all()?;
+        f.sync_data()?;
         Ok(())
     }
 

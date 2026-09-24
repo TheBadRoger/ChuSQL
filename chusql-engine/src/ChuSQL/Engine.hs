@@ -14,6 +14,7 @@ import Control.Monad (filterM)
 -- 引擎入口：语义检查 + 分发执行，以及内存实现与泛型版本。
 
 -- * 对外入口
+
 -- | 跑一条语句（内存实现）
 runStatement :: Database -> Statement -> Either String (Database, [Row])
 runStatement db q = do
@@ -25,35 +26,36 @@ runStatement db q = do
 rowsOf :: Either String (Database, [Row]) -> Either String [Row]
 rowsOf = fmap snd
 
-
 -- | 泛型入口：先检查再执行
 runStatementM :: (MonadStorage m) => Statement -> m (Either String [Row])
 runStatementM q = do
     db <- snapshot
     case check db q of
         Left err -> pure (Left err)
-        Right _ -> runStatementUncheckedM q
+        Right _ -> runStatementUncheckedM db q
 
 -- * 分发执行
+
 -- | 按语句类型分发（已检查过）
-runStatementUncheckedM :: (MonadStorage m) => Statement -> m (Either String [Row])
-runStatementUncheckedM q@Select{} = do
-    db <- snapshot
+runStatementUncheckedM :: (MonadStorage m) => Database -> Statement -> m (Either String [Row])
+runStatementUncheckedM db q@Select{} =
     case translate q of
         Left e -> pure (Left e)
-        Right relOp -> evalRelOpM db (optimize db relOp)
-
-runStatementUncheckedM (Insert tbl cols vals) =
+        Right relOp -> evalRelOpM (optimize db relOp)
+runStatementUncheckedM _ (Insert tbl cols vals) =
     case mapM (\e -> evalExpr e []) vals of
         Left err -> pure (Left err)
         Right values
             | length cols /= length values ->
                 pure (Left "column count does not match value count")
             | otherwise -> do
-                result <- insert tbl (zip cols values)
+                let row = zip cols values
+                    key = case lookup "id" row of
+                        Just (VInt k) -> Just k
+                        _ -> Nothing
+                result <- insert tbl row key
                 pure (result >> Right [])
-
-runStatementUncheckedM (Delete tbl mWhere) = do
+runStatementUncheckedM _ (Delete tbl mWhere) = do
     rowsResult <- scan tbl
     case rowsResult of
         Left err -> pure (Left err)
@@ -70,8 +72,7 @@ runStatementUncheckedM (Delete tbl mWhere) = do
     -- \| 保留 = 条件不成立
     shouldKeep :: Expr -> Row -> Either String Bool
     shouldKeep e row = not <$> evalCondForRow e row
-
-runStatementUncheckedM (Update tbl assigns mWhere) = do
+runStatementUncheckedM _ (Update tbl assigns mWhere) = do
     rowsResult <- scan tbl
     case rowsResult of
         Left err -> pure (Left err)
@@ -90,15 +91,15 @@ runStatementUncheckedM (Update tbl assigns mWhere) = do
             Nothing -> Right True
             Just e -> evalCondForRow e row
         if keep then applyUpdates asgns row else Right row
-
-runStatementUncheckedM (CreateTable name cols) = do
+runStatementUncheckedM _ (CreateTable name cols) = do
     result <- createTable name cols
     pure (result >> Right [])
-runStatementUncheckedM (DropTable name) = do
+runStatementUncheckedM _ (DropTable name) = do
     result <- dropTable name
     pure (result >> Right [])
 
 -- * 更新辅助
+
 -- | 依次求值并覆盖列
 applyUpdates :: [(String, Expr)] -> Row -> Either String Row
 applyUpdates [] row = Right row

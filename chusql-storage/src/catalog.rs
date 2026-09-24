@@ -39,6 +39,11 @@ impl Catalog {
         serde_json::from_slice(&bytes).map_err(io::Error::other)
     }
 
+    /// 返回所有表的 (表名, schema)。
+    pub fn all_tables(&self) -> Vec<(&str, &TableSchema)> {
+        self.tables.iter().map(|(k, v)| (k.as_str(), v)).collect()
+    }
+
     /// 写回文件
     pub fn save<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         let bytes = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
@@ -98,22 +103,27 @@ impl Catalog {
         }
     }
     /// 记一次插入：补列 + 行数 +1
-    pub fn record_insert(&mut self, table: &str, row: &Row) {
+    pub fn record_insert(&mut self, table: &str, row: &Row) -> bool {
         let entry = self.tables.entry(table.to_string()).or_default();
+        let mut changed = false;
         for (k, v) in row {
             if entry.columns.iter().any(|c| &c.name == k) {
                 continue;
             }
             if let Some(ty) = infer_type(v) {
                 entry.columns.push(SchemaColumn { name: k.clone(), ty });
+                changed = true;
             }
         }
         entry.row_count += 1;
+        changed
     }
 
+
     /// 记一次整表替换：列照补，行数重置
-    pub fn record_replace_all(&mut self, table: &str, rows: &[Row]) {
+    pub fn record_replace_all(&mut self, table: &str, rows: &[Row]) -> bool {
         let entry = self.tables.entry(table.to_string()).or_default();
+        let mut changed = false;
         for r in rows {
             for (k, v) in r {
                 if entry.columns.iter().any(|c| &c.name == k) {
@@ -121,10 +131,12 @@ impl Catalog {
                 }
                 if let Some(ty) = infer_type(v) {
                     entry.columns.push(SchemaColumn { name: k.clone(), ty });
+                    changed = true;
                 }
             }
         }
         entry.row_count = rows.len() as u64;
+        changed
     }
 
     /// 删表

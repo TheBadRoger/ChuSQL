@@ -11,8 +11,9 @@ import ChuSQL.Storage.IPC (IPCStorage (runIPCStorage), Request (ReqPing), Respon
 import ChuSQL.Syntax.AST
 import ChuSQL.Syntax.Parser
 import Control.Concurrent (threadDelay)
-import Control.Exception (IOException, bracket, try)
+import Control.Exception (IOException, bracket, finally, try)
 import Data.List (isInfixOf, sortOn)
+import Data.Unique (hashUnique, newUnique)
 import System.CPUTime (getCPUTime)
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, getTemporaryDirectory, removePathForcibly)
 import System.Environment (getEnvironment, lookupEnv, setEnv, unsetEnv)
@@ -340,7 +341,12 @@ main = hspec $ do
         it "returns Left when a value has the wrong type for comparison" $ do
             runStatement testDB (Insert "users" ["name"] [Col "other"])
                 `shouldSatisfy` isLeft
-
+        it "writes id column to index and queries it back" $ do
+            case parseStatement "INSERT INTO users (id, name, age) VALUES (42, 'Zoe', 20)" >>= runStatement testDB of
+                Left err -> expectationFailure err
+                Right (db', _) -> do
+                    rowsOf (parseStatement "SELECT name FROM users WHERE id = 42" >>= runStatement db')
+                        `shouldBe` Right [[("name", VStr "Zoe")]]
     describe "ChuSQL.Engine (DELETE)" $ do
         it "parses DELETE with WHERE" $ do
             parseStatement "DELETE FROM users WHERE age < 18"
@@ -1102,7 +1108,7 @@ main = hspec $ do
         it "scan returns rows with all three value types after insert" $ do
             withTestServer $ \srv -> withServerEnv srv $ do
                 let row = [("id", VInt 7), ("name", VStr "Alice"), ("flag", VBool True)]
-                runIPCStorage (insert "users" row) `shouldReturn` Right ()
+                runIPCStorage (insert "users" row (Just 7)) `shouldReturn` Right ()
                 rows <- runIPCStorage (scan "users")
                 (map sortRow <$> rows) `shouldBe` Right [sortRow row]
 
@@ -1113,7 +1119,7 @@ main = hspec $ do
 
         it "scan returns all 20 inserted rows in order" $ do
             withTestServer $ \srv -> withServerEnv srv $ do
-                mapM_ (\i -> runIPCStorage (insert "many" [("id", VInt i)])) [1 .. 20 :: Int]
+                mapM_ (\i -> runIPCStorage (insert "many" [("id", VInt i)] (Just i))) [1 .. 20 :: Int]
                 rows <- runIPCStorage (scan "many")
                 fmap length rows `shouldBe` Right 20
                 fmap (sortOn show . map (lookup "id")) rows
@@ -1121,7 +1127,7 @@ main = hspec $ do
 
         it "replaceAll leaves only the new rows" $ do
             withTestServer $ \srv -> withServerEnv srv $ do
-                runIPCStorage (insert "t" [("id", VInt 1)]) `shouldReturn` Right ()
+                runIPCStorage (insert "t" [("id", VInt 1)] (Just 1)) `shouldReturn` Right ()
                 runIPCStorage (replaceAll "t" [[("id", VInt 9)], [("id", VInt 8)]]) `shouldReturn` Right ()
                 rows <- runIPCStorage (scan "t")
                 fmap (sortOn show . map (lookup "id")) rows
@@ -1130,7 +1136,7 @@ main = hspec $ do
         it "lookupByKey finds a row inserted with an id over the pipe" $ do
             withTestServer $ \srv -> withServerEnv srv $ do
                 let row = [("id", VInt 7), ("name", VStr "Zoe")]
-                runIPCStorage (insert "keyed" row) `shouldReturn` Right ()
+                runIPCStorage (insert "keyed" row (Just 7)) `shouldReturn` Right ()
                 found <- runIPCStorage (lookupByKey "keyed" 7)
                 fmap (fmap sortRow) found `shouldBe` Right (Just (sortRow row))
                 missing <- runIPCStorage (lookupByKey "keyed" 8)
@@ -1138,7 +1144,7 @@ main = hspec $ do
 
         it "replaceAll rebuilds the index over the pipe" $ do
             withTestServer $ \srv -> withServerEnv srv $ do
-                runIPCStorage (insert "rb" [("id", VInt 1)]) `shouldReturn` Right ()
+                runIPCStorage (insert "rb" [("id", VInt 1)] (Just 1)) `shouldReturn` Right ()
                 runIPCStorage (replaceAll "rb" [[("id", VInt 9), ("name", VStr "Zoe")]]) `shouldReturn` Right ()
                 old <- runIPCStorage (lookupByKey "rb" 1)
                 old `shouldBe` Right Nothing
@@ -1148,8 +1154,8 @@ main = hspec $ do
 
         it "snapshot lists tables and scans each one to build the database" $ do
             withTestServer $ \srv -> withServerEnv srv $ do
-                runIPCStorage (insert "a" [("id", VInt 1)]) `shouldReturn` Right ()
-                runIPCStorage (insert "b" [("id", VInt 2)]) `shouldReturn` Right ()
+                runIPCStorage (insert "a" [("id", VInt 1)] (Just 1)) `shouldReturn` Right ()
+                runIPCStorage (insert "b" [("id", VInt 2)] (Just 2)) `shouldReturn` Right ()
                 db <- runIPCStorage snapshot
                 map fst db `shouldBe` ["a", "b"]
                 map (length . tableRows . snd) db `shouldBe` [1, 1]
@@ -1157,8 +1163,8 @@ main = hspec $ do
 
         it "doListTables returns the tables that exist" $ do
             withTestServer $ \srv -> withServerEnv srv $ do
-                runIPCStorage (insert "t1" [("id", VInt 1)]) `shouldReturn` Right ()
-                runIPCStorage (insert "t2" [("id", VInt 2)]) `shouldReturn` Right ()
+                runIPCStorage (insert "t1" [("id", VInt 1)] (Just 1)) `shouldReturn` Right ()
+                runIPCStorage (insert "t2" [("id", VInt 2)] (Just 2)) `shouldReturn` Right ()
                 doListTables `shouldReturn` Right ["t1", "t2"]
 
         it "rows survive a restart on the same data directory" $ do
@@ -1168,7 +1174,7 @@ main = hspec $ do
                 Right bin -> do
                     srv1 <- startServer bin
                     let dir = dataDir srv1
-                    withServerEnv srv1 $ runIPCStorage (insert "persist" [("id", VInt 42)]) `shouldReturn` Right ()
+                    withServerEnv srv1 $ runIPCStorage (insert "persist" [("id", VInt 42)] (Just 42)) `shouldReturn` Right ()
                     stopServer srv1
                     srv2 <- startServerAt bin dir
                     rows <- withServerEnv srv2 $ runIPCStorage (scan "persist")
@@ -1180,6 +1186,31 @@ main = hspec $ do
             withPipeName "chusql-no-such-server" $ do
                 result <- runIPCStorage (scan "users")
                 result `shouldSatisfy` isLeft
+        it "INSERT then SELECT WHERE id = k via IPC" $ do
+            withTestServer $ \srv -> withServerEnv srv $ do
+                _ <-
+                    runIPCStorage
+                        ( runStatementM
+                            (CreateTable "ipc_idx" [("id", TInt), ("name", TStr)])
+                        )
+                _ <-
+                    runIPCStorage
+                        ( runStatementM
+                            (Insert "ipc_idx" ["id", "name"] [LitInt 42, LitStr "Zoe"])
+                        )
+                result <-
+                    runIPCStorage
+                        ( runStatementM
+                            ( Select
+                                { selectCols = ["name"]
+                                , selectFrom = FromTable Nothing "ipc_idx"
+                                , selectWhere = Just (Eq (Col "id") (LitInt 42))
+                                , selectOrderBy = []
+                                , selectLimit = Nothing
+                                }
+                            )
+                        )
+                result `shouldBe` Right [[("name", VStr "Zoe")]]
         it "parses CREATE TABLE with two columns" $ do
             parseStatement "CREATE TABLE users (id INT, name TEXT)"
                 `shouldBe` Right (CreateTable "users" [("id", TInt), ("name", TStr)])
@@ -1280,7 +1311,7 @@ locateServer = do
 
 startServer :: FilePath -> IO IPCServer
 startServer bin = do
-    stamp <- show <$> getCPUTime
+    stamp <- uniqueStamp
     tmp <- getTemporaryDirectory
     let dir = tmp </> "chusql-hs-IPC" </> stamp
     createDirectoryIfMissing True dir
@@ -1288,7 +1319,7 @@ startServer bin = do
 
 startServerAt :: FilePath -> FilePath -> IO IPCServer
 startServerAt bin dir = do
-    stamp <- show <$> getCPUTime
+    stamp <- uniqueStamp
     let name = "chusql-hs-test-" ++ stamp
     parentEnv <- getEnvironment
     (_, _, _, ph) <-
@@ -1301,6 +1332,13 @@ startServerAt bin dir = do
     let srv = IPCServer name dir ph
     waitUntilReady srv 100
     pure srv
+
+-- | 每次调用都不同的后缀：CPU 时间精度不够，再加上一个唯一编号。
+uniqueStamp :: IO String
+uniqueStamp = do
+    cpu <- getCPUTime
+    u <- hashUnique <$> newUnique
+    pure (show cpu ++ "-" ++ show u)
 
 waitUntilReady :: IPCServer -> Int -> IO ()
 waitUntilReady srv tries = do
@@ -1337,10 +1375,9 @@ withServerEnv srv act = do
     oldDir <- lookupEnv "CHUSQL_DATA_DIR"
     setEnv "CHUSQL_PIPE" (pipeName srv)
     setEnv "CHUSQL_DATA_DIR" (dataDir srv)
-    r <- act
-    restore "CHUSQL_PIPE" oldPipe
-    restore "CHUSQL_DATA_DIR" oldDir
-    pure r
+    act `finally` do
+        restore "CHUSQL_PIPE" oldPipe
+        restore "CHUSQL_DATA_DIR" oldDir
   where
     restore k = maybe (unsetEnv k) (setEnv k)
 

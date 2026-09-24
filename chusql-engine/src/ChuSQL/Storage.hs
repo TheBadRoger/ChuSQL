@@ -12,7 +12,7 @@ class (Monad m) => MonadStorage m where
     scan :: String -> m (Either String [Row])
 
     -- \| 追加一行
-    insert :: String -> Row -> m (Either String ())
+    insert :: String -> Row -> Maybe Int -> m (Either String ())
 
     -- \| 整表替换
     replaceAll :: String -> [Row] -> m (Either String ())

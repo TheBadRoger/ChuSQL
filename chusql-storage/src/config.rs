@@ -11,7 +11,7 @@ use crate::log::Level;
 pub const DEFAULT_CONFIG_PATH: &str = "chusql-storage.toml";
 
 /// 默认池容量（页数）
-pub const DEFAULT_POOL_SIZE: usize = 64;
+pub const DEFAULT_POOL_SIZE: usize = 1024;
 /// 默认页大小
 pub const DEFAULT_PAGE_SIZE: usize = 4096;
 /// 默认 B+ 树 order

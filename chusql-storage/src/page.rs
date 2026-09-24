@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -41,7 +41,8 @@ pub struct PageFile {
     page_size: usize,
     capacity: usize,
     cache: HashMap<PageId, Page>,
-    order: VecDeque<PageId>,
+    last_used: HashMap<PageId, u64>,
+    clock: u64,
     dirty: HashSet<PageId>,
     hits: u64,
     misses: u64,
@@ -70,7 +71,8 @@ impl PageFile {
             page_size,
             capacity,
             cache: HashMap::new(),
-            order: VecDeque::new(),
+            last_used: HashMap::new(),
+            clock: 0,
             dirty: HashSet::new(),
             hits: 0,
             misses: 0,
@@ -116,26 +118,28 @@ impl PageFile {
 
     /// 标记为最近使用
     fn touch(&mut self, id: PageId) {
-        if let Some(pos) = self.order.iter().position(|&x| x == id) {
-            self.order.remove(pos);
-        }
-        self.order.push_back(id);
+        self.clock += 1;
+        self.last_used.insert(id, self.clock);
     }
 
     /// 淘汰一个最冷的页
     fn evict_one(&mut self) -> io::Result<bool> {
-        while let Some(victim) = self.order.pop_front() {
-            if let Some(p) = self.cache.get(&victim) {
-                if self.dirty.contains(&victim) {
-                    let p = p.clone();
-                    self.write_raw(&p)?;
-                    self.dirty.remove(&victim);
-                }
-                self.cache.remove(&victim);
-                return Ok(true);
-            }
+        let victim = self
+            .cache
+            .keys()
+            .min_by_key(|id| self.last_used.get(id).copied().unwrap_or(0))
+            .copied();
+        let Some(victim) = victim else {
+            return Ok(false);
+        };
+        if self.dirty.contains(&victim) {
+            let p = self.cache[&victim].clone();
+            self.write_raw(&p)?;
+            self.dirty.remove(&victim);
         }
-        Ok(false)
+        self.cache.remove(&victim);
+        self.last_used.remove(&victim);
+        Ok(true)
     }
 
     /// 直接写文件
@@ -166,20 +170,38 @@ impl PageFile {
 
     /// 读一页（走缓存）
     pub fn read_page(&mut self, id: PageId) -> io::Result<Page> {
-        if let Some(p) = self.cache.get(&id) {
-            let p = p.clone();
+        self.note_access(id)?;
+        Ok(self.cache[&id].clone())
+    }
+
+    /// 只读地用一页（走缓存，不整页拷贝）
+    pub fn with_page<R>(&mut self, id: PageId, f: impl FnOnce(&Page) -> R) -> io::Result<R> {
+        self.note_access(id)?;
+        Ok(f(&self.cache[&id]))
+    }
+
+    /// 就地改一页（走缓存，不整页拷贝）
+    pub fn update_page<R>(&mut self, id: PageId, f: impl FnOnce(&mut Page) -> R) -> io::Result<R> {
+        self.note_access(id)?;
+        let r = f(self.cache.get_mut(&id).expect("cached above"));
+        self.dirty.insert(id);
+        Ok(r)
+    }
+
+    /// 记一次访问：命中加 hits，未命中读进来并记 misses
+    fn note_access(&mut self, id: PageId) -> io::Result<()> {
+        if self.cache.contains_key(&id) {
             self.hits += 1;
-            self.touch(id);
-            return Ok(p);
+        } else {
+            self.misses += 1;
+            let p = self.read_raw(id)?;
+            if self.cache.len() >= self.capacity {
+                self.evict_one()?;
+            }
+            self.cache.insert(id, p);
         }
-        self.misses += 1;
-        let p = self.read_raw(id)?;
-        if self.cache.len() >= self.capacity {
-            self.evict_one()?;
-        }
-        self.cache.insert(id, p.clone());
-        self.order.push_back(id);
-        Ok(p)
+        self.touch(id);
+        Ok(())
     }
 
     /// 写一页（走缓存）
@@ -257,7 +279,7 @@ impl PageFile {
     /// 清空文件
     pub fn truncate(&mut self) -> io::Result<()> {
         self.cache.clear();
-        self.order.clear();
+        self.last_used.clear();
         self.dirty.clear();
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
