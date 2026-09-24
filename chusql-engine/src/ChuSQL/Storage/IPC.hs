@@ -11,11 +11,13 @@ module ChuSQL.Storage.IPC (
     doLookupByKey,
     doInsertKeyed,
     doDescribeTable,
+    doCreateTable,
+    doDropTable,
 ) where
 
 import ChuSQL.Model
 import ChuSQL.Storage
-import Control.Exception (bracket)
+import Control.Exception (IOException, bracket, try)
 import Data.Aeson (FromJSON (..), ToJSON (..), eitherDecodeStrict, encode, object, withObject, (.:), (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as K
@@ -29,39 +31,41 @@ import Data.Text qualified as T
 import System.Environment (lookupEnv)
 import System.IO
 
--- IPC 存储实现：每个 MonadStorage 方法翻译成管道上的一条 JSON 请求。
+-- IPC 存储实现：每个存储方法翻成管道上的一条 JSON 请求。
 
--- | IPC 实现：通过命名管道连 Rust 存储进程。
+-- * 存储实现
+-- | 命名管道上的存储
 newtype IPCStorage a = IPCStorage
     { runIPCStorage :: IO a
     }
 
--- | Functor：把 fmap 转发给底下的 IO。
+-- | Functor：转发给 IO
 instance Functor IPCStorage where
     fmap f (IPCStorage m) = IPCStorage (fmap f m)
 
--- | Applicative：把 pure / <*> 转发给底下的 IO。
+-- | Applicative：转发给 IO
 instance Applicative IPCStorage where
     pure = IPCStorage . pure
     IPCStorage mf <*> IPCStorage ma = IPCStorage (mf <*> ma)
 
--- | Monad：顺序执行，转发给底下的 IO。
+-- | Monad：顺序执行
 instance Monad IPCStorage where
     IPCStorage m >>= k = IPCStorage $ do
         a <- m
         runIPCStorage (k a)
 
--- | 管道路径；默认 \\.\pipe\chusql-storage，可用 CHUSQL_PIPE 覆盖。
+-- * 管道
+-- | 管道路径
 pipePath :: IO String
 pipePath = do
     name <- maybe "chusql-storage" id <$> lookupEnv "CHUSQL_PIPE"
     pure ("\\\\.\\pipe\\" ++ name)
 
--- | 打开管道、跑闭包、关闭。
+-- | 开管道跑闭包
 withPipe :: (Handle -> IO a) -> IO a
 withPipe = bracket openPipe hClose
   where
-    -- \| 二进制读写、不做换行翻译，跟 Rust 侧对齐。
+    -- \| 打开管道句柄
     openPipe = do
         path <- pipePath
         h <- openFile path ReadWriteMode
@@ -69,39 +73,46 @@ withPipe = bracket openPipe hClose
         hSetNewlineMode h noNewlineTranslation
         pure h
 
--- | 发一条请求，读一条响应。
+-- | 发一条请求读一条响应
 sendRequest :: Request -> IO Response
-sendRequest req = withPipe $ \h -> do
-    BL.hPutStr h (encode req)
-    BSC.hPutStr h "\n"
-    hFlush h
-    line <- BSC.hGetLine h
-    let cleaned = BSC.dropWhileEnd (== '\r') line
-    case eitherDecodeStrict cleaned of
-        Left err -> pure (RespError ("decode: " ++ err))
-        Right r -> pure r
+sendRequest req = do
+    result <- try (withPipe roundTrip) :: IO (Either IOException Response)
+    pure $ case result of
+        Left e -> RespError ("pipe error: " ++ show e)
+        Right r -> r
+  where
+    roundTrip h = do
+        BL.hPutStr h (encode req)
+        BSC.hPutStr h "\n"
+        hFlush h
+        line <- BSC.hGetLine h
+        let cleaned = BSC.dropWhileEnd (== '\r') line
+        case eitherDecodeStrict cleaned of
+            Left err -> pure (RespError ("decode: " ++ err))
+            Right r -> pure r
 
--- * JSON 编解码
 
--- | 一列的 schema；对应 Rust 侧的 SchemaColumn。
+-- * 编解码
+-- | 一列的 schema
 data SchemaColumn = SchemaColumn
     { scName :: String
     , scType :: String
     }
     deriving (Show, Eq)
 
--- | SchemaColumn 编码；Haskell 侧只发 DescribeTable，编码用不上，暂存实现。
+-- | SchemaColumn 编码
 instance ToJSON SchemaColumn where
     toJSON (SchemaColumn n t) = object ["name" .= n, "ty" .= t]
 
--- | SchemaColumn 解码：从 {"name": "...", "ty": "int"|"str"|"bool"} 读回。
+-- | SchemaColumn 解码
 instance FromJSON SchemaColumn where
     parseJSON = withObject "SchemaColumn" $ \o -> do
         n <- o .: "name"
         t <- o .: "ty"
         pure (SchemaColumn n t)
 
--- | 请求；对应 Rust 侧带 method tag 的 enum。
+-- * 请求
+-- | 请求类型
 data Request
     = ReqPing
     | ReqScan String
@@ -110,8 +121,10 @@ data Request
     | ReqListTables
     | ReqLookupByKey String Int
     | ReqDescribeTable String
+    | ReqCreateTable String [SchemaColumn]
+    | ReqDropTable String
 
--- | 请求编码：method 字段 + 各自参数。
+-- | 请求编码
 instance ToJSON Request where
     toJSON ReqPing = object ["method" .= ("ping" :: T.Text)]
     toJSON (ReqScan t) = object ["method" .= ("scan" :: T.Text), "table" .= t]
@@ -142,17 +155,26 @@ instance ToJSON Request where
             [ "method" .= ("describe_table" :: T.Text)
             , "table" .= t
             ]
+    toJSON (ReqCreateTable t cols) =
+        object
+            [ "method" .= ("create_table" :: T.Text)
+            , "table" .= t
+            , "columns" .= cols
+            ]
+    toJSON (ReqDropTable t) =
+        object ["method" .= ("drop_table" :: T.Text), "table" .= t]
 
--- | 响应；对应 Rust 侧带 status tag 的 enum。
+
+-- | 响应类型
 data Response
     = RespPong
     | RespRows [Row]
     | RespTables [String]
-    | RespSchema [SchemaColumn]
+    | RespSchema [SchemaColumn] Int
     | RespOk
     | RespError String
 
--- | 响应解码：按 status 字段分派。
+-- | 响应解码
 instance FromJSON Response where
     parseJSON = withObject "Response" $ \o -> do
         status <- o .: "status"
@@ -161,17 +183,20 @@ instance FromJSON Response where
             "ok" -> pure RespOk
             "rows" -> RespRows <$> (o .: "rows" >>= mapM rowFromJSON)
             "tables" -> RespTables <$> o .: "tables"
-            "schema" -> RespSchema <$> o .: "columns"
             "error" -> RespError <$> o .: "message"
+            "schema" -> do
+                cols <- o .: "columns"
+                cnt <- o .: "row_count"
+                pure (RespSchema cols cnt)
             other -> fail ("unknown status: " ++ T.unpack other)
 
--- | Value 编码成 JSON 的 number / string / bool。
+-- | 值编码成 JSON
 valueToJSON :: Value -> A.Value
 valueToJSON (VInt n) = A.Number (fromIntegral n)
 valueToJSON (VStr s) = A.String (T.pack s)
 valueToJSON (VBool b) = A.Bool b
 
--- | JSON 解回 Value；number 只接受整数。
+-- | JSON 解回值
 valueFromJSON :: A.Value -> Parser Value
 valueFromJSON (A.Number n) =
     case floatingOrInteger n :: Either Double Integer of
@@ -181,24 +206,24 @@ valueFromJSON (A.String s) = pure (VStr (T.unpack s))
 valueFromJSON (A.Bool b) = pure (VBool b)
 valueFromJSON _ = fail "unsupported value type"
 
--- | 一行编成 JSON object。
+-- | 一行编码成 JSON
 rowToJSON :: Row -> A.Value
 rowToJSON r =
     A.Object (KM.fromList [(K.fromString k, valueToJSON v) | (k, v) <- r])
 
--- | JSON object 解成一行。
+-- | JSON 解回一行
 rowFromJSON :: A.Value -> Parser Row
 rowFromJSON (A.Object o) = mapM toPair (KM.toList o)
   where
-    -- \| 解一个键值对。
+    -- \| 解一个键值对
     toPair (k, v) = do
         val <- valueFromJSON v
         pure (K.toString k, val)
 rowFromJSON _ = fail "row must be a JSON object"
 
--- * 内部请求封装
 
--- | 发 Scan 并把结果取成 Either。
+-- * 内部封装
+-- | 发 Scan
 doScan :: String -> IO (Either String [Row])
 doScan t = do
     resp <- sendRequest (ReqScan t)
@@ -207,16 +232,22 @@ doScan t = do
         RespError e -> Left e
         _ -> Left "unexpected response to scan"
 
--- | 发 Insert（不带索引键）。
+-- | 发 Insert（带 id 键）
 doInsert :: String -> Row -> IO (Either String ())
 doInsert t r = do
-    resp <- sendRequest (ReqInsert t r Nothing)
+    resp <- sendRequest (ReqInsert t r (rowKey r))
     pure $ case resp of
         RespOk -> Right ()
         RespError e -> Left e
         _ -> Left "unexpected response to insert"
 
--- | 发 Insert（带索引键）。
+-- | 取行里的 id 作索引键
+rowKey :: Row -> Maybe Int
+rowKey r = case lookup "id" r of
+    Just (VInt k) -> Just k
+    _ -> Nothing
+
+-- | 发 Insert（指定键）
 doInsertKeyed :: String -> Row -> Int -> IO (Either String ())
 doInsertKeyed t r k = do
     resp <- sendRequest (ReqInsert t r (Just k))
@@ -225,7 +256,7 @@ doInsertKeyed t r k = do
         RespError e -> Left e
         _ -> Left "unexpected response to insert"
 
--- | 发 ReplaceAll。
+-- | 发 ReplaceAll
 doReplaceAll :: String -> [Row] -> IO (Either String ())
 doReplaceAll t rs = do
     resp <- sendRequest (ReqReplaceAll t rs)
@@ -234,7 +265,7 @@ doReplaceAll t rs = do
         RespError e -> Left e
         _ -> Left "unexpected response to replace_all"
 
--- | 发 ListTables。
+-- | 发 ListTables
 doListTables :: IO (Either String [String])
 doListTables = do
     resp <- sendRequest ReqListTables
@@ -243,7 +274,7 @@ doListTables = do
         RespError e -> Left e
         _ -> Left "unexpected response to list_tables"
 
--- | 发 LookupByIndex。
+-- | 发 LookupByIndex
 doLookupByKey :: String -> Int -> IO (Either String (Maybe Row))
 doLookupByKey t k = do
     resp <- sendRequest (ReqLookupByKey t k)
@@ -253,45 +284,63 @@ doLookupByKey t k = do
         RespError e -> Left e
         _ -> Left "unexpected response to lookup_by_index"
 
--- | 发 DescribeTable。
-doDescribeTable :: String -> IO (Either String [SchemaColumn])
+-- | 发 DescribeTable
+doDescribeTable :: String -> IO (Either String ([SchemaColumn], Int))
 doDescribeTable t = do
     resp <- sendRequest (ReqDescribeTable t)
     pure $ case resp of
-        RespSchema cols -> Right cols
+        RespSchema cols n -> Right (cols, n)
         RespError e -> Left e
         _ -> Left "unexpected response to describe_table"
 
--- | 把 Rust 的 schema 列转成 Model 的 Column；未知类型降级为 TStr。
+-- | 发 CreateTable
+doCreateTable :: String -> [SchemaColumn] -> IO (Either String ())
+doCreateTable t cols = do
+    resp <- sendRequest (ReqCreateTable t cols)
+    pure $ case resp of
+        RespOk -> Right ()
+        RespError e -> Left e
+        _ -> Left "unexpected response to create_table"
+
+-- | 发 DropTable
+doDropTable :: String -> IO (Either String ())
+doDropTable t = do
+    resp <- sendRequest (ReqDropTable t)
+    pure $ case resp of
+        RespOk -> Right ()
+        RespError e -> Left e
+        _ -> Left "unexpected response to drop_table"
+
+-- * 表结构
+-- | 线上 schema 转本地列
 schemaToColumns :: [SchemaColumn] -> [(String, Column)]
 schemaToColumns = map go
   where
-    -- \| 按 ty 字符串映射成 Column 构造子。
     go (SchemaColumn n "int") = (n, TInt)
     go (SchemaColumn n "str") = (n, TStr)
     go (SchemaColumn n "bool") = (n, TBool)
     go (SchemaColumn n _) = (n, TStr)
 
--- | 从若干行推断列名与类型；catalog 拿不到时的兜底。
+-- | 从行推断列和类型
 inferColumns :: [Row] -> [(String, Column)]
 inferColumns rows = [(n, inferType n) | n <- names]
   where
-    -- \| 全部出现过的列名。
+    -- \| 出现过的列名
     names = nub (concatMap (map fst) rows)
 
-    -- \| 用第一个出现的值推断列类型；找不到就给 TStr。
+    -- \| 按第一个值推断类型
     inferType n = case [v | r <- rows, Just v <- [lookup n r]] of
         (VInt _ : _) -> TInt
         (VStr _ : _) -> TStr
         (VBool _ : _) -> TBool
         [] -> TStr
 
--- | 先 describe 拿列，再 scan 拿行；describe 拿不到时退回扫行推断。
+-- | 扫一张表拼成 Table
 loadTable :: String -> IO Table
 loadTable t = do
     schemaR <- doDescribeTable t
     case schemaR of
-        Right cols -> do
+        Right (cols, _n) -> do
             rowsR <- doScan t
             case rowsR of
                 Right rows -> pure (Table t (schemaToColumns cols) rows)
@@ -302,30 +351,41 @@ loadTable t = do
                 Right rows -> pure (Table t (inferColumns rows) rows)
                 Left _ -> pure (Table t [] [])
 
--- * MonadStorage 实例
 
--- | IPC 实现：所有方法都走管道。
+-- * MonadStorage 实例
+-- | 存储方法全走管道
 instance MonadStorage IPCStorage where
-    -- \| 发 Scan。
+    -- \| 发 Scan
     scan t = IPCStorage (doScan t)
 
-    -- \| 发 Insert，不带索引键。
+    -- \| 发 Insert
     insert t r = IPCStorage (doInsert t r)
 
-    -- \| 发 ReplaceAll。
+    -- \| 发 ReplaceAll
     replaceAll t rs = IPCStorage (doReplaceAll t rs)
 
-    -- \| 发 LookupByIndex。
+    -- \| 发 LookupByIndex
     lookupByKey t k = IPCStorage (doLookupByKey t k)
 
-    -- \| ListTables + 逐表 (describe, scan)，拼成 Database。
+    -- \| 发 CreateTable
+    createTable name cols = IPCStorage (doCreateTable name (map toWire cols))
+      where
+        -- \| 本地列类型转线上字符串
+        toWire (n, TInt) = SchemaColumn n "int"
+        toWire (n, TStr) = SchemaColumn n "str"
+        toWire (n, TBool) = SchemaColumn n "bool"
+
+    -- \| 发 DropTable
+    dropTable name = IPCStorage (doDropTable name)
+
+    -- \| 列表 + 逐表扫描拼库
     snapshot = IPCStorage $ do
         result <- doListTables
         case result of
             Left _ -> pure []
             Right ts -> mapM loadDbEntry ts
       where
-        -- \| 加载一个 (表名, 表) 对。
+        -- \| 加载一个 (表名, 表) 对
         loadDbEntry t = do
             tbl <- loadTable t
             pure (t, tbl)

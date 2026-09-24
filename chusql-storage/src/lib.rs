@@ -1,4 +1,4 @@
-// 存储层库入口：对外暴露 page / protocol / heap / btree / config / log（server 与集成测试都从这里引）。
+// 存储层库入口：对外暴露下面这些模块，服务与集成测试都从这里引。
 
 pub mod btree;
 pub mod config;

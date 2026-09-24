@@ -1,11 +1,11 @@
 use chusql_storage::config::DEFAULT_PAGE_SIZE;
 use chusql_storage::heap::HeapTable;
+use chusql_storage::page::DEFAULT_POOL_SIZE;
 use chusql_storage::protocol::Row;
 use serde_json::json;
 
-// 堆表测试：插入 + 全表扫描、跨页多行、大行、超大行报错、重开文件后数据还在、自定义页大小。
+// 堆表测试：插查、跨页、大行、重开、索引重建。
 
-/// 造一行测试数据（列名 → JSON 值）。
 fn row(pairs: &[(&str, serde_json::Value)]) -> Row {
     let mut m = Row::new();
     for (k, v) in pairs {
@@ -14,12 +14,12 @@ fn row(pairs: &[(&str, serde_json::Value)]) -> Row {
     m
 }
 
-/// 插一行再扫描，能原样读回来。
+/// 插一行再扫描读回
 #[test]
 fn insert_and_scan_one_row() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.db");
-    let mut t = HeapTable::open(&path, DEFAULT_PAGE_SIZE).unwrap();
+    let mut t = HeapTable::open(&path, DEFAULT_PAGE_SIZE, DEFAULT_POOL_SIZE).unwrap();
 
     t.insert(&row(&[("id", json!(1)), ("name", json!("Alice"))]))
         .unwrap();
@@ -30,12 +30,12 @@ fn insert_and_scan_one_row() {
     assert_eq!(rows[0]["name"], json!("Alice"));
 }
 
-/// 插 500 行（必然跨多页），扫描回来的行数和顺序都要对。
+/// 500 行跨页顺序不变
 #[test]
 fn insert_many_rows_cross_pages() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.db");
-    let mut t = HeapTable::open(&path, DEFAULT_PAGE_SIZE).unwrap();
+    let mut t = HeapTable::open(&path, DEFAULT_PAGE_SIZE, DEFAULT_POOL_SIZE).unwrap();
 
     for i in 0..500 {
         t.insert(&row(&[("id", json!(i))])).unwrap();
@@ -43,18 +43,17 @@ fn insert_many_rows_cross_pages() {
 
     let rows = t.scan().unwrap();
     assert_eq!(rows.len(), 500);
-    // 顺序保持
     for (i, r) in rows.iter().enumerate() {
         assert_eq!(r["id"], json!(i as i64));
     }
 }
 
-/// 约 2KB 的大行也要能放进一页。
+/// 2KB 大行放得下
 #[test]
 fn large_row_still_fits() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.db");
-    let mut t = HeapTable::open(&path, DEFAULT_PAGE_SIZE).unwrap();
+    let mut t = HeapTable::open(&path, DEFAULT_PAGE_SIZE, DEFAULT_POOL_SIZE).unwrap();
 
     let big = "x".repeat(2000);
     t.insert(&row(&[("data", json!(big.clone()))])).unwrap();
@@ -64,43 +63,43 @@ fn large_row_still_fits() {
     assert_eq!(rows[0]["data"], json!(big));
 }
 
-/// 超过一页容量的行要报错，而不是悄悄写坏。
+/// 超页的行要报错
 #[test]
 fn row_too_large_errors() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.db");
-    let mut t = HeapTable::open(&path, DEFAULT_PAGE_SIZE).unwrap();
+    let mut t = HeapTable::open(&path, DEFAULT_PAGE_SIZE, DEFAULT_POOL_SIZE).unwrap();
 
     let huge = "x".repeat(10_000);
     let err = t.insert(&row(&[("data", json!(huge))]));
     assert!(err.is_err());
 }
 
-/// 关掉再重新打开同一个文件，之前插入的数据还在。
+/// 重开文件数据还在
 #[test]
 fn reopen_and_scan() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.db");
 
     {
-        let mut t = HeapTable::open(&path, DEFAULT_PAGE_SIZE).unwrap();
+        let mut t = HeapTable::open(&path, DEFAULT_PAGE_SIZE, DEFAULT_POOL_SIZE).unwrap();
         t.insert(&row(&[("id", json!(1))])).unwrap();
         t.insert(&row(&[("id", json!(2))])).unwrap();
     }
 
-    let mut t = HeapTable::open(&path, DEFAULT_PAGE_SIZE).unwrap();
+    let mut t = HeapTable::open(&path, DEFAULT_PAGE_SIZE, DEFAULT_POOL_SIZE).unwrap();
     let rows = t.scan().unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0]["id"], json!(1));
     assert_eq!(rows[1]["id"], json!(2));
 }
 
-/// 页大小可以配置：512 字节的页装得下小行、放不下大行，行数不变。
+/// 512 字节页可用
 #[test]
 fn custom_page_size() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("small.db");
-    let mut t = HeapTable::open(&path, 512).unwrap();
+    let mut t = HeapTable::open(&path, 512, DEFAULT_POOL_SIZE).unwrap();
 
     for i in 0..50 {
         t.insert(&row(&[("id", json!(i))])).unwrap();
@@ -111,7 +110,7 @@ fn custom_page_size() {
     assert!(t.insert(&row(&[("data", json!(big))])).is_err());
 }
 
-/// 整表改写之后索引必须跟着重建：旧键查不到，新行按 id 能查到。
+/// 整表改写后索引重建
 #[test]
 fn replace_all_rebuilds_index() {
     let dir = tempfile::tempdir().unwrap();
@@ -120,6 +119,7 @@ fn replace_all_rebuilds_index() {
         dir.path().join("t.idx"),
         DEFAULT_PAGE_SIZE,
         chusql_storage::config::DEFAULT_BTREE_ORDER,
+        DEFAULT_POOL_SIZE,
     )
     .unwrap();
 

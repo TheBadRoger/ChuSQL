@@ -4,45 +4,50 @@ use serde::Deserialize;
 
 use crate::log::Level;
 
-// 配置：优先环境变量，其次 TOML 文件，最后内置默认值（下面写的就是默认值）。
-// 每个选项的来源都记在 Loaded::origins 里，server 启动时打进日志——读了哪个文件、
-// 哪些选项走了默认回退，一眼能看出来。
+// 配置：环境变量优先于 TOML，最后回退内置默认值。
 
-/// 默认配置文件名（相对当前工作目录）；可用 CHUSQL_CONFIG 指到别处。
+// 默认值
+/// 默认配置文件路径
 pub const DEFAULT_CONFIG_PATH: &str = "chusql-storage.toml";
 
-/// 默认页大小（字节）。
+/// 默认池容量（页数）
+pub const DEFAULT_POOL_SIZE: usize = 64;
+/// 默认页大小
 pub const DEFAULT_PAGE_SIZE: usize = 4096;
-/// 默认 B+ 树节点最大孩子数。
+/// 默认 B+ 树 order
 pub const DEFAULT_BTREE_ORDER: usize = 4;
-/// 默认数据目录。
+/// 默认数据目录
 pub const DEFAULT_DATA_DIR: &str = "data";
-/// 默认管道名。
+/// 默认管道名
 pub const DEFAULT_PIPE_NAME: &str = "chusql-storage";
-/// 默认日志等级。
+/// 默认日志等级
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 
-/// 页大小允许的范围。
+/// 页大小允许范围
 const MIN_PAGE_SIZE: usize = 512;
 const MAX_PAGE_SIZE: usize = 65536;
-/// B+ 树节点至少要放得下 2 个键，分裂规则才成立。
+/// order 最小值
 const MIN_BTREE_ORDER: usize = 3;
 
-/// 生效的配置。
 #[derive(Debug, Clone, PartialEq, Eq)]
+// 配置
+/// 生效的配置
 pub struct Config {
     pub page_size: usize,
     pub btree_order: usize,
+    pub pool_size: usize,
     pub data_dir: PathBuf,
     pub pipe_name: String,
     pub log_level: Level,
 }
 
+/// 全默认值
 impl Default for Config {
     fn default() -> Self {
         Config {
             page_size: DEFAULT_PAGE_SIZE,
             btree_order: DEFAULT_BTREE_ORDER,
+            pool_size: DEFAULT_POOL_SIZE,
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             pipe_name: DEFAULT_PIPE_NAME.to_string(),
             log_level: Level::Info,
@@ -50,8 +55,8 @@ impl Default for Config {
     }
 }
 
-/// 一个选项的来源。
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// 一个选项的来源
 pub enum Origin {
     Default,
     File(PathBuf),
@@ -59,7 +64,7 @@ pub enum Origin {
 }
 
 impl Origin {
-    /// 日志里那一列怎么写。
+    /// 来源的文案
     pub fn describe(&self) -> String {
         match self {
             Origin::Default => "default".to_string(),
@@ -69,20 +74,22 @@ impl Origin {
     }
 }
 
-/// 生效配置 + 每个选项的来源。
 #[derive(Debug, Clone)]
+/// 配置 + 每项来源
 pub struct Loaded {
     pub config: Config,
     pub config_path: Option<PathBuf>,
     pub origins: Vec<(&'static str, String, Origin)>,
 }
 
-/// TOML 文件里的形状：字段全部可选，没写的就当"文件没提这一项"。
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+// 文件形状
+/// TOML 的形状（字段都可选）
 struct FileConfig {
     page: Option<FilePage>,
     btree: Option<FileBtree>,
+    buffer: Option<FileBuffer>,
     storage: Option<FileStorage>,
     server: Option<FileServer>,
     log: Option<FileLog>,
@@ -90,35 +97,48 @@ struct FileConfig {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// [buffer] 段
+struct FileBuffer {
+    pool_size: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// [page] 段
 struct FilePage {
     size: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// [btree] 段
 struct FileBtree {
     order: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// [storage] 段
 struct FileStorage {
     data_dir: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// [server] 段
 struct FileServer {
     pipe_name: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// [log] 段
 struct FileLog {
     level: Option<String>,
 }
 
-/// 从真实环境加载：CHUSQL_CONFIG（或当前目录的默认文件）+ 环境变量覆盖。
+// 加载
+/// 按真实环境加载
 pub fn load() -> Result<Loaded, String> {
     let path = match std::env::var("CHUSQL_CONFIG") {
         Ok(p) if !p.trim().is_empty() => Some(PathBuf::from(p)),
@@ -137,7 +157,7 @@ pub fn load() -> Result<Loaded, String> {
     resolve(text.as_deref(), path, &|k| std::env::var(k).ok())
 }
 
-/// 解析 TOML 文本 + 套环境变量覆盖；测试直接调这个，不碰真实环境。
+/// 解析文本并套环境变量
 pub fn resolve(
     text: Option<&str>,
     path: Option<PathBuf>,
@@ -180,6 +200,18 @@ pub fn resolve(
                 .map_err(|_| format!("not a number: {}", s))
         },
     )?;
+    let (pool_size, pool_origin) = pick(
+        "CHUSQL_POOL_SIZE",
+        file.buffer.and_then(|b| b.pool_size),
+        DEFAULT_POOL_SIZE,
+        &file_origin,
+        env,
+        |s| {
+            s.trim()
+                .parse::<usize>()
+                .map_err(|_| format!("not a number: {}", s))
+        },
+    )?;
     let (data_dir, dir_origin) = pick(
         "CHUSQL_DATA_DIR",
         file.storage.and_then(|s| s.data_dir),
@@ -214,10 +246,13 @@ pub fn resolve(
         return Err("server.pipe_name must not be empty".to_string());
     }
     validate_layout(page_size, btree_order)?;
-
+    if pool_size == 0 {
+        return Err("buffer.pool_size must be at least 1".to_string());
+    }
     let origins = vec![
         ("page.size", page_size.to_string(), page_origin),
         ("btree.order", btree_order.to_string(), order_origin),
+        ("buffer.pool_size", pool_size.to_string(), pool_origin),    // 新增
         ("storage.data_dir", data_dir.clone(), dir_origin),
         ("server.pipe_name", pipe_name.clone(), pipe_origin),
         ("log.level", log_level.name().to_string(), log_origin),
@@ -227,6 +262,7 @@ pub fn resolve(
         config: Config {
             page_size,
             btree_order,
+            pool_size,
             data_dir: PathBuf::from(data_dir),
             pipe_name,
             log_level,
@@ -236,7 +272,7 @@ pub fn resolve(
     })
 }
 
-/// 取一个选项：环境变量 → 配置文件 → 默认值，并记下它从哪来。
+/// 取一项：env -> 文件 -> 默认
 fn pick<T: Clone>(
     env_key: &'static str,
     file_value: Option<T>,
@@ -255,7 +291,8 @@ fn pick<T: Clone>(
     Ok((default, Origin::Default))
 }
 
-/// 检查选项本身和选项之间是否说得通。
+// 校验
+/// 检查选项是否自洽
 fn validate_layout(page_size: usize, btree_order: usize) -> Result<(), String> {
     if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&page_size) || !page_size.is_power_of_two() {
         return Err(format!(

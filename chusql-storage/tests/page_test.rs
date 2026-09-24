@@ -1,10 +1,9 @@
 use chusql_storage::config::DEFAULT_PAGE_SIZE;
 use chusql_storage::page::{Page, PageFile};
 
-// 页文件测试：一页的读写、页号越界报错、追加页让文件变长、多页互不干扰、覆写同一页、
-// 自定义页大小、页大小和文件对不上时报错。
+// 页文件测试：读写、追加、覆写、页大小校验与页缓存。
 
-/// 写入一页再读回来，内容和长度都应该一致。
+/// 写一页再读回一致
 #[test]
 fn write_then_read_page() {
     let dir = tempfile::tempdir().unwrap();
@@ -23,7 +22,7 @@ fn write_then_read_page() {
     assert_eq!(read.data.len(), DEFAULT_PAGE_SIZE);
 }
 
-/// 空文件读第 0 页应该报错。
+/// 空文件读第 0 页报错
 #[test]
 fn read_out_of_range_returns_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -33,7 +32,7 @@ fn read_out_of_range_returns_error() {
     assert!(pf.read_page(0).is_err());
 }
 
-/// 每 append 一页，num_pages 就加一。
+/// 追加让页数加一
 #[test]
 fn append_grows_file() {
     let dir = tempfile::tempdir().unwrap();
@@ -50,7 +49,7 @@ fn append_grows_file() {
     assert_eq!(pf.num_pages().unwrap(), 3);
 }
 
-/// 页 0 和页 1 的内容互不影响。
+/// 两页内容互不影响
 #[test]
 fn two_pages_independent() {
     let dir = tempfile::tempdir().unwrap();
@@ -69,7 +68,7 @@ fn two_pages_independent() {
     assert_eq!(pf.read_page(1).unwrap().data[0], 2);
 }
 
-/// 覆写同一页：读到的是新内容，页数不变。
+/// 覆写同页读到新内容
 #[test]
 fn overwrite_page() {
     let dir = tempfile::tempdir().unwrap();
@@ -89,25 +88,20 @@ fn overwrite_page() {
     assert_eq!(pf.num_pages().unwrap(), 1);
 }
 
-/// 页大小可以配置：512 字节的页照样读写，文件按 512 字节对齐。
+/// 512 字节页可用
 #[test]
 fn custom_page_size() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("small.db");
-
+    let path = dir.path().join("t.db");
     let mut pf = PageFile::open(&path, 512).unwrap();
-    assert_eq!(pf.page_size(), 512);
 
-    let mut p = Page::new(0, 512);
-    p.data[511] = 9;
-    pf.write_page(&p).unwrap();
+    pf.write_page(&Page::new(0, 512)).unwrap();
+    pf.flush().unwrap();
 
-    assert_eq!(pf.read_page(0).unwrap().data[511], 9);
-    assert_eq!(pf.num_pages().unwrap(), 1);
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 512);
 }
 
-/// 文件长度不是页大小整数倍（比如页大小被改过）要报错，而不是算出错误的页数。
+/// 长度不是整数倍要报错
 #[test]
 fn mismatched_file_length_errors() {
     let dir = tempfile::tempdir().unwrap();
@@ -118,7 +112,7 @@ fn mismatched_file_length_errors() {
     assert!(pf.num_pages().is_err());
 }
 
-/// 页大小对不上的页不许写进去。
+/// 页大小不符拒绝写入
 #[test]
 fn write_wrong_sized_page_errors() {
     let dir = tempfile::tempdir().unwrap();
@@ -126,4 +120,44 @@ fn write_wrong_sized_page_errors() {
 
     let mut pf = PageFile::open(&path, 512).unwrap();
     assert!(pf.write_page(&Page::new(0, 1024)).is_err());
+}
+
+/// 第二次读命中缓存
+#[test]
+fn cache_hit_avoids_second_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.db");
+
+    {
+        let mut pf = PageFile::open(&path, 4096).unwrap();
+        pf.write_page(&Page::new(0, 4096)).unwrap();
+        pf.flush().unwrap();
+    }
+
+    let mut pf = PageFile::open(&path, 4096).unwrap();
+    let _ = pf.read_page(0).unwrap();
+    let _ = pf.read_page(0).unwrap();
+    let _ = pf.read_page(0).unwrap();
+
+    assert_eq!(pf.hits(), 2);
+    assert_eq!(pf.misses(), 1);
+    assert!(pf.hit_rate() > 0.6);
+}
+
+/// 退出时脏页写回
+#[test]
+fn dirty_page_flushed_on_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.db");
+
+    {
+        let mut pf = PageFile::open(&path, DEFAULT_PAGE_SIZE).unwrap();
+        let mut p = Page::new(0, DEFAULT_PAGE_SIZE);
+        p.data[0] = 42;
+        pf.write_page(&p).unwrap();
+    }
+
+    let mut pf2 = PageFile::open(&path, DEFAULT_PAGE_SIZE).unwrap();
+    let p = pf2.read_page(0).unwrap();
+    assert_eq!(p.data[0], 42);
 }

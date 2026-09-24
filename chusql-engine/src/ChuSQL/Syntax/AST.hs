@@ -1,9 +1,12 @@
-module ChuSQL.Syntax.AST (Query (..), FromClause (..), Expr (..), SortDir (..), makeSelect) where
+module ChuSQL.Syntax.AST (Statement (..), FromClause (..), Expr (..), SortDir (..), makeSelect) where
 
--- SQL 语法树：四类语句（SELECT / INSERT / DELETE / UPDATE）+ 表达式、FROM 从句、排序方向。
+import ChuSQL.Model (Column (..))
 
--- 查询语句
-data Query
+-- 语法树：语句、数据来源、条件表达式、排序方向。
+
+-- * 语句
+-- | 一条语句：查 / 加 / 删 / 改 / 建表 / 删表
+data Statement
     = Select
         { selectCols :: [String]
         , selectFrom :: FromClause
@@ -14,15 +17,18 @@ data Query
     | Insert String [String] [Expr]
     | Delete String (Maybe Expr)
     | Update String [(String, Expr)] (Maybe Expr)
+    | CreateTable String [(String, Column)]
+    | DropTable String
     deriving (Show, Eq)
 
--- FROM 从句：单表或 JOIN。
+-- | 数据来源：单表，或两表拼接
 data FromClause
     = FromTable (Maybe String) String
     | FromJoin FromClause (Maybe String) String Expr
     deriving (Show, Eq)
 
--- 条件表达式
+-- * 表达式
+-- | 条件表达式
 data Expr
     = Col String
     | LitInt Int
@@ -35,14 +41,16 @@ data Expr
     | Or Expr Expr
     deriving (Show, Eq)
 
--- 排序方向
+-- * 排序
+-- | 排序方向
 data SortDir
     = Asc
     | Desc
     deriving (Show, Eq)
 
--- 便捷构造：造一条最简单的 SELECT（给测试和演示用）。
-makeSelect :: [String] -> String -> Maybe Expr -> Query
+-- * 构造
+-- | 造一个最简单的 SELECT
+makeSelect :: [String] -> String -> Maybe Expr -> Statement
 makeSelect cols tbl w =
     Select
         { selectCols = cols

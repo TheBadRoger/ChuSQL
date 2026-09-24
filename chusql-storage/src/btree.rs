@@ -3,100 +3,98 @@ use std::path::Path;
 
 use crate::page::{Page, PageFile, PageId};
 
-// 磁盘版 B+ 树：每个节点占一页，page 0 存文件头（魔数 + 页大小 + order + 根页号）。
-// 节点页布局（order = 一个节点最多几个孩子，来自配置）：
-//   [0]              节点类型：0=叶子，1=内部
-//   [1..3]           键数量 u16
-//   [3..11]          叶子的 next 页号 u64（内部保留）
-//   [12..12+K*8]     键：K = order-1 个 i64
-//   [后面]           叶子：K 个 u64 值；内部：order 个 u64 孩子页号
+// 磁盘 B+ 树：节点占一页，文件头记页大小与 order。
 
-/// 文件头放在这一页。
+// 布局常量
+/// 文件头放在第 0 页
 const META_PAGE: PageId = 0;
-/// 文件头魔数。
+/// 魔数，用来认出索引文件
 const META_MAGIC: &[u8; 4] = b"CBTR";
-/// 文件头里各字段的偏移。
+/// 文件头各字段的偏移
 const OFF_META_PAGE_SIZE: usize = 4;
 const OFF_META_ORDER: usize = 8;
 const OFF_META_ROOT: usize = 10;
 
-/// 节点类型标记。
+/// 节点类型标记
 const NODE_LEAF: u8 = 0;
 const NODE_INTERNAL: u8 = 1;
-/// 布局偏移。
+/// 节点内布局的偏移
 const OFF_TYPE: usize = 0;
 const OFF_COUNT: usize = 1;
 const OFF_NEXT: usize = 3;
 const OFF_KEYS: usize = 12;
 
-/// 一个 order 的节点占多少字节（内部节点最坏情况：order-1 个键 + order 个孩子）。
+// 容量计算
+/// 一个节点占多少字节
 fn node_bytes(order: usize) -> usize {
     OFF_KEYS + max_keys(order) * 8 + order * 8
 }
 
-/// 一个节点最多几个键。
+/// 最多几个键
 fn max_keys(order: usize) -> usize {
     order - 1
 }
 
-/// 键后面那片区域的起点。
+/// 值区域的起点
 fn off_payload(order: usize) -> usize {
     OFF_KEYS + max_keys(order) * 8
 }
 
-/// 这个 order 放得进 size 字节的页吗。
+/// 这个 order 放得进一页吗
 pub fn fits_in_page(page_size: usize, order: usize) -> bool {
     order >= 2 && node_bytes(order) <= page_size
 }
 
-/// 给定页大小，order 最大能取多少（解 12 + (order-1)*8 + order*8 <= page_size）。
+/// 一页最多几个孩子
 pub fn max_order(page_size: usize) -> usize {
     page_size.saturating_sub(4) / 16
 }
 
-/// 读一个 u8。
+// 小端读写
+/// 读一个 u8
 fn read_u8(p: &Page, off: usize) -> u8 {
     p.data[off]
 }
 
-/// 写一个 u8。
+/// 写一个 u8
 fn write_u8(p: &mut Page, off: usize, v: u8) {
     p.data[off] = v;
 }
 
-/// 读一个小端 u16。
+/// 读一个小端 u16
 fn read_u16(p: &Page, off: usize) -> u16 {
     u16::from_le_bytes([p.data[off], p.data[off + 1]])
 }
 
-/// 写一个小端 u16。
+/// 写一个小端 u16
 fn write_u16(p: &mut Page, off: usize, v: u16) {
     p.data[off..off + 2].copy_from_slice(&v.to_le_bytes());
 }
 
-/// 读一个小端 u32。
+/// 读一个小端 u32
 fn read_u32(p: &Page, off: usize) -> u32 {
     u32::from_le_bytes([p.data[off], p.data[off + 1], p.data[off + 2], p.data[off + 3]])
 }
 
-/// 写一个小端 u32。
+/// 写一个小端 u32
 fn write_u32(p: &mut Page, off: usize, v: u32) {
     p.data[off..off + 4].copy_from_slice(&v.to_le_bytes());
 }
 
-/// 读一个小端 u64。
+/// 读一个小端 u64
 fn read_u64(p: &Page, off: usize) -> u64 {
     let mut b = [0u8; 8];
     b.copy_from_slice(&p.data[off..off + 8]);
     u64::from_le_bytes(b)
 }
 
-/// 写一个小端 u64。
+/// 写一个小端 u64
 fn write_u64(p: &mut Page, off: usize, v: u64) {
     p.data[off..off + 8].copy_from_slice(&v.to_le_bytes());
 }
 
-/// 写文件头。
+// 文件头
+/// 写文件头
 fn write_meta(page: &mut Page, page_size: usize, order: usize, root: PageId) {
     page.zero();
     page.data[0..4].copy_from_slice(META_MAGIC);
@@ -105,7 +103,7 @@ fn write_meta(page: &mut Page, page_size: usize, order: usize, root: PageId) {
     write_u64(page, OFF_META_ROOT, root);
 }
 
-/// 检查文件头和当前配置是否一致（页大小 / order 改了就会对不上）。
+/// 校验文件头与配置
 fn check_meta(page: &Page, page_size: usize, order: usize) -> io::Result<()> {
     if page.data[0..4] != *META_MAGIC {
         return Err(io::Error::new(
@@ -127,7 +125,8 @@ fn check_meta(page: &Page, page_size: usize, order: usize) -> io::Result<()> {
     Ok(())
 }
 
-/// 一个节点在内存里的样子。
+// 节点编解码
+/// 节点在内存里的样子
 enum NodeData {
     Leaf {
         keys: Vec<i64>,
@@ -140,7 +139,7 @@ enum NodeData {
     },
 }
 
-/// 从一页里读出节点。
+/// 从一页读出节点
 fn read_node(p: &Page, order: usize) -> NodeData {
     let ty = read_u8(p, OFF_TYPE);
     let n = read_u16(p, OFF_COUNT) as usize;
@@ -167,7 +166,7 @@ fn read_node(p: &Page, order: usize) -> NodeData {
     }
 }
 
-/// 把节点写回一页（先清零，避免残留）。
+/// 把节点写回一页
 fn write_node(p: &mut Page, node: &NodeData, order: usize) {
     p.zero();
     let payload = off_payload(order);
@@ -196,7 +195,7 @@ fn write_node(p: &mut Page, node: &NodeData, order: usize) {
     }
 }
 
-/// 二分找 key 应该下探到的孩子下标。
+/// 二分选孩子
 fn child_index(keys: &[i64], key: i64) -> usize {
     let mut lo = 0;
     let mut hi = keys.len();
@@ -211,15 +210,21 @@ fn child_index(keys: &[i64], key: i64) -> usize {
     lo
 }
 
-/// 磁盘版 B+ 树。
+// B+ 树
+/// 磁盘 B+ 树
 pub struct DiskBTree {
     file: PageFile,
     order: usize,
 }
 
 impl DiskBTree {
-    /// 打开或新建索引文件；页大小 / order 和文件头里记的不一致就报错。
-    pub fn open<P: AsRef<Path>>(path: P, page_size: usize, order: usize) -> io::Result<Self> {
+    /// 打开或新建索引文件
+    pub fn open<P: AsRef<Path>>(
+            path: P,
+            page_size: usize,
+            order: usize,
+            pool_size: usize,
+        ) -> io::Result<Self> {
         if !fits_in_page(page_size, order) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -231,7 +236,7 @@ impl DiskBTree {
                 ),
             ));
         }
-        let mut file = PageFile::open(path, page_size)?;
+        let mut file = PageFile::with_options(path, page_size, pool_size)?;
         if file.num_pages()? == 0 {
             let mut meta = Page::new(META_PAGE, page_size);
             write_meta(&mut meta, page_size, order, 0);
@@ -243,26 +248,26 @@ impl DiskBTree {
         Ok(DiskBTree { file, order })
     }
 
-    /// 读根页号；0 表示空树。
+    /// 读根页号
     fn root(&mut self) -> io::Result<Option<PageId>> {
         let meta = self.file.read_page(META_PAGE)?;
         let r = read_u64(&meta, OFF_META_ROOT);
         Ok(if r == 0 { None } else { Some(r) })
     }
 
-    /// 写根页号。
+    /// 写根页号
     fn set_root(&mut self, r: Option<PageId>) -> io::Result<()> {
         let mut meta = self.file.read_page(META_PAGE)?;
         write_u64(&mut meta, OFF_META_ROOT, r.unwrap_or(0));
         self.file.write_page(&meta)
     }
 
-    /// 分配一个新页。
+    /// 分配新页
     fn alloc(&mut self) -> io::Result<PageId> {
         Ok(self.file.append_page()?.id)
     }
 
-    /// 清空整棵树：截断文件后重写文件头（根页号归零）。
+    /// 清空整棵树
     pub fn clear(&mut self) -> io::Result<()> {
         let page_size = self.file.page_size();
         self.file.truncate()?;
@@ -272,12 +277,12 @@ impl DiskBTree {
         Ok(())
     }
 
-    /// 空页，用来拼一个新节点。
+    /// 空页，用来拼节点
     fn new_page(&self, id: PageId) -> Page {
         Page::new(id, self.file.page_size())
     }
 
-    /// 按 key 找 value。
+    /// 按 key 找 value
     pub fn get(&mut self, key: i64) -> io::Result<Option<u64>> {
         match self.root()? {
             None => Ok(None),
@@ -285,7 +290,7 @@ impl DiskBTree {
         }
     }
 
-    /// 递归查找。
+    /// 递归查找
     fn get_rec(&mut self, page_id: PageId, key: i64) -> io::Result<Option<u64>> {
         let p = self.file.read_page(page_id)?;
         match read_node(&p, self.order) {
@@ -299,7 +304,7 @@ impl DiskBTree {
         }
     }
 
-    /// 插入 / 覆盖一个键值对。
+    /// 插入或覆盖
     pub fn insert(&mut self, key: i64, value: u64) -> io::Result<()> {
         match self.root()? {
             None => {
@@ -317,7 +322,6 @@ impl DiskBTree {
             Some(r) => {
                 let (_, split) = self.insert_rec(r, key, value)?;
                 if let Some((sep, right_id)) = split {
-                    // 根分裂：长高一层。
                     let root_id = self.alloc()?;
                     let node = NodeData::Internal {
                         keys: vec![sep],
@@ -334,7 +338,7 @@ impl DiskBTree {
         }
     }
 
-    /// 递归插入；返回可能上提的 (分隔键, 新右页号)。
+    /// 递归插入，可能上提
     fn insert_rec(
         &mut self,
         page_id: PageId,
@@ -358,7 +362,6 @@ impl DiskBTree {
                     self.file.write_page(&p2)?;
                     Ok((page_id, None))
                 } else {
-                    // 叶子分裂：右叶最小键复制上提。
                     let mid = keys.len() / 2;
                     let rkeys = keys.split_off(mid);
                     let rvalues = values.split_off(mid);
@@ -409,7 +412,6 @@ impl DiskBTree {
                             self.file.write_page(&p2)?;
                             Ok((page_id, None))
                         } else {
-                            // 内部节点分裂：中间键上提，不再保留原件。
                             let mid = keys.len() / 2;
                             let up = keys[mid];
                             let rkeys = keys.split_off(mid + 1);
@@ -441,7 +443,7 @@ impl DiskBTree {
         }
     }
 
-    /// 按 key 升序返回所有键值对。
+    /// 按键升序返回全部
     pub fn iter_all(&mut self) -> io::Result<Vec<(i64, u64)>> {
         let mut out = Vec::new();
         if let Some(r) = self.root()? {
@@ -450,7 +452,7 @@ impl DiskBTree {
         Ok(out)
     }
 
-    /// 中序遍历一棵子树。
+    /// 中序遍历
     fn walk(&mut self, page_id: PageId, out: &mut Vec<(i64, u64)>) -> io::Result<()> {
         let p = self.file.read_page(page_id)?;
         match read_node(&p, self.order) {
@@ -467,4 +469,10 @@ impl DiskBTree {
         }
         Ok(())
     }
+
+    /// 把脏页写回
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+
 }

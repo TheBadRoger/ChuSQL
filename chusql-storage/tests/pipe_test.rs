@@ -9,9 +9,9 @@ use interprocess::local_socket::{
 };
 use interprocess::TryClone;
 
-// 命名管道集成测试：起 server 子进程，用唯一管道名，测试之间互不干扰。
+// 命名管道集成测试：起真 server，跑协议、索引与配置。
 
-/// 生成唯一管道名，避免测试之间抢占。
+/// 唯一管道名，避免测试互抢
 fn unique_pipe_name() -> String {
     let id = std::process::id();
     let ns = std::time::SystemTime::now()
@@ -21,18 +21,18 @@ fn unique_pipe_name() -> String {
     format!("chusql-test-{}-{}", id, ns)
 }
 
-/// 持有 server 子进程，Drop 时杀掉。
+/// 持有 server 子进程，退出时杀掉
 struct ServerProc(Child);
 
 impl Drop for ServerProc {
-    /// 测试结束时杀掉子进程并回收，避免留下孤儿进程。
+    /// 测试结束杀掉子进程
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
 }
 
-/// 启动 server 子进程，并等管道可连（最多 5 秒）。
+/// 起 server，等管道可连
 fn start_server(pipe: &str) -> (ServerProc, tempfile::TempDir) {
     let data = tempfile::tempdir().unwrap();
 
@@ -57,7 +57,7 @@ fn start_server(pipe: &str) -> (ServerProc, tempfile::TempDir) {
     panic!("server did not start within 5s");
 }
 
-/// 连到指定管道。
+/// 连到指定管道
 fn connect(pipe: &str) -> std::io::Result<LocalSocketStream> {
     let name = pipe
         .to_ns_name::<GenericNamespaced>()
@@ -65,7 +65,7 @@ fn connect(pipe: &str) -> std::io::Result<LocalSocketStream> {
     LocalSocketStream::connect(name)
 }
 
-/// 发一行请求，读一行响应。
+/// 发一行请求读一行响应
 fn send(stream: &mut LocalSocketStream, line: &str) -> String {
     stream.write_all(line.as_bytes()).unwrap();
     stream.write_all(b"\n").unwrap();
@@ -77,7 +77,7 @@ fn send(stream: &mut LocalSocketStream, line: &str) -> String {
     buf.trim().to_string()
 }
 
-/// ping 应该回 pong。
+/// ping 回 pong
 #[test]
 fn ping_pong() {
     let pipe = unique_pipe_name();
@@ -87,7 +87,7 @@ fn ping_pong() {
     assert_eq!(send(&mut c, r#"{"method":"ping"}"#), r#"{"status":"pong"}"#);
 }
 
-/// 插一行再 scan，能扫到刚插进去的数据。
+/// 插入后能扫到
 #[test]
 fn insert_then_scan() {
     let pipe = unique_pipe_name();
@@ -104,6 +104,7 @@ fn insert_then_scan() {
     assert!(r2.contains("Alice"), "scan response: {}", r2);
 }
 
+/// 不存在的表报错
 #[test]
 fn scan_unknown_table_errors() {
     let pipe = unique_pipe_name();
@@ -115,6 +116,7 @@ fn scan_unknown_table_errors() {
     assert!(r.contains("unknown table"), "got {}", r);
 }
 
+/// 列出已建的表
 #[test]
 fn list_tables_returns_created_tables() {
     let pipe = unique_pipe_name();
@@ -129,6 +131,7 @@ fn list_tables_returns_created_tables() {
     assert!(r.contains("orders"), "got {}", r);
 }
 
+/// 整表替换只剩新行
 #[test]
 fn replace_all_replaces_rows() {
     let pipe = unique_pipe_name();
@@ -149,13 +152,13 @@ fn replace_all_replaces_rows() {
     assert!(!r.contains("Alice"), "old row should be gone: {}", r);
 }
 
+/// 带 key 插入后能按下标查
 #[test]
 fn insert_with_key_then_lookup() {
     let pipe = unique_pipe_name();
     let (_srv, _data) = start_server(&pipe);
     let mut c = connect(&pipe).unwrap();
 
-    // 带索引键插三行
     for (id, name) in [(1, "Alice"), (2, "Bob"), (3, "Carol")] {
         let req = format!(
             r#"{{"method":"insert","table":"idx_users","row":{{"id":{},"name":"{}"}},"key":{}}}"#,
@@ -165,15 +168,14 @@ fn insert_with_key_then_lookup() {
         assert!(r.contains(r#""status":"ok""#), "insert: {}", r);
     }
 
-    // 命中
     let r = send(&mut c, r#"{"method":"lookup_by_index","table":"idx_users","key":2}"#);
     assert!(r.contains("Bob"), "lookup: {}", r);
 
-    // 未命中
     let r = send(&mut c, r#"{"method":"lookup_by_index","table":"idx_users","key":99}"#);
     assert!(r.contains(r#""rows":[]"#), "miss: {}", r);
 }
 
+/// 不带 key 不建索引
 #[test]
 fn insert_without_key_does_not_index() {
     let pipe = unique_pipe_name();
@@ -185,12 +187,12 @@ fn insert_without_key_does_not_index() {
     assert!(r.contains(r#""rows":[]"#), "got: {}", r);
 }
 
+/// 重开服务后索引仍在
 #[test]
 fn lookup_survives_reopen() {
     let pipe = unique_pipe_name();
     let data = tempfile::tempdir().unwrap();
 
-    // 第一次：写 3 行带 key
     {
         let exe = env!("CARGO_BIN_EXE_server");
         let child = Command::new(exe)
@@ -213,13 +215,11 @@ fn lookup_survives_reopen() {
             );
             send(&mut c, &req);
         }
-        drop(srv);  // 杀 server
+        drop(srv);
     }
 
-    // 等一下，让文件句柄真正释放
     thread::sleep(Duration::from_millis(200));
 
-    // 第二次：重开 server，从索引查到
     let (_srv, _data) = {
         let child = Command::new(env!("CARGO_BIN_EXE_server"))
             .env("CHUSQL_PIPE", &pipe)
@@ -241,7 +241,7 @@ fn lookup_survives_reopen() {
     assert!(r.contains("Bob"), "persist lookup: {}", r);
 }
 
-/// 配置文件里的管道名和数据目录要真的生效（这里不设 CHUSQL_PIPE / CHUSQL_DATA_DIR）。
+/// 配置文件真的生效
 #[test]
 fn config_file_is_used() {
     let dir = tempfile::tempdir().unwrap();
@@ -249,7 +249,6 @@ fn config_file_is_used() {
     let data_dir = dir.path().join("data");
     let config_path = dir.path().join("chusql-storage.toml");
 
-    // TOML 里写正斜杠，省得转义 Windows 路径
     let text = format!(
         "[server]\npipe_name = \"{}\"\n[storage]\ndata_dir = \"{}\"\n[log]\nlevel = \"debug\"\n",
         pipe,
@@ -276,9 +275,62 @@ fn config_file_is_used() {
     let r = send(&mut c, r#"{"method":"insert","table":"cfg","row":{"id":1}}"#);
     assert!(r.contains(r#""status":"ok""#), "insert: {}", r);
 
-    // 数据真的落在配置文件指的那个目录里
     assert!(
         data_dir.join("cfg.db").exists(),
         "data dir from config file was not used"
     );
+}
+
+/// 建表后能查 schema
+#[test]
+fn create_table_then_describe() {
+    let pipe = unique_pipe_name();
+    let (_srv, _data) = start_server(&pipe);
+    let mut c = connect(&pipe).unwrap();
+
+    let r = send(
+        &mut c,
+        r#"{"method":"create_table","table":"ct_users","columns":[{"name":"id","ty":"int"},{"name":"name","ty":"str"}]}"#,
+    );
+    assert!(r.contains(r#""status":"ok""#), "create: {}", r);
+
+    let r = send(&mut c, r#"{"method":"describe_table","table":"ct_users"}"#);
+    assert!(r.contains("id"), "describe: {}", r);
+    assert!(r.contains("name"), "describe: {}", r);
+    assert!(r.contains(r#""ty":"int""#), "describe: {}", r);
+    assert!(r.contains(r#""ty":"str""#), "describe: {}", r);
+}
+
+/// 重复建表报错
+#[test]
+fn create_table_twice_errors() {
+    let pipe = unique_pipe_name();
+    let (_srv, _data) = start_server(&pipe);
+    let mut c = connect(&pipe).unwrap();
+
+    let req = r#"{"method":"create_table","table":"dup","columns":[{"name":"id","ty":"int"}]}"#;
+    let r1 = send(&mut c, req);
+    assert!(r1.contains(r#""status":"ok""#), "first: {}", r1);
+
+    let r2 = send(&mut c, req);
+    assert!(r2.contains(r#""status":"error""#), "second: {}", r2);
+    assert!(r2.contains("already exists"), "second: {}", r2);
+}
+
+/// 新建空表能扫描
+#[test]
+fn scan_empty_table_after_create() {
+    let pipe = unique_pipe_name();
+    let (_srv, _data) = start_server(&pipe);
+    let mut c = connect(&pipe).unwrap();
+
+    let r = send(
+        &mut c,
+        r#"{"method":"create_table","table":"empty_t","columns":[{"name":"id","ty":"int"}]}"#,
+    );
+    assert!(r.contains(r#""status":"ok""#), "create: {}", r);
+
+    let r = send(&mut c, r#"{"method":"scan","table":"empty_t"}"#);
+    assert!(r.contains(r#""status":"rows""#), "scan: {}", r);
+    assert!(r.contains(r#""rows":[]"#), "scan: {}", r);
 }

@@ -1,7 +1,8 @@
 {-# LANGUAGE ImportQualifiedPost #-}
 
-module ChuSQL.Syntax.Parser (parseQuery) where
+module ChuSQL.Syntax.Parser (parseStatement) where
 
+import ChuSQL.Model (Column (..))
 import ChuSQL.Syntax.AST
 import Control.Monad.Combinators.Expr (Operator (..), makeExprParser)
 import Data.Char (isAlpha, isAlphaNum, toLower)
@@ -12,48 +13,50 @@ import Text.Megaparsec
 import Text.Megaparsec.Char
 import Text.Megaparsec.Char.Lexer qualified as Lxr
 
--- SQL 解析器：把 SQL 文本解析成 AST。词法层管空白、关键字、标识符、字面量与符号；
--- 语法层按优先级 比较 > AND > OR 自底向上组装表达式。
+-- SQL 解析：词法 + 语法，把文本变成语句树。
 
+-- * 词法
+-- | 解析器类型
 type Parser = Parsec Void String
 
--- * 词法层
 
--- | 跳过空白（含换行）。
+-- | 跳过空白
 sc :: Parser ()
 sc = Lxr.space space1 empty empty
 
--- | 消费一个词法单元以及其后的空白。
+-- | 词后面吃掉空白
 lexeme :: Parser a -> Parser a
 lexeme = Lxr.lexeme sc
 
--- | 匹配一个符号（如 ","、"("），并吃掉其后的空白。
+-- | 读一个符号
 symbol :: String -> Parser String
 symbol = Lxr.symbol sc
 
--- | 大小写不敏感的关键字；其后不能紧跟标识符字符，避免把 @selection@ 读成 @select@。
--- 整体用 'try' 包住：否则 @ORDER@ 会被 @keyword "or"@ 吃掉前缀 @OR@ 再报错，导致无法回溯。
+{- | 大小写不敏感的关键字；其后不能紧跟标识符字符，避免把 @selection@ 读成 @select@。
+整体用 'try' 包住：否则 @ORDER@ 会被 @keyword "or"@ 吃掉前缀 @OR@ 再报错，导致无法回溯。
+-}
+-- | 读关键字（不分大小写）
 keyword :: String -> Parser ()
 keyword k = lexeme $ try $ do
     _ <- string' k
     notFollowedBy (satisfy isIdentChar)
 
--- | 标识符：字母或下划线开头，其后可跟字母、数字或下划线。
+-- | 读一个名字
 identifier :: Parser String
 identifier = lexeme $ do
     first <- satisfy (\ch -> isAlpha ch || ch == '_')
     rest <- many (satisfy isIdentChar)
     return (first : rest)
 
--- | 标识符允许的字符：字母、数字或下划线。
+-- | 名字里允许的字符
 isIdentChar :: Char -> Bool
 isIdentChar ch = isAlphaNum ch || ch == '_'
 
--- | 十进制整数字面量。
+-- | 读一个整数
 integer :: Parser Int
 integer = lexeme Lxr.decimal
 
--- | 单引号字符串字面量，遵循标准 SQL 转义规则：
+-- | 读一个字符串字面量
 stringLit :: Parser String
 stringLit = lexeme $ do
     _ <- char '\''
@@ -61,8 +64,10 @@ stringLit = lexeme $ do
     _ <- char '\''
     return s
 
--- | 字符串内的一个字符：@''@ 折叠成一个单引号，其余字符（含反斜杠）原样保留。
--- 两个分支都不会在失败时消耗输入，因此可以安全地放进 'many'。
+{- | 字符串内的一个字符：@''@ 折叠成一个单引号，其余字符（含反斜杠）原样保留。
+两个分支都不会在失败时消耗输入，因此可以安全地放进 'many'。
+-}
+-- | 字符串里的一个字符
 stringChar :: Parser Char
 stringChar =
     choice
@@ -70,31 +75,34 @@ stringChar =
         , satisfy (/= '\'')
         ]
 
--- | 解析 ASC/DESC
+-- * 子句
+-- | 升序或降序
 sortDir :: Parser SortDir
 sortDir = (Desc <$ keyword "desc") <|> (Asc <$ keyword "asc") <|> pure Asc
 
--- | 解析 LIMIT
+-- | LIMIT 后面的整数
 limitClause :: Parser Int
 limitClause = do
     keyword "limit"
     integer
 
--- | 解析JOIN和限定列名
+-- | 能带表名的列名
 qualifiedName :: Parser String
 qualifiedName = do
     first <- identifier
     rest <- many (symbol "." *> identifier)
     return (intercalate "." (first : rest))
 
--- * 表达式层
 
--- | 表达式入口，最低优先级。
+-- * 表达式
+-- | 读一个表达式
 expr :: Parser Expr
 expr = makeExprParser atom operatorTable
 
--- | 运算符表。注意 'makeExprParser' 要求各层按优先级从高到低排列：
--- 比较运算符绑定最紧，'AND' 次之，'OR' 最松。
+{- | 运算符表。注意 'makeExprParser' 要求各层按优先级从高到低排列：
+比较运算符绑定最紧，'AND' 次之，'OR' 最松。
+-}
+-- | 运算符优先级（从紧到松）
 operatorTable :: [[Operator Parser Expr]]
 operatorTable =
     [
@@ -106,7 +114,7 @@ operatorTable =
     , [InfixL (Or <$ keyword "OR")] -- 最低优先级
     ]
 
--- | 原子表达式：字面量、列引用或括号表达式。
+-- | 最小的表达式单位
 atom :: Parser Expr
 atom =
     choice
@@ -116,23 +124,22 @@ atom =
         , between (symbol "(") (symbol ")") expr
         ]
 
--- * 语句层
 
--- | 显式指定排序的语句
+-- | 一个排序列
 orderItem :: Parser (String, SortDir)
 orderItem = do
     col <- qualifiedName
     dir <- sortDir
     return (col, dir)
 
--- | @ORDER BY col [ASC|DESC], ...@。
+-- | ORDER BY 的列表
 orderByClause :: Parser [(String, SortDir)]
 orderByClause = do
     keyword "order"
     keyword "by"
     sepBy1 orderItem (symbol ",")
 
--- | @col = expr@，用于 UPDATE 的 SET 子句。
+-- | SET 里的一条赋值
 assignment :: Parser (String, Expr)
 assignment = do
     col <- identifier
@@ -140,9 +147,8 @@ assignment = do
     e <- expr
     return (col, e)
 
--- * 从句层
 
--- | SQL 保留字，不能用作表别名
+-- | 保留字清单
 reservedWords :: [String]
 reservedWords =
     [ "select"
@@ -163,24 +169,28 @@ reservedWords =
     , "delete"
     , "update"
     , "set"
+    , "create"
+    , "table"
     ]
 
--- | 表别名。别名不能是保留字：否则 @FROM users WHERE age > 18@ 会把 @WHERE@
--- 当成 @users@ 的别名吃掉，后面真正的 WHERE 子句就再也解析不到。
--- 用 'try' 包住，一旦命中保留字就整体回溯，让 'optional' 正常返回 'Nothing'。
+{- | 表别名。别名不能是保留字：否则 @FROM users WHERE age > 18@ 会把 @WHERE@
+当成 @users@ 的别名吃掉，后面真正的 WHERE 子句就再也解析不到。
+用 'try' 包住，一旦命中保留字就整体回溯，让 'optional' 正常返回 'Nothing'。
+-}
+-- | 别名（不许用保留字）
 aliasName :: Parser String
 aliasName = try $ do
     name <- identifier
     if map toLower name `elem` reservedWords then empty else return name
 
--- | @表名 [别名]@。
+-- | 表名 + 可选别名
 tableRef :: Parser (Maybe String, String)
 tableRef = do
     tbl <- identifier
     mAlias <- optional aliasName
     return (mAlias, tbl)
 
--- | @JOIN 表 [别名] ON 条件@。
+-- | 一个 JOIN ... ON
 joinClause :: Parser (Maybe String, String, Expr)
 joinClause = do
     keyword "join"
@@ -189,14 +199,14 @@ joinClause = do
     cond <- expr
     return (mAlias, tbl, cond)
 
--- | FROM 从句：一张表 + 任意多个 JOIN。
+-- | FROM 子句（可含多个 JOIN）
 fromClause :: Parser FromClause
 fromClause = do
     (mAlias, tbl) <- tableRef
     joins <- many joinClause
     return (foldl (\acc (a, t, c) -> FromJoin acc a t c) (FromTable mAlias tbl) joins)
 
--- | 选择列表：@*@ 或逗号分隔的列名。
+-- | SELECT 的列清单
 selectList :: Parser [String]
 selectList =
     choice
@@ -204,9 +214,46 @@ selectList =
         , (:) <$> qualifiedName <*> many (symbol "," *> qualifiedName)
         ]
 
--- | @SELECT ... FROM ... [WHERE ...]@。
-selectQuery :: Parser Query
-selectQuery = do
+
+-- | 读 CREATE TABLE
+createTableStatement :: Parser Statement
+createTableStatement = do
+    keyword "create"
+    keyword "table"
+    name <- identifier
+    cols <- between (symbol "(") (symbol ")") (sepBy1 columnDef (symbol ","))
+    return (CreateTable name cols)
+
+-- | 读 DROP TABLE
+dropTableStatement :: Parser Statement
+dropTableStatement = do
+    keyword "drop"
+    keyword "table"
+    name <- identifier
+    return (DropTable name)
+
+-- | 建表时的一列
+columnDef :: Parser (String, Column)
+columnDef = do
+    name <- identifier
+    ty <- columnType
+    return (name, ty)
+
+-- | 列类型关键字
+columnType :: Parser Column
+columnType =
+    (keyword "integer" >> pure TInt)
+        <|> (keyword "int" >> pure TInt)
+        <|> (keyword "varchar" >> pure TStr)
+        <|> (keyword "text" >> pure TStr)
+        <|> (keyword "str" >> pure TStr)
+        <|> (keyword "boolean" >> pure TBool)
+        <|> (keyword "bool" >> pure TBool)
+
+-- * 语句
+-- | 读 SELECT
+selectStatement :: Parser Statement
+selectStatement = do
     keyword "select"
     cols <- selectList
     keyword "from"
@@ -223,9 +270,9 @@ selectQuery = do
             , selectLimit = mLimit
             }
 
--- | @INSERT ... INTO ... VALUES ...@。
-insertQuery :: Parser Query
-insertQuery = do
+-- | 读 INSERT
+insertStatement :: Parser Statement
+insertStatement = do
     keyword "INSERT"
     keyword "INTO"
     tbl <- identifier
@@ -242,18 +289,18 @@ insertQuery = do
             (sepBy1 atom (symbol ","))
     return (Insert tbl cols vals)
 
--- | @DELETE ... FROM ... [WHERE ...]@。
-deleteQuery :: Parser Query
-deleteQuery = do
+-- | 读 DELETE
+deleteStatement :: Parser Statement
+deleteStatement = do
     keyword "DELETE"
     keyword "FROM"
     tbl <- identifier
     mWhere <- optional (keyword "WHERE" *> expr)
     return (Delete tbl mWhere)
 
--- | UPDATE ... SET col = val, ... [WHERE ...]@
-updateQuery :: Parser Query
-updateQuery = do
+-- | 读 UPDATE
+updateStatement :: Parser Statement
+updateStatement = do
     keyword "update"
     tbl <- identifier
     keyword "set"
@@ -261,9 +308,19 @@ updateQuery = do
     mWhere <- optional (keyword "where" *> expr)
     return (Update tbl assigns mWhere)
 
--- | 解析一条完整的语句；失败时返回可直接展示的错误信息。
-parseQuery :: String -> Either String Query
-parseQuery input =
-    case runParser (sc *> (selectQuery <|> insertQuery <|> deleteQuery <|> updateQuery) <* sc <* eof) "<query>" input of
+-- * 入口
+-- | 解析总入口
+parseStatement :: String -> Either String Statement
+parseStatement input =
+    case runParser (sc *> statementP <* sc <* eof) "<query>" input of
         Left err -> Left (errorBundlePretty err)
         Right q -> Right q
+  where
+    -- \| 依次尝试各种语句
+    statementP =
+        selectStatement
+            <|> insertStatement
+            <|> deleteStatement
+            <|> updateStatement
+            <|> createTableStatement
+            <|> dropTableStatement

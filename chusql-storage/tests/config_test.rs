@@ -6,10 +6,9 @@ use chusql_storage::config::{
 };
 use chusql_storage::log::Level;
 
-// 配置测试：没有文件时全默认、文件里写了才覆盖、环境变量优先于文件、
-// 非法值 / 未知键要报错、每个选项的来源都记得下来。
+// 配置测试：默认值、文件覆盖、环境变量优先、非法值报错。
 
-/// 没有配置文件、没有环境变量：全部走内置默认值。
+/// 无文件时全默认
 #[test]
 fn defaults_without_file() {
     let loaded = config::resolve(None, None, &|_| None).unwrap();
@@ -23,7 +22,7 @@ fn defaults_without_file() {
     assert_eq!(loaded.config.log_level, Level::Info);
 }
 
-/// 文件里只写了一项：这一项生效，其余回退默认（并且来源记得清清楚楚）。
+/// 只覆盖文件里写了的项
 #[test]
 fn file_overrides_only_written_keys() {
     let path = PathBuf::from("t.toml");
@@ -41,15 +40,16 @@ fn file_overrides_only_written_keys() {
     assert_eq!(order.2, Origin::Default);
 }
 
-/// 五项全写：值都生效，来源都是文件。
+/// 六项全写都生效
 #[test]
 fn file_all_keys() {
-    let text = "[page]\nsize = 8192\n[btree]\norder = 32\n[storage]\ndata_dir = \"mydata\"\n[server]\npipe_name = \"mypipe\"\n[log]\nlevel = \"debug\"\n";
+    let text = "[page]\nsize = 8192\n[btree]\norder = 32\n[buffer]\npool_size = 128\n[storage]\ndata_dir = \"mydata\"\n[server]\npipe_name = \"mypipe\"\n[log]\nlevel = \"debug\"\n";
     let path = PathBuf::from("t.toml");
     let loaded = config::resolve(Some(text), Some(path.clone()), &|_| None).unwrap();
 
     assert_eq!(loaded.config.page_size, 8192);
     assert_eq!(loaded.config.btree_order, 32);
+    assert_eq!(loaded.config.pool_size, 128);
     assert_eq!(loaded.config.data_dir, PathBuf::from("mydata"));
     assert_eq!(loaded.config.pipe_name, "mypipe");
     assert_eq!(loaded.config.log_level, Level::Debug);
@@ -61,7 +61,7 @@ fn file_all_keys() {
     );
 }
 
-/// 环境变量优先于文件。
+/// 环境变量优先于文件
 #[test]
 fn env_beats_file() {
     let text = "[storage]\ndata_dir = \"from-file\"\n";
@@ -77,14 +77,14 @@ fn env_beats_file() {
     assert_eq!(dir.2, Origin::Env("CHUSQL_DATA_DIR"));
 }
 
-/// 日志等级写错要报错，而不是悄悄按默认跑。
+/// 日志等级非法要报错
 #[test]
 fn rejects_bad_log_level() {
     let err = config::resolve(Some("[log]\nlevel = \"loud\"\n"), None, &|_| None).unwrap_err();
     assert!(err.contains("log.level"), "got {}", err);
 }
 
-/// 页大小必须是 512..65536 之间的 2 的幂。
+/// 页大小非法要报错
 #[test]
 fn rejects_bad_page_size() {
     let err = config::resolve(Some("[page]\nsize = 3000\n"), None, &|_| None).unwrap_err();
@@ -94,7 +94,7 @@ fn rejects_bad_page_size() {
     assert!(err.contains("page.size"), "got {}", err);
 }
 
-/// order 太小、或者放不进一页，都要报错。
+/// order 非法要报错
 #[test]
 fn rejects_bad_btree_order() {
     let err = config::resolve(Some("[btree]\norder = 2\n"), None, &|_| None).unwrap_err();
@@ -104,14 +104,14 @@ fn rejects_bad_btree_order() {
     assert!(err.contains("does not fit"), "got {}", err);
 }
 
-/// 配置里出现认不出来的键要报错（拼错了不能当没看见）。
+/// 未知配置键要报错
 #[test]
 fn rejects_unknown_key() {
     let err = config::resolve(Some("[page]\nsizes = 4096\n"), None, &|_| None).unwrap_err();
     assert!(err.contains("bad config"), "got {}", err);
 }
 
-/// 环境变量给了非法值也要报错。
+/// 环境变量非法要报错
 #[test]
 fn rejects_bad_env_value() {
     let env = |k: &str| (k == "CHUSQL_PAGE_SIZE").then(|| "big".to_string());
@@ -119,7 +119,7 @@ fn rejects_bad_env_value() {
     assert!(err.contains("CHUSQL_PAGE_SIZE"), "got {}", err);
 }
 
-/// 来源文案要能说清"哪来的"。
+/// 来源文案正确
 #[test]
 fn origin_description() {
     assert_eq!(Origin::Default.describe(), "default");

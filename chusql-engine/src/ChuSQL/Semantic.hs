@@ -3,19 +3,18 @@ module ChuSQL.Semantic (check) where
 import ChuSQL.Algebra.Expr (colsInExpr)
 import ChuSQL.Model
 import ChuSQL.Syntax.AST
-import Data.List (intercalate)
+import Data.List (intercalate, nub)
 
--- 语义检查：执行前的关卡 —— 表和列存不存在、表达式类型对不对、写入的值类型是否匹配。
+-- 语义检查：表和列在不在、类型对不对，全部在执行前查。
 
--- * 表与列名解析
-
--- | 给一批列加上"别名."前缀
+-- * 环境
+-- | 给列名加上别名前缀
 prefixColumns :: Maybe String -> [(String, Column)] -> [(String, Column)]
 prefixColumns mAlias cols = [(prefix ++ c, ty) | (c, ty) <- cols]
   where
     prefix = maybe "" (++ ".") mAlias
 
--- | 走一遍 FROM：算出可用列（带别名前缀），顺手把每个 ON 条件也查了
+-- | 收集 FROM 能提供的列
 checkFrom :: Database -> FromClause -> Either String [(String, Column)]
 checkFrom db (FromTable mAlias tbl) = do
     t <- lookupTable db tbl
@@ -27,9 +26,9 @@ checkFrom db (FromJoin left mAlias tbl cond) = do
     checkBool "ON" env cond
     Right env
 
--- * 列检查与报错
 
--- | 统一拼一条带"可用列清单"的报错
+-- * 检查
+-- | 拼“列不存在”的报错
 missingColumn :: String -> String -> [(String, Column)] -> String
 missingColumn place c env =
     "unknown column in " ++ place ++ ": " ++ c ++ hint
@@ -38,16 +37,15 @@ missingColumn place c env =
         | null env = ""
         | otherwise = " (available: " ++ intercalate ", " (map fst env) ++ ")"
 
--- | 请求的列必须都在可用清单里；哨兵 allColumns 表示"全部列"，放行
+-- | 检查列是否都在环境里
 checkColumns :: String -> [(String, Column)] -> [String] -> Either String ()
 checkColumns place env requested =
     case [c | c <- requested, c /= allColumns, c `notElem` map fst env] of
         [] -> Right ()
         (c : _) -> Left (missingColumn place c env)
 
--- * 表达式类型推导
 
--- | 推出一个表达式的结果类型；列不存在、或类型对不上，都报错
+-- | 推导表达式的类型
 inferExpr :: String -> [(String, Column)] -> Expr -> Either String Column
 inferExpr place env (Col c) = maybe (Left (missingColumn place c env)) Right (lookup c env)
 inferExpr _ _ (LitInt _) = Right TInt
@@ -64,7 +62,7 @@ inferExpr place env (Eq a b) = do
         then Right TBool
         else Left (place ++ ": both sides of = must have the same type, got " ++ show ta ++ " and " ++ show tb)
 
--- | 二元运算的通用检查：两边都必须是同一种期望类型，结果都是布尔
+-- | 检查二元运算两边的类型
 operands :: String -> [(String, Column)] -> Column -> Expr -> Expr -> Either String Column
 operands place env want a b = do
     ta <- inferExpr place env a
@@ -73,7 +71,7 @@ operands place env want a b = do
         then Right TBool
         else Left (place ++ ": operator needs " ++ show want ++ " on both sides, got " ++ show ta ++ " and " ++ show tb)
 
--- | 这个表达式必须能算成一个条件（布尔）
+-- | 要求条件能算出布尔
 checkBool :: String -> [(String, Column)] -> Expr -> Either String ()
 checkBool place env e = do
     checkColumns place env (colsInExpr e)
@@ -82,9 +80,9 @@ checkBool place env e = do
         then Right ()
         else Left (place ++ ": condition must be a boolean, got " ++ show t)
 
--- * 写入语句
 
--- | 一条赋值的通用检查：目标列必须存在，右边表达式的类型要对得上
+-- * 写入语句
+-- | 检查赋值列和类型
 checkTyped :: String -> [(String, Column)] -> Table -> (String, Expr) -> Either String ()
 checkTyped place env t (c, e) = do
     want <- maybe (Left (missingColumn place c (tableCols t))) Right (colType t c)
@@ -93,18 +91,18 @@ checkTyped place env t (c, e) = do
         then Right ()
         else Left (place ++ ": column " ++ c ++ " needs " ++ show want ++ ", got " ++ show got)
 
--- | INSERT 的一个值：环境是空的 —— 值必须是字面量，写列名会被拦下
+-- | 检查插入值的类型
 checkValue :: Table -> (String, Expr) -> Either String ()
 checkValue = checkTyped "INSERT" []
 
--- | UPDATE 的一个赋值：环境是整张表 —— 右边可以引用本行的列
+-- | 检查 UPDATE 的赋值
 checkAssign :: Table -> (String, Expr) -> Either String ()
 checkAssign t = checkTyped "UPDATE" (tableCols t) t
 
--- * 总入口
 
--- | 语义检查总入口：合法返回 Right ()，不合法返回 Left（带人话解释）
-check :: Database -> Query -> Either String ()
+-- * 入口
+-- | 按语句类型分派检查
+check :: Database -> Statement -> Either String ()
 check db q = case q of
     Select
         { selectCols = cols
@@ -128,3 +126,15 @@ check db q = case q of
         checkColumns "UPDATE" (tableCols t) (map fst assigns)
         mapM_ (checkAssign t) assigns
         mapM_ (checkBool "WHERE" (tableCols t)) mWhere
+    CreateTable name cols -> do
+        if null name
+            then Left "CREATE TABLE: empty table name"
+            else do
+                let names = map fst cols
+                if length names /= length (nub names)
+                    then Left ("CREATE TABLE: duplicate column names in " ++ name)
+                    else Right ()
+    DropTable name ->
+        if null name
+            then Left "DROP TABLE: empty table name"
+            else Right ()

@@ -2,6 +2,9 @@ use chusql_storage::protocol::Row;
 use chusql_storage::wal::{Wal, WalOp};
 use serde_json::json;
 
+// WAL 测试：追加、读取、清空、截断尾巴。
+
+
 fn row(pairs: &[(&str, serde_json::Value)]) -> Row {
     let mut m = Row::new();
     for (k, v) in pairs {
@@ -10,6 +13,7 @@ fn row(pairs: &[(&str, serde_json::Value)]) -> Row {
     m
 }
 
+/// 写读 Insert 操作
 #[test]
 fn append_and_read_insert() {
     let dir = tempfile::tempdir().unwrap();
@@ -26,6 +30,7 @@ fn append_and_read_insert() {
     assert_eq!(back, op);
 }
 
+/// 写读 ReplaceAll 操作
 #[test]
 fn append_and_read_replace_all() {
     let dir = tempfile::tempdir().unwrap();
@@ -44,6 +49,7 @@ fn append_and_read_replace_all() {
     assert_eq!(back, op);
 }
 
+/// 文件不存在返回 None
 #[test]
 fn missing_file_returns_none() {
     let dir = tempfile::tempdir().unwrap();
@@ -51,6 +57,7 @@ fn missing_file_returns_none() {
     assert!(wal.read().unwrap().is_none());
 }
 
+/// 空文件返回 None
 #[test]
 fn empty_file_returns_none() {
     let dir = tempfile::tempdir().unwrap();
@@ -60,6 +67,7 @@ fn empty_file_returns_none() {
     assert!(wal.read().unwrap().is_none());
 }
 
+/// 清空后读不到
 #[test]
 fn clear_truncates() {
     let dir = tempfile::tempdir().unwrap();
@@ -79,6 +87,7 @@ fn clear_truncates() {
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
 }
 
+/// 尾巴截断被忽略
 #[test]
 fn truncated_tail_is_ignored() {
     let dir = tempfile::tempdir().unwrap();
@@ -92,19 +101,15 @@ fn truncated_tail_is_ignored() {
     })
     .unwrap();
 
-    // 砍掉最后 5 个字节，模拟"写一半断电"
     let full = std::fs::read(&path).unwrap();
     std::fs::write(&path, &full[..full.len() - 5]).unwrap();
 
-    // 读回来应该当作"没有这条"
     assert!(wal.read().unwrap().is_none());
 }
 
+/// 第二次追加会覆盖
 #[test]
 fn overwrite_on_second_append_is_visible() {
-    // 简化版一次只允许一条，append 两次会叠在文件里——
-    // 但正常路径下 clear 先跑，所以实际不会叠加。
-    // 这个测试只验证 read 能解析最前面那一条。
     let dir = tempfile::tempdir().unwrap();
     let wal = Wal::new(dir.path().join("wal.log"));
 

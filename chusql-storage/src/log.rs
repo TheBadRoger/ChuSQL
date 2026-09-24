@@ -3,23 +3,21 @@ use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
 
-// 极简日志：等级存在一个原子变量里，被关掉的等级只花一次原子读——不求值参数、不做格式化。
-// 行格式：[等级 本地日期时间] [来源] 消息
-//   - ERROR 加粗红、WARN 加粗橙、DEBUG 加粗不变色（只在 stderr 是终端时着色，重定向到文件时是纯文本）
-//   - 来源区分 core（服务自身：启动、配置）和 pipe（由管道请求触发）
-// 等级由配置文件的 log.level 或环境变量 CHUSQL_LOG 决定。
+// 极简日志：等级用原子变量，关掉的等级只花一次原子读。
 
-/// 转义序列收尾。
+// 颜色
+/// 转义序列收尾
 const RESET: &str = "\u{1b}[0m";
-/// 加粗红（ERROR）。
+/// 加粗红（ERROR）
 const BOLD_RED: &str = "\u{1b}[1m\u{1b}[31m";
-/// 加粗橙（WARN）：256 色里的 208 号。
+/// 加粗橙（WARN）
 const BOLD_ORANGE: &str = "\u{1b}[1m\u{1b}[38;5;208m";
-/// 只加粗（DEBUG）。
+/// 只加粗（DEBUG）
 const BOLD: &str = "\u{1b}[1m";
 
-/// 日志等级；Off 表示全关。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+// 等级与来源
+/// 日志等级
 pub enum Level {
     Off,
     Error,
@@ -28,15 +26,15 @@ pub enum Level {
     Debug,
 }
 
-/// 日志来源：core = 服务自身，pipe = 由管道请求触发。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 来源：服务自身或管道请求
 pub enum Channel {
     Core,
     Pipe,
 }
 
 impl Channel {
-    /// 日志行里的来源标签。
+    /// 来源标签
     fn tag(self) -> &'static str {
         match self {
             Channel::Core => "core",
@@ -46,7 +44,7 @@ impl Channel {
 }
 
 impl Level {
-    /// 解析等级名（大小写不敏感）。
+    /// 解析等级名
     pub fn parse(s: &str) -> Option<Level> {
         match s.trim().to_ascii_lowercase().as_str() {
             "off" => Some(Level::Off),
@@ -58,7 +56,7 @@ impl Level {
         }
     }
 
-    /// 等级名（写日志和写配置说明用）。
+    /// 等级名
     pub fn name(self) -> &'static str {
         match self {
             Level::Off => "off",
@@ -69,7 +67,7 @@ impl Level {
         }
     }
 
-    /// 日志行里的标签，固定 5 字符宽，方便对齐。
+    /// 行里的等级标签
     fn tag(self) -> &'static str {
         match self {
             Level::Error => "ERROR",
@@ -79,7 +77,7 @@ impl Level {
         }
     }
 
-    /// 这个等级要不要着色（INFO 不着色）。
+    /// 等级的颜色
     fn color(self) -> &'static str {
         match self {
             Level::Error => BOLD_RED,
@@ -90,29 +88,28 @@ impl Level {
     }
 }
 
-/// 当前等级，默认 info。
 static LEVEL: AtomicU8 = AtomicU8::new(Level::Info as u8);
 
-/// stderr 是不是终端（决定要不要着色），只问一次。
 static COLOR: OnceLock<bool> = OnceLock::new();
 
-/// 设置全局等级。
+// 写入
+/// 设置全局等级
 pub fn set_level(level: Level) {
     LEVEL.store(level as u8, Ordering::Relaxed);
 }
 
-/// 这个等级要不要输出——热路径上只走这一步（一次原子读 + 比较）。
 #[inline]
+/// 这个等级要不要输出
 pub fn enabled(level: Level) -> bool {
     level as u8 <= LEVEL.load(Ordering::Relaxed)
 }
 
-/// 启动时调一次：Windows 上给 stderr 打开 VT 处理，让 ANSI 颜色能被认识。
+/// 启动时调一次
 pub fn init() {
     enable_vt();
 }
 
-/// 写出一行；只在 enabled 为真时调用。
+/// 写出一行
 pub fn write(channel: Channel, level: Level, args: fmt::Arguments) {
     let msg = args.to_string();
     let line = render(level, channel, color_enabled(), &now(), &msg);
@@ -121,7 +118,7 @@ pub fn write(channel: Channel, level: Level, args: fmt::Arguments) {
     let _ = writeln!(out, "{}", line);
 }
 
-/// stderr 是终端才着色；CHUSQL_LOG_COLOR=always / never 可以强制开关。
+/// 是否着色（终端或强制）
 fn color_enabled() -> bool {
     *COLOR.get_or_init(|| match std::env::var("CHUSQL_LOG_COLOR").as_deref().map(str::trim) {
         Ok("always") | Ok("yes") | Ok("1") => true,
@@ -130,7 +127,7 @@ fn color_enabled() -> bool {
     })
 }
 
-/// 拼一行：[等级 时间] [来源] 消息。纯函数，方便测试。
+/// 拼一行（纯函数，可测）
 fn render(level: Level, channel: Channel, color: bool, stamp: &Stamp, msg: &str) -> String {
     let tag = level.tag();
     let paint = level.color();
@@ -142,8 +139,9 @@ fn render(level: Level, channel: Channel, color: bool, stamp: &Stamp, msg: &str)
     format!("[{} {}] [{}] {}", level_text, stamp, channel.tag(), msg)
 }
 
-/// 一个本地日期时间。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// 时间
+/// 本地日期时间
 pub struct Stamp {
     pub year: u16,
     pub month: u16,
@@ -154,6 +152,7 @@ pub struct Stamp {
     pub milli: u16,
 }
 
+/// 格式：年-月-日 时:分:秒.毫秒
 impl fmt::Display for Stamp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -164,7 +163,7 @@ impl fmt::Display for Stamp {
     }
 }
 
-/// 当前本地时间：Windows 上走 kernel32::GetLocalTime。
+/// 当前本地时间（Windows）
 #[cfg(windows)]
 fn now() -> Stamp {
     #[repr(C)]
@@ -206,7 +205,7 @@ fn now() -> Stamp {
     }
 }
 
-/// 当前时间：其他平台没有取本地时区的零依赖办法，退回 UTC。
+/// 当前时间（其他平台用 UTC）
 #[cfg(not(windows))]
 fn now() -> Stamp {
     let d = std::time::SystemTime::now()
@@ -225,7 +224,7 @@ fn now() -> Stamp {
     }
 }
 
-/// 把"距 1970-01-01 的天数"换算成 (年, 月, 日)：非 Windows 平台算时间用，单元测试也走这里。
+/// 天数换算成日期
 pub fn civil_from_days(days: i64) -> (i64, u16, u16) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -239,7 +238,8 @@ pub fn civil_from_days(days: i64) -> (i64, u16, u16) {
     (y + i64::from(month <= 2), month, day)
 }
 
-/// Windows：打开 stderr 的 VT 处理。
+// 终端
+/// 打开 Windows 的 VT 处理
 #[cfg(windows)]
 fn enable_vt() {
     #[link(name = "kernel32")]
@@ -249,9 +249,7 @@ fn enable_vt() {
         fn SetConsoleMode(handle: *mut core::ffi::c_void, mode: u32) -> i32;
     }
 
-    /// STD_ERROR_HANDLE：-12 的无符号写法。
     const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4;
-    /// 让控制台认识 ANSI 转义序列。
     const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
 
     unsafe {
@@ -263,11 +261,12 @@ fn enable_vt() {
     }
 }
 
-/// 非 Windows：不用做任何事。
+/// 其他平台什么都不用做
 #[cfg(not(windows))]
 fn enable_vt() {}
 
-/// 打一条 debug 日志（关掉时只花一次原子读）。
+// 宏
+/// debug 日志
 #[macro_export]
 macro_rules! log_debug {
     (core, $($arg:tt)*) => {
@@ -278,7 +277,7 @@ macro_rules! log_debug {
     };
 }
 
-/// 打一条 info 日志。
+/// info 日志
 #[macro_export]
 macro_rules! log_info {
     (core, $($arg:tt)*) => {
@@ -289,7 +288,7 @@ macro_rules! log_info {
     };
 }
 
-/// 打一条 warn 日志。
+/// warn 日志
 #[macro_export]
 macro_rules! log_warn {
     (core, $($arg:tt)*) => {
@@ -300,7 +299,7 @@ macro_rules! log_warn {
     };
 }
 
-/// 打一条 error 日志。
+/// error 日志
 #[macro_export]
 macro_rules! log_error {
     (core, $($arg:tt)*) => {
@@ -311,7 +310,7 @@ macro_rules! log_error {
     };
 }
 
-/// 上面四个宏的公共部分：先看等级，再看要不要真的写。内部用，别直接调。
+/// 四个宏的公共部分
 #[doc(hidden)]
 #[macro_export]
 macro_rules! log_line {
@@ -326,7 +325,6 @@ macro_rules! log_line {
 mod tests {
     use super::*;
 
-    /// 天数换算日期：几个已知点 + 两次闰年的 2 月 29 日。
     #[test]
     fn civil_from_days_known_dates() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
@@ -336,7 +334,6 @@ mod tests {
         assert_eq!(civil_from_days(19_782), (2024, 2, 29));
     }
 
-    /// 行格式：等级 + 本地日期时间 + 来源 + 消息，等级该粗的粗、该色的色。
     #[test]
     fn render_has_time_channel_and_colors() {
         let stamp = Stamp {
@@ -367,7 +364,6 @@ mod tests {
         );
     }
 
-    /// 关掉颜色时整行必须是纯文本（重定向到文件时用）。
     #[test]
     fn render_without_color_is_plain() {
         let stamp = Stamp {

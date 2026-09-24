@@ -1,17 +1,15 @@
-//! 命名管道服务：按行读写 JSON。Windows 上管道名映射为 \\.\pipe\<name>。
-//! 启动时读配置（环境变量 → TOML → 默认值）并把每项来源打进日志。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use chusql_storage::catalog::Catalog;
 use chusql_storage::config::{self, Config, Loaded};
 use chusql_storage::heap::HeapTable;
 use chusql_storage::log;
-use chusql_storage::protocol::{Request, Response};
+use chusql_storage::protocol::{Request, Response, SchemaColumn};
 use chusql_storage::wal::{Wal, WalOp};
 use chusql_storage::{log_debug, log_error, log_info, log_warn};
 use interprocess::local_socket::{
@@ -21,308 +19,413 @@ use interprocess::local_socket::{
 };
 use interprocess::TryClone;
 
-// * 路径
+// 命名管道服务：按行读写 JSON，Windows 上映射成 \\.\pipe\<name>。
+// 启动时读配置并把每项来源打进日志；表句柄按名字缓存复用。
 
-/// 表名 -> 数据文件路径。
-fn table_path(cfg: &Config, table: &str) -> PathBuf {
-    cfg.data_dir.join(format!("{}.db", table))
+// 服务器
+/// 服务器状态：配置 + 表句柄缓存 + 写锁
+struct Server {
+    cfg: Config,
+    tables: Mutex<HashMap<String, Arc<Mutex<HeapTable>>>>,
+    write_lock: Mutex<()>,
 }
 
-/// 表名 -> 索引文件路径。
-fn index_path(cfg: &Config, table: &str) -> PathBuf {
-    cfg.data_dir.join(format!("{}.idx", table))
-}
+impl Server {
+    /// 新建服务器状态
+    fn new(cfg: Config) -> std::io::Result<Self> {
+        std::fs::create_dir_all(&cfg.data_dir)?;
+        Ok(Server {
+            cfg,
+            tables: Mutex::new(HashMap::new()),
+            write_lock: Mutex::new(()),
+        })
+    }
 
-/// 数据字典文件路径。
-fn catalog_path(cfg: &Config) -> PathBuf {
-    cfg.data_dir.join("catalog.json")
-}
 
-/// WAL 文件路径。
-fn wal_path(cfg: &Config) -> PathBuf {
-    cfg.data_dir.join("wal.log")
-}
+// 路径
+    /// 表名 -> 数据文件
+    fn table_path(&self, table: &str) -> PathBuf {
+        self.cfg.data_dir.join(format!("{}.db", table))
+    }
 
-// * 表操作
+    /// 表名 -> 索引文件
+    fn index_path(&self, table: &str) -> PathBuf {
+        self.cfg.data_dir.join(format!("{}.idx", table))
+    }
 
-/// 打开一张表，执行闭包；表不存在就创建。
-fn with_table<R>(
-    cfg: &Config,
-    table: &str,
-    f: impl FnOnce(&mut HeapTable) -> std::io::Result<R>,
-) -> std::io::Result<R> {
-    std::fs::create_dir_all(&cfg.data_dir)?;
-    let mut t = HeapTable::open(table_path(cfg, table), cfg.page_size)?;
-    f(&mut t)
-}
+    /// 数据字典文件
+    fn catalog_path(&self) -> PathBuf {
+        self.cfg.data_dir.join("catalog.json")
+    }
 
-/// 打开带索引的表，执行闭包。
-fn with_indexed_table<R>(
-    cfg: &Config,
-    table: &str,
-    f: impl FnOnce(&mut HeapTable) -> std::io::Result<R>,
-) -> std::io::Result<R> {
-    std::fs::create_dir_all(&cfg.data_dir)?;
-    let mut t = HeapTable::open_indexed(
-        table_path(cfg, table),
-        index_path(cfg, table),
-        cfg.page_size,
-        cfg.btree_order,
-    )?;
-    f(&mut t)
-}
+    /// WAL 文件
+    fn wal_path(&self) -> PathBuf {
+        self.cfg.data_dir.join("wal.log")
+    }
 
-/// 表文件是否存在且非空。
-fn table_exists(cfg: &Config, table: &str) -> bool {
-    let p = table_path(cfg, table);
-    std::fs::metadata(&p).map(|m| m.len() > 0).unwrap_or(false)
-}
 
-/// 打开已存在的表；不存在返回 NotFound。
-fn with_existing_table<R>(
-    cfg: &Config,
-    table: &str,
-    f: impl FnOnce(&mut HeapTable) -> std::io::Result<R>,
-) -> std::io::Result<R> {
-    if !table_exists(cfg, table) {
-        return Err(std::io::Error::new(
+// 表句柄
+    /// 表文件存在且非空
+    fn table_exists(&self, table: &str) -> bool {
+        if self.tables.lock().unwrap().contains_key(table) {
+            return true;
+        }
+        if let Ok(c) = Catalog::load(self.catalog_path()) {
+            if c.describe(table).is_some() {
+                return true;
+            }
+        }
+        std::fs::metadata(self.table_path(table))
+            .map(|m| m.len() > 0)
+            .unwrap_or(false)
+    }
+
+    /// 拿表句柄（缓存复用）
+    fn table_handle(&self, table: &str) -> std::io::Result<Arc<Mutex<HeapTable>>> {
+        let mut map = self.tables.lock().unwrap();
+        if let Some(h) = map.get(table) {
+            return Ok(h.clone());
+        }
+        std::fs::create_dir_all(&self.cfg.data_dir)?;
+        let t = HeapTable::open_indexed(
+            self.table_path(table),
+            self.index_path(table),
+            self.cfg.page_size,
+            self.cfg.btree_order,
+            self.cfg.pool_size,
+        )?;
+        let h = Arc::new(Mutex::new(t));
+        map.insert(table.to_string(), h.clone());
+        Ok(h)
+    }
+
+    /// 在表上跑闭包
+    fn with_table<R>(
+        &self,
+        table: &str,
+        f: impl FnOnce(&mut HeapTable) -> std::io::Result<R>,
+    ) -> std::io::Result<R> {
+        let h = self.table_handle(table)?;
+        let mut guard = h.lock().unwrap();
+        f(&mut guard)
+    }
+
+    /// 同上，但一定带索引
+    fn with_indexed_table<R>(
+        &self,
+        table: &str,
+        f: impl FnOnce(&mut HeapTable) -> std::io::Result<R>,
+    ) -> std::io::Result<R> {
+        self.with_table(table, f)
+    }
+
+    /// 表不存在就报错
+    fn with_existing_table<R>(
+        &self,
+        table: &str,
+        f: impl FnOnce(&mut HeapTable) -> std::io::Result<R>,
+    ) -> std::io::Result<R> {
+        if !self.table_exists(table) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("unknown table: {}", table),
+            ));
+        }
+        self.with_table(table, f)
+    }
+
+// 写入路径
+    /// 把一条 WAL 操作落到磁盘
+    fn apply_op(&self, op: &WalOp) -> std::io::Result<()> {
+        match op {
+            WalOp::Insert { table, row, key } => {
+                match key {
+                    None => self.with_table(table, |t| t.insert(row))?,
+                    Some(k) => self.with_indexed_table(table, |t| t.insert_keyed(row, *k))?,
+                }
+                let mut c = Catalog::load(self.catalog_path())?;
+                let row: chusql_storage::protocol::Row = row.clone().into_iter().collect();
+                c.record_insert(table, &row);
+                c.save(self.catalog_path())?;
+                Ok(())
+            }
+            WalOp::ReplaceAll { table, rows } => {
+                self.with_indexed_table(table, |t| t.replace_all(rows))?;
+                let mut c = Catalog::load(self.catalog_path())?;
+                let rows: Vec<chusql_storage::protocol::Row> =
+                    rows.iter().map(|r| r.clone().into_iter().collect()).collect();
+                c.record_replace_all(table, &rows);
+                c.save(self.catalog_path())?;
+                Ok(())
+            }
+        }
+    }
+
+    /// 先写 WAL 再改数据
+    fn write_via_wal(&self, op: &WalOp) -> std::io::Result<()> {
+        let _guard = self.write_lock.lock().unwrap();
+        std::fs::create_dir_all(&self.cfg.data_dir)?;
+        let wal = Wal::new(self.wal_path());
+
+        wal.clear()?;
+
+        wal.append(op)?;
+
+        let result = self.apply_op(op);
+
+        if result.is_ok() {
+            if let Err(e) = self.flush_op_tables(op) {
+                return Err(e);
+            }
+        }
+
+        wal.clear()?;
+        result
+    }
+
+    /// 把涉及的表写回磁盘
+    fn flush_op_tables(&self, op: &WalOp) -> std::io::Result<()> {
+        match op {
+            WalOp::Insert { table, key, .. } => {
+                if key.is_some() {
+                    self.with_indexed_table(table, |t| t.flush())
+                } else {
+                    self.with_table(table, |t| t.flush())
+                }
+            }
+            WalOp::ReplaceAll { table, .. } => {
+                self.with_indexed_table(table, |t| t.flush())
+            }
+        }
+    }
+
+    /// 启动时重放残留 WAL
+    fn recover_wal(&self) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.cfg.data_dir)?;
+        let wal = Wal::new(self.wal_path());
+        match wal.read()? {
+            None => Ok(()),
+            Some(op) => {
+                log_warn!(core, "replaying incomplete WAL entry");
+                self.apply_op(&op)?;
+                wal.clear()?;
+                log_info!(core, "WAL replay complete");
+                Ok(())
+            }
+        }
+    }
+
+
+// 请求分发
+    /// 一条请求翻成一条响应
+    fn handle_request(&self, req: Request) -> Response {
+        match req {
+            Request::Ping => {
+                log_debug!(pipe, "ping");
+                Response::Pong
+            }
+
+            Request::Scan { table } => {
+                log_debug!(pipe, "scan table={}", table);
+
+                let result = self.with_existing_table(&table, |t| t.scan());
+
+                match result {
+                    Ok(rows) => Response::Rows { rows },
+                    Err(e) => {
+                        log_warn!(pipe, "scan {}: {}", table, e);
+                        Response::Error {
+                            message: format!("scan {}: {}", table, e),
+                        }
+                    }
+                }
+            }
+
+            Request::Insert { table, row, key } => {
+                log_debug!(pipe, "insert table={} key={:?}", table, key);
+                let tname = table.clone();
+                let op = WalOp::Insert { table, row, key };
+                match self.write_via_wal(&op) {
+                    Ok(()) => Response::Ok,
+                    Err(e) => {
+                        log_warn!(pipe, "insert {}: {}", tname, e);
+                        Response::Error {
+                            message: format!("insert {}: {}", tname, e),
+                        }
+                    }
+                }
+            }
+
+            Request::LookupByIndex { table, key } => {
+                log_debug!(pipe, "lookup_by_index table={} key={}", table, key);
+                match self.with_indexed_table(&table, |t| t.get_by_key(key)) {
+                    Ok(Some(row)) => Response::Rows { rows: vec![row] },
+                    Ok(None) => Response::Rows { rows: vec![] },
+                    Err(e) => {
+                        log_warn!(pipe, "lookup_by_index {}: {}", table, e);
+                        Response::Error {
+                            message: format!("lookup_by_index {}: {}", table, e),
+                        }
+                    }
+                }
+            }
+
+            Request::ReplaceAll { table, rows } => {
+                log_debug!(pipe, "replace_all table={} rows={}", table, rows.len());
+                let tname = table.clone();
+                let op = WalOp::ReplaceAll { table, rows };
+                match self.write_via_wal(&op) {
+                    Ok(()) => Response::Ok,
+                    Err(e) => {
+                        log_warn!(pipe, "replace_all {}: {}", tname, e);
+                        Response::Error {
+                            message: format!("replace_all {}: {}", tname, e),
+                        }
+                    }
+                }
+            }
+
+            Request::ListTables => {
+                log_debug!(pipe, "list_tables");
+                match self.list_tables() {
+                    Ok(tables) => Response::Tables { tables },
+                    Err(e) => {
+                        log_warn!(pipe, "list_tables: {}", e);
+                        Response::Error {
+                            message: format!("list_tables: {}", e),
+                        }
+                    }
+                }
+            }
+
+            Request::DescribeTable { table } => {
+                log_debug!(pipe, "describe_table table={}", table);
+                match self.describe_table(&table) {
+                    Ok((cols, count)) => Response::Schema {
+                        columns: cols,
+                        row_count: count,
+                    },
+                    Err(e) => {
+                        log_warn!(pipe, "describe_table {}: {}", table, e);
+                        Response::Error {
+                            message: format!("describe_table {}: {}", table, e),
+                        }
+                    }
+                }
+            }
+
+            Request::CreateTable { table, columns } => {
+                log_debug!(pipe, "create_table table={} cols={}", table, columns.len());
+
+                let mut c = match Catalog::load(self.catalog_path()) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Response::Error {
+                            message: format!("create_table {}: catalog: {}", table, e),
+                        }
+                    }
+                };
+                if c.describe(&table).is_some() {
+                    return Response::Error {
+                        message: format!("create_table {}: table already exists", table),
+                    };
+                }
+
+                if let Err(e) = self.with_table(&table, |_t| Ok(())) {
+                    return Response::Error {
+                        message: format!("create_table {}: {}", table, e),
+                    };
+                }
+
+                if let Err(e) = c.create_table(&table, columns) {
+                    return Response::Error {
+                        message: format!("create_table {}: {}", table, e),
+                    };
+                }
+                if let Err(e) = c.save(self.catalog_path()) {
+                    return Response::Error {
+                        message: format!("create_table {}: catalog save: {}", table, e),
+                    };
+                }
+
+                Response::Ok
+            }
+            Request::DropTable { table } => {
+                log_debug!(pipe, "drop_table table={}", table);
+
+                let mut c = match Catalog::load(self.catalog_path()) {
+                    Ok(c) => c,
+                    Err(e) => return Response::Error {
+                        message: format!("drop_table {}: catalog: {}", table, e),
+                    },
+                };
+                if let Err(e) = c.drop_table(&table) {
+                    return Response::Error {
+                        message: format!("drop_table {}: {}", table, e),
+                    };
+                }
+                if let Err(e) = c.save(self.catalog_path()) {
+                    return Response::Error {
+                        message: format!("drop_table {}: catalog save: {}", table, e),
+                    };
+                }
+
+                self.tables.lock().unwrap().remove(&table);
+
+                let _ = std::fs::remove_file(self.table_path(&table));
+                let _ = std::fs::remove_file(self.index_path(&table));
+
+                Response::Ok
+            }
+        }
+    }
+
+// 信息查询
+    /// 表名：catalog 与目录取并集
+    fn list_tables(&self) -> std::io::Result<Vec<String>> {
+        let mut names = BTreeSet::new();
+
+        let c = Catalog::load(self.catalog_path())?;
+        for t in c.table_names() {
+            names.insert(t);
+        }
+
+        let dir = &self.cfg.data_dir;
+        if dir.exists() {
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                if let Some(stem) = name.strip_suffix(".db") {
+                    names.insert(stem.to_string());
+                }
+            }
+        }
+
+        Ok(names.into_iter().collect())
+    }
+
+    /// 查一张表的 schema
+    fn describe_table(&self, table: &str) -> std::io::Result<(Vec<SchemaColumn>, u64)> {
+        let c = Catalog::load(self.catalog_path())?;
+        if let Some(schema) = c.describe(table) {
+            return Ok((schema.columns.clone(), schema.row_count));
+        }
+        if self.tables.lock().unwrap().contains_key(table)
+            || std::fs::metadata(self.table_path(table)).is_ok()
+        {
+            return Ok((Vec::new(), 0));
+        }
+        Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("unknown table: {}", table),
-        ));
-    }
-    let mut t = HeapTable::open(table_path(cfg, table), cfg.page_size)?;
-    f(&mut t)
-}
-
-// * 数据字典操作
-
-/// 读 catalog，按一行数据补列，再写回。
-fn catalog_add_row(
-    cfg: &Config,
-    table: &str,
-    row: &serde_json::Map<String, serde_json::Value>,
-) -> std::io::Result<()> {
-    let mut c = Catalog::load(catalog_path(cfg))?;
-    let row: chusql_storage::protocol::Row = row.clone().into_iter().collect();
-    c.ensure_columns(table, &row);
-    c.save(catalog_path(cfg))
-}
-
-/// 读 catalog，按多行数据补列，再写回。
-fn catalog_add_rows(
-    cfg: &Config,
-    table: &str,
-    rows: &[serde_json::Map<String, serde_json::Value>],
-) -> std::io::Result<()> {
-    let mut c = Catalog::load(catalog_path(cfg))?;
-    for r in rows {
-        let row: chusql_storage::protocol::Row = r.clone().into_iter().collect();
-        c.ensure_columns(table, &row);
-    }
-    c.save(catalog_path(cfg))
-}
-
-// * WAL 写路径与恢复
-
-/// 把一条 WAL 操作真正落到磁盘（堆表 + 索引 + catalog）。
-fn apply_op(cfg: &Config, op: &WalOp) -> std::io::Result<()> {
-    match op {
-        WalOp::Insert { table, row, key } => {
-            match key {
-                None => with_table(cfg, table, |t| t.insert(row))?,
-                Some(k) => with_indexed_table(cfg, table, |t| t.insert_keyed(row, *k))?,
-            }
-            let map: serde_json::Map<_, _> = row.clone().into_iter().collect();
-            catalog_add_row(cfg, table, &map)?;
-            Ok(())
-        }
-        WalOp::ReplaceAll { table, rows } => {
-            with_indexed_table(cfg, table, |t| t.replace_all(rows))?;
-            let maps: Vec<_> = rows.iter().map(|r| r.clone().into_iter().collect()).collect();
-            catalog_add_rows(cfg, table, &maps)?;
-            Ok(())
-        }
+        ))
     }
 }
 
-/// 写前日志 + 写数据 + 清空 WAL。
-///
-/// 顺序：clear（清掉上次已完成的） → append+fsync → apply → clear。
-/// 若中途进程被杀，重启时 WAL 里能读到那条操作并重放。
-fn write_via_wal(cfg: &Config, op: &WalOp) -> std::io::Result<()> {
-    let wal = Wal::new(wal_path(cfg));
 
-    // 清掉上一次遗留（正常情况下已经是空的）
-    wal.clear()?;
-
-    // 先写 WAL 并 fsync
-    wal.append(op)?;
-
-    // 再写数据
-    let result = apply_op(cfg, op);
-
-    // 无论 apply 成功还是返回 Err，都清空 WAL：
-    // 失败的操作不应被重放；若中途被杀，这里跑不到，WAL 会留到重启时重放。
-    wal.clear()?;
-
-    result
-}
-
-/// 启动时重放 WAL 里的残留操作。
-fn recover_wal(cfg: &Config) -> std::io::Result<()> {
-    let wal = Wal::new(wal_path(cfg));
-    match wal.read()? {
-        None => Ok(()),
-        Some(op) => {
-            log_warn!(core, "replaying incomplete WAL entry");
-            apply_op(cfg, &op)?;
-            wal.clear()?;
-            log_info!(core, "WAL replay complete");
-            Ok(())
-        }
-    }
-}
-
-// * 请求分发
-
-/// 把一条请求翻译成一条响应。
-fn handle_request(cfg: &Config, req: Request) -> Response {
-    match req {
-        Request::Ping => {
-            log_debug!(pipe, "ping");
-            Response::Pong
-        }
-
-        Request::Scan { table } => {
-            log_debug!(pipe, "scan table={}", table);
-            match with_existing_table(cfg, &table, |t| t.scan()) {
-                Ok(rows) => Response::Rows { rows },
-                Err(e) => {
-                    log_warn!(pipe, "scan {}: {}", table, e);
-                    Response::Error {
-                        message: format!("scan {}: {}", table, e),
-                    }
-                }
-            }
-        }
-
-        Request::Insert { table, row, key } => {
-            log_debug!(pipe, "insert table={} key={:?}", table, key);
-            let tname = table.clone();
-            let op = WalOp::Insert { table, row, key };
-            match write_via_wal(cfg, &op) {
-                Ok(()) => Response::Ok,
-                Err(e) => {
-                    log_warn!(pipe, "insert {}: {}", tname, e);
-                    Response::Error {
-                        message: format!("insert {}: {}", tname, e),
-                    }
-                }
-            }
-        }
-
-        Request::LookupByIndex { table, key } => {
-            log_debug!(pipe, "lookup_by_index table={} key={}", table, key);
-            match with_indexed_table(cfg, &table, |t| t.get_by_key(key)) {
-                Ok(Some(row)) => Response::Rows { rows: vec![row] },
-                Ok(None) => Response::Rows { rows: vec![] },
-                Err(e) => {
-                    log_warn!(pipe, "lookup_by_index {}: {}", table, e);
-                    Response::Error {
-                        message: format!("lookup_by_index {}: {}", table, e),
-                    }
-                }
-            }
-        }
-
-        Request::ReplaceAll { table, rows } => {
-            log_debug!(pipe, "replace_all table={} rows={}", table, rows.len());
-            let tname = table.clone();
-            let op = WalOp::ReplaceAll { table, rows };
-            match write_via_wal(cfg, &op) {
-                Ok(()) => Response::Ok,
-                Err(e) => {
-                    log_warn!(pipe, "replace_all {}: {}", tname, e);
-                    Response::Error {
-                        message: format!("replace_all {}: {}", tname, e),
-                    }
-                }
-            }
-        }
-
-        Request::ListTables => {
-            log_debug!(pipe, "list_tables");
-            match list_tables(cfg) {
-                Ok(tables) => Response::Tables { tables },
-                Err(e) => {
-                    log_warn!(pipe, "list_tables: {}", e);
-                    Response::Error {
-                        message: format!("list_tables: {}", e),
-                    }
-                }
-            }
-        }
-
-        Request::DescribeTable { table } => {
-            log_debug!(pipe, "describe_table table={}", table);
-            match describe_table(cfg, &table) {
-                Ok(cols) => Response::Schema { columns: cols },
-                Err(e) => {
-                    log_warn!(pipe, "describe_table {}: {}", table, e);
-                    Response::Error {
-                        message: format!("describe_table {}: {}", table, e),
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// 列出表名：catalog 记录 + data 目录下的 .db 文件，取并集。
-fn list_tables(cfg: &Config) -> std::io::Result<Vec<String>> {
-    let mut names = BTreeSet::new();
-
-    let c = Catalog::load(catalog_path(cfg))?;
-    for t in c.table_names() {
-        names.insert(t);
-    }
-
-    let dir = &cfg.data_dir;
-    if dir.exists() {
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().to_string();
-            if let Some(stem) = name.strip_suffix(".db") {
-                names.insert(stem.to_string());
-            }
-        }
-    }
-
-    Ok(names.into_iter().collect())
-}
-
-/// 查一张表的 schema。表在 catalog 里没有，但文件存在，返回空列。
-fn describe_table(
-    cfg: &Config,
-    table: &str,
-) -> std::io::Result<Vec<chusql_storage::protocol::SchemaColumn>> {
-    let c = Catalog::load(catalog_path(cfg))?;
-    if let Some(schema) = c.describe(table) {
-        return Ok(schema.columns.clone());
-    }
-    if table_exists(cfg, table) {
-        return Ok(Vec::new());
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        format!("unknown table: {}", table),
-    ))
-}
-
-// * 连接处理
-
-/// 处理一条连接：逐行读 JSON 请求，逐行回 JSON 响应。
-fn handle(cfg: &Config, conn: LocalSocketStream) -> std::io::Result<()> {
+// 连接
+/// 处理一条连接
+fn handle(server: &Server, conn: LocalSocketStream) -> std::io::Result<()> {
     let mut writer = conn.try_clone()?;
     let reader = BufReader::new(conn);
 
@@ -333,7 +436,7 @@ fn handle(cfg: &Config, conn: LocalSocketStream) -> std::io::Result<()> {
         }
 
         let resp = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => handle_request(cfg, req),
+            Ok(req) => server.handle_request(req),
             Err(e) => {
                 log_warn!(pipe, "bad request line: {}", e);
                 Response::Error {
@@ -349,19 +452,20 @@ fn handle(cfg: &Config, conn: LocalSocketStream) -> std::io::Result<()> {
     Ok(())
 }
 
-// * 主入口
 
-/// 把"配置从哪来"打进日志。
+// 入口
+/// 把配置来源打进日志
 fn log_config(loaded: &Loaded) {
     match &loaded.config_path {
         Some(p) => log_info!(core, "config file: {}", p.display()),
         None => log_info!(core, "config file: none"),
     }
     for (name, value, origin) in &loaded.origins {
-        log_info!(core, "  {:<17} {} [{}]", name, value, origin.describe());
+        log_info!(core, "  {:<18} {} [{}]", name, value, origin.describe());
     }
 }
 
+/// 进程入口
 fn main() -> std::io::Result<()> {
     let loaded = match config::load() {
         Ok(l) => l,
@@ -376,15 +480,15 @@ fn main() -> std::io::Result<()> {
     log_info!(core, "chusql-storage {} starting", env!("CARGO_PKG_VERSION"));
     log_config(&loaded);
 
-    let cfg = Arc::new(loaded.config);
+    let server = Arc::new(Server::new(loaded.config)?);
 
-    // 启动时先重放 WAL，再做其他事
-    if let Err(e) = recover_wal(&cfg) {
+    if let Err(e) = server.recover_wal() {
         log_error!(core, "WAL recovery failed: {}", e);
         return Err(e);
     }
 
-    let ns_name = cfg
+    let ns_name = server
+        .cfg
         .pipe_name
         .as_str()
         .to_ns_name::<GenericNamespaced>()
@@ -394,16 +498,16 @@ fn main() -> std::io::Result<()> {
     log_info!(
         core,
         "listening on pipe {} (\\\\.\\pipe\\{})",
-        cfg.pipe_name,
-        cfg.pipe_name
+        server.cfg.pipe_name,
+        server.cfg.pipe_name
     );
 
     for conn in listener.incoming() {
         let conn = conn?;
-        let cfg = Arc::clone(&cfg);
+        let server = Arc::clone(&server);
         thread::spawn(move || {
             log_debug!(pipe, "connection accepted");
-            if let Err(e) = handle(&cfg, conn) {
+            if let Err(e) = handle(&server, conn) {
                 log_error!(pipe, "connection error: {}", e);
             }
         });

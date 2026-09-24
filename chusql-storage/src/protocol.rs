@@ -1,30 +1,30 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-// 协议定义：Haskell ↔ Rust 之间那条"行分隔 JSON"消息的类型（请求 / 响应）。
+// 协议：Haskell 与 Rust 之间的请求 / 响应类型。
 
-/// 一行：列名到 JSON 值的映射。
+/// 一行：列名到 JSON 值
 pub type Row = HashMap<String, serde_json::Value>;
 
-/// 列类型；跟 Haskell 侧 TInt / TStr / TBool 对应。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+/// 列类型（对应 Haskell 的 TInt / TStr / TBool）
 pub enum ColumnType {
     Int,
     Str,
     Bool,
 }
 
-/// 一列的 schema。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// 一列的 schema
 pub struct SchemaColumn {
     pub name: String,
     pub ty: ColumnType,
 }
 
-/// 请求；method 字段做 tag。
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
+/// 请求：method 字段决定类型
 pub enum Request {
     Ping,
     Scan { table: String },
@@ -38,16 +38,25 @@ pub enum Request {
     ReplaceAll { table: String, rows: Vec<Row> },
     ListTables,
     DescribeTable { table: String },
+    CreateTable {
+        table: String,
+        columns: Vec<SchemaColumn>,
+    },
+    DropTable { table: String },
 }
 
-/// 响应；status 字段做 tag。
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "lowercase")]
+/// 响应：status 字段决定类型
 pub enum Response {
     Pong,
     Rows { rows: Vec<Row> },
     Tables { tables: Vec<String> },
-    Schema { columns: Vec<SchemaColumn> },
+    Schema {
+        columns: Vec<SchemaColumn>,
+        #[serde(default)]
+        row_count: u64,
+    },
     Ok,
     Error { message: String },
 }

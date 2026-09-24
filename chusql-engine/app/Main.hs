@@ -8,6 +8,8 @@ import ChuSQL.Model
 import ChuSQL.Syntax.AST
 import ChuSQL.Syntax.Parser
 
+-- 命令行演示：跑几条语句，打印结果与优化前后的计划。
+
 users :: Table
 users =
     Table
@@ -35,17 +37,18 @@ orders =
 db :: Database
 db = [("users", users), ("orders", orders)]
 
+-- | 演示入口
 main :: IO ()
 main = do
     putStrLn "==================== Engine ====================="
     let q1 = makeSelect ["name"] "users" (Just (Gt (Col "age") (LitInt 18)))
-    print (rowsOf (runQuery db q1))
+    print (rowsOf (runStatement db q1))
 
     let q2 = makeSelect ["*"] "users" Nothing
-    print (rowsOf (runQuery db q2))
+    print (rowsOf (runStatement db q2))
 
     let q3 = makeSelect ["name"] "nonexistent" Nothing
-    print (rowsOf (runQuery db q3))
+    print (rowsOf (runStatement db q3))
 
     let q4 =
             makeSelect
@@ -57,17 +60,16 @@ main = do
                         (Gt (Col "age") (LitInt 30))
                     )
                 )
-    print (rowsOf (runQuery db q4))
+    print (rowsOf (runStatement db q4))
 
-    -- 解析 SQL 文本，再交给执行引擎
-    let parsed = parseQuery "SELECT name FROM users WHERE age > 18 AND name = 'Alice'"
-    print (rowsOf (parsed >>= runQuery db))
+    let parsed = parseStatement "SELECT name FROM users WHERE age > 18 AND name = 'Alice'"
+    print (rowsOf (parsed >>= runStatement db))
 
     putStrLn "\n==================== Optimizer ====================="
     let planSql =
             "SELECT u.name, o.product FROM users u \
             \JOIN orders o ON u.id = o.user_id WHERE u.age > 18"
-    case parseQuery planSql of
+    case parseStatement planSql of
         Left err -> putStrLn err
         Right query -> case translate query of
             Left err -> putStrLn err
@@ -77,4 +79,4 @@ main = do
                 putStrLn "--- plan after optimization ---"
                 putStrLn (renderPlan (optimize db plan))
                 putStrLn "--- rows ---"
-                print (rowsOf (runQuery db query))
+                print (rowsOf (runStatement db query))
