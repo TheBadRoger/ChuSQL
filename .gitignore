@@ -35,6 +35,9 @@ cabal.project.local~
 target/
 **/*.rs.bk
 
+# 运行时数据（Rust 服务默认数据目录 CHUSQL_DATA_DIR=data/），不入库
+chusql-storage/data/
+
 # Cargo.lock 要入库（本项目是要产出可执行程序的 crate，不是纯库）
 
 # ------------------------------------------------------------

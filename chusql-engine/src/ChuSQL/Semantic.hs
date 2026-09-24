@@ -5,6 +5,8 @@ import ChuSQL.Model
 import ChuSQL.Syntax.AST
 import Data.List (intercalate)
 
+-- 语义检查：执行前的关卡 —— 表和列存不存在、表达式类型对不对、写入的值类型是否匹配。
+
 -- * 表与列名解析
 
 -- | 给一批列加上"别名."前缀

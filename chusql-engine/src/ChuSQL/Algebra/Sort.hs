@@ -4,20 +4,22 @@ import ChuSQL.Model
 import ChuSQL.Syntax.AST
 import Data.List (sortBy)
 
--- | 反向排序
+-- 排序：按 ORDER BY 的列清单逐列比较（支持 ASC / DESC），供执行 Sort 算子时使用。
+
+-- 反向排序
 flipOrdering :: Ordering -> Ordering
 flipOrdering LT = GT
 flipOrdering GT = LT
 flipOrdering EQ = EQ
 
--- | 定义值的比较规则
+-- 定义值的比较规则
 compareValue :: Value -> Value -> Ordering
 compareValue (VInt a) (VInt b) = compare a b
 compareValue (VStr a) (VStr b) = compare a b
 compareValue (VBool a) (VBool b) = compare a b
 compareValue _ _ = EQ
 
--- | 定义行的比较规则
+-- 定义行的比较规则
 compareRows :: [(String, SortDir)] -> Row -> Row -> Ordering
 compareRows [] _ _ = EQ
 compareRows ((col, dir) : rest) r1 r2 =
@@ -31,7 +33,7 @@ compareRows ((col, dir) : rest) r1 r2 =
                         else o
         _ -> compareRows rest r1 r2
 
--- | 将表的每行排序
+-- 将表的每行排序
 sortRows :: [(String, SortDir)] -> [Row] -> [Row]
 sortRows [] rows = rows
 sortRows spec rows = sortBy (compareRows spec) rows

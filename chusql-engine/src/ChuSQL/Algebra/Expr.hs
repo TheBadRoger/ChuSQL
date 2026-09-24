@@ -4,6 +4,8 @@ import ChuSQL.Model
 import ChuSQL.Syntax.AST
 import Control.Monad (join)
 
+-- 表达式求值：在一行（列名 → 值）上算出单个值；另外提供"静态收集表达式里用到哪些列"的工具。
+
 -- 表达式求值
 evalExpr :: Expr -> Row -> Either String Value
 evalExpr (Col name) row =
@@ -17,7 +19,7 @@ evalExpr (Eq a b) row = liftBinOp eqOp a b row
 evalExpr (And a b) row = liftBinOp (boolOp (&&)) a b row
 evalExpr (Or a b) row = liftBinOp (boolOp (||)) a b row
 
--- | 收集表达式里用到的列名
+-- 收集表达式里用到的列名
 colsInExpr :: Expr -> [String]
 colsInExpr (Col c) = [c]
 colsInExpr (Gt a b) = colsInExpr a ++ colsInExpr b

@@ -1,9 +1,11 @@
 module ChuSQL.Algebra.Optimize (optimize, pushProject) where
 
+import ChuSQL.Algebra.Expr (colsInExpr, evalExpr)
 import ChuSQL.Algebra.Op (RelOp (..))
 import ChuSQL.Model
 import ChuSQL.Syntax.AST (Expr (..))
-import ChuSQL.Algebra.Expr (colsInExpr, evalExpr)
+
+-- 查询优化：谓词下推 + 投影下推 + 常量折叠，反复应用规则直到算子树形状不再变化。
 
 -- * 谓词下推
 
@@ -15,6 +17,7 @@ relOpCols db (Limit _ x) = relOpCols db x
 relOpCols _ (Project ["*"] _) = ["*"]
 relOpCols _ (Project cols _) = cols
 relOpCols db (Join l r _) = relOpCols db l ++ relOpCols db r
+relOpCols db (Lookup tbl _) = relOpCols db (Scan Nothing tbl)
 relOpCols db (Scan mAlias tbl) =
     case lookup tbl db of
         Nothing -> []
@@ -73,10 +76,18 @@ pushOne _ op = op
 
 -- * 投影下推
 
--- | 工具函数
+-- | 是不是要拿全部列（need 里含哨兵 "*"）。
 needsAll :: [String] -> Bool
 needsAll = elem allColumns
 
+-- | 叶子算子（扫描 / 索引查找）的投影下推：需要全部列就原样保留，缺列才套一层 Project
+pushProjectLeaf :: Database -> [String] -> RelOp -> RelOp
+pushProjectLeaf db need leaf
+    | needsAll need = leaf
+    | all (`elem` need) (relOpCols db leaf) = leaf
+    | otherwise = Project need leaf
+
+-- | 投影下推：把"上层需要哪些列"一路往下传，JOIN 两侧各自只保留自己需要的列。
 pushProject :: Database -> [String] -> RelOp -> RelOp
 pushProject db _ (Project cols x) = case pushProject db cols x of
     Project cols' y | cols' == cols -> Project cols y
@@ -93,10 +104,8 @@ pushProject db need (Join l r c)
             lNeed = if needsAll lCols then ["*"] else [x | x <- tot, x `elem` lCols]
             rNeed = if needsAll rCols then ["*"] else [x | x <- tot, x `elem` rCols]
          in Join (pushProject db lNeed l) (pushProject db rNeed r) c
-pushProject db need scan@(Scan _ _)
-    | needsAll need = scan
-    | all (`elem` need) (relOpCols db scan) = scan
-    | otherwise = Project need scan
+pushProject db need leaf@(Scan _ _) = pushProjectLeaf db need leaf
+pushProject db need leaf@(Lookup _ _) = pushProjectLeaf db need leaf
 
 -- * 常量折叠
 
@@ -123,6 +132,8 @@ foldConstants e = e
 
 -- | 单节点重写：把 Filter 分派给上面几条规则，另外负责恒真条件删除与恒等投影消除
 rewriteNode :: Database -> RelOp -> RelOp
+rewriteNode _ (Filter (Eq (Col k) (LitInt v)) (Scan _ t))
+    | k == "id" = Lookup t v
 rewriteNode db (Filter p (Join l r c)) = pushJoin db p l r c
 rewriteNode db (Filter p x) = case foldConstants p of
     LitBool True -> x

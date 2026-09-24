@@ -4,15 +4,24 @@ import ChuSQL.Algebra.Eval (evalRelOp)
 import ChuSQL.Algebra.Op (RelOp (..), renderPlan)
 import ChuSQL.Algebra.Optimize (optimize, pushProject)
 import ChuSQL.Algebra.Planner (translate)
-import ChuSQL.Model
-import ChuSQL.Syntax.AST
 import ChuSQL.Engine
+import ChuSQL.Model
+import ChuSQL.Storage (MonadStorage (..))
+import ChuSQL.Storage.IPC (IPCStorage (runIPCStorage), Request (ReqPing), Response (RespPong), doListTables, sendRequest)
+import ChuSQL.Syntax.AST
 import ChuSQL.Syntax.Parser
+import Control.Concurrent (threadDelay)
+import Control.Exception (IOException, bracket, try)
+import Data.List (isInfixOf, sortOn)
+import System.CPUTime (getCPUTime)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, getTemporaryDirectory, removePathForcibly)
+import System.Environment (getEnvironment, lookupEnv, setEnv, unsetEnv)
+import System.Exit (ExitCode (..))
+import System.FilePath ((</>))
+import System.IO (Handle)
+import System.Process (CreateProcess (..), ProcessHandle, StdStream (NoStream), createProcess, proc, terminateProcess, waitForProcess)
 import Test.Hspec
 
--- ============================================================
--- Test database
--- ============================================================
 users :: Table
 users =
     Table
@@ -40,14 +49,8 @@ orders =
 testDB :: Database
 testDB = [("users", users), ("orders", orders)]
 
--- ============================================================
--- Main
--- ============================================================
 main :: IO ()
 main = hspec $ do
-    -- ============================================================
-    -- AST
-    -- ============================================================
     describe "ChuSQL.Syntax.AST" $ do
         it "equal Selects are equal" $ do
             makeSelect ["name"] "users" Nothing
@@ -57,9 +60,6 @@ main = hspec $ do
             makeSelect ["name"] "users" Nothing
                 `shouldNotBe` makeSelect ["age"] "users" Nothing
 
-    -- ============================================================
-    -- Parser
-    -- ============================================================
     describe "ChuSQL.Syntax.Parser" $ do
         it "parses a simple SELECT" $ do
             parseQuery "SELECT name FROM users"
@@ -201,9 +201,6 @@ main = hspec $ do
             parseQuery "SELECT name FROM"
                 `shouldSatisfy` isLeft
 
-    -- ============================================================
-    -- Parser: JOIN
-    -- ============================================================
     describe "ChuSQL.Syntax.Parser (JOIN)" $ do
         it "parses a simple JOIN without aliases" $ do
             parseQuery "SELECT name FROM users JOIN orders ON id = user_id"
@@ -244,9 +241,6 @@ main = hspec $ do
                 Right q -> selectCols q `shouldBe` ["u.name", "o.product"]
                 Left err -> expectationFailure err
 
-    -- ============================================================
-    -- Engine: SELECT
-    -- ============================================================
     describe "ChuSQL.Engine (SELECT)" $ do
         it "returns all rows without WHERE" $ do
             rowsOf (runQuery testDB (makeSelect ["*"] "users" Nothing))
@@ -301,9 +295,6 @@ main = hspec $ do
             runQuery testDB (makeSelect ["nope"] "users" Nothing)
                 `shouldSatisfy` isLeft
 
-    -- ============================================================
-    -- Engine: INSERT
-    -- ============================================================
     describe "ChuSQL.Engine (INSERT)" $ do
         it "parses a simple INSERT" $ do
             parseQuery "INSERT INTO users (name, age) VALUES ('Dave', 22)"
@@ -350,9 +341,6 @@ main = hspec $ do
             runQuery testDB (Insert "users" ["name"] [Col "other"])
                 `shouldSatisfy` isLeft
 
-    -- ============================================================
-    -- Engine: DELETE
-    -- ============================================================
     describe "ChuSQL.Engine (DELETE)" $ do
         it "parses DELETE with WHERE" $ do
             parseQuery "DELETE FROM users WHERE age < 18"
@@ -400,9 +388,6 @@ main = hspec $ do
             runQuery testDB (Delete "users" (Just (Gt (Col "unknown") (LitInt 18))))
                 `shouldSatisfy` isLeft
 
-    -- ============================================================
-    -- Engine: UPDATE
-    -- ============================================================
     describe "ChuSQL.Engine (UPDATE)" $ do
         it "parses UPDATE with WHERE" $ do
             parseQuery "UPDATE users SET age = 26 WHERE name = 'Alice'"
@@ -492,9 +477,6 @@ main = hspec $ do
                     Right _ -> True
                     Left _ -> True
 
-    -- ============================================================
-    -- Engine: ORDER BY
-    -- ============================================================
     describe "ChuSQL.Engine (ORDER BY)" $ do
         it "parses ORDER BY ASC" $ do
             case parseQuery "SELECT name FROM users ORDER BY age ASC" of
@@ -580,9 +562,6 @@ main = hspec $ do
                         }
             runQuery testDB q `shouldSatisfy` isLeft
 
-    -- ============================================================
-    -- Engine: LIMIT
-    -- ============================================================
     describe "ChuSQL.Engine (LIMIT)" $ do
         it "parses LIMIT" $ do
             case parseQuery "SELECT * FROM users LIMIT 2" of
@@ -663,9 +642,6 @@ main = hspec $ do
             parseQuery "SELECT * FROM users LIMIT -1"
                 `shouldSatisfy` isLeft
 
-    -- ============================================================
-    -- Engine: JOIN
-    -- ============================================================
     describe "ChuSQL.Engine (JOIN)" $ do
         it "executes a two-table JOIN with aliases" $ do
             rowsOf (parseQuery "SELECT u.name, o.product FROM users u JOIN orders o ON u.id = o.user_id" >>= runQuery testDB)
@@ -733,9 +709,6 @@ main = hspec $ do
                 )
                 `shouldSatisfy` isLeft
 
-    -- ============================================================
-    -- End-to-end
-    -- ============================================================
     describe "ChuSQL end-to-end" $ do
         it "parses and executes a simple query" $ do
             rowsOf (parseQuery "SELECT name FROM users WHERE age > 18" >>= runQuery testDB)
@@ -937,7 +910,8 @@ main = hspec $ do
             let plan =
                     Project
                         ["name"]
-                        ( Limit 2
+                        ( Limit
+                            2
                             ( Sort
                                 [("age", Desc)]
                                 (Filter (Gt (Col "age") (LitInt 18)) (Scan Nothing "users"))
@@ -979,10 +953,12 @@ main = hspec $ do
 
         it "keeps projection with ORDER BY and LIMIT results identical" $ do
             sameResultAsUnoptimized "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id ORDER BY o.product DESC LIMIT 2"
+        it "rewrites Filter id = k into Lookup" $ do
+            fmap planRoot (optimizedPlan "SELECT name FROM users WHERE id = 2")
+                `shouldBe` Right (Lookup "users" 2)
+        it "keeps Lookup result identical to unoptimized" $ do
+            sameResultAsUnoptimized "SELECT name FROM users WHERE id = 2"
 
-    -- ============================================================
-    -- Semantic
-    -- ============================================================
     describe "ChuSQL.Semantic" $ do
         it "rejects an unknown column in WHERE" $ do
             (parseQuery "SELECT name FROM users WHERE nope > 18" >>= runQuery testDB)
@@ -1092,9 +1068,6 @@ main = hspec $ do
             (parseQuery "SELECT * FROM users u JOIN orders o ON u.id = o.user_id" >>= runQuery testDB)
                 `shouldSatisfy` isRight
 
-    -- ============================================================
-    -- Op
-    -- ============================================================
     describe "ChuSQL.Algebra.Op" $ do
         it "renders a plan as indented text" $ do
             case parseQuery "SELECT name FROM users WHERE age > 18" >>= translate of
@@ -1125,12 +1098,203 @@ main = hspec $ do
                                    , "      Scan Nothing \"users\""
                                    ]
 
-emptyDB :: Database
-emptyDB = [(n, t {tableRows = []}) | (n, t) <- testDB]
+    describe "ChuSQL.Storage.IPC" $ do
+        it "scan returns rows with all three value types after insert" $ do
+            withTestServer $ \srv -> withServerEnv srv $ do
+                let row = [("id", VInt 7), ("name", VStr "Alice"), ("flag", VBool True)]
+                runIPCStorage (insert "users" row) `shouldReturn` Right ()
+                rows <- runIPCStorage (scan "users")
+                (map sortRow <$> rows) `shouldBe` Right [sortRow row]
 
--- ============================================================
--- Helpers
--- ============================================================
+        it "scan on a missing table returns Left" $ do
+            withTestServer $ \srv -> withServerEnv srv $ do
+                result <- runIPCStorage (scan "no_such_table")
+                result `shouldSatisfy` isLeft
+
+        it "scan returns all 20 inserted rows in order" $ do
+            withTestServer $ \srv -> withServerEnv srv $ do
+                mapM_ (\i -> runIPCStorage (insert "many" [("id", VInt i)])) [1 .. 20 :: Int]
+                rows <- runIPCStorage (scan "many")
+                fmap length rows `shouldBe` Right 20
+                fmap (sortOn show . map (lookup "id")) rows
+                    `shouldBe` Right (sortOn show (map (Just . VInt) [1 .. 20]))
+
+        it "replaceAll leaves only the new rows" $ do
+            withTestServer $ \srv -> withServerEnv srv $ do
+                runIPCStorage (insert "t" [("id", VInt 1)]) `shouldReturn` Right ()
+                runIPCStorage (replaceAll "t" [[("id", VInt 9)], [("id", VInt 8)]]) `shouldReturn` Right ()
+                rows <- runIPCStorage (scan "t")
+                fmap (sortOn show . map (lookup "id")) rows
+                    `shouldBe` Right (sortOn show [Just (VInt 9), Just (VInt 8)])
+
+        it "lookupByKey finds a row inserted with an id over the pipe" $ do
+            withTestServer $ \srv -> withServerEnv srv $ do
+                let row = [("id", VInt 7), ("name", VStr "Zoe")]
+                runIPCStorage (insert "keyed" row) `shouldReturn` Right ()
+                found <- runIPCStorage (lookupByKey "keyed" 7)
+                fmap (fmap sortRow) found `shouldBe` Right (Just (sortRow row))
+                missing <- runIPCStorage (lookupByKey "keyed" 8)
+                missing `shouldBe` Right Nothing
+
+        it "replaceAll rebuilds the index over the pipe" $ do
+            withTestServer $ \srv -> withServerEnv srv $ do
+                runIPCStorage (insert "rb" [("id", VInt 1)]) `shouldReturn` Right ()
+                runIPCStorage (replaceAll "rb" [[("id", VInt 9), ("name", VStr "Zoe")]]) `shouldReturn` Right ()
+                old <- runIPCStorage (lookupByKey "rb" 1)
+                old `shouldBe` Right Nothing
+                new <- runIPCStorage (lookupByKey "rb" 9)
+                fmap (fmap sortRow) new
+                    `shouldBe` Right (Just (sortRow [("id", VInt 9), ("name", VStr "Zoe")]))
+
+        it "snapshot lists tables and scans each one to build the database" $ do
+            withTestServer $ \srv -> withServerEnv srv $ do
+                runIPCStorage (insert "a" [("id", VInt 1)]) `shouldReturn` Right ()
+                runIPCStorage (insert "b" [("id", VInt 2)]) `shouldReturn` Right ()
+                db <- runIPCStorage snapshot
+                map fst db `shouldBe` ["a", "b"]
+                map (length . tableRows . snd) db `shouldBe` [1, 1]
+                map (map (lookup "id") . tableRows . snd) db `shouldBe` [[Just (VInt 1)], [Just (VInt 2)]]
+
+        it "doListTables returns the tables that exist" $ do
+            withTestServer $ \srv -> withServerEnv srv $ do
+                runIPCStorage (insert "t1" [("id", VInt 1)]) `shouldReturn` Right ()
+                runIPCStorage (insert "t2" [("id", VInt 2)]) `shouldReturn` Right ()
+                doListTables `shouldReturn` Right ["t1", "t2"]
+
+        it "rows survive a restart on the same data directory" $ do
+            located <- locateServer
+            case located of
+                Left err -> pendingWith err
+                Right bin -> do
+                    srv1 <- startServer bin
+                    let dir = dataDir srv1
+                    withServerEnv srv1 $ runIPCStorage (insert "persist" [("id", VInt 42)]) `shouldReturn` Right ()
+                    stopServer srv1
+                    srv2 <- startServerAt bin dir
+                    rows <- withServerEnv srv2 $ runIPCStorage (scan "persist")
+                    stopServer srv2
+                    cleanServerDir srv1
+                    (map sortRow <$> rows) `shouldBe` Right [sortRow [("id", VInt 42)]]
+
+        it "a missing server yields Left without throwing" $ do
+            withPipeName "chusql-no-such-server" $ do
+                result <- runIPCStorage (scan "users")
+                result `shouldSatisfy` isLeft
+
+emptyDB :: Database
+emptyDB = [(n, t{tableRows = []}) | (n, t) <- testDB]
+
+data IPCServer = IPCServer
+    { pipeName :: String
+    , dataDir :: FilePath
+    , processHandle :: ProcessHandle
+    }
+
+locateServer :: IO (Either String FilePath)
+locateServer = do
+    mdir <- firstDir [".." </> "chusql-storage", "chusql-storage"]
+    case mdir of
+        Nothing -> pure (Left "chusql-storage directory not found (run these tests inside the repository)")
+        Just dir -> do
+            built <-
+                try (createProcess (proc "cargo" ["build", "--bin", "server"]){cwd = Just dir, std_out = NoStream, std_err = NoStream}) ::
+                    IO (Either IOException (Maybe Handle, Maybe Handle, Maybe Handle, ProcessHandle))
+            case built of
+                Left e -> pure (Left ("cannot run cargo (Rust is required for the IPC tests): " ++ show e))
+                Right (_, _, _, ph) -> do
+                    ec <- waitForProcess ph
+                    case ec of
+                        ExitFailure n -> pure (Left ("cargo build --bin server failed with exit code " ++ show n))
+                        ExitSuccess -> do
+                            found <- firstExisting [dir </> "target" </> "debug" </> "server.exe", dir </> "target" </> "debug" </> "server"]
+                            pure (maybe (Left "cargo build finished but no server executable was found") Right found)
+  where
+    firstDir [] = pure Nothing
+    firstDir (d : ds) = do
+        ok <- doesDirectoryExist d
+        if ok then pure (Just d) else firstDir ds
+    firstExisting [] = pure Nothing
+    firstExisting (p : ps) = do
+        ok <- doesFileExist p
+        if ok then pure (Just p) else firstExisting ps
+
+startServer :: FilePath -> IO IPCServer
+startServer bin = do
+    stamp <- show <$> getCPUTime
+    tmp <- getTemporaryDirectory
+    let dir = tmp </> "chusql-hs-IPC" </> stamp
+    createDirectoryIfMissing True dir
+    startServerAt bin dir
+
+startServerAt :: FilePath -> FilePath -> IO IPCServer
+startServerAt bin dir = do
+    stamp <- show <$> getCPUTime
+    let name = "chusql-hs-test-" ++ stamp
+    parentEnv <- getEnvironment
+    (_, _, _, ph) <-
+        createProcess
+            (proc bin [])
+                { env = Just (("CHUSQL_PIPE", name) : ("CHUSQL_DATA_DIR", dir) : parentEnv)
+                , std_out = NoStream
+                , std_err = NoStream
+                }
+    let srv = IPCServer name dir ph
+    waitUntilReady srv 100
+    pure srv
+
+waitUntilReady :: IPCServer -> Int -> IO ()
+waitUntilReady srv tries = do
+    probe <- try (withServerEnv srv (sendRequest ReqPing)) :: IO (Either IOException Response)
+    case probe of
+        Right RespPong -> pure ()
+        _ | tries > 0 -> threadDelay 50000 >> waitUntilReady srv (tries - 1)
+        Right _ -> ioError (userError "server is up but ping did not answer pong")
+        Left e -> ioError e
+
+stopServer :: IPCServer -> IO ()
+stopServer srv = do
+    _ <- try (terminateProcess (processHandle srv)) :: IO (Either IOException ())
+    _ <- try (waitForProcess (processHandle srv)) :: IO (Either IOException ExitCode)
+    pure ()
+
+cleanServerDir :: IPCServer -> IO ()
+cleanServerDir srv = do
+    _ <- try (removePathForcibly (dataDir srv)) :: IO (Either IOException ())
+    pure ()
+
+withTestServer :: (IPCServer -> IO ()) -> IO ()
+withTestServer act = do
+    located <- locateServer
+    case located of
+        Left err
+            | "cannot run cargo" `isInfixOf` err -> pendingWith err
+            | otherwise -> expectationFailure err
+        Right bin -> bracket (startServer bin) (\s -> stopServer s >> cleanServerDir s) act
+
+withServerEnv :: IPCServer -> IO a -> IO a
+withServerEnv srv act = do
+    oldPipe <- lookupEnv "CHUSQL_PIPE"
+    oldDir <- lookupEnv "CHUSQL_DATA_DIR"
+    setEnv "CHUSQL_PIPE" (pipeName srv)
+    setEnv "CHUSQL_DATA_DIR" (dataDir srv)
+    r <- act
+    restore "CHUSQL_PIPE" oldPipe
+    restore "CHUSQL_DATA_DIR" oldDir
+    pure r
+  where
+    restore k = maybe (unsetEnv k) (setEnv k)
+
+withPipeName :: String -> IO a -> IO a
+withPipeName name act = do
+    old <- lookupEnv "CHUSQL_PIPE"
+    setEnv "CHUSQL_PIPE" name
+    r <- act
+    maybe (unsetEnv "CHUSQL_PIPE") (setEnv "CHUSQL_PIPE") old
+    pure r
+
+sortRow :: Row -> Row
+sortRow = sortOn fst
+
 isLeft :: Either a b -> Bool
 isLeft (Left _) = True
 isLeft (Right _) = False
@@ -1167,6 +1331,7 @@ firstFilterCond (Join l r _) = case firstFilterCond l of
     Just p -> Just p
     Nothing -> firstFilterCond r
 firstFilterCond (Scan _ _) = Nothing
+firstFilterCond (Lookup _ _) = Nothing
 
 anyFilter :: RelOp -> Bool
 anyFilter (Filter _ _) = True
@@ -1175,6 +1340,7 @@ anyFilter (Sort _ x) = anyFilter x
 anyFilter (Limit _ x) = anyFilter x
 anyFilter (Join l r _) = anyFilter l || anyFilter r
 anyFilter (Scan _ _) = False
+anyFilter (Lookup _ _) = False
 
 stripProjects :: RelOp -> RelOp
 stripProjects (Project _ x) = stripProjects x
@@ -1183,6 +1349,7 @@ stripProjects (Sort spec x) = Sort spec (stripProjects x)
 stripProjects (Limit n x) = Limit n (stripProjects x)
 stripProjects (Join l r c) = Join (stripProjects l) (stripProjects r) c
 stripProjects (Scan a t) = Scan a t
+stripProjects (Lookup t k) = Lookup t k
 
 projectedPlan :: String -> Either String RelOp
 projectedPlan sql = do
@@ -1205,3 +1372,7 @@ countFilters _ = 0
 leftSideFilters :: RelOp -> Maybe Int
 leftSideFilters (Project _ (Join l _ _)) = Just (countFilters l)
 leftSideFilters _ = Nothing
+
+planRoot :: RelOp -> RelOp
+planRoot (Project _ x) = planRoot x
+planRoot x = x

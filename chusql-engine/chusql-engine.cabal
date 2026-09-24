@@ -18,11 +18,18 @@ library
                       ChuSQL.Engine
                       ChuSQL.Model
                       ChuSQL.Semantic
+                      ChuSQL.Storage
+                      ChuSQL.Storage.IPC
+                      ChuSQL.Storage.Memory
                       ChuSQL.Syntax.AST
                       ChuSQL.Syntax.Parser
     build-depends:    base >= 4.14 && < 5
+                    , aeson
+                    , bytestring
                     , megaparsec
                     , parser-combinators
+                    , scientific
+                    , text
     default-language: Haskell2010
     ghc-options:      -Wall
 
@@ -40,6 +47,9 @@ test-suite chusql-engine-test
     hs-source-dirs:   test
     build-depends:    base
                     , chusql-engine
+                    , directory
+                    , filepath
                     , hspec
+                    , process
     default-language: Haskell2010
     ghc-options:      -Wall

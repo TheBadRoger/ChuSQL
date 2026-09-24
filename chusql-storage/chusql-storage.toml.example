@@ -1,0 +1,40 @@
+# ChuSQL 存储服务配置示例
+#
+# 用法：把本文件复制成 chusql-storage.toml（放在启动 server 时的当前目录下），
+#       或者让环境变量 CHUSQL_CONFIG 指向任意路径的这个文件。
+#
+# 每一项都可以删掉：没写的项回退到内置默认值（下面注释里的值就是默认值）。
+# 优先级：环境变量 > 本文件 > 内置默认值。
+# 启动时 server 会把"读了哪个文件、每个选项从哪来"打进日志（[INFO] 开头那几行）。
+
+[page]
+# 页大小（字节）：512 ~ 65536 之间的 2 的幂。
+# 注意：改它会让已有数据文件（.db）读不出来（文件长度对不上页大小会直接报错）。
+# 环境变量：CHUSQL_PAGE_SIZE
+size = 4096
+
+[btree]
+# B+ 树一个节点最多几个孩子（>= 3，且必须能放进一页：12 + (order-1)*8 + order*8 <= size）。
+# 注意：改它会让已有索引文件（.idx）对不上文件头里记的值，打开时报错。
+# 环境变量：CHUSQL_BTREE_ORDER
+order = 4
+
+[storage]
+# 数据目录：一张表一个 <表名>.db，一个索引一个 <表名>.idx。
+# 环境变量：CHUSQL_DATA_DIR
+data_dir = "data"
+
+[server]
+# 命名管道名（Windows 上实际是 \\.\pipe\<这个名字>）。
+# 环境变量：CHUSQL_PIPE
+pipe_name = "chusql-storage"
+
+[log]
+# 日志等级：off / error / warn / info / debug。debug 会多打每个请求和连接。
+# 环境变量：CHUSQL_LOG
+level = "info"
+
+# 颜色不用写在文件里，用环境变量控制：CHUSQL_LOG_COLOR = auto（默认，stderr 是终端才着色）
+#                                    / always / never
+# 行格式：[等级 本地日期时间] [来源] 消息；来源 core=服务自身、pipe=由管道请求触发
+# ERROR 加粗红、WARN 加粗橙、DEBUG 加粗不变色、INFO 不加样式
