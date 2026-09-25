@@ -9,7 +9,6 @@ import ChuSQL.Semantic (check)
 import ChuSQL.Storage (MonadStorage (..))
 import ChuSQL.Storage.Memory (MemoryStorage (runMemoryStorage))
 import ChuSQL.Syntax.AST
-import Control.Monad (filterM)
 
 -- 引擎入口：语义检查 + 分发执行，以及内存实现与泛型版本。
 
@@ -29,7 +28,9 @@ rowsOf = fmap snd
 -- | 泛型入口：先检查再执行
 runStatementM :: (MonadStorage m) => Statement -> m (Either String [Row])
 runStatementM q = do
-    db <- snapshot
+    -- 只要结构：语义检查和查询优化都只看列，一行数据都不碰，
+    -- 所以这里不用取整库快照（那会把所有行拉一遍）
+    db <- schema
     case check db q of
         Left err -> pure (Left err)
         Right _ -> runStatementUncheckedM db q
@@ -42,36 +43,43 @@ runStatementUncheckedM db q@Select{} =
     case translate q of
         Left e -> pure (Left e)
         Right relOp -> evalRelOpM (optimize db relOp)
-runStatementUncheckedM _ (Insert tbl cols vals) =
-    case mapM (\e -> evalExpr e []) vals of
+runStatementUncheckedM _ (Insert tbl cols rows) =
+    -- 多行一次交给存储：N 行只落一次盘（键怎么算、索引怎么写是存储层的事）
+    case mapM toRow rows of
         Left err -> pure (Left err)
-        Right values
-            | length cols /= length values ->
-                pure (Left "column count does not match value count")
-            | otherwise -> do
-                let row = zip cols values
-                    key = case lookup "id" row of
-                        Just (VInt k) -> Just k
-                        _ -> Nothing
-                result <- insert tbl row key
-                pure (result >> Right [])
+        Right rs -> do
+            result <- insertMany tbl rs
+            pure (result >> Right [])
+  where
+    -- \| 一行字面量求值成一行数据
+    toRow :: [Expr] -> Either String Row
+    toRow vals = do
+        values <- mapM (\e -> evalExpr e []) vals
+        if length cols /= length values
+            then Left "column count does not match value count"
+            else Right (zip cols values)
 runStatementUncheckedM _ (Delete tbl mWhere) = do
     rowsResult <- scan tbl
     case rowsResult of
         Left err -> pure (Left err)
-        Right rows -> do
-            let kept = case mWhere of
-                    Nothing -> Right []
-                    Just e -> filterM (shouldKeep e) rows
-            case kept of
-                Left err -> pure (Left err)
-                Right keptRows -> do
-                    result <- replaceAll tbl keptRows
-                    pure (result >> Right [])
+        Right rows -> case splitByCondition mWhere rows of
+            Left err -> pure (Left err)
+            Right (doomed, kept) ->
+                -- 要删的行都有 id 就走行级删（存储层原地删，代价只和删几行有关）；
+                -- 没有 id 的表定位不到行，只能整表写回。
+                case mapM rowId doomed of
+                    Right ids -> do
+                        result <- deleteKeys tbl ids
+                        pure (result >> Right [])
+                    Left _ -> do
+                        result <- replaceAll tbl kept
+                        pure (result >> Right [])
   where
-    -- \| 保留 = 条件不成立
-    shouldKeep :: Expr -> Row -> Either String Bool
-    shouldKeep e row = not <$> evalCondForRow e row
+    -- \| 这一行的 id（要拿来当删除键）
+    rowId :: Row -> Either String Int
+    rowId r = case lookup "id" r of
+        Just (VInt k) -> Right k
+        _ -> Left "row has no integer id"
 runStatementUncheckedM _ (Update tbl assigns mWhere) = do
     rowsResult <- scan tbl
     case rowsResult of
@@ -97,8 +105,26 @@ runStatementUncheckedM _ (CreateTable name cols) = do
 runStatementUncheckedM _ (DropTable name) = do
     result <- dropTable name
     pure (result >> Right [])
+runStatementUncheckedM _ (CreateIndex tbl col) = do
+    result <- createIndex tbl col
+    pure (result >> Right [])
+runStatementUncheckedM _ (DropIndex tbl col) = do
+    result <- dropIndex tbl col
+    pure (result >> Right [])
 
 -- * 更新辅助
+
+-- | 按条件把行分成"要删的"和"留着的"两拨（没有条件就全都要删）
+splitByCondition :: Maybe Expr -> [Row] -> Either String ([Row], [Row])
+splitByCondition cond = go [] []
+  where
+    -- \| 一行一行过，保持原顺序；条件求值出错就立刻停（和 filterM 一样）
+    go doomed kept [] = Right (reverse doomed, reverse kept)
+    go doomed kept (r : rs) = do
+        hit <- case cond of
+            Nothing -> Right True
+            Just e -> evalCondForRow e r
+        go (if hit then r : doomed else doomed) (if hit then kept else r : kept) rs
 
 -- | 依次求值并覆盖列
 applyUpdates :: [(String, Expr)] -> Row -> Either String Row

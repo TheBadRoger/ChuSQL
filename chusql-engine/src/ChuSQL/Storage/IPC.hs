@@ -6,11 +6,14 @@ module ChuSQL.Storage.IPC (
     Request (..),
     Response (..),
     SchemaColumn (..),
+    TableInfo (..),
     sendRequest,
     closeConnection,
     doListTables,
-    doLookupByKey,
-    doInsertWith,
+    doLookupByColumn,
+    doInsert,
+    doInsertMany,
+    doDeleteKeys,
     doDescribeTable,
     doDropTable,
     doListCatalog,
@@ -20,7 +23,7 @@ import ChuSQL.Model
 import ChuSQL.Storage
 import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar)
 import Control.Exception (IOException, try)
-import Data.Aeson (FromJSON (..), ToJSON (..), eitherDecodeStrict, encode, object, withObject, (.:), (.=))
+import Data.Aeson (FromJSON (..), ToJSON (..), eitherDecodeStrict, encode, object, withObject, (.:), (.:?), (.!=), (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as K
 import Data.Aeson.KeyMap qualified as KM
@@ -155,28 +158,41 @@ instance FromJSON SchemaColumn where
 data Request
     = ReqPing
     | ReqScan String
-    | ReqInsert String Row (Maybe Int)
+    | ReqInsert String Row
+    | ReqInsertBatch String [Row]
+    | ReqDeleteKeys String [Int]
     | ReqReplaceAll String [Row]
     | ReqListTables
-    | ReqLookupByKey String Int
+    | ReqLookupByColumn String String Int
     | ReqDescribeTable String
     | ReqCreateTable String [SchemaColumn]
     | ReqDropTable String
+    | ReqCreateIndex String String
+    | ReqDropIndex String String
     | ReqListCatalog
 
 -- | 请求编码
 instance ToJSON Request where
     toJSON ReqPing = object ["method" .= ("ping" :: T.Text)]
     toJSON (ReqScan t) = object ["method" .= ("scan" :: T.Text), "table" .= t]
-    toJSON (ReqInsert t r mk) =
-        object $
+    toJSON (ReqInsert t r) =
+        object
             [ "method" .= ("insert" :: T.Text)
             , "table" .= t
             , "row" .= rowToJSON r
             ]
-                ++ case mk of
-                    Nothing -> []
-                    Just k -> ["key" .= k]
+    toJSON (ReqInsertBatch t rs) =
+        object
+            [ "method" .= ("insert_batch" :: T.Text)
+            , "table" .= t
+            , "rows" .= map rowToJSON rs
+            ]
+    toJSON (ReqDeleteKeys t ks) =
+        object
+            [ "method" .= ("delete_keys" :: T.Text)
+            , "table" .= t
+            , "keys" .= ks
+            ]
     toJSON (ReqReplaceAll t rs) =
         object
             [ "method" .= ("replace_all" :: T.Text)
@@ -184,10 +200,11 @@ instance ToJSON Request where
             , "rows" .= map rowToJSON rs
             ]
     toJSON ReqListTables = object ["method" .= ("list_tables" :: T.Text)]
-    toJSON (ReqLookupByKey t k) =
+    toJSON (ReqLookupByColumn t c k) =
         object
             [ "method" .= ("lookup_by_index" :: T.Text)
             , "table" .= t
+            , "column" .= c
             , "key" .= k
             ]
     toJSON (ReqDescribeTable t) =
@@ -203,17 +220,40 @@ instance ToJSON Request where
             ]
     toJSON (ReqDropTable t) =
         object ["method" .= ("drop_table" :: T.Text), "table" .= t]
+    toJSON (ReqCreateIndex t c) =
+        object
+            [ "method" .= ("create_index" :: T.Text)
+            , "table" .= t
+            , "column" .= c
+            ]
+    toJSON (ReqDropIndex t c) =
+        object
+            [ "method" .= ("drop_index" :: T.Text)
+            , "table" .= t
+            , "column" .= c
+            ]
     toJSON ReqListCatalog = object ["method" .= ("list_catalog" :: T.Text)]
+
+-- | 一张表的线上信息：列 + 行数 + 索引 + 列统计
+data TableInfo = TableInfo
+    { tiTable :: String
+    , tiColumns :: [SchemaColumn]
+    , tiRows :: Int
+    , tiIndexes :: [String]
+    , tiStats :: [(String, Int, Bool)]
+    }
+    deriving (Show, Eq)
 
 -- | 响应类型
 data Response
     = RespPong
     | RespRows [Row]
     | RespTables [String]
-    | RespSchema [SchemaColumn] Int
+    | RespSchema TableInfo
+    | RespNoIndex
     | RespOk
     | RespError String
-    | RespCatalog [(String, [SchemaColumn], Int)]
+    | RespCatalog [TableInfo]
 
 -- | 响应解码
 instance FromJSON Response where
@@ -222,25 +262,35 @@ instance FromJSON Response where
         case status :: T.Text of
             "pong" -> pure RespPong
             "ok" -> pure RespOk
+            "no_index" -> pure RespNoIndex
             "rows" -> RespRows <$> (o .: "rows" >>= mapM rowFromJSON)
             "tables" -> RespTables <$> o .: "tables"
             "error" -> RespError <$> o .: "message"
-            "schema" -> do
-                cols <- o .: "columns"
-                cnt <- o .: "row_count"
-                pure (RespSchema cols cnt)
+            "schema" -> RespSchema <$> parseTable (A.Object o)
             "catalog" -> do
-                xs <- o .: "schemas"
-                parsed <- mapM parseTableSchema xs
-                pure (RespCatalog parsed)
+                xs <- o .: "schemas" :: Parser [A.Value]
+                RespCatalog <$> mapM parseTable xs
             other -> fail ("unknown status: " ++ T.unpack other)
       where
-        -- \| 解析一条 list_catalog 记录。
-        parseTableSchema = withObject "TableSchema" $ \o -> do
+        -- \| 解一张表的 schema（新字段都给了默认值，老响应也能解）
+        parseTable :: A.Value -> Parser TableInfo
+        parseTable = withObject "TableInfo" $ \o -> do
             t <- o .: "table"
             cols <- o .: "columns"
             cnt <- o .: "row_count"
-            pure (t, cols, cnt)
+            idx <- o .:? "indexes" .!= []
+            sts <- o .:? "stats" .!= []
+            idxCols <- mapM (\v -> withObject "IndexWire" (.: "column") v) (idx :: [A.Value])
+            stats <- mapM parseStat (sts :: [A.Value])
+            pure (TableInfo t cols cnt idxCols stats)
+
+        -- \| 解一条列统计
+        parseStat :: A.Value -> Parser (String, Int, Bool)
+        parseStat = withObject "ColumnStat" $ \o -> do
+            name <- o .: "name"
+            distinct <- o .: "distinct"
+            capped <- o .:? "capped" .!= False
+            pure (name, distinct, capped)
 
 -- | 值编码成 JSON
 valueToJSON :: Value -> A.Value
@@ -275,87 +325,88 @@ rowFromJSON _ = fail "row must be a JSON object"
 
 -- * 内部封装
 
+-- | 发一条请求，把响应翻成 Either。
+--
+-- 每个操作的区别只有两处：发什么请求、认哪种响应。所以固定套路收在这里：
+-- 对面报错 → `Left`；认得这种响应 → `Right`；其余一律算协议错（比如对面版本对不上）。
+ask :: String -> Request -> (Response -> Maybe a) -> IO (Either String a)
+ask what req recognize = do
+    resp <- sendRequest req
+    pure $ case resp of
+        RespError e -> Left e
+        other -> case recognize other of
+            Just a -> Right a
+            Nothing -> Left ("unexpected response to " ++ what)
+
+-- | 只认"成了"（多数写操作都这样）
+okOnly :: Response -> Maybe ()
+okOnly RespOk = Just ()
+okOnly _ = Nothing
+
 -- | 发 Scan
 doScan :: String -> IO (Either String [Row])
-doScan t = do
-    resp <- sendRequest (ReqScan t)
-    pure $ case resp of
-        RespRows rows -> Right rows
-        RespError e -> Left e
-        _ -> Left "unexpected response to scan"
+doScan t = ask "scan" (ReqScan t) $ \resp -> case resp of
+    RespRows rows -> Just rows
+    _ -> Nothing
 
--- | 发 Insert，可带索引键。
-doInsertWith :: String -> Row -> Maybe Int -> IO (Either String ())
-doInsertWith t r mk = do
-    resp <- sendRequest (ReqInsert t r mk)
-    pure $ case resp of
-        RespOk -> Right ()
-        RespError e -> Left e
-        _ -> Left "unexpected response to insert"
+-- | 发 Insert（索引由存储层自己维护，这里不传 key）
+doInsert :: String -> Row -> IO (Either String ())
+doInsert t r = ask "insert" (ReqInsert t r) okOnly
+
+-- | 发 InsertBatch：一批行一次请求
+doInsertMany :: String -> [Row] -> IO (Either String ())
+doInsertMany t rs = ask "insert_batch" (ReqInsertBatch t rs) okOnly
+
+-- | 发 DeleteKeys
+doDeleteKeys :: String -> [Int] -> IO (Either String ())
+doDeleteKeys t ks = ask "delete_keys" (ReqDeleteKeys t ks) okOnly
 
 -- | 发 ReplaceAll
 doReplaceAll :: String -> [Row] -> IO (Either String ())
-doReplaceAll t rs = do
-    resp <- sendRequest (ReqReplaceAll t rs)
-    pure $ case resp of
-        RespOk -> Right ()
-        RespError e -> Left e
-        _ -> Left "unexpected response to replace_all"
+doReplaceAll t rs = ask "replace_all" (ReqReplaceAll t rs) okOnly
 
 -- | 发 ListTables
 doListTables :: IO (Either String [String])
-doListTables = do
-    resp <- sendRequest ReqListTables
-    pure $ case resp of
-        RespTables ts -> Right ts
-        RespError e -> Left e
-        _ -> Left "unexpected response to list_tables"
+doListTables = ask "list_tables" ReqListTables $ \resp -> case resp of
+    RespTables ts -> Just ts
+    _ -> Nothing
 
--- | 一次拿全库 schema（表名 + 列 + 行数）。
-doListCatalog :: IO (Either String [(String, [SchemaColumn], Int)])
-doListCatalog = do
-    resp <- sendRequest ReqListCatalog
-    pure $ case resp of
-        RespCatalog xs -> Right xs
-        RespError e -> Left e
-        _ -> Left "unexpected response to list_catalog"
+-- | 一次拿全库 schema（表名 + 列 + 行数 + 索引 + 统计）。
+doListCatalog :: IO (Either String [TableInfo])
+doListCatalog = ask "list_catalog" ReqListCatalog $ \resp -> case resp of
+    RespCatalog xs -> Just xs
+    _ -> Nothing
 
--- | 发 LookupByIndex
-doLookupByKey :: String -> Int -> IO (Either String (Maybe Row))
-doLookupByKey t k = do
-    resp <- sendRequest (ReqLookupByKey t k)
-    pure $ case resp of
-        RespRows [] -> Right Nothing
-        RespRows (r : _) -> Right (Just r)
-        RespError e -> Left e
-        _ -> Left "unexpected response to lookup_by_index"
+-- | 按某一列的索引取一行。
+-- 返回 `NoIndex` 表示"这个列上没有索引"，上层据此退回全表扫描。
+doLookupByColumn :: String -> String -> Int -> IO (Either String IndexResult)
+doLookupByColumn t c k = ask "lookup_by_index" (ReqLookupByColumn t c k) $ \resp -> case resp of
+    RespRows [] -> Just (IndexRow Nothing)
+    RespRows (r : _) -> Just (IndexRow (Just r))
+    RespNoIndex -> Just NoIndex
+    _ -> Nothing
 
 -- | 发 DescribeTable
-doDescribeTable :: String -> IO (Either String ([SchemaColumn], Int))
-doDescribeTable t = do
-    resp <- sendRequest (ReqDescribeTable t)
-    pure $ case resp of
-        RespSchema cols n -> Right (cols, n)
-        RespError e -> Left e
-        _ -> Left "unexpected response to describe_table"
+doDescribeTable :: String -> IO (Either String TableInfo)
+doDescribeTable t = ask "describe_table" (ReqDescribeTable t) $ \resp -> case resp of
+    RespSchema info -> Just info
+    _ -> Nothing
+
+-- | 给某一列建索引
+doCreateIndex :: String -> String -> IO (Either String ())
+doCreateIndex t c = ask "create_index" (ReqCreateIndex t c) okOnly
+
+-- | 去掉某一列的索引
+doDropIndex :: String -> String -> IO (Either String ())
+doDropIndex t c = ask "drop_index" (ReqDropIndex t c) okOnly
 
 -- | 发 CreateTable
 doCreateTable :: String -> [SchemaColumn] -> IO (Either String ())
-doCreateTable t cols = do
-    resp <- sendRequest (ReqCreateTable t cols)
-    pure $ case resp of
-        RespOk -> Right ()
-        RespError e -> Left e
-        _ -> Left "unexpected response to create_table"
+doCreateTable t cols = ask "create_table" (ReqCreateTable t cols) okOnly
 
 -- | 发 DropTable
 doDropTable :: String -> IO (Either String ())
-doDropTable t = do
-    resp <- sendRequest (ReqDropTable t)
-    pure $ case resp of
-        RespOk -> Right ()
-        RespError e -> Left e
-        _ -> Left "unexpected response to drop_table"
+doDropTable t = ask "drop_table" (ReqDropTable t) okOnly
 
 -- * 表结构
 
@@ -375,14 +426,20 @@ instance MonadStorage IPCStorage where
     -- \| 发 Scan
     scan t = IPCStorage (doScan t)
 
-    -- \| 发 Insert
-    insert t r mk = IPCStorage (doInsertWith t r mk)
+    -- \| 发 Insert（索引由存储层自己维护）
+    insert t r = IPCStorage (doInsert t r)
+
+    -- \| 一批行一次请求：N 行只落一次盘
+    insertMany t rs = IPCStorage (doInsertMany t rs)
+
+    -- \| 按 id 批量删行
+    deleteKeys t ks = IPCStorage (doDeleteKeys t ks)
 
     -- \| 发 ReplaceAll
     replaceAll t rs = IPCStorage (doReplaceAll t rs)
 
-    -- \| 发 LookupByIndex
-    lookupByKey t k = IPCStorage (doLookupByKey t k)
+    -- \| 按某一列的索引取一行（没有索引就回 NoIndex）
+    lookupByColumn t c k = IPCStorage (doLookupByColumn t c k)
 
     -- \| 发 CreateTable
     createTable name cols = IPCStorage (doCreateTable name (map toWire cols))
@@ -395,6 +452,12 @@ instance MonadStorage IPCStorage where
     -- \| 发 DropTable
     dropTable name = IPCStorage (doDropTable name)
 
+    -- \| 建索引
+    createIndex t c = IPCStorage (doCreateIndex t c)
+
+    -- \| 删索引
+    dropIndex t c = IPCStorage (doDropIndex t c)
+
     -- \| 列表 + 逐表扫描拼库
     snapshot = IPCStorage $ do
         result <- doListCatalog
@@ -403,6 +466,19 @@ instance MonadStorage IPCStorage where
             Right xs -> mapM loadEntry xs
       where
         -- \| 加载一张表（schema 来自 catalog，行来自 scan）
-        loadEntry (t, cols, _n) = do
-            rows <- doScan t
-            pure (t, Table t (schemaToColumns cols) (either (const []) id rows))
+        loadEntry info = do
+            rows <- doScan (tiTable info)
+            pure
+                ( tiTable info
+                , Table (tiTable info) (schemaToColumns (tiColumns info)) (either (const []) id rows)
+                )
+
+    -- \| 只问数据字典要结构，一行数据都不拉过来
+    schema = IPCStorage $ do
+        result <- doListCatalog
+        pure $ case result of
+            Left _ -> []
+            Right xs ->
+                [ (tiTable i, Table (tiTable i) (schemaToColumns (tiColumns i)) [])
+                | i <- xs
+                ]

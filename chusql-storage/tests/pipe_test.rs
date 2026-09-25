@@ -152,17 +152,17 @@ fn replace_all_replaces_rows() {
     assert!(!r.contains("Alice"), "old row should be gone: {}", r);
 }
 
-/// 带 key 插入后能按下标查
+/// 按 id 查（列名走默认值 `id`，老客户端不用改）
 #[test]
-fn insert_with_key_then_lookup() {
+fn insert_then_lookup_by_index() {
     let pipe = unique_pipe_name();
     let (_srv, _data) = start_server(&pipe);
     let mut c = connect(&pipe).unwrap();
 
     for (id, name) in [(1, "Alice"), (2, "Bob"), (3, "Carol")] {
         let req = format!(
-            r#"{{"method":"insert","table":"idx_users","row":{{"id":{},"name":"{}"}},"key":{}}}"#,
-            id, name, id
+            r#"{{"method":"insert","table":"idx_users","row":{{"id":{},"name":"{}"}}}}"#,
+            id, name
         );
         let r = send(&mut c, &req);
         assert!(r.contains(r#""status":"ok""#), "insert: {}", r);
@@ -175,16 +175,170 @@ fn insert_with_key_then_lookup() {
     assert!(r.contains(r#""rows":[]"#), "miss: {}", r);
 }
 
-/// 不带 key 不建索引
+/// 插入时索引由表自己维护：没给 key，id 也会进索引
 #[test]
-fn insert_without_key_does_not_index() {
+fn insert_indexes_the_id_column_automatically() {
     let pipe = unique_pipe_name();
     let (_srv, _data) = start_server(&pipe);
     let mut c = connect(&pipe).unwrap();
 
-    send(&mut c, r#"{"method":"insert","table":"nokey","row":{"id":1}}"#);
-    let r = send(&mut c, r#"{"method":"lookup_by_index","table":"nokey","key":1}"#);
-    assert!(r.contains(r#""rows":[]"#), "got: {}", r);
+    send(&mut c, r#"{"method":"insert","table":"auto_idx","row":{"id":7,"name":"Zoe"}}"#);
+    let r = send(
+        &mut c,
+        r#"{"method":"lookup_by_index","table":"auto_idx","column":"id","key":7}"#,
+    );
+    assert!(r.contains("Zoe"), "got: {}", r);
+}
+
+/// 同一个 id 插两次要报错（索引列是唯一的）
+#[test]
+fn duplicate_id_is_rejected() {
+    let pipe = unique_pipe_name();
+    let (_srv, _data) = start_server(&pipe);
+    let mut c = connect(&pipe).unwrap();
+
+    let req = r#"{"method":"insert","table":"dup_id","row":{"id":1,"name":"A"}}"#;
+    assert!(send(&mut c, req).contains(r#""status":"ok""#));
+
+    let r = send(&mut c, r#"{"method":"insert","table":"dup_id","row":{"id":1,"name":"B"}}"#);
+    assert!(r.contains(r#""status":"error""#), "got: {}", r);
+    assert!(r.contains("duplicate key"), "got: {}", r);
+}
+
+/// 批量插入一次全进
+#[test]
+fn insert_batch_writes_all_rows() {
+    let pipe = unique_pipe_name();
+    let (_srv, _data) = start_server(&pipe);
+    let mut c = connect(&pipe).unwrap();
+
+    let r = send(
+        &mut c,
+        r#"{"method":"insert_batch","table":"batch_t","rows":[{"id":1,"name":"A"},{"id":2,"name":"B"},{"id":3,"name":"C"}]}"#,
+    );
+    assert!(r.contains(r#""status":"ok""#), "batch: {}", r);
+
+    let r = send(&mut c, r#"{"method":"scan","table":"batch_t"}"#);
+    assert!(r.contains("A") && r.contains("B") && r.contains("C"), "scan: {}", r);
+
+    let r = send(&mut c, r#"{"method":"lookup_by_index","table":"batch_t","key":2}"#);
+    assert!(r.contains("B"), "index after batch: {}", r);
+}
+
+/// 行级删除：行没了、索引条目也没了、别人不受影响
+#[test]
+fn delete_keys_removes_row_and_index_entry() {
+    let pipe = unique_pipe_name();
+    let (_srv, _data) = start_server(&pipe);
+    let mut c = connect(&pipe).unwrap();
+
+    for (id, name) in [(1, "Alice"), (2, "Bob"), (3, "Carol")] {
+        let req = format!(
+            r#"{{"method":"insert","table":"del_t","row":{{"id":{},"name":"{}"}}}}"#,
+            id, name
+        );
+        send(&mut c, &req);
+    }
+
+    let r = send(&mut c, r#"{"method":"delete_keys","table":"del_t","keys":[2]}"#);
+    assert!(r.contains(r#""status":"ok""#), "delete: {}", r);
+
+    let r = send(&mut c, r#"{"method":"scan","table":"del_t"}"#);
+    assert!(!r.contains("Bob"), "row should be gone: {}", r);
+    assert!(r.contains("Alice") && r.contains("Carol"), "others stay: {}", r);
+
+    let r = send(&mut c, r#"{"method":"lookup_by_index","table":"del_t","key":2}"#);
+    assert!(r.contains(r#""rows":[]"#), "index entry should be gone: {}", r);
+
+    let r = send(&mut c, r#"{"method":"insert","table":"del_t","row":{"id":2,"name":"Bob2"}}"#);
+    assert!(r.contains(r#""status":"ok""#), "id 2 应该能再插进来: {}", r);
+}
+
+/// 给第二列建索引后能按那一列查
+#[test]
+fn create_index_on_secondary_column() {
+    let pipe = unique_pipe_name();
+    let (_srv, _data) = start_server(&pipe);
+    let mut c = connect(&pipe).unwrap();
+
+    for (id, code) in [(1, 5001), (2, 5002), (3, 5003)] {
+        let req = format!(
+            r#"{{"method":"insert","table":"sec_t","row":{{"id":{},"code":{}}}}}"#,
+            id, code
+        );
+        send(&mut c, &req);
+    }
+
+    // 没建之前：明确回 no_index，而不是回空结果
+    let r = send(&mut c, r#"{"method":"lookup_by_index","table":"sec_t","column":"code","key":5002}"#);
+    assert!(r.contains(r#""status":"no_index""#), "got: {}", r);
+
+    let r = send(&mut c, r#"{"method":"create_index","table":"sec_t","column":"code"}"#);
+    assert!(r.contains(r#""status":"ok""#), "create_index: {}", r);
+
+    let r = send(&mut c, r#"{"method":"lookup_by_index","table":"sec_t","column":"code","key":5002}"#);
+    assert!(r.contains(r#""id":2"#), "lookup by code: {}", r);
+
+    // 建完索引之后新插入的行也要进索引
+    send(&mut c, r#"{"method":"insert","table":"sec_t","row":{"id":4,"code":5004}}"#);
+    let r = send(&mut c, r#"{"method":"lookup_by_index","table":"sec_t","column":"code","key":5004}"#);
+    assert!(r.contains(r#""id":4"#), "lookup new row: {}", r);
+
+    // schema 里能看到这条索引
+    let r = send(&mut c, r#"{"method":"describe_table","table":"sec_t"}"#);
+    assert!(r.contains(r#""column":"code""#), "describe: {}", r);
+
+    // 删掉索引后回到 no_index
+    let r = send(&mut c, r#"{"method":"drop_index","table":"sec_t","column":"code"}"#);
+    assert!(r.contains(r#""status":"ok""#), "drop_index: {}", r);
+    let r = send(&mut c, r#"{"method":"lookup_by_index","table":"sec_t","column":"code","key":5002}"#);
+    assert!(r.contains(r#""status":"no_index""#), "after drop: {}", r);
+}
+
+/// 有重复值的列不给建索引（不然"走索引"和"全表扫"会给出不同答案）
+#[test]
+fn create_index_rejects_duplicate_values() {
+    let pipe = unique_pipe_name();
+    let (_srv, _data) = start_server(&pipe);
+    let mut c = connect(&pipe).unwrap();
+
+    send(&mut c, r#"{"method":"insert","table":"dup_t","row":{"id":1,"age":30}}"#);
+    send(&mut c, r#"{"method":"insert","table":"dup_t","row":{"id":2,"age":30}}"#);
+
+    let r = send(&mut c, r#"{"method":"create_index","table":"dup_t","column":"age"}"#);
+    assert!(r.contains(r#""status":"error""#), "got: {}", r);
+    assert!(r.contains("duplicate value"), "got: {}", r);
+
+    // 失败之后不留半成品：查这一列仍然是 no_index
+    let r = send(&mut c, r#"{"method":"lookup_by_index","table":"dup_t","column":"age","key":30}"#);
+    assert!(r.contains(r#""status":"no_index""#), "got: {}", r);
+}
+
+/// 数据字典里的统计：不同值个数
+#[test]
+fn stats_report_distinct_values() {
+    let pipe = unique_pipe_name();
+    let (_srv, _data) = start_server(&pipe);
+    let mut c = connect(&pipe).unwrap();
+
+    for (id, age) in [(1, 30), (2, 30), (3, 41)] {
+        let req = format!(
+            r#"{{"method":"insert","table":"stat_t","row":{{"id":{},"age":{}}}}}"#,
+            id, age
+        );
+        send(&mut c, &req);
+    }
+
+    let r = send(&mut c, r#"{"method":"describe_table","table":"stat_t"}"#);
+    assert!(r.contains(r#""row_count":3"#), "row_count: {}", r);
+    assert!(r.contains(r#""name":"age","distinct":2"#), "age 有 2 个不同值: {}", r);
+    assert!(r.contains(r#""name":"id","distinct":3"#), "id 有 3 个不同值: {}", r);
+
+    // 删掉一行，统计跟着掉
+    send(&mut c, r#"{"method":"delete_keys","table":"stat_t","keys":[1]}"#);
+    let r = send(&mut c, r#"{"method":"describe_table","table":"stat_t"}"#);
+    assert!(r.contains(r#""row_count":2"#), "after delete: {}", r);
+    assert!(r.contains(r#""name":"age","distinct":1"#), "after delete: {}", r);
 }
 
 /// 重开服务后索引仍在

@@ -2,9 +2,11 @@ module ChuSQL.Storage.Memory (MemoryStorage (runMemoryStorage)) where
 
 import ChuSQL.Model
 import ChuSQL.Storage
-import Data.List (find)
 
 -- 内存实现：状态是 Database，错误通道是 Either String。
+--
+-- 它只实现"必须有"的那几个：批量插入、行级删除、索引、统计全走类的默认实现
+-- （内存里数据本来就在手上，扫一遍就是最快的做法）。
 
 -- * 实例
 
@@ -39,7 +41,7 @@ instance MonadStorage MemoryStorage where
         Right (Right (tableRows tbl), db)
 
     -- \| 追加一行
-    insert t r _ = MemoryStorage $ \db -> do
+    insert t r = MemoryStorage $ \db -> do
         tbl <- lookupTable db t
         Right (Right (), replaceTable t tbl{tableRows = tableRows tbl ++ [r]} db)
 
@@ -47,11 +49,6 @@ instance MonadStorage MemoryStorage where
     replaceAll t rows = MemoryStorage $ \db -> do
         tbl <- lookupTable db t
         Right (Right (), replaceTable t tbl{tableRows = rows} db)
-
-    -- \| 按主键找第一行
-    lookupByKey t k = MemoryStorage $ \db -> do
-        tbl <- lookupTable db t
-        Right (Right (findRow tbl k), db)
 
     -- \| 建空表；已存在报错
     createTable name cols = MemoryStorage $ \db ->
@@ -70,14 +67,8 @@ instance MonadStorage MemoryStorage where
 
 -- * 工具
 
--- | 按 id 列找一行
-findRow :: Table -> Int -> Maybe Row
-findRow tbl k = find matches (tableRows tbl)
-  where
-    -- \| 这行的 id 是否等于 k
-    matches r = lookup "id" r == Just (VInt k)
-
 -- | 用给定表替换同名表
 replaceTable :: String -> Table -> Database -> Database
 replaceTable name table =
     map (\(n, t) -> if n == name then (n, table) else (n, t))
+

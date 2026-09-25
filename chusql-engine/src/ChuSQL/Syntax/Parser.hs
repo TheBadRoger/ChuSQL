@@ -171,6 +171,8 @@ reservedWords =
     , "set"
     , "create"
     , "table"
+    , "index"
+    , "drop"
     ]
 
 {- | 表别名。别名不能是保留字：否则 @FROM users WHERE age > 18@ 会把 @WHERE@
@@ -232,6 +234,26 @@ dropTableStatement = do
     name <- identifier
     return (DropTable name)
 
+-- | 读 CREATE INDEX（列名即索引名：一列最多一个索引）
+createIndexStatement :: Parser Statement
+createIndexStatement = do
+    keyword "create"
+    keyword "index"
+    keyword "on"
+    tbl <- identifier
+    col <- between (symbol "(") (symbol ")") identifier
+    return (CreateIndex tbl col)
+
+-- | 读 DROP INDEX
+dropIndexStatement :: Parser Statement
+dropIndexStatement = do
+    keyword "drop"
+    keyword "index"
+    keyword "on"
+    tbl <- identifier
+    col <- between (symbol "(") (symbol ")") identifier
+    return (DropIndex tbl col)
+
 -- | 建表时的一列
 columnDef :: Parser (String, Column)
 columnDef = do
@@ -270,7 +292,7 @@ selectStatement = do
             , selectLimit = mLimit
             }
 
--- | 读 INSERT
+-- | 读 INSERT：`VALUES (...)` 后面可以跟多个括号，一次插多行
 insertStatement :: Parser Statement
 insertStatement = do
     keyword "INSERT"
@@ -282,12 +304,12 @@ insertStatement = do
             (symbol ")")
             (sepBy1 identifier (symbol ","))
     keyword "VALUES"
-    vals <-
-        between
-            (symbol "(")
-            (symbol ")")
-            (sepBy1 atom (symbol ","))
-    return (Insert tbl cols vals)
+    rows <- sepBy1 valueRow (symbol ",")
+    return (Insert tbl cols rows)
+
+-- | 一行值：一对括号里的若干字面量
+valueRow :: Parser [Expr]
+valueRow = between (symbol "(") (symbol ")") (sepBy1 atom (symbol ","))
 
 -- | 读 DELETE
 deleteStatement :: Parser Statement
@@ -316,11 +338,16 @@ parseStatement input =
         Left err -> Left (errorBundlePretty err)
         Right q -> Right q
   where
-    -- \| 依次尝试各种语句
+    -- \| 依次尝试各种语句。
+    -- `CREATE` / `DROP` 后面跟的词决定是哪条语句，而 `keyword` 的 `try` 只能回溯到
+    -- "这个词之前"——`CREATE` 一旦被吃掉就没得退了。所以带 `INDEX` 的那两个各自
+    -- 用 `try` 包住并排在前面：`CREATE INDEX ...` 先试，退回来再试 `CREATE TABLE ...`。
     statementP =
         selectStatement
             <|> insertStatement
             <|> deleteStatement
             <|> updateStatement
-            <|> createTableStatement
+            <|> try createIndexStatement
+            <|> try createTableStatement
+            <|> try dropIndexStatement
             <|> dropTableStatement

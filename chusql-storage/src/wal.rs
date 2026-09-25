@@ -1,7 +1,8 @@
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +12,8 @@ use crate::protocol::Row;
 
 const OP_INSERT: u8 = 1;
 const OP_REPLACE_ALL: u8 = 2;
+const OP_INSERT_BATCH: u8 = 3;
+const OP_DELETE_KEYS: u8 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 /// 一条待写入的操作
@@ -18,7 +21,16 @@ pub enum WalOp {
     Insert {
         table: String,
         row: Row,
-        key: Option<i64>,
+    },
+    /// 一批行：一次日志、一次 fsync 就能全部落盘
+    InsertBatch {
+        table: String,
+        rows: Vec<Row>,
+    },
+    /// 按 id 批量删行（重放是幂等的：再删一次等于什么都没删）
+    DeleteKeys {
+        table: String,
+        keys: Vec<i64>,
     },
     ReplaceAll {
         table: String,
@@ -27,8 +39,13 @@ pub enum WalOp {
 }
 
 /// WAL 文件
+///
+/// 句柄只开一次并一直留着：写入路径是每条操作一次
+/// `truncate -> append -> truncate`，每次都重新 open/close 文件要多花
+/// 一倍的时间（见 benchmark/chusql-storage）。
 pub struct Wal {
     path: PathBuf,
+    handle: Mutex<Option<File>>,
 }
 
 impl Wal {
@@ -37,6 +54,7 @@ impl Wal {
     pub fn new<P: AsRef<Path>>(path: P) -> Self {
         Wal {
             path: path.as_ref().to_path_buf(),
+            handle: Mutex::new(None),
         }
     }
 
@@ -45,26 +63,43 @@ impl Wal {
         &self.path
     }
 
-    /// 清空 WAL
-    pub fn clear(&self) -> io::Result<()> {
-        if self.path.exists() {
-            let f = OpenOptions::new().write(true).open(&self.path)?;
-            f.set_len(0)?;
-            f.sync_all()?;
+    /// 拿常驻句柄（没有就开一个）
+    fn with_handle<R>(&self, f: impl FnOnce(&mut File) -> io::Result<R>) -> io::Result<R> {
+        let mut slot = self.handle.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&self.path)?,
+            );
         }
-        Ok(())
+        f(slot.as_mut().expect("just opened"))
+    }
+
+    /// 截断到空并落盘
+    pub fn clear(&self) -> io::Result<()> {
+        self.with_handle(|f| {
+            truncate(f)?;
+            f.sync_all()
+        })
+    }
+
+    /// 只截断、不落盘：紧跟其后的 `append` 会 fsync，
+    /// 那一次会把截断一起落下去，所以这里不必单独再刷一遍。
+    pub fn truncate(&self) -> io::Result<()> {
+        self.with_handle(truncate)
     }
 
     /// 追加一条并 fsync
     pub fn append(&self, op: &WalOp) -> io::Result<()> {
         let bytes = encode(op)?;
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        f.write_all(&bytes)?;
-        f.sync_data()?;
-        Ok(())
+        self.with_handle(|f| {
+            f.write_all(&bytes)?;
+            f.sync_data()
+        })
     }
 
     /// 读当前 WAL；空则 None
@@ -88,13 +123,28 @@ impl Wal {
     }
 }
 
+/// 清空文件并回到起点（句柄不是 append 模式，位置要自己摆正）
+fn truncate(f: &mut File) -> io::Result<()> {
+    f.set_len(0)?;
+    f.seek(SeekFrom::Start(0))?;
+    Ok(())
+}
+
 // 编解码
 /// 把操作编成字节
 fn encode(op: &WalOp) -> io::Result<Vec<u8>> {
     let (op_type, table, payload) = match op {
-        WalOp::Insert { table, row, key } => {
-            let p = serde_json::to_vec(&(row, key)).map_err(io::Error::other)?;
+        WalOp::Insert { table, row } => {
+            let p = serde_json::to_vec(row).map_err(io::Error::other)?;
             (OP_INSERT, table.clone(), p)
+        }
+        WalOp::InsertBatch { table, rows } => {
+            let p = serde_json::to_vec(rows).map_err(io::Error::other)?;
+            (OP_INSERT_BATCH, table.clone(), p)
+        }
+        WalOp::DeleteKeys { table, keys } => {
+            let p = serde_json::to_vec(keys).map_err(io::Error::other)?;
+            (OP_DELETE_KEYS, table.clone(), p)
         }
         WalOp::ReplaceAll { table, rows } => {
             let p = serde_json::to_vec(rows).map_err(io::Error::other)?;
@@ -145,9 +195,19 @@ fn decode(buf: &[u8]) -> Result<Option<WalOp>, String> {
 
     let op = match op_type {
         OP_INSERT => {
-            let (row, key): (Row, Option<i64>) = serde_json::from_slice(payload)
-                .map_err(|e| format!("bad insert payload: {}", e))?;
-            WalOp::Insert { table, row, key }
+            let row: Row =
+                serde_json::from_slice(payload).map_err(|e| format!("bad insert payload: {}", e))?;
+            WalOp::Insert { table, row }
+        }
+        OP_INSERT_BATCH => {
+            let rows: Vec<Row> = serde_json::from_slice(payload)
+                .map_err(|e| format!("bad insert_batch payload: {}", e))?;
+            WalOp::InsertBatch { table, rows }
+        }
+        OP_DELETE_KEYS => {
+            let keys: Vec<i64> = serde_json::from_slice(payload)
+                .map_err(|e| format!("bad delete_keys payload: {}", e))?;
+            WalOp::DeleteKeys { table, keys }
         }
         OP_REPLACE_ALL => {
             let rows: Vec<Row> = serde_json::from_slice(payload)

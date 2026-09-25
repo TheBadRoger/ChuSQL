@@ -1,0 +1,17 @@
+cabal-version: 2.4
+
+name:           chusql-fullchain
+version:        1.0.0
+synopsis:       ChuSQL 全链路基准：Haskell 引擎 + Rust 存储进程一起跑
+build-type:     Simple
+
+executable chusql-fullchain
+    main-is:          Main.hs
+    hs-source-dirs:   src
+    build-depends:    base >= 4.14 && < 5
+                    , chusql-engine
+                    , directory
+                    , filepath
+                    , process
+    default-language: Haskell2010
+    ghc-options:      -O2 -Wall

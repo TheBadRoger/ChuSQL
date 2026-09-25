@@ -16,7 +16,7 @@ relOpCols db (Scan mAlias tbl) =
         Just t -> map (prefix ++) (colNames t)
   where
     prefix = maybe "" (++ ".") mAlias
-relOpCols db (Lookup tbl _) = relOpCols db (Scan Nothing tbl)
+relOpCols db (Lookup mAlias tbl _ _) = relOpCols db (Scan mAlias tbl)
 relOpCols db (Filter _ x) = relOpCols db x
 relOpCols _ (Project ["*"] _) = ["*"]
 relOpCols _ (Project cols _) = cols
@@ -104,7 +104,7 @@ pushProject db need (Join l r c)
             rNeed = if needsAll rCols then ["*"] else [x | x <- tot, x `elem` rCols]
          in Join (pushProject db lNeed l) (pushProject db rNeed r) c
 pushProject db need leaf@(Scan _ _) = pushProjectLeaf db need leaf
-pushProject db need leaf@(Lookup _ _) = pushProjectLeaf db need leaf
+pushProject db need leaf@(Lookup _ _ _ _) = pushProjectLeaf db need leaf
 
 
 -- * 常量折叠
@@ -131,8 +131,12 @@ foldConstants e = e
 -- * 执行优化
 -- | 单节点重写
 rewriteNode :: Database -> RelOp -> RelOp
-rewriteNode _ (Filter (Eq (Col k) (LitInt v)) (Scan _ t))
-    | k == "id" = Lookup t v
+-- 单列等值条件改成点查：这里是"可以走索引"的意思，
+-- 到底走不走得成由存储层回答（这个列上没有索引就退回全表扫描，见 Eval），
+-- 所以优化器不必先知道表上到底有哪些索引。
+-- 别名要留在节点里：回来的一行必须和 `Scan 别名 表` 长得一样，不然后面取列就对不上了。
+rewriteNode _ (Filter (Eq (Col k) (LitInt v)) (Scan mAlias t)) =
+    Lookup mAlias t (unqualify mAlias k) v
 rewriteNode db (Filter p (Join l r c)) = pushJoin db p l r c
 rewriteNode db (Filter p x) = case foldConstants p of
     LitBool True -> x

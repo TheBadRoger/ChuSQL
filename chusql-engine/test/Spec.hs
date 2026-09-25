@@ -6,7 +6,7 @@ import ChuSQL.Algebra.Optimize (optimize, pushProject)
 import ChuSQL.Algebra.Planner (translate)
 import ChuSQL.Engine
 import ChuSQL.Model
-import ChuSQL.Storage (MonadStorage (..))
+import ChuSQL.Storage (IndexResult (..), MonadStorage (..))
 import ChuSQL.Storage.IPC (IPCStorage (runIPCStorage), Request (ReqPing), Response (RespPong), doListTables, sendRequest)
 import ChuSQL.Syntax.AST
 import ChuSQL.Syntax.Parser
@@ -299,18 +299,18 @@ main = hspec $ do
     describe "ChuSQL.Engine (INSERT)" $ do
         it "parses a simple INSERT" $ do
             parseStatement "INSERT INTO users (name, age) VALUES ('Dave', 22)"
-                `shouldBe` Right (Insert "users" ["name", "age"] [LitStr "Dave", LitInt 22])
+                `shouldBe` Right (Insert "users" ["name", "age"] [[LitStr "Dave", LitInt 22]])
 
         it "parses INSERT with a single column" $ do
             parseStatement "INSERT INTO users (name) VALUES ('Eve')"
-                `shouldBe` Right (Insert "users" ["name"] [LitStr "Eve"])
+                `shouldBe` Right (Insert "users" ["name"] [[LitStr "Eve"]])
 
         it "parses INSERT case-insensitively" $ do
             parseStatement "insert into users (name, age) values ('Dave', 22)"
-                `shouldBe` Right (Insert "users" ["name", "age"] [LitStr "Dave", LitInt 22])
+                `shouldBe` Right (Insert "users" ["name", "age"] [[LitStr "Dave", LitInt 22]])
 
         it "executes INSERT and adds a row at the end" $ do
-            case runStatement testDB (Insert "users" ["name", "age"] [LitStr "Dave", LitInt 22]) of
+            case runStatement testDB (Insert "users" ["name", "age"] [[LitStr "Dave", LitInt 22]]) of
                 Left err -> expectationFailure err
                 Right (db', _) -> do
                     rowsOf (runStatement db' (makeSelect ["name", "age"] "users" Nothing))
@@ -322,7 +322,7 @@ main = hspec $ do
                             ]
 
         it "does not modify the original database" $ do
-            case runStatement testDB (Insert "users" ["name", "age"] [LitStr "Dave", LitInt 22]) of
+            case runStatement testDB (Insert "users" ["name", "age"] [[LitStr "Dave", LitInt 22]]) of
                 Left err -> expectationFailure err
                 Right (_, _) -> do
                     rowsOf (runStatement testDB (makeSelect ["name"] "users" Nothing))
@@ -331,15 +331,15 @@ main = hspec $ do
                             Left _ -> False
 
         it "returns Left when column count does not match value count" $ do
-            runStatement testDB (Insert "users" ["name", "age"] [LitStr "Dave"])
+            runStatement testDB (Insert "users" ["name", "age"] [[LitStr "Dave"]])
                 `shouldSatisfy` isLeft
 
         it "returns Left for an unknown table" $ do
-            runStatement testDB (Insert "nonexistent" ["name"] [LitStr "X"])
+            runStatement testDB (Insert "nonexistent" ["name"] [[LitStr "X"]])
                 `shouldSatisfy` isLeft
 
         it "returns Left when a value has the wrong type for comparison" $ do
-            runStatement testDB (Insert "users" ["name"] [Col "other"])
+            runStatement testDB (Insert "users" ["name"] [[Col "other"]])
                 `shouldSatisfy` isLeft
         it "writes id column to index and queries it back" $ do
             case parseStatement "INSERT INTO users (id, name, age) VALUES (42, 'Zoe', 20)" >>= runStatement testDB of
@@ -347,6 +347,49 @@ main = hspec $ do
                 Right (db', _) -> do
                     rowsOf (parseStatement "SELECT name FROM users WHERE id = 42" >>= runStatement db')
                         `shouldBe` Right [[("name", VStr "Zoe")]]
+
+        it "parses multi-row INSERT into one statement" $ do
+            parseStatement "INSERT INTO users (id, name) VALUES (10, 'A'), (11, 'B'), (12, 'C')"
+                `shouldBe` Right
+                    ( Insert
+                        "users"
+                        ["id", "name"]
+                        [ [LitInt 10, LitStr "A"]
+                        , [LitInt 11, LitStr "B"]
+                        , [LitInt 12, LitStr "C"]
+                        ]
+                    )
+
+        it "inserts all rows of a multi-row INSERT" $ do
+            case parseStatement "INSERT INTO users (id, name, age) VALUES (7, 'A', 1), (8, 'B', 2)" >>= runStatement testDB of
+                Left err -> expectationFailure err
+                Right (db', _) -> do
+                    rowsOf (parseStatement "SELECT name FROM users WHERE age < 3" >>= runStatement db')
+                        `shouldBe` Right [[("name", VStr "A")], [("name", VStr "B")]]
+                    -- 多行里只要有一行列数不对，整条都要拒绝
+                    runStatement testDB (Insert "users" ["id", "name"] [[LitInt 1, LitStr "A"], [LitInt 2]])
+                        `shouldSatisfy` isLeft
+
+    describe "ChuSQL.Engine (INDEX)" $ do
+        it "parses CREATE INDEX and DROP INDEX" $ do
+            parseStatement "CREATE INDEX ON users (age)"
+                `shouldBe` Right (CreateIndex "users" "age")
+            parseStatement "DROP INDEX ON users (age)"
+                `shouldBe` Right (DropIndex "users" "age")
+
+        it "rejects an index on an unknown column" $ do
+            (parseStatement "CREATE INDEX ON users (nope)" >>= runStatement testDB)
+                `shouldSatisfy` isLeft
+
+        it "rejects an index on an unknown table" $ do
+            (parseStatement "CREATE INDEX ON nope (age)" >>= runStatement testDB)
+                `shouldSatisfy` isLeft
+
+        it "accepts index DDL in the memory storage (no-op there)" $ do
+            rowsOf (parseStatement "CREATE INDEX ON users (age)" >>= runStatement testDB)
+                `shouldBe` Right []
+            rowsOf (parseStatement "DROP INDEX ON users (age)" >>= runStatement testDB)
+                `shouldBe` Right []
     describe "ChuSQL.Engine (DELETE)" $ do
         it "parses DELETE with WHERE" $ do
             parseStatement "DELETE FROM users WHERE age < 18"
@@ -961,9 +1004,26 @@ main = hspec $ do
             sameResultAsUnoptimized "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id ORDER BY o.product DESC LIMIT 2"
         it "rewrites Filter id = k into Lookup" $ do
             fmap planRoot (optimizedPlan "SELECT name FROM users WHERE id = 2")
-                `shouldBe` Right (Lookup "users" 2)
+                `shouldBe` Right (Lookup Nothing "users" "id" 2)
         it "keeps Lookup result identical to unoptimized" $ do
             sameResultAsUnoptimized "SELECT name FROM users WHERE id = 2"
+
+        it "rewrites an equality on any column into Lookup" $ do
+            -- 能不能真走索引由存储层回答；优化器只负责说"这里可以点查"
+            fmap planRoot (optimizedPlan "SELECT name FROM users WHERE age = 25")
+                `shouldBe` Right (Lookup Nothing "users" "age" 25)
+
+        it "keeps a point lookup on a non-indexed column identical to unoptimized" $ do
+            -- 内存实现没有索引，这条会走"退回扫描"的分支
+            sameResultAsUnoptimized "SELECT name FROM users WHERE age = 25"
+
+        it "keeps an aliased point lookup identical to unoptimized" $ do
+            -- 别名要留住：回来的一行必须和 Scan 别名 表 长得一样，不然投影取不到列
+            sameResultAsUnoptimized "SELECT u.name FROM users u WHERE u.id = 1"
+
+        it "returns the row for an aliased point lookup" $ do
+            rowsOf (parseStatement "SELECT u.name FROM users u WHERE u.id = 1" >>= runStatement testDB)
+                `shouldBe` Right [[("u.name", VStr "Alice")]]
 
     describe "ChuSQL.Semantic" $ do
         it "rejects an unknown column in WHERE" $ do
@@ -1108,7 +1168,7 @@ main = hspec $ do
         it "scan returns rows with all three value types after insert" $ do
             withTestServer $ \srv -> withServerEnv srv $ do
                 let row = [("id", VInt 7), ("name", VStr "Alice"), ("flag", VBool True)]
-                runIPCStorage (insert "users" row (Just 7)) `shouldReturn` Right ()
+                runIPCStorage (insert "users" row) `shouldReturn` Right ()
                 rows <- runIPCStorage (scan "users")
                 (map sortRow <$> rows) `shouldBe` Right [sortRow row]
 
@@ -1119,7 +1179,7 @@ main = hspec $ do
 
         it "scan returns all 20 inserted rows in order" $ do
             withTestServer $ \srv -> withServerEnv srv $ do
-                mapM_ (\i -> runIPCStorage (insert "many" [("id", VInt i)] (Just i))) [1 .. 20 :: Int]
+                mapM_ (\i -> runIPCStorage (insert "many" [("id", VInt i)])) [1 .. 20 :: Int]
                 rows <- runIPCStorage (scan "many")
                 fmap length rows `shouldBe` Right 20
                 fmap (sortOn show . map (lookup "id")) rows
@@ -1127,35 +1187,35 @@ main = hspec $ do
 
         it "replaceAll leaves only the new rows" $ do
             withTestServer $ \srv -> withServerEnv srv $ do
-                runIPCStorage (insert "t" [("id", VInt 1)] (Just 1)) `shouldReturn` Right ()
+                runIPCStorage (insert "t" [("id", VInt 1)]) `shouldReturn` Right ()
                 runIPCStorage (replaceAll "t" [[("id", VInt 9)], [("id", VInt 8)]]) `shouldReturn` Right ()
                 rows <- runIPCStorage (scan "t")
                 fmap (sortOn show . map (lookup "id")) rows
                     `shouldBe` Right (sortOn show [Just (VInt 9), Just (VInt 8)])
 
-        it "lookupByKey finds a row inserted with an id over the pipe" $ do
+        it "lookupByColumn finds a row inserted with an id over the pipe" $ do
             withTestServer $ \srv -> withServerEnv srv $ do
                 let row = [("id", VInt 7), ("name", VStr "Zoe")]
-                runIPCStorage (insert "keyed" row (Just 7)) `shouldReturn` Right ()
-                found <- runIPCStorage (lookupByKey "keyed" 7)
-                fmap (fmap sortRow) found `shouldBe` Right (Just (sortRow row))
-                missing <- runIPCStorage (lookupByKey "keyed" 8)
-                missing `shouldBe` Right Nothing
+                runIPCStorage (insert "keyed" row) `shouldReturn` Right ()
+                found <- runIPCStorage (lookupByColumn "keyed" "id" 7)
+                fmap sortRow (indexRow found) `shouldBe` Just (sortRow row)
+                missing <- runIPCStorage (lookupByColumn "keyed" "id" 8)
+                missing `shouldBe` Right (IndexRow Nothing)
 
         it "replaceAll rebuilds the index over the pipe" $ do
             withTestServer $ \srv -> withServerEnv srv $ do
-                runIPCStorage (insert "rb" [("id", VInt 1)] (Just 1)) `shouldReturn` Right ()
+                runIPCStorage (insert "rb" [("id", VInt 1)]) `shouldReturn` Right ()
                 runIPCStorage (replaceAll "rb" [[("id", VInt 9), ("name", VStr "Zoe")]]) `shouldReturn` Right ()
-                old <- runIPCStorage (lookupByKey "rb" 1)
-                old `shouldBe` Right Nothing
-                new <- runIPCStorage (lookupByKey "rb" 9)
-                fmap (fmap sortRow) new
-                    `shouldBe` Right (Just (sortRow [("id", VInt 9), ("name", VStr "Zoe")]))
+                old <- runIPCStorage (lookupByColumn "rb" "id" 1)
+                old `shouldBe` Right (IndexRow Nothing)
+                new <- runIPCStorage (lookupByColumn "rb" "id" 9)
+                fmap sortRow (indexRow new)
+                    `shouldBe` Just (sortRow [("id", VInt 9), ("name", VStr "Zoe")])
 
         it "snapshot lists tables and scans each one to build the database" $ do
             withTestServer $ \srv -> withServerEnv srv $ do
-                runIPCStorage (insert "a" [("id", VInt 1)] (Just 1)) `shouldReturn` Right ()
-                runIPCStorage (insert "b" [("id", VInt 2)] (Just 2)) `shouldReturn` Right ()
+                runIPCStorage (insert "a" [("id", VInt 1)]) `shouldReturn` Right ()
+                runIPCStorage (insert "b" [("id", VInt 2)]) `shouldReturn` Right ()
                 db <- runIPCStorage snapshot
                 map fst db `shouldBe` ["a", "b"]
                 map (length . tableRows . snd) db `shouldBe` [1, 1]
@@ -1163,8 +1223,8 @@ main = hspec $ do
 
         it "doListTables returns the tables that exist" $ do
             withTestServer $ \srv -> withServerEnv srv $ do
-                runIPCStorage (insert "t1" [("id", VInt 1)] (Just 1)) `shouldReturn` Right ()
-                runIPCStorage (insert "t2" [("id", VInt 2)] (Just 2)) `shouldReturn` Right ()
+                runIPCStorage (insert "t1" [("id", VInt 1)]) `shouldReturn` Right ()
+                runIPCStorage (insert "t2" [("id", VInt 2)]) `shouldReturn` Right ()
                 doListTables `shouldReturn` Right ["t1", "t2"]
 
         it "rows survive a restart on the same data directory" $ do
@@ -1174,7 +1234,7 @@ main = hspec $ do
                 Right bin -> do
                     srv1 <- startServer bin
                     let dir = dataDir srv1
-                    withServerEnv srv1 $ runIPCStorage (insert "persist" [("id", VInt 42)] (Just 42)) `shouldReturn` Right ()
+                    withServerEnv srv1 $ runIPCStorage (insert "persist" [("id", VInt 42)]) `shouldReturn` Right ()
                     stopServer srv1
                     srv2 <- startServerAt bin dir
                     rows <- withServerEnv srv2 $ runIPCStorage (scan "persist")
@@ -1196,7 +1256,7 @@ main = hspec $ do
                 _ <-
                     runIPCStorage
                         ( runStatementM
-                            (Insert "ipc_idx" ["id", "name"] [LitInt 42, LitStr "Zoe"])
+                            (Insert "ipc_idx" ["id", "name"] [[LitInt 42, LitStr "Zoe"]])
                         )
                 result <-
                     runIPCStorage
@@ -1211,6 +1271,76 @@ main = hspec $ do
                             )
                         )
                 result `shouldBe` Right [[("name", VStr "Zoe")]]
+
+        it "CREATE INDEX makes a query on that column use the index" $ do
+            withTestServer $ \srv -> withServerEnv srv $ do
+                _ <- runIPCStorage (runStatementM (CreateTable "ix_t" [("id", TInt), ("code", TInt)]))
+                _ <-
+                    runIPCStorage
+                        ( runStatementM
+                            (Insert "ix_t" ["id", "code"] [[LitInt 1, LitInt 500], [LitInt 2, LitInt 501]])
+                        )
+
+                -- 还没建索引：存储层明确回"我帮不上忙"，上层会退回扫描
+                withoutIndex <- runIPCStorage (lookupByColumn "ix_t" "code" 501)
+                withoutIndex `shouldBe` Right NoIndex
+                scanned <- runIPCStorage (runStatementM (makeSelect ["code"] "ix_t" (Just (Eq (Col "code") (LitInt 501)))))
+                scanned `shouldBe` Right [[("code", VInt 501)]]
+
+                -- 建索引之后就真的走索引了
+                created <- runIPCStorage (runStatementM (CreateIndex "ix_t" "code"))
+                created `shouldBe` Right []
+                withIndex <- runIPCStorage (lookupByColumn "ix_t" "code" 501)
+                fmap sortRow (indexRow withIndex)
+                    `shouldBe` Just (sortRow [("id", VInt 2), ("code", VInt 501)])
+                indexed <- runIPCStorage (runStatementM (makeSelect ["code"] "ix_t" (Just (Eq (Col "code") (LitInt 501)))))
+                indexed `shouldBe` Right [[("code", VInt 501)]]
+
+                -- 建完索引之后插入的行也要进索引
+                _ <- runIPCStorage (runStatementM (Insert "ix_t" ["id", "code"] [[LitInt 3, LitInt 502]]))
+                fresh <- runIPCStorage (lookupByColumn "ix_t" "code" 502)
+                fmap sortRow (indexRow fresh)
+                    `shouldBe` Just (sortRow [("id", VInt 3), ("code", VInt 502)])
+
+        it "CREATE INDEX over the pipe rejects a column with duplicates" $ do
+            withTestServer $ \srv -> withServerEnv srv $ do
+                _ <- runIPCStorage (runStatementM (CreateTable "dup_ix" [("id", TInt), ("age", TInt)]))
+                _ <-
+                    runIPCStorage
+                        ( runStatementM
+                            (Insert "dup_ix" ["id", "age"] [[LitInt 1, LitInt 30], [LitInt 2, LitInt 30]])
+                        )
+                res <- runIPCStorage (runStatementM (CreateIndex "dup_ix" "age"))
+                res `shouldSatisfy` isLeft
+
+        it "DELETE removes only the matching rows over the pipe" $ do
+            withTestServer $ \srv -> withServerEnv srv $ do
+                _ <- runIPCStorage (runStatementM (CreateTable "del_t" [("id", TInt), ("name", TStr)]))
+                _ <-
+                    runIPCStorage
+                        ( runStatementM
+                            ( Insert
+                                "del_t"
+                                ["id", "name"]
+                                [[LitInt 1, LitStr "A"], [LitInt 2, LitStr "B"], [LitInt 3, LitStr "C"]]
+                            )
+                        )
+                _ <- runIPCStorage (runStatementM (Delete "del_t" (Just (Eq (Col "id") (LitInt 2)))))
+                rows <- runIPCStorage (runStatementM (makeSelect ["name"] "del_t" Nothing))
+                rows `shouldBe` Right [[("name", VStr "A")], [("name", VStr "C")]]
+                gone <- runIPCStorage (lookupByColumn "del_t" "id" 2)
+                gone `shouldBe` Right (IndexRow Nothing)
+
+        it "multi-row INSERT goes over the pipe in one statement" $ do
+            withTestServer $ \srv -> withServerEnv srv $ do
+                _ <- runIPCStorage (runStatementM (CreateTable "many_t" [("id", TInt)]))
+                _ <-
+                    runIPCStorage
+                        ( runStatementM
+                            (Insert "many_t" ["id"] [[LitInt i] | i <- [1 .. 50]])
+                        )
+                rows <- runIPCStorage (runStatementM (makeSelect ["id"] "many_t" Nothing))
+                fmap length rows `shouldBe` Right 50
         it "parses CREATE TABLE with two columns" $ do
             parseStatement "CREATE TABLE users (id INT, name TEXT)"
                 `shouldBe` Right (CreateTable "users" [("id", TInt), ("name", TStr)])
@@ -1392,6 +1522,11 @@ withPipeName name act = do
 sortRow :: Row -> Row
 sortRow = sortOn fst
 
+-- | 从一次索引点查的结果里取出那一行（没索引、没查到都给 Nothing）
+indexRow :: Either String IndexResult -> Maybe Row
+indexRow (Right (IndexRow r)) = r
+indexRow _ = Nothing
+
 isLeft :: Either a b -> Bool
 isLeft (Left _) = True
 isLeft (Right _) = False
@@ -1428,7 +1563,7 @@ firstFilterCond (Join l r _) = case firstFilterCond l of
     Just p -> Just p
     Nothing -> firstFilterCond r
 firstFilterCond (Scan _ _) = Nothing
-firstFilterCond (Lookup _ _) = Nothing
+firstFilterCond (Lookup _ _ _ _) = Nothing
 
 anyFilter :: RelOp -> Bool
 anyFilter (Filter _ _) = True
@@ -1437,7 +1572,7 @@ anyFilter (Sort _ x) = anyFilter x
 anyFilter (Limit _ x) = anyFilter x
 anyFilter (Join l r _) = anyFilter l || anyFilter r
 anyFilter (Scan _ _) = False
-anyFilter (Lookup _ _) = False
+anyFilter (Lookup _ _ _ _) = False
 
 stripProjects :: RelOp -> RelOp
 stripProjects (Project _ x) = stripProjects x
@@ -1446,7 +1581,7 @@ stripProjects (Sort spec x) = Sort spec (stripProjects x)
 stripProjects (Limit n x) = Limit n (stripProjects x)
 stripProjects (Join l r c) = Join (stripProjects l) (stripProjects r) c
 stripProjects (Scan a t) = Scan a t
-stripProjects (Lookup t k) = Lookup t k
+stripProjects (Lookup a t c k) = Lookup a t c k
 
 projectedPlan :: String -> Either String RelOp
 projectedPlan sql = do

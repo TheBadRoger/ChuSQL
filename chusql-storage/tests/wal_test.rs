@@ -22,7 +22,6 @@ fn append_and_read_insert() {
     let op = WalOp::Insert {
         table: "users".into(),
         row: row(&[("id", json!(1)), ("name", json!("Alice"))]),
-        key: Some(1),
     };
     wal.append(&op).unwrap();
 
@@ -77,7 +76,6 @@ fn clear_truncates() {
     wal.append(&WalOp::Insert {
         table: "t".into(),
         row: row(&[("id", json!(1))]),
-        key: None,
     })
     .unwrap();
     assert!(wal.read().unwrap().is_some());
@@ -97,7 +95,6 @@ fn truncated_tail_is_ignored() {
     wal.append(&WalOp::Insert {
         table: "users".into(),
         row: row(&[("id", json!(1)), ("name", json!("Alice"))]),
-        key: Some(1),
     })
     .unwrap();
 
@@ -116,9 +113,9 @@ fn overwrite_on_second_append_is_visible() {
     wal.append(&WalOp::Insert {
         table: "t".into(),
         row: row(&[("id", json!(1))]),
-        key: None,
     })
     .unwrap();
     let first = wal.read().unwrap().unwrap();
     assert!(matches!(first, WalOp::Insert { .. }));
 }
+

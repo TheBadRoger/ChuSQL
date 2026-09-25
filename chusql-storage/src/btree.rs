@@ -430,6 +430,41 @@ impl DiskBTree {
         }
     }
 
+    /// 删掉一个键；键不存在返回 false。
+    ///
+    /// 这是**惰性删除**：只把叶子里那一对 (key, value) 拿掉，不做合并、也不向兄弟借位。
+    /// 于是树可能变稀、甚至留下空叶子，但查找依然正确——内部节点的分隔键仍然满足
+    /// "小于等于它的往左、大于它的往右"，空叶子二分找不到东西自然返回 None。
+    /// 代价是空间不回收（节点删空了也不还页），整表重写（`clear`）时会一起重建。
+    pub fn delete(&mut self, key: i64) -> io::Result<bool> {
+        match self.root()? {
+            None => Ok(false),
+            Some(r) => self.delete_rec(r, key),
+        }
+    }
+
+    /// 递归删除：一路走到叶子，删掉那一对
+    fn delete_rec(&mut self, page_id: PageId, key: i64) -> io::Result<bool> {
+        let order = self.order;
+        match self.file.with_page(page_id, |p| read_node(p, order))? {
+            NodeData::Leaf { mut keys, mut values, next } => match keys.binary_search(&key) {
+                Err(_) => Ok(false),
+                Ok(i) => {
+                    keys.remove(i);
+                    values.remove(i);
+                    self.file.update_page(page_id, |p| {
+                        write_node(p, &NodeData::Leaf { keys, values, next }, order)
+                    })?;
+                    Ok(true)
+                }
+            },
+            NodeData::Internal { keys, children } => {
+                let i = child_index(&keys, key);
+                self.delete_rec(children[i], key)
+            }
+        }
+    }
+
     /// 按键升序返回全部
     pub fn iter_all(&mut self) -> io::Result<Vec<(i64, u64)>> {
         let mut out = Vec::new();

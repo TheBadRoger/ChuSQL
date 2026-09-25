@@ -1,0 +1,16 @@
+[package]
+name = "chusql-storage-bench"
+version = "0.1.0"
+edition = "2024"
+
+# 存储层基准单独成包，不混进功能代码（见同目录 README）。
+[dependencies]
+chusql-storage = { path = "../../chusql-storage" }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bench]]
+name = "storage"
+harness = false

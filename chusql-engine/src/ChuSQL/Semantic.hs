@@ -114,10 +114,12 @@ check db q = case q of
             checkColumns "SELECT" env cols
             checkColumns "ORDER BY" env (map fst orderBy)
             mapM_ (checkBool "WHERE" env) mWhere
-    Insert tbl cols vals -> do
+    Insert tbl cols rows -> do
         t <- lookupTable db tbl
         checkColumns "INSERT" (tableCols t) cols
-        mapM_ (checkValue t) (zip cols vals)
+        if null rows
+            then Left "INSERT: no values"
+            else mapM_ (mapM_ (checkValue t) . zip cols) rows
     Delete tbl mWhere -> do
         t <- lookupTable db tbl
         mapM_ (checkBool "WHERE" (tableCols t)) mWhere
@@ -138,3 +140,16 @@ check db q = case q of
         if null name
             then Left "DROP TABLE: empty table name"
             else Right ()
+    CreateIndex tbl col -> do
+        t <- lookupTable db tbl
+        if col `elem` tableCols' t
+            then Right ()
+            else Left ("CREATE INDEX: unknown column: " ++ col)
+    DropIndex tbl col -> do
+        t <- lookupTable db tbl
+        if col `elem` tableCols' t
+            then Right ()
+            else Left ("DROP INDEX: unknown column: " ++ col)
+  where
+    -- \| 表的列名清单
+    tableCols' = map fst . tableCols

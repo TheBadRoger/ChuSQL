@@ -6,7 +6,7 @@ import ChuSQL.Model (Column (..))
 
 -- * 语句
 
--- | 一条语句：查 / 加 / 删 / 改 / 建表 / 删表
+-- | 一条语句：查 / 加 / 删 / 改 / 建表 / 删表 / 建索引 / 删索引
 data Statement
     = Select
         { selectCols :: [String]
@@ -15,11 +15,15 @@ data Statement
         , selectOrderBy :: [(String, SortDir)]
         , selectLimit :: Maybe Int
         }
-    | Insert String [String] [Expr]
+    | -- \| 表、列、若干行（`VALUES (...), (...)` 可以一次给多行）
+      Insert String [String] [[Expr]]
     | Delete String (Maybe Expr)
     | Update String [(String, Expr)] (Maybe Expr)
     | CreateTable String [(String, Column)]
     | DropTable String
+    | -- \| 给某一列建索引（列名即索引名）
+      CreateIndex String String
+    | DropIndex String String
     deriving (Show, Eq)
 
 -- | 数据来源：单表，或两表拼接
