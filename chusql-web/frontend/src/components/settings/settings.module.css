@@ -1,0 +1,29 @@
+/* 设置面板样式：侧边分组、字段与字体预览。 */
+.settings { display: grid; grid-template-columns: 210px minmax(0, 1fr); height: 100%; overflow: hidden; }
+.settings aside { background: var(--bg-elevated); border-right: 1px solid var(--border); padding-top: 8px; }
+.settings aside h2 { font-size: 12px; letter-spacing: .12em; margin: 8px 12px 12px; text-transform: uppercase; }
+.settings aside button { background: transparent; border: 0; border-left: 2px solid transparent; color: var(--fg-primary); display: block; font: inherit; height: 28px; padding: 0 12px; text-align: left; width: 100%; }
+.settings aside button:hover, .settings aside .active { background: var(--bg-active); }
+.settings aside .active { border-left-color: var(--accent); }
+.settings > section { overflow: auto; padding: 0 18px 20px; }
+.settings header { background: var(--bg-base); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 2; }
+.settings h1 { font-size: 18px; font-weight: 500; margin: 0; padding: 16px 0 10px; }
+.fontGroup { border: 1px solid var(--border); margin: 14px 0; padding: 9px; }
+.fontGroup legend { color: var(--info); font-weight: 700; padding: 0 5px; }
+.fontList { display: grid; gap: 3px; margin-bottom: 6px; }
+.fontRow { align-items: center; display: grid; gap: 5px; grid-template-columns: 16px minmax(160px, 360px) 24px; }
+.fontRow input, .field input { background: var(--bg-base); border: 1px solid var(--border); color: var(--fg-primary); height: 24px; padding: 0 6px; }
+.field { align-items: center; display: grid; gap: 10px; grid-template-columns: 150px 120px; margin: 7px 0; }
+.toggle { align-items: center; display: flex; gap: 8px; margin: 10px 0; }
+.preview { background: var(--bg-base); border: 1px solid var(--border-subtle); display: grid; gap: 4px; margin-top: 9px; min-height: 52px; padding: 7px; }
+.preview strong { color: var(--fg-muted); font-family: var(--ui-font); font-size: 11px; }
+.behavior { padding: 12px 0; }
+.settings footer { border-top: 1px solid var(--border); margin-top: 16px; padding-top: 8px; }
+@media (max-width: 720px) { .settings { grid-template-columns: 140px minmax(0, 1fr); } .settings > section { padding-inline: 10px; } }
+@media (max-width: 720px) {
+  .settings { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .settings aside { display: flex; border-right: 0; border-bottom: 1px solid var(--border); padding: 0; }
+  .settings aside h2 { display: none; }
+  .fontRow { grid-template-columns: 16px minmax(0, 1fr) 24px; }
+  .field { grid-template-columns: minmax(0, 1fr) 90px; }
+}

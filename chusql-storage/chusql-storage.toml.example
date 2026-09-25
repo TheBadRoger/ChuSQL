@@ -22,7 +22,7 @@ order = 4
 [storage]
 # 数据目录：一张表一个 <表名>.db，一个索引一个 <表名>.idx。
 # 环境变量：CHUSQL_DATA_DIR
-data_dir = "data"
+data_dir = "../localdata"
 
 [server]
 # 命名管道名（Windows 上实际是 \\.\pipe\<这个名字>）。

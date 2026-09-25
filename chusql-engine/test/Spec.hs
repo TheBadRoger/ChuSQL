@@ -23,6 +23,8 @@ import System.IO (Handle)
 import System.Process (CreateProcess (..), ProcessHandle, StdStream (NoStream), createProcess, proc, terminateProcess, waitForProcess)
 import Test.Hspec
 
+-- 引擎层的 hspec 测试：语法、执行、优化器与 IPC 行为。
+
 users :: Table
 users =
     Table
@@ -366,7 +368,6 @@ main = hspec $ do
                 Right (db', _) -> do
                     rowsOf (parseStatement "SELECT name FROM users WHERE age < 3" >>= runStatement db')
                         `shouldBe` Right [[("name", VStr "A")], [("name", VStr "B")]]
-                    -- 多行里只要有一行列数不对，整条都要拒绝
                     runStatement testDB (Insert "users" ["id", "name"] [[LitInt 1, LitStr "A"], [LitInt 2]])
                         `shouldSatisfy` isLeft
 
@@ -390,6 +391,36 @@ main = hspec $ do
                 `shouldBe` Right []
             rowsOf (parseStatement "DROP INDEX ON users (age)" >>= runStatement testDB)
                 `shouldBe` Right []
+
+    describe "ChuSQL.Engine (DROP COLUMN)" $ do
+        it "parses ALTER TABLE ... DROP COLUMN case-insensitively" $ do
+            parseStatement "ALTER TABLE users DROP COLUMN age"
+                `shouldBe` Right (DropColumn "users" "age")
+            parseStatement "alter table users drop column age"
+                `shouldBe` Right (DropColumn "users" "age")
+
+        it "after execution the column definition and every row cell are gone, other columns untouched" $ do
+            case runStatement testDB (DropColumn "users" "age") of
+                Left err -> expectationFailure err
+                Right (db', _) -> do
+                    case lookup "users" db' of
+                        Nothing -> expectationFailure "users table is gone"
+                        Just t -> do
+                            map fst (tableCols t) `shouldBe` ["id", "name"]
+                            tableRows t `shouldSatisfy` all (all (\(k, _) -> k /= "age"))
+                            let rowCountBefore = maybe 0 (length . tableRows) (lookup "users" testDB)
+                            length (tableRows t) `shouldBe` rowCountBefore
+                            tableRows t `shouldBe` map (filter ((/= "age") . fst)) (maybe [] tableRows (lookup "users" testDB))
+
+        it "unknown column or unknown table reports an error" $ do
+            (parseStatement "ALTER TABLE users DROP COLUMN nope" >>= runStatement testDB)
+                `shouldSatisfy` isLeft
+            (parseStatement "ALTER TABLE nope DROP COLUMN age" >>= runStatement testDB)
+                `shouldSatisfy` isLeft
+
+        it "the built-in id column cannot be dropped (the UI locates a row by it)" $ do
+            (parseStatement "ALTER TABLE users DROP COLUMN id" >>= runStatement testDB)
+                `shouldSatisfy` isLeft
     describe "ChuSQL.Engine (DELETE)" $ do
         it "parses DELETE with WHERE" $ do
             parseStatement "DELETE FROM users WHERE age < 18"
@@ -1009,16 +1040,13 @@ main = hspec $ do
             sameResultAsUnoptimized "SELECT name FROM users WHERE id = 2"
 
         it "rewrites an equality on any column into Lookup" $ do
-            -- 能不能真走索引由存储层回答；优化器只负责说"这里可以点查"
             fmap planRoot (optimizedPlan "SELECT name FROM users WHERE age = 25")
                 `shouldBe` Right (Lookup Nothing "users" "age" 25)
 
         it "keeps a point lookup on a non-indexed column identical to unoptimized" $ do
-            -- 内存实现没有索引，这条会走"退回扫描"的分支
             sameResultAsUnoptimized "SELECT name FROM users WHERE age = 25"
 
         it "keeps an aliased point lookup identical to unoptimized" $ do
-            -- 别名要留住：回来的一行必须和 Scan 别名 表 长得一样，不然投影取不到列
             sameResultAsUnoptimized "SELECT u.name FROM users u WHERE u.id = 1"
 
         it "returns the row for an aliased point lookup" $ do
@@ -1281,13 +1309,11 @@ main = hspec $ do
                             (Insert "ix_t" ["id", "code"] [[LitInt 1, LitInt 500], [LitInt 2, LitInt 501]])
                         )
 
-                -- 还没建索引：存储层明确回"我帮不上忙"，上层会退回扫描
                 withoutIndex <- runIPCStorage (lookupByColumn "ix_t" "code" 501)
                 withoutIndex `shouldBe` Right NoIndex
                 scanned <- runIPCStorage (runStatementM (makeSelect ["code"] "ix_t" (Just (Eq (Col "code") (LitInt 501)))))
                 scanned `shouldBe` Right [[("code", VInt 501)]]
 
-                -- 建索引之后就真的走索引了
                 created <- runIPCStorage (runStatementM (CreateIndex "ix_t" "code"))
                 created `shouldBe` Right []
                 withIndex <- runIPCStorage (lookupByColumn "ix_t" "code" 501)
@@ -1296,7 +1322,6 @@ main = hspec $ do
                 indexed <- runIPCStorage (runStatementM (makeSelect ["code"] "ix_t" (Just (Eq (Col "code") (LitInt 501)))))
                 indexed `shouldBe` Right [[("code", VInt 501)]]
 
-                -- 建完索引之后插入的行也要进索引
                 _ <- runIPCStorage (runStatementM (Insert "ix_t" ["id", "code"] [[LitInt 3, LitInt 502]]))
                 fresh <- runIPCStorage (lookupByColumn "ix_t" "code" 502)
                 fmap sortRow (indexRow fresh)
@@ -1352,6 +1377,24 @@ main = hspec $ do
         it "parses CREATE TABLE with BOOL column" $ do
             parseStatement "CREATE TABLE t (flag BOOL)"
                 `shouldBe` Right (CreateTable "t" [("flag", TBool)])
+
+        it "parses TRUE / FALSE as boolean literals (case-insensitive)" $ do
+            parseStatement "INSERT INTO t (flag) VALUES (TRUE)"
+                `shouldBe` Right (Insert "t" ["flag"] [[LitBool True]])
+            parseStatement "INSERT INTO t (flag) VALUES (false)"
+                `shouldBe` Right (Insert "t" ["flag"] [[LitBool False]])
+
+        it "boolean literals work in WHERE (and don't need a column named true)" $ do
+            parseStatement "SELECT * FROM t WHERE flag = TRUE"
+                `shouldBe` Right (makeSelect ["*"] "t" (Just (Eq (Col "flag") (LitBool True))))
+
+        it "inserts and reads back a boolean column end-to-end" $ do
+            let db = [("t", Table "t" [("id", TInt), ("flag", TBool)] [])]
+            case runStatement db (Insert "t" ["id", "flag"] [[LitInt 1, LitBool True]]) of
+                Left e -> expectationFailure e
+                Right (db', _) ->
+                    rowsOf (runStatement db' (makeSelect ["flag"] "t" Nothing))
+                        `shouldBe` Right [[("flag", VBool True)]]
 
         it "parses CREATE TABLE with VARCHAR as TStr" $ do
             parseStatement "CREATE TABLE t (name VARCHAR)"
@@ -1418,17 +1461,17 @@ locateServer = do
         Nothing -> pure (Left "chusql-storage directory not found (run these tests inside the repository)")
         Just dir -> do
             built <-
-                try (createProcess (proc "cargo" ["build", "--bin", "server"]){cwd = Just dir, std_out = NoStream, std_err = NoStream}) ::
+                try (createProcess (proc "cargo" ["build", "--bin", "chusql-storage"]){cwd = Just dir, std_out = NoStream, std_err = NoStream}) ::
                     IO (Either IOException (Maybe Handle, Maybe Handle, Maybe Handle, ProcessHandle))
             case built of
                 Left e -> pure (Left ("cannot run cargo (Rust is required for the IPC tests): " ++ show e))
                 Right (_, _, _, ph) -> do
                     ec <- waitForProcess ph
                     case ec of
-                        ExitFailure n -> pure (Left ("cargo build --bin server failed with exit code " ++ show n))
+                        ExitFailure n -> pure (Left ("cargo build --bin chusql-storage failed with exit code " ++ show n))
                         ExitSuccess -> do
-                            found <- firstExisting [dir </> "target" </> "debug" </> "server.exe", dir </> "target" </> "debug" </> "server"]
-                            pure (maybe (Left "cargo build finished but no server executable was found") Right found)
+                            found <- firstExisting [dir </> "target" </> "debug" </> "chusql-storage.exe", dir </> "target" </> "debug" </> "chusql-storage"]
+                            pure (maybe (Left "cargo build finished but no storage executable was found") Right found)
   where
     firstDir [] = pure Nothing
     firstDir (d : ds) = do
@@ -1463,7 +1506,7 @@ startServerAt bin dir = do
     waitUntilReady srv 100
     pure srv
 
--- | 每次调用都不同的后缀：CPU 时间精度不够，再加上一个唯一编号。
+-- | 每次调用都不同的后缀：CPU 时间加唯一编号
 uniqueStamp :: IO String
 uniqueStamp = do
     cpu <- getCPUTime
@@ -1522,7 +1565,7 @@ withPipeName name act = do
 sortRow :: Row -> Row
 sortRow = sortOn fst
 
--- | 从一次索引点查的结果里取出那一行（没索引、没查到都给 Nothing）
+-- | 取出索引点查返回的那一行，取不到给 Nothing
 indexRow :: Either String IndexResult -> Maybe Row
 indexRow (Right (IndexRow r)) = r
 indexRow _ = Nothing

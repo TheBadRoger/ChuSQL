@@ -65,3 +65,28 @@ fn describe_unknown_returns_none() {
     let c = Catalog::load(&path).unwrap();
     assert!(c.describe("nope").is_none());
 }
+
+/// 删列同时清掉统计与索引
+#[test]
+fn remove_column_drops_definition_stats_and_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.json");
+
+    let mut c = Catalog::load(&path).unwrap();
+    c.ensure_columns("t", &row(&[("id", json!(1)), ("code", json!(5))]));
+    c.add_index("t", "code").unwrap();
+    c.rebuild_stats("t", &[row(&[("id", json!(1)), ("code", json!(5))])]);
+
+    let removed = c.remove_column("t", "code").unwrap();
+    assert!(removed, "first remove should hit the column");
+    let s = c.describe("t").unwrap();
+    assert_eq!(s.columns.len(), 1);
+    assert_eq!(s.columns[0].name, "id");
+    assert!(s.indexes.is_empty(), "index on code should be gone");
+    assert!(s.stats.get("code").is_none(), "stats for code should be gone");
+
+    let again = c.remove_column("t", "code").unwrap();
+    assert!(!again);
+
+    assert!(c.remove_column("nope", "code").is_err());
+}

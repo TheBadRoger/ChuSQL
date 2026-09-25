@@ -1,4 +1,3 @@
-
 use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -10,7 +9,7 @@ use chusql_storage::config::{self, Config, Loaded};
 use chusql_storage::heap::HeapTable;
 use chusql_storage::log;
 use chusql_storage::protocol::{
-    ColumnStatWire, IndexWire, Request, Response, SchemaColumn, TableSchemaWire,
+    ColumnStatWire, IndexWire, Request, Response, Row, SchemaColumn, TableSchemaWire,
 };
 use chusql_storage::wal::{Wal, WalOp};
 use chusql_storage::{log_debug, log_error, log_info, log_warn};
@@ -20,8 +19,6 @@ use interprocess::TryClone;
 // 命名管道服务：按行读写 JSON，Windows 上映射成 \\.\pipe\<name>。
 // 启动时读配置并把每项来源打进日志；表句柄按名字缓存复用。
 
-// 服务器
-/// 服务器状态：配置 + 表句柄缓存 + 写锁 + 数据字典
 struct Server {
     cfg: Config,
     tables: Mutex<HashMap<String, Arc<Mutex<HeapTable>>>>,
@@ -45,16 +42,12 @@ impl Server {
         })
     }
 
-    // 路径
     /// 表名 -> 数据文件
     fn table_path(&self, table: &str) -> PathBuf {
         self.cfg.data_dir.join(format!("{}.db", table))
     }
 
-    /// (表名, 列名) -> 索引文件。
-    ///
-    /// `id` 是内建索引，沿用老文件名 `表名.idx`（老数据目录不用迁移）；
-    /// 其余列是 `表名.列名.idx`。
+    /// (表名, 列名) 对应哪个索引文件
     fn index_path(&self, table: &str, column: &str) -> PathBuf {
         if column == "id" {
             self.cfg.data_dir.join(format!("{}.idx", table))
@@ -70,7 +63,6 @@ impl Server {
         self.cfg.data_dir.join("catalog.json")
     }
 
-    // 表句柄
     /// 表文件存在且非空
     fn table_exists(&self, table: &str) -> bool {
         if self.tables.lock().unwrap().contains_key(table) {
@@ -86,7 +78,7 @@ impl Server {
             .unwrap_or(false)
     }
 
-    /// 一张表该开哪些索引：内建的 `id`，加上数据字典里记的那些
+    /// 一张表该开哪些索引
     fn index_columns(&self, table: &str) -> Vec<String> {
         let mut cols = vec!["id".to_string()];
         let c = self.catalog.lock().unwrap();
@@ -105,7 +97,6 @@ impl Server {
         if let Some(h) = self.tables.lock().unwrap().get(table) {
             return Ok(h.clone());
         }
-        // 先把索引清单取出来，再进 tables 锁（别套着锁去要 catalog）
         let columns = self.index_columns(table);
         let paths: Vec<(String, PathBuf)> = columns
             .iter()
@@ -146,7 +137,6 @@ impl Server {
         table: &str,
         f: impl FnOnce(&mut HeapTable) -> std::io::Result<R>,
     ) -> std::io::Result<R> {
-        // 已经在缓存里的表不用再查磁盘（省一次 metadata 系统调用）
         let cached = self.tables.lock().unwrap().contains_key(table);
         if !cached && !self.table_exists(table) {
             return Err(std::io::Error::new(
@@ -157,7 +147,6 @@ impl Server {
         self.with_table(table, f)
     }
 
-    // 写入路径
     /// 把一条 WAL 操作落到磁盘
     fn apply_op(&self, op: &WalOp) -> std::io::Result<()> {
         match op {
@@ -191,10 +180,22 @@ impl Server {
             }
             WalOp::ReplaceAll { table, rows } => {
                 self.with_table(table, |t| t.replace_all(rows))?;
-                // 整表重写 = 统计与行数从头再数一遍
                 let mut c = self.catalog.lock().unwrap();
                 c.rebuild_stats(table, rows);
                 c.save(self.catalog_path())
+            }
+            WalOp::DropColumn { table, column, rows } => {
+                self.with_table(table, |t| {
+                    t.detach_index(column);
+                    t.replace_all(rows)
+                })?;
+                let mut c = self.catalog.lock().unwrap();
+                c.remove_column(table, column)?;
+                c.rebuild_stats(table, rows);
+                c.save(self.catalog_path())?;
+                drop(c);
+                let _ = std::fs::remove_file(self.index_path(table, column));
+                Ok(())
             }
         }
     }
@@ -205,8 +206,6 @@ impl Server {
         std::fs::create_dir_all(&self.cfg.data_dir)?;
         let wal = &self.wal;
 
-        // 只截断不落盘：上一条写操作最后已经把 WAL 刷成空的了，
-        // 这里的截断只是保证下面追加的是唯一一条，跟着的 append 会顺手把它落下去。
         wal.truncate()?;
 
         wal.append(op)?;
@@ -219,7 +218,6 @@ impl Server {
             }
         }
 
-        // 这一步必须落盘：WAL 空 = 这条操作已经提交
         wal.clear()?;
         result
     }
@@ -230,7 +228,8 @@ impl Server {
             WalOp::Insert { table, .. }
             | WalOp::InsertBatch { table, .. }
             | WalOp::DeleteKeys { table, .. }
-            | WalOp::ReplaceAll { table, .. } => table,
+            | WalOp::ReplaceAll { table, .. }
+            | WalOp::DropColumn { table, .. } => table,
         };
         self.with_table(table, |t| t.flush())
     }
@@ -251,10 +250,7 @@ impl Server {
         }
     }
 
-    /// 启动时把列统计重数一遍。
-    ///
-    /// 统计是"每列见过哪些值"精确数出来的，只在内存里维护（随 catalog 落盘），
-    /// 所以重启之后要扫一遍表把它重建出来；否则统计会随重启慢慢失真。
+    /// 启动时重建列统计
     fn rebuild_stats(&self) -> std::io::Result<()> {
         let names: Vec<String> = self.catalog.lock().unwrap().table_names();
         let mut touched = false;
@@ -274,13 +270,12 @@ impl Server {
         Ok(())
     }
 
-    // 索引维护
     /// 给一列建索引
     fn create_index(&self, table: &str, column: &str) -> std::io::Result<()> {
         if column == "id" {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
-                "id 是内建索引，不需要再建",
+                "id is the built-in index and cannot be created twice",
             ));
         }
         {
@@ -321,7 +316,7 @@ impl Server {
         if column == "id" {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "id 是内建索引，不能删",
+                "id is the built-in index and cannot be dropped",
             ));
         }
         {
@@ -347,7 +342,48 @@ impl Server {
         Ok(())
     }
 
-    // 请求分发
+    /// 删一列：定义、索引、行里的字段
+    fn drop_column(&self, table: &str, column: &str) -> std::io::Result<()> {
+        if column == "id" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the built-in id column cannot be dropped",
+            ));
+        }
+        {
+            let c = self.catalog.lock().unwrap();
+            let Some(schema) = c.describe(table) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("unknown table: {}", table),
+                ));
+            };
+            if !schema.columns.iter().any(|c| c.name == column) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("unknown column: {}", column),
+                ));
+            }
+        }
+
+        let rows: Vec<Row> = self
+            .with_existing_table(table, |t| t.scan())?
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .filter(|(k, _)| k != column)
+                    .collect::<Row>()
+            })
+            .collect();
+
+        let op = WalOp::DropColumn {
+            table: table.to_string(),
+            column: column.to_string(),
+            rows,
+        };
+        self.write_via_wal(&op)
+    }
+
     /// 一条请求翻成一条响应
     fn handle_request(&self, req: Request) -> Response {
         match req {
@@ -430,8 +466,6 @@ impl Server {
                         }
                     };
                 if !indexed {
-                    // 没有这个索引：告诉查询层"这条我帮不上忙"，让它退回全表扫描。
-                    // 回 NoIndex 而不是空结果，是因为"没有索引"和"没查到"必须分开。
                     return Response::NoIndex;
                 }
                 match self.with_table(&table, |t| t.get_by_column_key(&column, key)) {
@@ -599,10 +633,22 @@ impl Server {
                     }
                 }
             }
+
+            Request::DropColumn { table, column } => {
+                log_debug!(pipe, "drop_column table={} column={}", table, column);
+                match self.drop_column(&table, &column) {
+                    Ok(()) => Response::Ok,
+                    Err(e) => {
+                        log_warn!(pipe, "drop_column {}({}): {}", table, column, e);
+                        Response::Error {
+                            message: format!("drop_column {}({}): {}", table, column, e),
+                        }
+                    }
+                }
+            }
         }
     }
 
-    // 信息查询
     /// 表名：catalog 与目录取并集
     fn list_tables(&self) -> std::io::Result<Vec<String>> {
         let mut names = BTreeSet::new();
@@ -625,7 +671,7 @@ impl Server {
         Ok(names.into_iter().collect())
     }
 
-    /// 查一张表的 schema（列 + 行数 + 索引 + 统计）
+    /// 查一张表的 schema
     fn describe_table(
         &self,
         table: &str,
@@ -650,8 +696,7 @@ impl Server {
     }
 }
 
-/// 一张表的索引定义 -> 线上格式。
-/// `id` 是内建索引（表一开出来就有），数据字典里不记它，但对外要报出来。
+/// 一张表的索引定义转线上格式
 fn index_wires(schema: &chusql_storage::catalog::TableSchema) -> Vec<IndexWire> {
     let mut out = vec![IndexWire {
         column: "id".to_string(),
@@ -687,7 +732,6 @@ impl Drop for Server {
     }
 }
 
-// 连接
 /// 处理一条连接
 fn handle(server: &Server, conn: LocalSocketStream) -> std::io::Result<()> {
     let mut writer = conn.try_clone()?;
@@ -716,7 +760,6 @@ fn handle(server: &Server, conn: LocalSocketStream) -> std::io::Result<()> {
     Ok(())
 }
 
-// 入口
 /// 把配置来源打进日志
 fn log_config(loaded: &Loaded) {
     match &loaded.config_path {
@@ -751,7 +794,6 @@ fn main() -> std::io::Result<()> {
     }
 
     if let Err(e) = server.rebuild_stats() {
-        // 统计重建失败不影响服务：报一声，继续跑（统计会停留在落盘时的值）
         log_warn!(core, "stats rebuild skipped: {}", e);
     }
 

@@ -1,0 +1,15 @@
+/* SQL 控制台样式：工具栏、编辑器与语句状态条。 */
+.console { display: grid; grid-template: 30px minmax(0, 1fr) auto / minmax(0, 1fr); height: 100%; min-height: 0; min-width: 0; overflow: hidden; }
+.toolbar { align-items: center; background: var(--bg-elevated); border-bottom: 1px solid var(--border); display: flex; gap: 2px; padding: 2px 5px; }
+.editor { min-height: 0; min-width: 0; overflow: hidden; position: relative; }
+.statementList { background: var(--bg-elevated); border-top: 1px solid var(--border); display: flex; gap: 12px; list-style: none; margin: 0; min-height: 28px; overflow-x: auto; padding: 4px 8px; }
+.statementList li { align-items: center; color: var(--fg-muted); display: flex; gap: 5px; white-space: nowrap; }
+.statementList small { color: var(--success); }
+.runningLine { background: rgb(0 122 204 / 14%); }
+.runningEdge { border-left: 2px solid var(--accent); margin-left: 3px; }
+.glyphPending::before { color: var(--fg-muted); content: '○'; }
+.glyphRunning::before { color: var(--info); content: '▶'; }
+.glyphSuccess::before { color: var(--success); content: '✓'; }
+.glyphError::before { color: var(--danger); content: '✗'; }
+.editor > :global(.monaco-editor) { position: absolute; inset: 0; }
+.statementList { max-height: 64px; }

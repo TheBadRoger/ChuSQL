@@ -1,0 +1,15 @@
+/* 底部面板：标签页、变更列表与结果表格样式 */
+.panel { display: grid; grid-template-rows: 28px minmax(0, 1fr); height: 100%; }
+.panel nav { border-bottom: 1px solid var(--border); display: flex; gap: 2px; }
+.panel nav button { background: transparent; border: 0; border-bottom: 1px solid transparent; color: var(--fg-primary); font: inherit; padding: 0 9px; }
+.panel nav .active { border-bottom-color: var(--accent); }
+.body { min-height: 0; overflow: auto; padding: 6px 8px; }
+.body p { color: var(--fg-muted); margin: 4px; }
+.changes, .messages { list-style: none; margin: 0; padding: 0; }
+.changes li { align-items: center; border-bottom: 1px solid var(--border-subtle); display: grid; gap: 10px; grid-template-columns: 200px minmax(0, 1fr) 24px; min-height: 26px; }
+.changes code { color: rgb(200 200 200); font-family: var(--ui-font); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.messages li { border-bottom: 1px solid var(--border-subtle); min-height: 22px; }
+.body select { background: var(--bg-overlay); border: 1px solid var(--border); color: var(--fg-primary); height: 24px; }
+.resultScroll { overflow: auto; }
+.resultScroll table { border-collapse: collapse; margin-top: 6px; }
+.resultScroll th, .resultScroll td { border: 1px solid var(--border); min-width: 100px; padding: 3px 6px; text-align: left; }

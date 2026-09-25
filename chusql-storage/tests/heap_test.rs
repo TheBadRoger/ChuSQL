@@ -135,9 +135,9 @@ fn replace_all_rebuilds_index() {
     ])
     .unwrap();
 
-    assert!(t.get_by_key(1).unwrap().is_none(), "旧键必须作废");
+    assert!(t.get_by_key(1).unwrap().is_none(), "old key must be invalidated");
     assert!(t.get_by_key(2).unwrap().is_none());
-    let got = t.get_by_key(7).unwrap().expect("新行应该按 id 建好索引");
+    let got = t.get_by_key(7).unwrap().expect("new row should be indexed by id");
     assert_eq!(got["name"], json!("Zoe"));
     assert_eq!(t.scan().unwrap().len(), 2);
 }
@@ -161,7 +161,7 @@ fn delete_by_keys_removes_rows() {
     }
 
     let deleted = t.delete_by_keys(&[2, 4, 99]).unwrap();
-    assert_eq!(deleted.len(), 2, "只有 2、4 真的删掉了");
+    assert_eq!(deleted.len(), 2, "only 2 and 4 were actually deleted");
 
     let ids: Vec<i64> = t
         .scan()
@@ -169,13 +169,12 @@ fn delete_by_keys_removes_rows() {
         .iter()
         .map(|r| r["id"].as_i64().unwrap())
         .collect();
-    assert_eq!(ids, vec![1, 3, 5], "剩下的行要保持原顺序");
+    assert_eq!(ids, vec![1, 3, 5], "remaining rows must keep their order");
 
-    assert!(t.get_by_key(2).unwrap().is_none(), "索引条目要跟着删");
+    assert!(t.get_by_key(2).unwrap().is_none(), "index entry should be deleted too");
     assert!(t.get_by_key(4).unwrap().is_none());
     assert!(t.get_by_key(3).unwrap().is_some());
 
-    // 删掉的位置可以再插回来
     t.insert_row(&row(&[("id", json!(2)), ("name", json!("u2b"))]))
         .unwrap();
     assert_eq!(t.get_by_key(2).unwrap().unwrap()["name"], json!("u2b"));
@@ -202,7 +201,6 @@ fn insert_rows_batch() {
     assert_eq!(t.scan().unwrap().len(), 20);
     assert_eq!(t.get_by_key(20).unwrap().unwrap()["name"], json!("u20"));
 
-    // 批里出现重复键要报错（整批之前就查出来，不会插一半）
     let dup = vec![
         row(&[("id", json!(100))]),
         row(&[("id", json!(100))]),
@@ -241,16 +239,13 @@ fn secondary_index_is_maintained() {
     assert!(t.has_index("code"));
     assert_eq!(t.get_by_column_key("code", 7002).unwrap().unwrap()["id"], json!(2));
 
-    // 建索引之后新插入的行也进索引
     t.insert_row(&row(&[("id", json!(3)), ("code", json!(7003))]))
         .unwrap();
     assert_eq!(t.get_by_column_key("code", 7003).unwrap().unwrap()["id"], json!(3));
 
-    // 删掉一行，索引条目跟着走
     t.delete_by_keys(&[2]).unwrap();
     assert!(t.get_by_column_key("code", 7002).unwrap().is_none());
 
-    // code 已经有索引，重复的 code 插不进去（索引列是唯一的）
     assert!(t.insert_row(&row(&[("id", json!(4)), ("code", json!(7001))])).is_err());
     let mut t2 = HeapTable::open(&dir.path().join("d.db"), DEFAULT_PAGE_SIZE, DEFAULT_POOL_SIZE).unwrap();
     t2.insert_rows(&[
@@ -265,8 +260,8 @@ fn secondary_index_is_maintained() {
         chusql_storage::config::DEFAULT_BTREE_ORDER,
         DEFAULT_POOL_SIZE,
     );
-    assert!(err.is_err(), "重复值不给建索引");
-    assert!(!t2.has_index("age"), "失败之后不留半成品");
+    assert!(err.is_err(), "duplicate values must not be indexed");
+    assert!(!t2.has_index("age"), "no half-built index after failure");
 }
 
 /// 同一个 id 插两次要报错
@@ -285,6 +280,6 @@ fn duplicate_key_is_rejected() {
     t.insert_row(&row(&[("id", json!(1))])).unwrap();
     let r = t.insert_row(&row(&[("id", json!(1))]));
     assert!(r.is_err());
-    assert_eq!(t.scan().unwrap().len(), 1, "失败的那一行不应该进堆表");
+    assert_eq!(t.scan().unwrap().len(), 1, "the failed row should not reach the heap");
 }
 

@@ -1,4 +1,3 @@
-
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -10,32 +9,22 @@ use serde::{Deserialize, Serialize};
 use crate::protocol::{ColumnType, Row, SchemaColumn};
 
 // 数据字典：记每张表有哪些列、什么类型、多少行、有哪些索引，以及列级统计。
-//
-// 统计只在内存里精确维护（每列见过哪些值的哈希，有上限），随 catalog.json 一起落盘；
-// 服务启动时会扫一遍表把统计重建出来，所以重启之后数字仍然是对的。
 
-/// 一列的不同值个数最多精确统计到这里；超过就只报"下界"
 const STATS_DISTINCT_CAP: u64 = 4096;
 
-// 表结构
 #[derive(Debug, Clone, Serialize, Deserialize)]
-/// 一条索引定义：只记"盯的是哪一列"（索引按列命名，一列最多一个）
 pub struct IndexSchema {
     pub column: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-/// 一列的统计
 pub struct ColumnStat {
-    /// 不同值个数（`capped` 为真时是下界）
     pub distinct: u64,
-    /// 不同值太多，已经不再精确统计
     #[serde(default)]
     pub capped: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-/// 一张表的 schema + 统计
 pub struct TableSchema {
     pub columns: Vec<SchemaColumn>,
     #[serde(default)]
@@ -47,16 +36,13 @@ pub struct TableSchema {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-/// 数据字典：表名到 schema
 pub struct Catalog {
     tables: BTreeMap<String, TableSchema>,
-    /// 每列"见过的值"的哈希集合（只在内存里，不落盘；有上限）
     #[serde(skip)]
     seen: BTreeMap<String, HashSet<u64>>,
 }
 
 impl Catalog {
-    // 读取与保存
     /// 从文件读；不存在给空字典
     pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         if !path.as_ref().exists() {
@@ -80,7 +66,6 @@ impl Catalog {
         std::fs::write(path, bytes)
     }
 
-    // 查询
     /// 一张表的 schema
     pub fn describe(&self, table: &str) -> Option<&TableSchema> {
         self.tables.get(table)
@@ -91,7 +76,6 @@ impl Catalog {
         self.tables.keys().cloned().collect()
     }
 
-    // 更新
     /// 按一行数据补列
     pub fn ensure_columns(&mut self, table: &str, row: &Row) {
         let entry = self.tables.entry(table.to_string()).or_default();
@@ -118,7 +102,7 @@ impl Catalog {
         Ok(())
     }
 
-    /// 记一次插入：补列 + 行数 +1 + 更新列统计；返回"列有没有变化"（决定要不要立刻写盘）
+    /// 记一次插入，返回列有没有变化
     pub fn record_insert(&mut self, table: &str, row: &Row) -> bool {
         let changed = {
             let entry = self.tables.entry(table.to_string()).or_default();
@@ -141,7 +125,6 @@ impl Catalog {
                 if stat.capped {
                     continue;
                 }
-                // 这个值彻底没了才减：集合里删得掉说明没有别的行还用它
                 if seen.remove(&fold(name, value_hash(v))) {
                     stat.distinct = stat.distinct.saturating_sub(1);
                 }
@@ -149,7 +132,7 @@ impl Catalog {
         }
     }
 
-    /// 重数一遍统计与行数（启动时重建、整表改写完都走它）；返回"列有没有变化"
+    /// 重数一遍统计与行数
     pub fn rebuild_stats(&mut self, table: &str, rows: &[Row]) -> bool {
         self.seen.remove(table);
         {
@@ -157,12 +140,11 @@ impl Catalog {
             entry.stats.clear();
             entry.row_count = 0;
         }
-        // 逐行"插入"地数：行数、列、统计一次到位
         rows.iter()
             .fold(false, |changed, r| self.record_insert(table, r) || changed)
     }
 
-    /// 列统计：这一列第一次见到这个值就 distinct +1（到上限之后只报下界）
+    /// 这一列第一次见到这个值就加一
     fn count_values(&mut self, table: &str, row: &Row) {
         let entry = self.tables.entry(table.to_string()).or_default();
         let seen = self.seen.entry(table.to_string()).or_default();
@@ -175,7 +157,7 @@ impl Catalog {
                 stat.distinct += 1;
                 if stat.distinct >= STATS_DISTINCT_CAP {
                     stat.capped = true;
-                    seen.clear(); // 到上限就不再精确统计，把内存还回去
+                    seen.clear();
                 }
             }
         }
@@ -192,7 +174,23 @@ impl Catalog {
         Ok(())
     }
 
-    // 索引
+    /// 删一列；之前没有也返回成功（重放幂等）
+    pub fn remove_column(&mut self, table: &str, column: &str) -> io::Result<bool> {
+        let entry = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("unknown table: {}", table)))?;
+        let had_column = {
+            let before = entry.columns.len();
+            entry.columns.retain(|c| c.name != column);
+            entry.columns.len() != before
+        };
+        entry.stats.remove(column);
+        entry.indexes.retain(|i| i.column != column);
+        self.seen.remove(table);
+        Ok(had_column)
+    }
+
     /// 记下一条索引定义
     pub fn add_index(&mut self, table: &str, column: &str) -> io::Result<()> {
         let entry = self
@@ -230,7 +228,6 @@ impl Catalog {
     }
 }
 
-// 推断
 /// 把行里"字典还不知道的列"补进来；返回有没有变化
 fn add_missing_columns(entry: &mut TableSchema, row: &Row) -> bool {
     let mut changed = false;
@@ -259,14 +256,14 @@ fn infer_type(v: &serde_json::Value) -> Option<ColumnType> {
     }
 }
 
-/// 一个值的哈希（按它的 JSON 文本算；统计"不同值个数"用）
+/// 一个值的哈希，统计不同值个数用
 fn value_hash(v: &serde_json::Value) -> u64 {
     let mut h = DefaultHasher::new();
     v.to_string().hash(&mut h);
     h.finish()
 }
 
-/// 把"列名"和"值哈希"合成一个哈希：避免两列的同值互相干扰
+/// 列名与值哈希合成一个哈希
 fn fold(column: &str, value_hash: u64) -> u64 {
     let mut h = DefaultHasher::new();
     column.hash(&mut h);

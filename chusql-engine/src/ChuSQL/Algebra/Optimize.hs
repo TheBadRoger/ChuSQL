@@ -7,7 +7,6 @@ import ChuSQL.Syntax.AST (Expr (..))
 
 -- 查询优化：谓词下推 + 投影下推 + 常量折叠，跑到不动点。
 
--- * 谓词下推
 -- | 算子会产出哪些列
 relOpCols :: Database -> RelOp -> [String]
 relOpCols db (Scan mAlias tbl) =
@@ -73,8 +72,6 @@ pushOne _ (Filter p (Filter q x)) = Filter (And p q) x
 pushOne _ (Filter p (Sort spec x)) = Sort spec (Filter p x)
 pushOne _ op = op
 
-
--- * 投影下推
 -- | 是否要全部列
 needsAll :: [String] -> Bool
 needsAll = elem allColumns
@@ -106,8 +103,6 @@ pushProject db need (Join l r c)
 pushProject db need leaf@(Scan _ _) = pushProjectLeaf db need leaf
 pushProject db need leaf@(Lookup _ _ _ _) = pushProjectLeaf db need leaf
 
-
--- * 常量折叠
 -- | 折一个表达式节点
 foldNode :: Expr -> Expr
 foldNode e
@@ -127,14 +122,8 @@ foldConstants (And a b) = foldNode (And (foldConstants a) (foldConstants b))
 foldConstants (Or a b) = foldNode (Or (foldConstants a) (foldConstants b))
 foldConstants e = e
 
-
--- * 执行优化
 -- | 单节点重写
 rewriteNode :: Database -> RelOp -> RelOp
--- 单列等值条件改成点查：这里是"可以走索引"的意思，
--- 到底走不走得成由存储层回答（这个列上没有索引就退回全表扫描，见 Eval），
--- 所以优化器不必先知道表上到底有哪些索引。
--- 别名要留在节点里：回来的一行必须和 `Scan 别名 表` 长得一样，不然后面取列就对不上了。
 rewriteNode _ (Filter (Eq (Col k) (LitInt v)) (Scan mAlias t)) =
     Lookup mAlias t (unqualify mAlias k) v
 rewriteNode db (Filter p (Join l r c)) = pushJoin db p l r c

@@ -3,12 +3,10 @@ use std::collections::HashMap;
 
 // 协议：Haskell 与 Rust 之间的请求 / 响应类型。
 
-/// 一行：列名到 JSON 值
 pub type Row = HashMap<String, serde_json::Value>;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-/// 列类型（对应 Haskell 的 TInt / TStr / TBool）
 pub enum ColumnType {
     Int,
     Str,
@@ -16,52 +14,43 @@ pub enum ColumnType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-/// 一列的 schema
 pub struct SchemaColumn {
     pub name: String,
     pub ty: ColumnType,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-/// 一列的统计（随数据字典一起走）
 pub struct ColumnStatWire {
     pub name: String,
-    /// 不同值个数；`capped` 为真时它只是下界
     pub distinct: u64,
     #[serde(default)]
     pub capped: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-/// 一条索引定义
 pub struct IndexWire {
     pub column: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
-/// 请求：method 字段决定类型
 pub enum Request {
     Ping,
     Scan {
         table: String,
     },
-    /// 插一行；要不要写索引由表上的索引决定（调用方不用管）
     Insert {
         table: String,
         row: Row,
     },
-    /// 一批行一起插：一次 WAL、一次 fsync
     InsertBatch {
         table: String,
         rows: Vec<Row>,
     },
-    /// 按 id 批量删行
     DeleteKeys {
         table: String,
         keys: Vec<i64>,
     },
-    /// 按某一列的索引取一行（列名默认 "id"，兼容老客户端）
     LookupByIndex {
         table: String,
         #[serde(default = "default_id_column")]
@@ -84,13 +73,15 @@ pub enum Request {
         table: String,
     },
     ListCatalog,
-    /// 给某一列建索引（要求这一列整数取值唯一）
     CreateIndex {
         table: String,
         column: String,
     },
-    /// 去掉某一列的索引
     DropIndex {
+        table: String,
+        column: String,
+    },
+    DropColumn {
         table: String,
         column: String,
     },
@@ -103,7 +94,6 @@ fn default_id_column() -> String {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-/// 响应：status 字段决定类型
 pub enum Response {
     Pong,
     Rows { rows: Vec<Row> },
@@ -118,7 +108,6 @@ pub enum Response {
         #[serde(default)]
         stats: Vec<ColumnStatWire>,
     },
-    /// 这一列没有索引 —— 调用方应该退回全表扫描
     NoIndex,
     Ok,
     Error { message: String },

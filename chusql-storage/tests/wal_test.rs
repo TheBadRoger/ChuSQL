@@ -48,6 +48,26 @@ fn append_and_read_replace_all() {
     assert_eq!(back, op);
 }
 
+/// 写读 DropColumn 操作，行随日志落盘
+#[test]
+fn append_and_read_drop_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal = Wal::new(dir.path().join("wal.log"));
+
+    let op = WalOp::DropColumn {
+        table: "users".into(),
+        column: "age".into(),
+        rows: vec![
+            row(&[("id", json!(1)), ("name", json!("Alice"))]),
+            row(&[("id", json!(2)), ("name", json!("Bob"))]),
+        ],
+    };
+    wal.append(&op).unwrap();
+
+    let back = wal.read().unwrap().unwrap();
+    assert_eq!(back, op);
+}
+
 /// 文件不存在返回 None
 #[test]
 fn missing_file_returns_none() {

@@ -5,19 +5,12 @@ use std::sync::OnceLock;
 
 // 极简日志：等级用原子变量，关掉的等级只花一次原子读。
 
-// 颜色
-/// 转义序列收尾
 const RESET: &str = "\u{1b}[0m";
-/// 加粗红（ERROR）
 const BOLD_RED: &str = "\u{1b}[1m\u{1b}[31m";
-/// 加粗橙（WARN）
 const BOLD_ORANGE: &str = "\u{1b}[1m\u{1b}[38;5;208m";
-/// 只加粗（DEBUG）
 const BOLD: &str = "\u{1b}[1m";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-// 等级与来源
-/// 日志等级
 pub enum Level {
     Off,
     Error,
@@ -27,7 +20,6 @@ pub enum Level {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// 来源：服务自身或管道请求
 pub enum Channel {
     Core,
     Pipe,
@@ -92,7 +84,6 @@ static LEVEL: AtomicU8 = AtomicU8::new(Level::Info as u8);
 
 static COLOR: OnceLock<bool> = OnceLock::new();
 
-// 写入
 /// 设置全局等级
 pub fn set_level(level: Level) {
     LEVEL.store(level as u8, Ordering::Relaxed);
@@ -140,8 +131,6 @@ fn render(level: Level, channel: Channel, color: bool, stamp: &Stamp, msg: &str)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// 时间
-/// 本地日期时间
 pub struct Stamp {
     pub year: u16,
     pub month: u16,
@@ -152,7 +141,6 @@ pub struct Stamp {
     pub milli: u16,
 }
 
-/// 格式：年-月-日 时:分:秒.毫秒
 impl fmt::Display for Stamp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -238,7 +226,6 @@ pub fn civil_from_days(days: i64) -> (i64, u16, u16) {
     (y + i64::from(month <= 2), month, day)
 }
 
-// 终端
 /// 打开 Windows 的 VT 处理
 #[cfg(windows)]
 fn enable_vt() {
@@ -265,8 +252,6 @@ fn enable_vt() {
 #[cfg(not(windows))]
 fn enable_vt() {}
 
-// 宏
-/// debug 日志
 #[macro_export]
 macro_rules! log_debug {
     (core, $($arg:tt)*) => {
@@ -277,7 +262,6 @@ macro_rules! log_debug {
     };
 }
 
-/// info 日志
 #[macro_export]
 macro_rules! log_info {
     (core, $($arg:tt)*) => {
@@ -288,7 +272,6 @@ macro_rules! log_info {
     };
 }
 
-/// warn 日志
 #[macro_export]
 macro_rules! log_warn {
     (core, $($arg:tt)*) => {
@@ -299,7 +282,6 @@ macro_rules! log_warn {
     };
 }
 
-/// error 日志
 #[macro_export]
 macro_rules! log_error {
     (core, $($arg:tt)*) => {
@@ -310,7 +292,6 @@ macro_rules! log_error {
     };
 }
 
-/// 四个宏的公共部分
 #[doc(hidden)]
 #[macro_export]
 macro_rules! log_line {

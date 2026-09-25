@@ -7,7 +7,6 @@ import Data.List (intercalate, nub)
 
 -- 语义检查：表和列在不在、类型对不对，全部在执行前查。
 
--- * 环境
 -- | 给列名加上别名前缀
 prefixColumns :: Maybe String -> [(String, Column)] -> [(String, Column)]
 prefixColumns mAlias cols = [(prefix ++ c, ty) | (c, ty) <- cols]
@@ -26,8 +25,6 @@ checkFrom db (FromJoin left mAlias tbl cond) = do
     checkBool "ON" env cond
     Right env
 
-
--- * 检查
 -- | 拼“列不存在”的报错
 missingColumn :: String -> String -> [(String, Column)] -> String
 missingColumn place c env =
@@ -43,7 +40,6 @@ checkColumns place env requested =
     case [c | c <- requested, c /= allColumns, c `notElem` map fst env] of
         [] -> Right ()
         (c : _) -> Left (missingColumn place c env)
-
 
 -- | 推导表达式的类型
 inferExpr :: String -> [(String, Column)] -> Expr -> Either String Column
@@ -80,8 +76,6 @@ checkBool place env e = do
         then Right ()
         else Left (place ++ ": condition must be a boolean, got " ++ show t)
 
-
--- * 写入语句
 -- | 检查赋值列和类型
 checkTyped :: String -> [(String, Column)] -> Table -> (String, Expr) -> Either String ()
 checkTyped place env t (c, e) = do
@@ -99,8 +93,6 @@ checkValue = checkTyped "INSERT" []
 checkAssign :: Table -> (String, Expr) -> Either String ()
 checkAssign t = checkTyped "UPDATE" (tableCols t) t
 
-
--- * 入口
 -- | 按语句类型分派检查
 check :: Database -> Statement -> Either String ()
 check db q = case q of
@@ -150,6 +142,17 @@ check db q = case q of
         if col `elem` tableCols' t
             then Right ()
             else Left ("DROP INDEX: unknown column: " ++ col)
+    DropColumn tbl col -> do
+        t <- lookupTable db tbl
+        if col `notElem` tableCols' t
+            then Left ("DROP COLUMN: unknown column: " ++ col)
+            else
+                if col == idColumn
+                    then Left "DROP COLUMN: the built-in id column cannot be dropped"
+                    else Right ()
   where
     -- \| 表的列名清单
     tableCols' = map fst . tableCols
+
+idColumn :: String
+idColumn = "id"

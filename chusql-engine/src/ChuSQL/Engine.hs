@@ -12,8 +12,6 @@ import ChuSQL.Syntax.AST
 
 -- 引擎入口：语义检查 + 分发执行，以及内存实现与泛型版本。
 
--- * 对外入口
-
 -- | 跑一条语句（内存实现）
 runStatement :: Database -> Statement -> Either String (Database, [Row])
 runStatement db q = do
@@ -28,14 +26,10 @@ rowsOf = fmap snd
 -- | 泛型入口：先检查再执行
 runStatementM :: (MonadStorage m) => Statement -> m (Either String [Row])
 runStatementM q = do
-    -- 只要结构：语义检查和查询优化都只看列，一行数据都不碰，
-    -- 所以这里不用取整库快照（那会把所有行拉一遍）
     db <- schema
     case check db q of
         Left err -> pure (Left err)
         Right _ -> runStatementUncheckedM db q
-
--- * 分发执行
 
 -- | 按语句类型分发（已检查过）
 runStatementUncheckedM :: (MonadStorage m) => Database -> Statement -> m (Either String [Row])
@@ -44,7 +38,6 @@ runStatementUncheckedM db q@Select{} =
         Left e -> pure (Left e)
         Right relOp -> evalRelOpM (optimize db relOp)
 runStatementUncheckedM _ (Insert tbl cols rows) =
-    -- 多行一次交给存储：N 行只落一次盘（键怎么算、索引怎么写是存储层的事）
     case mapM toRow rows of
         Left err -> pure (Left err)
         Right rs -> do
@@ -65,8 +58,6 @@ runStatementUncheckedM _ (Delete tbl mWhere) = do
         Right rows -> case splitByCondition mWhere rows of
             Left err -> pure (Left err)
             Right (doomed, kept) ->
-                -- 要删的行都有 id 就走行级删（存储层原地删，代价只和删几行有关）；
-                -- 没有 id 的表定位不到行，只能整表写回。
                 case mapM rowId doomed of
                     Right ids -> do
                         result <- deleteKeys tbl ids
@@ -111,14 +102,15 @@ runStatementUncheckedM _ (CreateIndex tbl col) = do
 runStatementUncheckedM _ (DropIndex tbl col) = do
     result <- dropIndex tbl col
     pure (result >> Right [])
+runStatementUncheckedM _ (DropColumn tbl col) = do
+    result <- dropColumn tbl col
+    pure (result >> Right [])
 
--- * 更新辅助
-
--- | 按条件把行分成"要删的"和"留着的"两拨（没有条件就全都要删）
+-- | 按条件把行分成待删和保留两拨
 splitByCondition :: Maybe Expr -> [Row] -> Either String ([Row], [Row])
 splitByCondition cond = go [] []
   where
-    -- \| 一行一行过，保持原顺序；条件求值出错就立刻停（和 filterM 一样）
+    -- \| 逐行过，保持原顺序
     go doomed kept [] = Right (reverse doomed, reverse kept)
     go doomed kept (r : rs) = do
         hit <- case cond of

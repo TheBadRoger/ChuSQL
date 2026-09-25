@@ -38,31 +38,22 @@ import System.IO.Unsafe (unsafePerformIO)
 
 -- IPC 存储实现：每个存储方法翻成管道上的一条 JSON 请求。
 
--- * 存储实现
-
--- | 命名管道上的存储
 newtype IPCStorage a = IPCStorage
     { runIPCStorage :: IO a
     }
 
--- | Functor：转发给 IO
 instance Functor IPCStorage where
     fmap f (IPCStorage m) = IPCStorage (fmap f m)
 
--- | Applicative：转发给 IO
 instance Applicative IPCStorage where
     pure = IPCStorage . pure
     IPCStorage mf <*> IPCStorage ma = IPCStorage (mf <*> ma)
 
--- | Monad：顺序执行
 instance Monad IPCStorage where
     IPCStorage m >>= k = IPCStorage $ do
         a <- m
         runIPCStorage (k a)
 
--- * 全局连接缓存
-
--- | 全局句柄缓存：按管道路径缓存，路径变了就换连接。
 {-# NOINLINE connectionRef #-}
 connectionRef :: MVar (Maybe (FilePath, Handle))
 connectionRef = unsafePerformIO (newMVar Nothing)
@@ -100,15 +91,13 @@ dropConnection = modifyMVar_ connectionRef $ \cached -> do
 closeConnection :: IO ()
 closeConnection = dropConnection
 
--- * 管道
-
 -- | 管道路径
 pipePath :: IO String
 pipePath = do
     name <- maybe "chusql-storage" id <$> lookupEnv "CHUSQL_PIPE"
     pure ("\\\\.\\pipe\\" ++ name)
 
--- | 发一条请求读一条响应；管道不通就回 RespError，并丢掉缓存等下次重连。
+-- | 发一条请求，管道不通就重连
 sendRequest :: Request -> IO Response
 sendRequest req = do
     path <- pipePath
@@ -132,29 +121,21 @@ roundTrip req path = do
         Left err -> pure (RespError ("decode: " ++ err))
         Right r -> pure r
 
--- * 编解码
-
--- | 一列的 schema
 data SchemaColumn = SchemaColumn
     { scName :: String
     , scType :: String
     }
     deriving (Show, Eq)
 
--- | SchemaColumn 编码
 instance ToJSON SchemaColumn where
     toJSON (SchemaColumn n t) = object ["name" .= n, "ty" .= t]
 
--- | SchemaColumn 解码
 instance FromJSON SchemaColumn where
     parseJSON = withObject "SchemaColumn" $ \o -> do
         n <- o .: "name"
         t <- o .: "ty"
         pure (SchemaColumn n t)
 
--- * 请求
-
--- | 请求类型
 data Request
     = ReqPing
     | ReqScan String
@@ -169,9 +150,9 @@ data Request
     | ReqDropTable String
     | ReqCreateIndex String String
     | ReqDropIndex String String
+    | ReqDropColumn String String
     | ReqListCatalog
 
--- | 请求编码
 instance ToJSON Request where
     toJSON ReqPing = object ["method" .= ("ping" :: T.Text)]
     toJSON (ReqScan t) = object ["method" .= ("scan" :: T.Text), "table" .= t]
@@ -232,9 +213,14 @@ instance ToJSON Request where
             , "table" .= t
             , "column" .= c
             ]
+    toJSON (ReqDropColumn t c) =
+        object
+            [ "method" .= ("drop_column" :: T.Text)
+            , "table" .= t
+            , "column" .= c
+            ]
     toJSON ReqListCatalog = object ["method" .= ("list_catalog" :: T.Text)]
 
--- | 一张表的线上信息：列 + 行数 + 索引 + 列统计
 data TableInfo = TableInfo
     { tiTable :: String
     , tiColumns :: [SchemaColumn]
@@ -244,7 +230,6 @@ data TableInfo = TableInfo
     }
     deriving (Show, Eq)
 
--- | 响应类型
 data Response
     = RespPong
     | RespRows [Row]
@@ -255,7 +240,6 @@ data Response
     | RespError String
     | RespCatalog [TableInfo]
 
--- | 响应解码
 instance FromJSON Response where
     parseJSON = withObject "Response" $ \o -> do
         status <- o .: "status"
@@ -272,7 +256,7 @@ instance FromJSON Response where
                 RespCatalog <$> mapM parseTable xs
             other -> fail ("unknown status: " ++ T.unpack other)
       where
-        -- \| 解一张表的 schema（新字段都给了默认值，老响应也能解）
+        -- \| 解一张表的 schema
         parseTable :: A.Value -> Parser TableInfo
         parseTable = withObject "TableInfo" $ \o -> do
             t <- o .: "table"
@@ -323,12 +307,7 @@ rowFromJSON (A.Object o) = mapM toPair (KM.toList o)
         pure (K.toString k, val)
 rowFromJSON _ = fail "row must be a JSON object"
 
--- * 内部封装
-
--- | 发一条请求，把响应翻成 Either。
---
--- 每个操作的区别只有两处：发什么请求、认哪种响应。所以固定套路收在这里：
--- 对面报错 → `Left`；认得这种响应 → `Right`；其余一律算协议错（比如对面版本对不上）。
+-- | 发请求并把响应翻成 Either
 ask :: String -> Request -> (Response -> Maybe a) -> IO (Either String a)
 ask what req recognize = do
     resp <- sendRequest req
@@ -349,7 +328,7 @@ doScan t = ask "scan" (ReqScan t) $ \resp -> case resp of
     RespRows rows -> Just rows
     _ -> Nothing
 
--- | 发 Insert（索引由存储层自己维护，这里不传 key）
+-- | 发 Insert（索引由存储层维护）
 doInsert :: String -> Row -> IO (Either String ())
 doInsert t r = ask "insert" (ReqInsert t r) okOnly
 
@@ -371,14 +350,13 @@ doListTables = ask "list_tables" ReqListTables $ \resp -> case resp of
     RespTables ts -> Just ts
     _ -> Nothing
 
--- | 一次拿全库 schema（表名 + 列 + 行数 + 索引 + 统计）。
+-- | 一次拿全库 schema
 doListCatalog :: IO (Either String [TableInfo])
 doListCatalog = ask "list_catalog" ReqListCatalog $ \resp -> case resp of
     RespCatalog xs -> Just xs
     _ -> Nothing
 
--- | 按某一列的索引取一行。
--- 返回 `NoIndex` 表示"这个列上没有索引"，上层据此退回全表扫描。
+-- | 按某一列的索引取一行
 doLookupByColumn :: String -> String -> Int -> IO (Either String IndexResult)
 doLookupByColumn t c k = ask "lookup_by_index" (ReqLookupByColumn t c k) $ \resp -> case resp of
     RespRows [] -> Just (IndexRow Nothing)
@@ -400,6 +378,10 @@ doCreateIndex t c = ask "create_index" (ReqCreateIndex t c) okOnly
 doDropIndex :: String -> String -> IO (Either String ())
 doDropIndex t c = ask "drop_index" (ReqDropIndex t c) okOnly
 
+-- | 删一列（列定义、这一列上的索引、每行里的那一格一起没）
+doDropColumn :: String -> String -> IO (Either String ())
+doDropColumn t c = ask "drop_column" (ReqDropColumn t c) okOnly
+
 -- | 发 CreateTable
 doCreateTable :: String -> [SchemaColumn] -> IO (Either String ())
 doCreateTable t cols = ask "create_table" (ReqCreateTable t cols) okOnly
@@ -407,8 +389,6 @@ doCreateTable t cols = ask "create_table" (ReqCreateTable t cols) okOnly
 -- | 发 DropTable
 doDropTable :: String -> IO (Either String ())
 doDropTable t = ask "drop_table" (ReqDropTable t) okOnly
-
--- * 表结构
 
 -- | 线上 schema 转本地列
 schemaToColumns :: [SchemaColumn] -> [(String, Column)]
@@ -419,9 +399,6 @@ schemaToColumns = map go
     go (SchemaColumn n "bool") = (n, TBool)
     go (SchemaColumn n _) = (n, TStr)
 
--- * MonadStorage 实例
-
--- | 存储方法全走管道
 instance MonadStorage IPCStorage where
     -- \| 发 Scan
     scan t = IPCStorage (doScan t)
@@ -458,6 +435,9 @@ instance MonadStorage IPCStorage where
     -- \| 删索引
     dropIndex t c = IPCStorage (doDropIndex t c)
 
+    -- \| 删一列
+    dropColumn t c = IPCStorage (doDropColumn t c)
+
     -- \| 列表 + 逐表扫描拼库
     snapshot = IPCStorage $ do
         result <- doListCatalog
@@ -465,7 +445,7 @@ instance MonadStorage IPCStorage where
             Left _ -> pure []
             Right xs -> mapM loadEntry xs
       where
-        -- \| 加载一张表（schema 来自 catalog，行来自 scan）
+        -- \| 加载一张表，行来自 scan
         loadEntry info = do
             rows <- doScan (tiTable info)
             pure

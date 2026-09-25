@@ -21,7 +21,6 @@ fn unique_pipe_name() -> String {
     format!("chusql-test-{}-{}", id, ns)
 }
 
-/// 持有 server 子进程，退出时杀掉
 struct ServerProc(Child);
 
 impl Drop for ServerProc {
@@ -36,7 +35,7 @@ impl Drop for ServerProc {
 fn start_server(pipe: &str) -> (ServerProc, tempfile::TempDir) {
     let data = tempfile::tempdir().unwrap();
 
-    let child = Command::new(env!("CARGO_BIN_EXE_server"))
+    let child = Command::new(env!("CARGO_BIN_EXE_chusql-storage"))
         .env("CHUSQL_PIPE", pipe)
         .env("CHUSQL_DATA_DIR", data.path())
         .env("CHUSQL_PAGE_SIZE", "4096")
@@ -251,7 +250,7 @@ fn delete_keys_removes_row_and_index_entry() {
     assert!(r.contains(r#""rows":[]"#), "index entry should be gone: {}", r);
 
     let r = send(&mut c, r#"{"method":"insert","table":"del_t","row":{"id":2,"name":"Bob2"}}"#);
-    assert!(r.contains(r#""status":"ok""#), "id 2 应该能再插进来: {}", r);
+    assert!(r.contains(r#""status":"ok""#), "id 2 should be insertable again: {}", r);
 }
 
 /// 给第二列建索引后能按那一列查
@@ -269,7 +268,6 @@ fn create_index_on_secondary_column() {
         send(&mut c, &req);
     }
 
-    // 没建之前：明确回 no_index，而不是回空结果
     let r = send(&mut c, r#"{"method":"lookup_by_index","table":"sec_t","column":"code","key":5002}"#);
     assert!(r.contains(r#""status":"no_index""#), "got: {}", r);
 
@@ -279,23 +277,64 @@ fn create_index_on_secondary_column() {
     let r = send(&mut c, r#"{"method":"lookup_by_index","table":"sec_t","column":"code","key":5002}"#);
     assert!(r.contains(r#""id":2"#), "lookup by code: {}", r);
 
-    // 建完索引之后新插入的行也要进索引
     send(&mut c, r#"{"method":"insert","table":"sec_t","row":{"id":4,"code":5004}}"#);
     let r = send(&mut c, r#"{"method":"lookup_by_index","table":"sec_t","column":"code","key":5004}"#);
     assert!(r.contains(r#""id":4"#), "lookup new row: {}", r);
 
-    // schema 里能看到这条索引
     let r = send(&mut c, r#"{"method":"describe_table","table":"sec_t"}"#);
     assert!(r.contains(r#""column":"code""#), "describe: {}", r);
 
-    // 删掉索引后回到 no_index
     let r = send(&mut c, r#"{"method":"drop_index","table":"sec_t","column":"code"}"#);
     assert!(r.contains(r#""status":"ok""#), "drop_index: {}", r);
     let r = send(&mut c, r#"{"method":"lookup_by_index","table":"sec_t","column":"code","key":5002}"#);
     assert!(r.contains(r#""status":"no_index""#), "after drop: {}", r);
 }
 
-/// 有重复值的列不给建索引（不然"走索引"和"全表扫"会给出不同答案）
+/// 删列同时摘掉索引与行内该格
+#[test]
+fn drop_column_removes_column_index_and_values() {
+    let pipe = unique_pipe_name();
+    let (_srv, _data) = start_server(&pipe);
+    let mut c = connect(&pipe).unwrap();
+
+    for (id, code, note) in [(1, 5001, "a"), (2, 5002, "b")] {
+        let req = format!(
+            r#"{{"method":"insert","table":"drop_t","row":{{"id":{},"code":{},"note":"{}"}}}}"#,
+            id, code, note
+        );
+        send(&mut c, &req);
+    }
+    let r = send(&mut c, r#"{"method":"create_index","table":"drop_t","column":"code"}"#);
+    assert!(r.contains(r#""status":"ok""#), "create_index: {}", r);
+
+    let r = send(&mut c, r#"{"method":"drop_column","table":"drop_t","column":"code"}"#);
+    assert!(r.contains(r#""status":"ok""#), "drop_column: {}", r);
+
+    let r = send(&mut c, r#"{"method":"describe_table","table":"drop_t"}"#);
+    assert!(!r.contains(r#""name":"code""#), "code column should be gone: {}", r);
+    assert!(r.contains(r#""name":"note""#), "note column should still be there: {}", r);
+    assert!(!r.contains(r#""column":"code""#), "index on code should be gone: {}", r);
+
+    let r = send(&mut c, r#"{"method":"scan","table":"drop_t"}"#);
+    assert!(r.contains(r#""note":"a""#), "row should still be there: {}", r);
+    assert!(!r.contains(r#""code""#), "row should no longer carry code: {}", r);
+
+    let r = send(
+        &mut c,
+        r#"{"method":"lookup_by_index","table":"drop_t","column":"code","key":5001}"#,
+    );
+    assert!(r.contains(r#""status":"no_index""#), "{}", r);
+
+    let r = send(&mut c, r#"{"method":"describe_table","table":"drop_t"}"#);
+    assert!(r.contains(r#""row_count":2"#), "row count should still be 2: {}", r);
+
+    let r = send(&mut c, r#"{"method":"drop_column","table":"drop_t","column":"id"}"#);
+    assert!(r.contains(r#""status":"error""#), "the built-in id column must not be dropped: {}", r);
+    let r = send(&mut c, r#"{"method":"drop_column","table":"drop_t","column":"nope"}"#);
+    assert!(r.contains(r#""status":"error""#), "a missing column should error: {}", r);
+}
+
+/// 重复值列不给建索引
 #[test]
 fn create_index_rejects_duplicate_values() {
     let pipe = unique_pipe_name();
@@ -309,7 +348,6 @@ fn create_index_rejects_duplicate_values() {
     assert!(r.contains(r#""status":"error""#), "got: {}", r);
     assert!(r.contains("duplicate value"), "got: {}", r);
 
-    // 失败之后不留半成品：查这一列仍然是 no_index
     let r = send(&mut c, r#"{"method":"lookup_by_index","table":"dup_t","column":"age","key":30}"#);
     assert!(r.contains(r#""status":"no_index""#), "got: {}", r);
 }
@@ -331,10 +369,9 @@ fn stats_report_distinct_values() {
 
     let r = send(&mut c, r#"{"method":"describe_table","table":"stat_t"}"#);
     assert!(r.contains(r#""row_count":3"#), "row_count: {}", r);
-    assert!(r.contains(r#""name":"age","distinct":2"#), "age 有 2 个不同值: {}", r);
-    assert!(r.contains(r#""name":"id","distinct":3"#), "id 有 3 个不同值: {}", r);
+    assert!(r.contains(r#""name":"age","distinct":2"#), "age has 2 distinct values: {}", r);
+    assert!(r.contains(r#""name":"id","distinct":3"#), "id has 3 distinct values: {}", r);
 
-    // 删掉一行，统计跟着掉
     send(&mut c, r#"{"method":"delete_keys","table":"stat_t","keys":[1]}"#);
     let r = send(&mut c, r#"{"method":"describe_table","table":"stat_t"}"#);
     assert!(r.contains(r#""row_count":2"#), "after delete: {}", r);
@@ -348,7 +385,7 @@ fn lookup_survives_reopen() {
     let data = tempfile::tempdir().unwrap();
 
     {
-        let exe = env!("CARGO_BIN_EXE_server");
+        let exe = env!("CARGO_BIN_EXE_chusql-storage");
         let child = Command::new(exe)
             .env("CHUSQL_PIPE", &pipe)
             .env("CHUSQL_DATA_DIR", data.path())
@@ -375,7 +412,7 @@ fn lookup_survives_reopen() {
     thread::sleep(Duration::from_millis(200));
 
     let (_srv, _data) = {
-        let child = Command::new(env!("CARGO_BIN_EXE_server"))
+        let child = Command::new(env!("CARGO_BIN_EXE_chusql-storage"))
             .env("CHUSQL_PIPE", &pipe)
             .env("CHUSQL_DATA_DIR", data.path())
             .stdout(Stdio::null())
@@ -410,7 +447,7 @@ fn config_file_is_used() {
     );
     std::fs::write(&config_path, text).unwrap();
 
-    let child = Command::new(env!("CARGO_BIN_EXE_server"))
+    let child = Command::new(env!("CARGO_BIN_EXE_chusql-storage"))
         .env("CHUSQL_CONFIG", &config_path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())

@@ -169,21 +169,19 @@ fn delete_removes_only_that_key() {
         t.insert(i, i as u64 + 1).unwrap();
     }
 
-    assert!(t.delete(50).unwrap(), "删一个存在的键应该返回 true");
+    assert!(t.delete(50).unwrap(), "deleting an existing key should return true");
     assert_eq!(t.get(50).unwrap(), None);
     assert_eq!(t.get(49).unwrap(), Some(50));
     assert_eq!(t.get(51).unwrap(), Some(52));
 
-    // 再删一次：它已经不在了
     assert!(!t.delete(50).unwrap());
 
-    // 遍历里也不能再有它
     let all = t.iter_all().unwrap();
     assert_eq!(all.len(), 199);
     assert!(all.iter().all(|(k, _)| *k != 50));
 }
 
-/// 删过之后树还能继续插（惰性删除会留下稀疏节点，但不能影响正确性）
+/// 删过之后树还能继续插
 #[test]
 fn insert_after_delete_still_works() {
     let dir = tempfile::tempdir().unwrap();
@@ -197,11 +195,9 @@ fn insert_after_delete_still_works() {
     for i in 0..300 {
         t.insert(i, i as u64).unwrap();
     }
-    // 把偶数键全删掉
     for i in (0..300).step_by(2) {
         assert!(t.delete(i).unwrap());
     }
-    // 再插一批新的
     for i in 1000..1100 {
         t.insert(i, i as u64).unwrap();
     }

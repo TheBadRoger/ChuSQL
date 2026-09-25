@@ -43,7 +43,7 @@ checksum :: Either String [Row] -> Int
 checksum (Left _) = -1
 checksum (Right rows) = go 0 rows
   where
-    -- \| 累加行长
+    -- | 累加行长
     go acc [] = acc
     go acc (r : rs) = go (acc + length r) rs
 
@@ -80,11 +80,9 @@ timed act = do
     t1 <- getCPUTime
     return (fromIntegral (t1 - t0) / 1e12)
 
--- | 每批至少跑几次（减少 CPU 时钟量化误差）
 minBatch :: Int
 minBatch = 8
 
--- | 取几批中位数
 rounds :: Int
 rounds = 3
 
@@ -103,7 +101,7 @@ benchOp target act = do
     ts <- mapM (const (timeBatch k act)) [1 .. rounds]
     return (median ts / fromIntegral k, k)
   where
-    -- \| 批次翻倍直到累计超过目标
+    -- | 批次翻倍直到累计超过目标
     pickBatch k = do
         t <- timeBatch k act
         if t < target || k < minBatch then pickBatch (k * 2) else return k
@@ -116,17 +114,17 @@ report saltRef db target sql = do
     (tUn, kUn) <- benchOp target (runOnce saltRef db sql False)
     (tOp, kOp) <- benchOp target (runOnce saltRef db sql True)
     let speedup = if tOp <= 0 then 0 else tUn / tOp
-        mismatch = if nUn == nOp then "" else "   <<< 结果不一致！"
+        mismatch = if nUn == nOp then "" else "   <<< result mismatch!"
     printf "%s\n" sql
     printf
-        "    结果行数 %-6d | 未优化 %9.3f ms | 优化后 %9.3f ms | 加速 %6.1fx%s\n"
+        "    rows %-6d | baseline %9.3f ms | optimized %9.3f ms | speedup %6.1fx%s\n"
         nOp
         (tUn * 1000)
         (tOp * 1000)
         speedup
         mismatch
     printf
-        "    （%d 次/批 × %d 批取中位数：未优化 %d 次/批，优化后 %d 次/批）\n\n"
+        "    (%d iters/batch x %d batches, median: baseline %d iters/batch, optimized %d iters/batch)\n\n"
         minBatch
         rounds
         kUn
@@ -152,9 +150,9 @@ main = do
         m = pick 1 500
         target = pick 2 (0.3 :: Double)
         db = [("users", mkUsers n), ("orders", mkOrders n m)]
-    printf "数据规模：users = %d 行，orders = %d 行\n" n m
-    printf "计时方式：CPU 时间；每批至少 %d 次迭代、累计超过 %.2f 秒后固定批次，取 %d 批中位数\n" minBatch target rounds
-    printf "（先跑一遍预热，避免把首次构造数据的开销算进去）\n\n"
+    printf "dataset: users = %d rows, orders = %d rows\n" n m
+    printf "timing: CPU time; at least %d iterations per batch, batch fixed after %.2f s, median of %d batches\n" minBatch target rounds
+    printf "(one warmup run first, so building the data is not counted)\n\n"
     saltRef <- newIORef ""
     _ <- runOnce saltRef db warmupSql False
     _ <- runOnce saltRef db warmupSql True

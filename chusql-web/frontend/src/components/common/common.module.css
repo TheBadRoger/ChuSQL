@@ -1,0 +1,41 @@
+/* 通用组件样式：图标按钮与模态对话框。 */
+.iconButton {
+  align-items: center;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 2px;
+  color: var(--fg-primary);
+  cursor: pointer;
+  display: inline-flex;
+  font: inherit;
+  gap: 6px;
+  height: 24px;
+  padding: 0 7px;
+}
+
+.iconButton:hover:not(:disabled) { background: var(--bg-active); }
+.iconButton:focus-visible { border-color: var(--accent); outline: 0; }
+.iconButton:disabled { color: var(--fg-disabled); cursor: default; }
+.compact { justify-content: center; padding: 0; width: 24px; }
+
+.dialog {
+  background: var(--bg-overlay);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  color: var(--fg-primary);
+  max-height: min(720px, 85vh);
+  max-width: min(760px, 90vw);
+  padding: 0;
+  width: 620px;
+}
+
+.dialog::backdrop { background: rgb(0 0 0 / 55%); }
+.dialogHeader { align-items: center; background: var(--bg-titlebar); display: flex; height: 34px; justify-content: space-between; padding: 0 8px; }
+.dialogHeader h2 { font-size: 13px; margin: 0; }
+.dialogBody { max-height: 60vh; overflow: auto; padding: 12px; }
+.dialogFooter { border-top: 1px solid var(--border); display: flex; gap: 8px; justify-content: flex-end; padding: 8px; }
+.iconButton { flex-shrink: 0; }
+.dialog button:not(.iconButton) { cursor: pointer; min-height: 26px; }
+.dialog button:disabled { cursor: default; opacity: .5; }
+.dialogFooter button, .dialogBody button { background: var(--bg-active); border: 1px solid var(--border); color: var(--fg-primary); padding: 4px 8px; }
+.dialog [role="alert"] { color: var(--danger); }

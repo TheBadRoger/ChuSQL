@@ -5,26 +5,19 @@ use crate::page::{Page, PageFile, PageId};
 
 // 磁盘 B+ 树：节点占一页，文件头记页大小与 order。
 
-// 布局常量
-/// 文件头放在第 0 页
 const META_PAGE: PageId = 0;
-/// 魔数，用来认出索引文件
 const META_MAGIC: &[u8; 4] = b"CBTR";
-/// 文件头各字段的偏移
 const OFF_META_PAGE_SIZE: usize = 4;
 const OFF_META_ORDER: usize = 8;
 const OFF_META_ROOT: usize = 10;
 
-/// 节点类型标记
 const NODE_LEAF: u8 = 0;
 const NODE_INTERNAL: u8 = 1;
-/// 节点内布局的偏移
 const OFF_TYPE: usize = 0;
 const OFF_COUNT: usize = 1;
 const OFF_NEXT: usize = 3;
 const OFF_KEYS: usize = 12;
 
-// 容量计算
 /// 一个节点占多少字节
 fn node_bytes(order: usize) -> usize {
     OFF_KEYS + max_keys(order) * 8 + order * 8
@@ -50,7 +43,6 @@ pub fn max_order(page_size: usize) -> usize {
     page_size.saturating_sub(4) / 16
 }
 
-// 小端读写
 /// 读一个 u8
 fn read_u8(p: &Page, off: usize) -> u8 {
     p.data[off]
@@ -93,7 +85,6 @@ fn write_u64(p: &mut Page, off: usize, v: u64) {
     p.data[off..off + 8].copy_from_slice(&v.to_le_bytes());
 }
 
-// 文件头
 /// 写文件头
 fn write_meta(page: &mut Page, page_size: usize, order: usize, root: PageId) {
     page.zero();
@@ -125,8 +116,6 @@ fn check_meta(page: &Page, page_size: usize, order: usize) -> io::Result<()> {
     Ok(())
 }
 
-// 节点编解码
-/// 节点在内存里的样子
 enum NodeData {
     Leaf {
         keys: Vec<i64>,
@@ -210,8 +199,6 @@ fn child_index(keys: &[i64], key: i64) -> usize {
     lo
 }
 
-// B+ 树
-/// 磁盘 B+ 树
 pub struct DiskBTree {
     file: PageFile,
     order: usize,
@@ -430,12 +417,7 @@ impl DiskBTree {
         }
     }
 
-    /// 删掉一个键；键不存在返回 false。
-    ///
-    /// 这是**惰性删除**：只把叶子里那一对 (key, value) 拿掉，不做合并、也不向兄弟借位。
-    /// 于是树可能变稀、甚至留下空叶子，但查找依然正确——内部节点的分隔键仍然满足
-    /// "小于等于它的往左、大于它的往右"，空叶子二分找不到东西自然返回 None。
-    /// 代价是空间不回收（节点删空了也不还页），整表重写（`clear`）时会一起重建。
+    /// 删掉一个键，键不存在返回 false
     pub fn delete(&mut self, key: i64) -> io::Result<bool> {
         match self.root()? {
             None => Ok(false),

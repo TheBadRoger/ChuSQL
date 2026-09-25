@@ -1,0 +1,67 @@
+全链路基准：Haskell 引擎 ←命名管道→ Rust 存储进程
+存储进程：../../chusql-storage/target\release\server.exe
+管道：chusql-fullchain-145262202226
+数据目录：C:\Users\32402\AppData\Local\Temp\chusql-fullchain-145262202226
+数据规模：users = 1000 行，orders = 1000 行
+计时：墙上时钟（单调）；每条语句都走完整链路
+
+[启动] 存储进程就绪，用时 0.05 s
+
+[建表]
+CREATE TABLE users                          2.3 ms        0 行
+CREATE TABLE orders                         1.6 ms        0 行
+
+[写入：每条 INSERT 都是一次完整落盘]
+1000 条 INSERT INTO users                 2949.8 ms   2.950 ms/条
+1000 条 INSERT INTO orders                3244.4 ms   3.244 ms/条
+
+[分解：同一条 INSERT 拆成两半，都用原始 IPC，不经过引擎]
+CREATE TABLE raw_users                      1.9 ms        0 行
+list_catalog（取结构）                          23.3 ms   0.116 ms/次
+原始 IPC insert × 1000                     2992.4 ms   2.992 ms/条
+
+[读取与查询：整条语句，含引擎侧的解析与语义检查]
+SELECT * FROM users                         1.9 ms     1000 行
+SELECT name FROM users WHERE age > 90       2.5 ms       90 行
+
+[读取与查询：连接]
+JOIN + WHERE（哈希连接）                          5.4 ms       90 行
+
+[点查]
+lookup_by_index（原始 IPC，按 id）                7.7 ms   0.077 ms/次（命中 100/100）
+SELECT ... WHERE id = k（走 Lookup）           0.4 ms        1 行
+
+[批量插入：一条语句带多行，N 行只落一次盘]
+CREATE TABLE batch_t                        3.0 ms        0 行
+多行 INSERT                                  58.8 ms   0.059 ms/行（100 行/条 × 10 条语句）
+
+[行级删除：代价和删几行无关，只和扫描 + 一次落盘有关]
+DELETE FROM users WHERE id = k（1 行）         4.8 ms        0 行
+DELETE FROM users（全部）                      20.2 ms        0 行
+
+[二级索引：没有索引回退扫描，建完索引走索引]
+CREATE TABLE items                          2.1 ms        0 行
+  （先把 1000 行灌进 items：53.2 ms）
+SELECT ... WHERE code = k（无索引）              1.8 ms        1 行
+CREATE INDEX ON items (code)                9.8 ms        0 行
+SELECT ... WHERE code = k（走索引）              0.2 ms        1 行
+
+[数据字典统计]
+  batch_t        1000 行  索引=id
+             统计=age:100 id:1000 name:1000
+  items          1000 行  索引=id code
+             统计=code:1000 id:1000
+  orders         1000 行  索引=id
+             统计=id:1000 product:50 user_id:1000
+  raw_users      1000 行  索引=id
+             统计=age:100 id:1000 name:1000
+  users             0 行  索引=id
+             统计=age:0 id:0 name:0
+
+[校验]
+age > 90 命中 90（按数据分布应为 90 行）
+JOIN 命中 90（每个用户恰好 1 张订单，应与上一行相同 = 90）
+多行 INSERT 灌进去 1000 行（应为 1000）
+二级索引那一行：code = 3501 应该查到 id = 500
+
+[收尾] 停存储进程、清理数据目录

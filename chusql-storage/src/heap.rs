@@ -8,16 +8,9 @@ use crate::page::{Page, PageFile};
 use crate::protocol::Row;
 
 // 堆表：行按插入顺序进页，支持全表扫描、按索引取行、行级删除。
-//
-// 索引由**表自己维护**：有哪些索引记在数据字典里，插入时按索引的列从行里取值写进去，
-// 调用方不需要知道有哪些索引，也不需要自己指定 key。
 
-// 页内布局
-/// 页头：slot_count 占 2 字节
 const HEADER_SIZE: usize = 2;
-/// 一个槽位占 8 字节
 const SLOT_SIZE: usize = 8;
-/// 槽位目录起点
 const SLOT_DIR_START: usize = HEADER_SIZE;
 
 /// 读一个小端 u16
@@ -40,7 +33,6 @@ fn write_u32(buf: &mut [u8], off: usize, v: u32) {
     buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
 }
 
-// 索引位置
 /// (页号, 槽位号) 打包成 u64
 fn pack_position(page_id: PageId, slot: u16) -> u64 {
     (page_id << 16) | (slot as u64)
@@ -59,8 +51,6 @@ fn row_int(row: &Row, column: &str) -> Option<i64> {
     }
 }
 
-// 页内操作
-/// 只管一页里的字节
 pub struct HeapPage;
 
 impl HeapPage {
@@ -115,7 +105,7 @@ impl HeapPage {
         Some(n)
     }
 
-    /// 删掉一个槽位：只把长度置 0，行字节原地留着（读的时候按"长度 0 = 没有这一行"处理）
+    /// 删掉一个槽位，只把长度置 0
     pub fn delete_tuple(page: &mut Page, slot: u16) -> bool {
         let n = Self::slot_count(page);
         if slot >= n {
@@ -150,15 +140,11 @@ impl HeapPage {
     }
 }
 
-// 索引
-/// 表上的一个索引：盯着一列，键是这一列的整数值
 struct NamedIndex {
     column: String,
     tree: DiskBTree,
 }
 
-// 堆表
-/// 一个数据文件 = 若干页；外加若干索引文件
 pub struct HeapTable {
     file: PageFile,
     indexes: Vec<NamedIndex>,
@@ -173,7 +159,7 @@ impl HeapTable {
         })
     }
 
-    /// 打开表 + `id` 列索引（`id` 沿用老文件名 `表名.idx`）
+    /// 打开表并挂上 id 列索引
     pub fn open_indexed<P: AsRef<Path>, Q: AsRef<Path>>(
         path: P,
         index_path: Q,
@@ -189,7 +175,7 @@ impl HeapTable {
         Ok(t)
     }
 
-    /// 打开表 + 任意组索引：(列名, 索引文件路径)
+    /// 打开表并挂上多组索引
     pub fn open_with_indexes<P: AsRef<Path>>(
         path: P,
         indexes: &[(String, std::path::PathBuf)],
@@ -207,7 +193,7 @@ impl HeapTable {
         Ok(t)
     }
 
-    /// 挂上一棵索引树（只打开/创建文件，不填数据）
+    /// 挂上一棵索引树，不填数据
     fn attach_index<P: AsRef<Path>>(
         &mut self,
         column: &str,
@@ -229,11 +215,7 @@ impl HeapTable {
         self.indexes.iter().any(|i| i.column == column)
     }
 
-    /// 建索引：先扫一遍查重，再建树填数据。
-    ///
-    /// **要求这一列的整数取值唯一**，不唯一就报错、一个索引文件都不留。
-    /// 这样"走索引取一行"和"全表扫一遍再筛"必然得到同一个答案；
-    /// 非唯一索引要等 B+ 树支持重复键（记在项目计划的 P2-② 里）。
+    /// 建索引：要求这一列取值唯一
     pub fn build_index(
         &mut self,
         column: &str,
@@ -249,18 +231,17 @@ impl HeapTable {
             ));
         }
 
-        // 第 1 步：扫全表，查重并攒下 (键, 位置)
         let mut seen: HashSet<i64> = HashSet::new();
         let mut entries: Vec<(i64, u64)> = Vec::new();
         for (page_id, slot, r) in self.scan_with_positions()? {
             let Some(k) = row_int(&r, column) else {
-                continue; // 这一列不是整数的行不进索引
+                continue;
             };
             if !seen.insert(k) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
-                        "column \"{}\" has duplicate value {} — 暂不支持非唯一索引",
+                        "column \"{}\" has duplicate value {} -- non-unique indexes are not supported yet",
                         column, k
                     ),
                 ));
@@ -268,10 +249,9 @@ impl HeapTable {
             entries.push((k, pack_position(page_id, slot)));
         }
 
-        // 第 2 步：建树
         self.attach_index(column, path, page_size, btree_order, pool_size)?;
         let i = self.indexes.len() - 1;
-        self.indexes[i].tree.clear()?; // 清掉可能残留的旧文件内容
+        self.indexes[i].tree.clear()?;
         for (k, pos) in entries {
             self.indexes[i].tree.insert(k, pos)?;
         }
@@ -289,19 +269,17 @@ impl HeapTable {
         }
     }
 
-    /// 插入一行：进堆表，并按每个索引的列顺手写索引
+    /// 插入一行，并顺手写各索引
     pub fn insert_row(&mut self, row: &Row) -> io::Result<()> {
         self.insert_row_returning_position(row).map(|_| ())
     }
 
     /// 插入一行并返回它的位置
     pub fn insert_row_returning_position(&mut self, row: &Row) -> io::Result<(PageId, u16)> {
-        // 先把键算好并查重：**查重必须在落堆之前**，
-        // 否则某个索引写不进去时行已经进堆了，表和索引就不一致了。
         let mut pending: Vec<(usize, i64)> = Vec::new();
         for (i, idx) in self.indexes.iter_mut().enumerate() {
             let Some(k) = row_int(row, &idx.column) else {
-                continue; // 这一列不是整数（或没这一列）：这行不进这个索引
+                continue;
             };
             if idx.tree.get(k)?.is_some() {
                 return Err(io::Error::new(
@@ -320,7 +298,7 @@ impl HeapTable {
         Ok((page_id, slot))
     }
 
-    /// 批量插入（只写缓冲池，落盘由调用方 `flush` 一次完成）
+    /// 批量插入，落盘由调用方负责
     pub fn insert_rows(&mut self, rows: &[Row]) -> io::Result<()> {
         for r in rows {
             self.insert_row(r)?;
@@ -387,9 +365,8 @@ impl HeapTable {
         }
     }
 
-    /// 按位置删一行：槽位长度置 0，从所有索引里摘掉，并把这一行交出来
+    /// 按位置删一行并返回它
     pub fn delete_at(&mut self, page_id: PageId, slot: u16) -> io::Result<Option<Row>> {
-        // 先读出来：删完就不知道这行各列是什么，索引也就无从摘起
         let row = self.read_at(page_id, slot)?;
         let existed = self.file.update_page(page_id, |p| HeapPage::delete_tuple(p, slot))?;
         if !existed {
@@ -405,9 +382,7 @@ impl HeapTable {
         Ok(row)
     }
 
-    /// 按 `id` 批量删行，返回被删掉的那些行（数据字典要用它更新统计）。
-    ///
-    /// 定位靠 `id` 索引；没有这个索引就退化成一趟全表扫描（仍然只删目标行）。
+    /// 按 id 批量删行，返回删掉的行
     pub fn delete_by_keys(&mut self, keys: &[i64]) -> io::Result<Vec<Row>> {
         let mut positions: Vec<(PageId, u16)> = Vec::new();
 
@@ -500,7 +475,6 @@ impl HeapTable {
         self.file.flush()
     }
 
-    // 缓冲池统计
     /// 当前缓存页数
     pub fn cached_pages(&self) -> usize { self.file.cached_pages() }
     /// 命中次数

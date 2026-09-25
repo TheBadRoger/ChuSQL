@@ -11,8 +11,6 @@ import qualified Data.HashMap.Strict as HM
 
 -- 执行：按算子树算出结果行（Scan 阶段会加别名前缀）。
 
--- * 工具
-
 -- | 只保留清单里的列
 project :: [String] -> Row -> Row
 project ["*"] row = row
@@ -28,13 +26,10 @@ evalScan db mAlias tbl = do
     table <- lookupTable db tbl
     Right (map (addPrefix mAlias) (tableRows table))
 
--- | 点查退化成"扫描 + 按条件筛"时用的条件：`列 = 值`（列名带上别名前缀）
+-- | 点查退化成扫描时用的条件
 lookupCondition :: Maybe String -> String -> Int -> Expr
 lookupCondition mAlias col k = Eq (Col (qualify mAlias col)) (LitInt k)
 
--- * 等值连接
-
--- | 等值连接的两侧键：左行取哪列、右行取哪列
 data EquiKeys = EquiKeys
     { ekLeft :: String
     , ekRight :: String
@@ -55,12 +50,10 @@ equiKeys lrows rrows (Eq (Col a) (Col b))
     rcols = rowsCols rrows
 equiKeys _ _ _ = Nothing
 
--- | 哈希连接：右表建哈希表，左表逐行探测。
--- 输出顺序与嵌套循环一致（左表顺序为主，右表顺序为辅）。
+-- | 哈希连接，输出顺序同嵌套循环
 hashJoin :: EquiKeys -> [Row] -> [Row] -> [Row]
 hashJoin keys lrows rrows = concatMap probe lrows
   where
-    -- 同一键的右行按原顺序排在桶里
     buckets =
         HM.fromListWith
             (flip (++))
@@ -88,12 +81,9 @@ joinRows cond lrows rrows = case equiKeys lrows rrows cond of
     Just keys -> Right (hashJoin keys lrows rrows)
     Nothing -> filterPairs (evalCondForRow cond) lrows rrows
 
--- * 求值
-
 -- | 纯求值（不需要存储）
 evalRelOp :: Database -> RelOp -> Either String [Row]
 evalRelOp db (Scan mAlias tbl) = evalScan db mAlias tbl
--- 纯求值没有索引可问：退回"扫描 + 按条件筛"，和未优化时的 Filter 完全等价
 evalRelOp db (Lookup mAlias tbl col k) = do
     rows <- evalScan db mAlias tbl
     filterM (evalCondForRow (lookupCondition mAlias col k)) rows
@@ -114,7 +104,7 @@ evalRelOp db (Join left right cond) = do
     rrows <- evalRelOp db right
     joinRows cond lrows rrows
 
--- | 单子求值：Lookup 先问存储有没有索引，没有就退回扫描
+-- | 单子求值：点查先问存储有无索引
 evalRelOpM :: (MonadStorage m) => RelOp -> m (Either String [Row])
 evalRelOpM (Scan mAlias t) = do
     result <- scan t
@@ -127,7 +117,6 @@ evalRelOpM (Lookup mAlias t col k) = do
     result <- lookupByColumn t col k
     case result of
         Left e -> pure (Left e)
-        -- 这个列上没有索引：老老实实扫一遍（结果和未优化时一样）
         Right NoIndex -> do
             rows <- evalRelOpM (Scan mAlias t)
             pure $ do

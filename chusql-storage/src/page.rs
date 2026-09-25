@@ -5,15 +5,11 @@ use std::path::Path;
 
 // 页管理：定长页的读写，外加一层页缓冲池。
 
-// 页
-/// 页号：从 0 开始
 pub type PageId = u64;
 
-/// 缓冲池默认容量（页数）
 pub const DEFAULT_POOL_SIZE: usize = 64;
 
 #[derive(Debug, Clone)]
-/// 一页：定长字节 + 页号
 pub struct Page {
     pub id: PageId,
     pub data: Vec<u8>,
@@ -35,7 +31,6 @@ impl Page {
 }
 
 #[derive(Debug)]
-/// 页文件：定长页读写 + 页缓存
 pub struct PageFile {
     file: File,
     page_size: usize,
@@ -84,7 +79,6 @@ impl PageFile {
         self.page_size
     }
 
-// 缓冲池
     /// 池容量（页数）
     pub fn capacity(&self) -> usize {
         self.capacity
@@ -188,7 +182,7 @@ impl PageFile {
         Ok(r)
     }
 
-    /// 记一次访问：命中加 hits，未命中读进来并记 misses
+    /// 记一次访问：命中 / 未命中都记数
     fn note_access(&mut self, id: PageId) -> io::Result<()> {
         if self.cache.contains_key(&id) {
             self.hits += 1;
@@ -287,7 +281,6 @@ impl PageFile {
     }
 }
 
-    /// 退出前把脏页写回
 impl Drop for PageFile {
     fn drop(&mut self) {
         let _ = self.flush();

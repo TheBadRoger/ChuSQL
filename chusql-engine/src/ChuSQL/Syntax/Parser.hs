@@ -15,10 +15,7 @@ import Text.Megaparsec.Char.Lexer qualified as Lxr
 
 -- SQL 解析：词法 + 语法，把文本变成语句树。
 
--- * 词法
--- | 解析器类型
 type Parser = Parsec Void String
-
 
 -- | 跳过空白
 sc :: Parser ()
@@ -32,9 +29,6 @@ lexeme = Lxr.lexeme sc
 symbol :: String -> Parser String
 symbol = Lxr.symbol sc
 
-{- | 大小写不敏感的关键字；其后不能紧跟标识符字符，避免把 @selection@ 读成 @select@。
-整体用 'try' 包住：否则 @ORDER@ 会被 @keyword "or"@ 吃掉前缀 @OR@ 再报错，导致无法回溯。
--}
 -- | 读关键字（不分大小写）
 keyword :: String -> Parser ()
 keyword k = lexeme $ try $ do
@@ -64,9 +58,6 @@ stringLit = lexeme $ do
     _ <- char '\''
     return s
 
-{- | 字符串内的一个字符：@''@ 折叠成一个单引号，其余字符（含反斜杠）原样保留。
-两个分支都不会在失败时消耗输入，因此可以安全地放进 'many'。
--}
 -- | 字符串里的一个字符
 stringChar :: Parser Char
 stringChar =
@@ -75,7 +66,6 @@ stringChar =
         , satisfy (/= '\'')
         ]
 
--- * 子句
 -- | 升序或降序
 sortDir :: Parser SortDir
 sortDir = (Desc <$ keyword "desc") <|> (Asc <$ keyword "asc") <|> pure Asc
@@ -94,31 +84,29 @@ qualifiedName = do
     return (intercalate "." (first : rest))
 
 
--- * 表达式
 -- | 读一个表达式
 expr :: Parser Expr
 expr = makeExprParser atom operatorTable
 
-{- | 运算符表。注意 'makeExprParser' 要求各层按优先级从高到低排列：
-比较运算符绑定最紧，'AND' 次之，'OR' 最松。
--}
 -- | 运算符优先级（从紧到松）
 operatorTable :: [[Operator Parser Expr]]
 operatorTable =
     [
-        [ InfixN (Gt <$ symbol ">") -- 最高优先级
+        [ InfixN (Gt <$ symbol ">")
         , InfixN (Lt <$ symbol "<")
         , InfixN (Eq <$ symbol "=")
         ]
     , [InfixL (And <$ keyword "AND")]
-    , [InfixL (Or <$ keyword "OR")] -- 最低优先级
+    , [InfixL (Or <$ keyword "OR")]
     ]
 
 -- | 最小的表达式单位
 atom :: Parser Expr
 atom =
     choice
-        [ LitInt <$> integer
+        [ LitBool True <$ keyword "TRUE"
+        , LitBool False <$ keyword "FALSE"
+        , LitInt <$> integer
         , LitStr <$> stringLit
         , Col <$> qualifiedName
         , between (symbol "(") (symbol ")") expr
@@ -148,7 +136,6 @@ assignment = do
     return (col, e)
 
 
--- | 保留字清单
 reservedWords :: [String]
 reservedWords =
     [ "select"
@@ -173,12 +160,10 @@ reservedWords =
     , "table"
     , "index"
     , "drop"
+    , "alter"
+    , "column"
     ]
 
-{- | 表别名。别名不能是保留字：否则 @FROM users WHERE age > 18@ 会把 @WHERE@
-当成 @users@ 的别名吃掉，后面真正的 WHERE 子句就再也解析不到。
-用 'try' 包住，一旦命中保留字就整体回溯，让 'optional' 正常返回 'Nothing'。
--}
 -- | 别名（不许用保留字）
 aliasName :: Parser String
 aliasName = try $ do
@@ -234,7 +219,7 @@ dropTableStatement = do
     name <- identifier
     return (DropTable name)
 
--- | 读 CREATE INDEX（列名即索引名：一列最多一个索引）
+-- | 读 CREATE INDEX（列名即索引名）
 createIndexStatement :: Parser Statement
 createIndexStatement = do
     keyword "create"
@@ -254,6 +239,17 @@ dropIndexStatement = do
     col <- between (symbol "(") (symbol ")") identifier
     return (DropIndex tbl col)
 
+-- | 读 ALTER TABLE ... DROP COLUMN
+alterDropColumnStatement :: Parser Statement
+alterDropColumnStatement = do
+    keyword "alter"
+    keyword "table"
+    tbl <- identifier
+    keyword "drop"
+    keyword "column"
+    col <- identifier
+    return (DropColumn tbl col)
+
 -- | 建表时的一列
 columnDef :: Parser (String, Column)
 columnDef = do
@@ -272,7 +268,6 @@ columnType =
         <|> (keyword "boolean" >> pure TBool)
         <|> (keyword "bool" >> pure TBool)
 
--- * 语句
 -- | 读 SELECT
 selectStatement :: Parser Statement
 selectStatement = do
@@ -292,7 +287,7 @@ selectStatement = do
             , selectLimit = mLimit
             }
 
--- | 读 INSERT：`VALUES (...)` 后面可以跟多个括号，一次插多行
+-- | 读 INSERT，可一次插多行
 insertStatement :: Parser Statement
 insertStatement = do
     keyword "INSERT"
@@ -330,7 +325,6 @@ updateStatement = do
     mWhere <- optional (keyword "where" *> expr)
     return (Update tbl assigns mWhere)
 
--- * 入口
 -- | 解析总入口
 parseStatement :: String -> Either String Statement
 parseStatement input =
@@ -338,10 +332,7 @@ parseStatement input =
         Left err -> Left (errorBundlePretty err)
         Right q -> Right q
   where
-    -- \| 依次尝试各种语句。
-    -- `CREATE` / `DROP` 后面跟的词决定是哪条语句，而 `keyword` 的 `try` 只能回溯到
-    -- "这个词之前"——`CREATE` 一旦被吃掉就没得退了。所以带 `INDEX` 的那两个各自
-    -- 用 `try` 包住并排在前面：`CREATE INDEX ...` 先试，退回来再试 `CREATE TABLE ...`。
+    -- \| 依次尝试各种语句
     statementP =
         selectStatement
             <|> insertStatement
@@ -350,4 +341,5 @@ parseStatement input =
             <|> try createIndexStatement
             <|> try createTableStatement
             <|> try dropIndexStatement
+            <|> try alterDropColumnStatement
             <|> dropTableStatement

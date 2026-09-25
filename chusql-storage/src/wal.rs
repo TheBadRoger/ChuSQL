@@ -1,4 +1,3 @@
-
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -14,20 +13,18 @@ const OP_INSERT: u8 = 1;
 const OP_REPLACE_ALL: u8 = 2;
 const OP_INSERT_BATCH: u8 = 3;
 const OP_DELETE_KEYS: u8 = 4;
+const OP_DROP_COLUMN: u8 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-/// 一条待写入的操作
 pub enum WalOp {
     Insert {
         table: String,
         row: Row,
     },
-    /// 一批行：一次日志、一次 fsync 就能全部落盘
     InsertBatch {
         table: String,
         rows: Vec<Row>,
     },
-    /// 按 id 批量删行（重放是幂等的：再删一次等于什么都没删）
     DeleteKeys {
         table: String,
         keys: Vec<i64>,
@@ -36,20 +33,25 @@ pub enum WalOp {
         table: String,
         rows: Vec<Row>,
     },
+    DropColumn {
+        table: String,
+        column: String,
+        rows: Vec<Row>,
+    },
 }
 
-/// WAL 文件
-///
-/// 句柄只开一次并一直留着：写入路径是每条操作一次
-/// `truncate -> append -> truncate`，每次都重新 open/close 文件要多花
-/// 一倍的时间（见 benchmark/chusql-storage）。
+#[derive(Debug, Serialize, Deserialize)]
+struct DropColumnPayload {
+    column: String,
+    rows: Vec<Row>,
+}
+
 pub struct Wal {
     path: PathBuf,
     handle: Mutex<Option<File>>,
 }
 
 impl Wal {
-    // 读写
     /// 绑定 WAL 文件路径
     pub fn new<P: AsRef<Path>>(path: P) -> Self {
         Wal {
@@ -87,8 +89,7 @@ impl Wal {
         })
     }
 
-    /// 只截断、不落盘：紧跟其后的 `append` 会 fsync，
-    /// 那一次会把截断一起落下去，所以这里不必单独再刷一遍。
+    /// 只截断，落盘交给紧随的 append
     pub fn truncate(&self) -> io::Result<()> {
         self.with_handle(truncate)
     }
@@ -123,14 +124,13 @@ impl Wal {
     }
 }
 
-/// 清空文件并回到起点（句柄不是 append 模式，位置要自己摆正）
+/// 清空文件并把读写位置归零
 fn truncate(f: &mut File) -> io::Result<()> {
     f.set_len(0)?;
     f.seek(SeekFrom::Start(0))?;
     Ok(())
 }
 
-// 编解码
 /// 把操作编成字节
 fn encode(op: &WalOp) -> io::Result<Vec<u8>> {
     let (op_type, table, payload) = match op {
@@ -149,6 +149,14 @@ fn encode(op: &WalOp) -> io::Result<Vec<u8>> {
         WalOp::ReplaceAll { table, rows } => {
             let p = serde_json::to_vec(rows).map_err(io::Error::other)?;
             (OP_REPLACE_ALL, table.clone(), p)
+        }
+        WalOp::DropColumn { table, column, rows } => {
+            let p = serde_json::to_vec(&DropColumnPayload {
+                column: column.clone(),
+                rows: rows.clone(),
+            })
+            .map_err(io::Error::other)?;
+            (OP_DROP_COLUMN, table.clone(), p)
         }
     };
 
@@ -213,6 +221,15 @@ fn decode(buf: &[u8]) -> Result<Option<WalOp>, String> {
             let rows: Vec<Row> = serde_json::from_slice(payload)
                 .map_err(|e| format!("bad replace_all payload: {}", e))?;
             WalOp::ReplaceAll { table, rows }
+        }
+        OP_DROP_COLUMN => {
+            let p: DropColumnPayload = serde_json::from_slice(payload)
+                .map_err(|e| format!("bad drop_column payload: {}", e))?;
+            WalOp::DropColumn {
+                table,
+                column: p.column,
+                rows: p.rows,
+            }
         }
         other => return Err(format!("unknown op type: {}", other)),
     };

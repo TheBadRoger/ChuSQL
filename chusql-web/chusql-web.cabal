@@ -1,0 +1,87 @@
+cabal-version: 2.4
+
+name:           chusql-web
+version:        1.0.0
+synopsis:       ChuSQL Web 管理端：Scotty + REST API + 静态页面
+description:    ChuSQL 的浏览器管理端。负责 HTTP 交付、鉴权、静态文件，
+                以及把用户 SQL 转交给 chusql-engine（再由 IPC 打到 Rust 存储进程）。
+build-type:     Simple
+
+library
+    hs-source-dirs:   src
+    exposed-modules:  ChuSQL.Web.Actions
+                      ChuSQL.Web.Api
+                      ChuSQL.Web.Auth
+                      ChuSQL.Web.Backend
+                      ChuSQL.Web.Config
+                      ChuSQL.Web.Demo
+                      ChuSQL.Web.RateLimit
+                      ChuSQL.Web.Secure
+                      ChuSQL.Web.Settings
+                      ChuSQL.Web.Static
+                      ChuSQL.Web.StorageProcess
+                      ChuSQL.Web.UiSettings
+    build-depends:    base >= 4.14 && < 5
+                    , aeson
+                    , bytestring
+                    , chusql-engine
+                    , containers
+                    , crypton
+                    , directory
+                    , filepath
+                    , http-types
+                    , memory
+                    , process
+                    , scientific
+                    , scotty
+                    , text
+                    , time
+                    , vector
+                    , wai
+    default-language: Haskell2010
+    ghc-options:      -Wall
+
+executable chusql-web
+    main-is:          Main.hs
+    hs-source-dirs:   app
+    build-depends:    base
+                    , bytestring
+                    , chusql-engine
+                    , chusql-web
+                    , crypton
+                    , directory
+                    , filepath
+                    , http-types
+                    , memory
+                    , text
+                    , time
+                    , wai
+                    , warp
+    default-language: Haskell2010
+    ghc-options:      -Wall
+
+test-suite chusql-web-test
+    type:             exitcode-stdio-1.0
+    main-is:          Spec.hs
+    hs-source-dirs:   test
+    build-depends:    base
+                    , aeson
+                    , bytestring
+                    , chusql-engine
+                    , chusql-web
+                    , containers
+                    , directory
+                    , filepath
+                    , hspec
+                    , hspec-wai
+                    , http-client
+                    , http-types
+                    , process
+                    , text
+                    , time
+                    , vector
+                    , wai
+                    , wai-extra
+                    , warp
+    default-language: Haskell2010
+    ghc-options:      -Wall

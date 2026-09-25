@@ -6,7 +6,6 @@ import Control.Monad (join)
 
 -- 表达式求值：拿一行数据算出一个值。
 
--- * 求值
 -- | 在一行上求出表达式的值
 evalExpr :: Expr -> Row -> Either String Value
 evalExpr (Col name) row =
@@ -20,7 +19,6 @@ evalExpr (Eq a b) row = liftBinOp eqOp a b row
 evalExpr (And a b) row = liftBinOp (boolOp (&&)) a b row
 evalExpr (Or a b) row = liftBinOp (boolOp (||)) a b row
 
--- * 列引用
 -- | 表达式用到了哪些列
 colsInExpr :: Expr -> [String]
 colsInExpr (Col c) = [c]
@@ -39,7 +37,6 @@ evalCondForRow e row = do
         VBool b -> Right b
         _ -> Left "type error: WHERE condition must be a boolean"
 
--- * 内部
 -- | 把二元运算提升到 Either
 liftBinOp ::
     (Value -> Value -> Either String Value) ->
