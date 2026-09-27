@@ -35,7 +35,6 @@ describe('uiSettings', () => {
       sqlLineNumbers: false,
       autocomplete: 'yes',
       minimap: true,
-      confirmBeforeCommit: 1,
       unknownKey: 5,
     }), { status: 200 }));
     vi.stubGlobal('fetch', request);

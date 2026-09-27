@@ -1403,7 +1403,7 @@ settingsSpec staticDir = do
 
 -- | 一份完整的合法 IDE 设置请求体
 uiSettingsBody :: BL.ByteString
-uiSettingsBody = "{\"uiFonts\":[\"JetBrains Mono\",\"Consolas\"],\"gridFonts\":[\"Consolas\"],\"sqlFonts\":[\"Mono\"],\"uiFontSize\":13,\"gridFontSize\":12,\"gridRowHeight\":24,\"sqlFontSize\":13,\"sqlLineHeight\":20,\"sqlTabSize\":2,\"pageSize\":200,\"nullText\":\"NULL\",\"sqlLineNumbers\":true,\"autocomplete\":true,\"minimap\":false,\"confirmBeforeCommit\":true}"
+uiSettingsBody = "{\"uiFonts\":[\"JetBrains Mono\",\"Consolas\"],\"gridFonts\":[\"Consolas\"],\"sqlFonts\":[\"Mono\"],\"uiFontSize\":13,\"gridFontSize\":12,\"gridRowHeight\":24,\"sqlFontSize\":13,\"sqlLineHeight\":20,\"sqlTabSize\":2,\"pageSize\":200,\"nullText\":\"NULL\",\"sqlLineNumbers\":true,\"autocomplete\":true,\"minimap\":false}"
 
 -- | 上面那份设置解出来的值
 fullUiSettings :: A.Value

@@ -99,6 +99,3 @@ chusql-web/static/
 Thumbs.db
 ehthumbs.db
 desktop.ini
-
-# Isolated UI verification build (the live server may lock the default executable)
-.stack-work-ui/

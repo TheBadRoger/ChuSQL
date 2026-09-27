@@ -80,7 +80,6 @@ validateUiSettings (A.Object o) = Map.fromList <$> mapM checkField (KM.toList o)
                 "sqlLineNumbers" -> pair key <$> boolValue key value
                 "autocomplete" -> pair key <$> boolValue key value
                 "minimap" -> pair key <$> boolValue key value
-                "confirmBeforeCommit" -> pair key <$> boolValue key value
                 _ -> Left ("unknown setting: " ++ T.unpack key)
 
     pair key value = (key, value)

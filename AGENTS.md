@@ -35,7 +35,7 @@
 4. **等价改造不许改结果**。典型：等值连接换哈希表，输出顺序必须和嵌套循环一致（左表序为主、右表序为辅，同键下右行保序）；认不出等值键或某侧空表时退回嵌套循环（决策 9）。
 5. **存储接口分 `schema` 与 `snapshot`**：语义检查与优化只走 `schema`，不许再拉全库行（决策 10）。
 6. **测试的位置约定**：Haskell 引擎测试全部在 `chusql-engine/test/Spec.hs`；Web 在 `chusql-web/test/Spec.hs`（web 是独立包，不能反向依赖 engine 的测试）；Rust 在 `chusql-storage/tests/*_test.rs`，另有 `src/log.rs` 里 3 条单元测试。新增测试放同一处，不另起目录。
-7. **只留根目录一个 README**：性能基准的跑法/结果/踩坑都写进 `README.md`；设计长文写 `docs/ENGINE_INTRO.md`、`docs/STORAGE_INTRO.md`，P3 的规格写 `docs/WEB_SPEC.md`。
+7. **只留根目录一个 README**：性能基准的跑法/结果/踩坑都写进 `README.md`；设计长文写 `docs/ENGINE_INTRO.md`、`docs/STORAGE_INTRO.md`，CLI 与接口说明写 `docs/COMMANDS.md`。
 8. 改任何**决策**或**已知问题**，同一轮内更新 `projectplan.txt`。
 
 ---
