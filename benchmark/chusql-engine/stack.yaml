@@ -1,5 +1,0 @@
-resolver: lts-24.59
-
-packages:
-    - .
-    - ../../chusql-engine

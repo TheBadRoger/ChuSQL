@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE OverloadedStrings #-}
 
@@ -5,10 +6,14 @@ module ChuSQL.Storage.IPC (
     IPCStorage (..),
     Request (..),
     Response (..),
+    Account (..),
     SchemaColumn (..),
     TableInfo (..),
     sendRequest,
     closeConnection,
+    defaultPipeName,
+    setPipeName,
+    getPipeName,
     doListTables,
     doLookupByColumn,
     doInsert,
@@ -21,8 +26,11 @@ module ChuSQL.Storage.IPC (
 
 import ChuSQL.Model
 import ChuSQL.Storage
-import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar)
+import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar, readMVar)
 import Control.Exception (IOException, try)
+#if !defined(mingw32_HOST_OS)
+import Control.Exception (onException)
+#endif
 import Data.Aeson (FromJSON (..), ToJSON (..), eitherDecodeStrict, encode, object, withObject, (.:), (.:?), (.!=), (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as K
@@ -30,13 +38,24 @@ import Data.Aeson.KeyMap qualified as KM
 import Data.Aeson.Types (Parser)
 import Data.ByteString.Char8 qualified as BSC
 import Data.ByteString.Lazy qualified as BL
-import Data.Scientific (floatingOrInteger)
+import Data.Maybe (fromMaybe)
+import Data.Scientific (floatingOrInteger, fromFloatDigits)
 import Data.Text qualified as T
-import System.Environment (lookupEnv)
 import System.IO
 import System.IO.Unsafe (unsafePerformIO)
+#if !defined(mingw32_HOST_OS)
+import Network.Socket (Family (AF_UNIX), SockAddr (SockAddrUnix), SocketType (Stream), close, connect, defaultProtocol, socket, socketToHandle)
+import System.Environment (lookupEnv)
+#endif
 
 -- IPC 存储实现：每个存储方法翻成管道上的一条 JSON 请求。
+-- 端点：Windows 是具名管道 \\.\pipe\<name>，Unix 是文件系统套接字 <dir>/<name>.sock。
+
+#if !defined(mingw32_HOST_OS)
+-- | Unix 套接字路径的最大长度（Linux 108 含结尾 NUL，BSD 104，这里留余量）
+maxSocketPathLength :: Int
+maxSocketPathLength = 100
+#endif
 
 newtype IPCStorage a = IPCStorage
     { runIPCStorage :: IO a
@@ -58,13 +77,37 @@ instance Monad IPCStorage where
 connectionRef :: MVar (Maybe (FilePath, Handle))
 connectionRef = unsafePerformIO (newMVar Nothing)
 
--- | 打开管道
+-- | 打开端点连接：Windows 把管道当文件打开，Unix 连一个 AF_UNIX 套接字
 openPipe :: FilePath -> IO Handle
+#if defined(mingw32_HOST_OS)
 openPipe path = do
     h <- openFile path ReadWriteMode
     hSetBuffering h LineBuffering
     hSetNewlineMode h noNewlineTranslation
     pure h
+#else
+openPipe path = do
+    if length path > maxSocketPathLength
+        then ioError (userError ("socket path too long (" ++ show (length path) ++ " bytes): " ++ path))
+        else pure ()
+    sock <- socket AF_UNIX Stream defaultProtocol
+    connect sock (SockAddrUnix path) `onException` close sock
+    h <- socketToHandle sock ReadWriteMode
+    hSetBuffering h LineBuffering
+    hSetNewlineMode h noNewlineTranslation
+    pure h
+
+-- | Unix 套接字目录：$XDG_RUNTIME_DIR → $TMPDIR → /tmp（与 Rust 侧同一规则）
+socketDir :: IO String
+socketDir = do
+    runtime <- fmap nonEmpty (lookupEnv "XDG_RUNTIME_DIR")
+    tmp <- fmap nonEmpty (lookupEnv "TMPDIR")
+    pure (fromMaybe "/tmp" (runtime <> tmp))
+  where
+    nonEmpty v = case v of
+        Just s | not (null s) -> Just s
+        _ -> Nothing
+#endif
 
 -- | 关掉缓存里的句柄（没有就什么都不做）
 closeCached :: Maybe (FilePath, Handle) -> IO ()
@@ -91,11 +134,34 @@ dropConnection = modifyMVar_ connectionRef $ \cached -> do
 closeConnection :: IO ()
 closeConnection = dropConnection
 
--- | 管道路径
+-- | 没配置管名时用的端点，与 chusql.toml 的 [server] pipe_name 默认值一致
+defaultPipeName :: String
+defaultPipeName = "chusql-joint"
+
+{-# NOINLINE pipeNameRef #-}
+pipeNameRef :: MVar String
+pipeNameRef = unsafePerformIO (newMVar defaultPipeName)
+
+-- | 设定本进程要连的端点；配置从哪来由调用方决定（本层不读环境变量）
+setPipeName :: String -> IO ()
+setPipeName name = modifyMVar_ pipeNameRef (\_ -> pure name)
+
+-- | 当前端点
+getPipeName :: IO String
+getPipeName = readMVar pipeNameRef
+
+-- | 端点的完整路径
 pipePath :: IO String
+#if defined(mingw32_HOST_OS)
 pipePath = do
-    name <- maybe "chusql-storage" id <$> lookupEnv "CHUSQL_PIPE"
+    name <- getPipeName
     pure ("\\\\.\\pipe\\" ++ name)
+#else
+pipePath = do
+    name <- getPipeName
+    dir <- socketDir
+    pure (dir ++ "/" ++ name ++ ".sock")
+#endif
 
 -- | 发一条请求，管道不通就重连
 sendRequest :: Request -> IO Response
@@ -124,38 +190,83 @@ roundTrip req path = do
 data SchemaColumn = SchemaColumn
     { scName :: String
     , scType :: String
+    , scNullable :: Bool
+    , scDefault :: Maybe Value
+    , scAutoIncrement :: Bool
+    , scPrimaryKey :: Bool
+    , scUnique :: Bool
+    , scCheck :: Maybe String
     }
     deriving (Show, Eq)
 
 instance ToJSON SchemaColumn where
-    toJSON (SchemaColumn n t) = object ["name" .= n, "ty" .= t]
+    toJSON sc =
+        object
+            [ "name" .= scName sc
+            , "ty" .= scType sc
+            , "nullable" .= scNullable sc
+            , "default" .= fmap valueToJSON (scDefault sc)
+            , "auto_increment" .= scAutoIncrement sc
+            , "primary_key" .= scPrimaryKey sc
+            , "unique" .= scUnique sc
+            , "check" .= scCheck sc
+            ]
 
 instance FromJSON SchemaColumn where
     parseJSON = withObject "SchemaColumn" $ \o -> do
         n <- o .: "name"
         t <- o .: "ty"
-        pure (SchemaColumn n t)
+        nullable <- o .:? "nullable" .!= True
+        defJson <- o .:? "default"
+        def <- mapM valueFromJSON defJson
+        auto <- o .:? "auto_increment" .!= False
+        pk <- o .:? "primary_key" .!= False
+        uniq <- o .:? "unique" .!= False
+        chk <- o .:? "check"
+        pure (SchemaColumn n t nullable def auto pk uniq chk)
 
 data Request
     = ReqPing
+    | ReqDatabase String String
+    | ReqAllCatalog
+    | ReqInDatabase String Request
+    | ReqAccountsList
+    | ReqAccountCreate T.Text T.Text
+    | ReqAccountReset T.Text T.Text
+    | ReqAccountLogin T.Text (Maybe T.Text)
+    | ReqAccountDrop T.Text
     | ReqScan String
+    | ReqScanColumns String [String]
     | ReqInsert String Row
     | ReqInsertBatch String [Row]
     | ReqDeleteKeys String [Int]
     | ReqReplaceAll String [Row]
     | ReqListTables
-    | ReqLookupByColumn String String Int
+    | ReqLookupByColumn String String Value
+    | ReqRangeByIndex String String (Maybe (Value, Bool)) (Maybe (Value, Bool))
     | ReqDescribeTable String
     | ReqCreateTable String [SchemaColumn]
     | ReqDropTable String
     | ReqCreateIndex String String
     | ReqDropIndex String String
     | ReqDropColumn String String
+    | ReqReplaceSchema String [SchemaColumn] [Row]
     | ReqListCatalog
 
 instance ToJSON Request where
+    toJSON (ReqDatabase method name) = object ["method" .= method, "database" .= name]
+    toJSON ReqAllCatalog = object ["method" .= ("all_catalogs" :: T.Text)]
+    toJSON (ReqInDatabase name req) = case toJSON req of
+        A.Object fields -> A.Object (KM.insert "database" (A.String (T.pack name)) fields)
+        other -> other
+    toJSON ReqAccountsList = object ["method" .= ("accounts_list" :: T.Text)]
+    toJSON (ReqAccountCreate u h) = object ["method" .= ("account_create" :: T.Text), "user" .= u, "password_hash" .= h]
+    toJSON (ReqAccountReset u h) = object ["method" .= ("account_reset" :: T.Text), "user" .= u, "password_hash" .= h]
+    toJSON (ReqAccountLogin u at) = object ["method" .= ("account_login" :: T.Text), "user" .= u, "at" .= at]
+    toJSON (ReqAccountDrop u) = object ["method" .= ("account_drop" :: T.Text), "user" .= u]
     toJSON ReqPing = object ["method" .= ("ping" :: T.Text)]
     toJSON (ReqScan t) = object ["method" .= ("scan" :: T.Text), "table" .= t]
+    toJSON (ReqScanColumns t cols) = object ["method" .= ("scan" :: T.Text), "table" .= t, "columns" .= cols]
     toJSON (ReqInsert t r) =
         object
             [ "method" .= ("insert" :: T.Text)
@@ -186,7 +297,17 @@ instance ToJSON Request where
             [ "method" .= ("lookup_by_index" :: T.Text)
             , "table" .= t
             , "column" .= c
-            , "key" .= k
+            , "key" .= valueToJSON k
+            ]
+    toJSON (ReqRangeByIndex t c lo hi) =
+        object
+            [ "method" .= ("range_by_index" :: T.Text)
+            , "table" .= t
+            , "column" .= c
+            , "lo" .= fmap (valueToJSON . fst) lo
+            , "lo_inclusive" .= maybe True snd lo
+            , "hi" .= fmap (valueToJSON . fst) hi
+            , "hi_inclusive" .= maybe True snd hi
             ]
     toJSON (ReqDescribeTable t) =
         object
@@ -219,6 +340,13 @@ instance ToJSON Request where
             , "table" .= t
             , "column" .= c
             ]
+    toJSON (ReqReplaceSchema t cols rs) =
+        object
+            [ "method" .= ("replace_schema" :: T.Text)
+            , "table" .= t
+            , "columns" .= cols
+            , "rows" .= map rowToJSON rs
+            ]
     toJSON ReqListCatalog = object ["method" .= ("list_catalog" :: T.Text)]
 
 data TableInfo = TableInfo
@@ -230,8 +358,31 @@ data TableInfo = TableInfo
     }
     deriving (Show, Eq)
 
+data Account = Account
+    { accountId :: Integer
+    , accountUser :: T.Text
+    , accountHash :: T.Text
+    , accountRevision :: Integer
+    , accountRegisteredAt :: T.Text
+    , accountLastLoginAt :: Maybe T.Text
+    } deriving (Eq)
+
+instance Show Account where
+    show a = "Account " ++ show (accountUser a) ++ " revision=" ++ show (accountRevision a)
+
+instance FromJSON Account where
+    parseJSON = withObject "Account" $ \o -> Account <$> o .: "id" <*> o .: "user"
+        <*> o .: "password_hash" <*> o .: "revision"
+        <*> o .:? "registered_at" .!= "" <*> o .:? "last_login_at"
+
+instance ToJSON Account where
+    toJSON a = object ["id" .= accountId a, "user" .= accountUser a,
+        "password_hash" .= accountHash a, "revision" .= accountRevision a,
+        "registered_at" .= accountRegisteredAt a, "last_login_at" .= accountLastLoginAt a]
+
 data Response
     = RespPong
+    | RespAccounts [Account]
     | RespRows [Row]
     | RespTables [String]
     | RespSchema TableInfo
@@ -244,6 +395,7 @@ instance FromJSON Response where
     parseJSON = withObject "Response" $ \o -> do
         status <- o .: "status"
         case status :: T.Text of
+            "accounts" -> RespAccounts <$> o .: "accounts"
             "pong" -> pure RespPong
             "ok" -> pure RespOk
             "no_index" -> pure RespNoIndex
@@ -256,7 +408,6 @@ instance FromJSON Response where
                 RespCatalog <$> mapM parseTable xs
             other -> fail ("unknown status: " ++ T.unpack other)
       where
-        -- \| 解一张表的 schema
         parseTable :: A.Value -> Parser TableInfo
         parseTable = withObject "TableInfo" $ \o -> do
             t <- o .: "table"
@@ -268,7 +419,6 @@ instance FromJSON Response where
             stats <- mapM parseStat (sts :: [A.Value])
             pure (TableInfo t cols cnt idxCols stats)
 
-        -- \| 解一条列统计
         parseStat :: A.Value -> Parser (String, Int, Bool)
         parseStat = withObject "ColumnStat" $ \o -> do
             name <- o .: "name"
@@ -278,16 +428,19 @@ instance FromJSON Response where
 
 -- | 值编码成 JSON
 valueToJSON :: Value -> A.Value
+valueToJSON VNull = A.Null
 valueToJSON (VInt n) = A.Number (fromIntegral n)
+valueToJSON (VFloat d) = A.Number (fromFloatDigits d)
 valueToJSON (VStr s) = A.String (T.pack s)
 valueToJSON (VBool b) = A.Bool b
 
 -- | JSON 解回值
 valueFromJSON :: A.Value -> Parser Value
+valueFromJSON A.Null = pure VNull
 valueFromJSON (A.Number n) =
     case floatingOrInteger n :: Either Double Integer of
         Right i -> pure (VInt (fromIntegral i))
-        Left _ -> fail "non-integer number"
+        Left d -> pure (VFloat d)
 valueFromJSON (A.String s) = pure (VStr (T.unpack s))
 valueFromJSON (A.Bool b) = pure (VBool b)
 valueFromJSON _ = fail "unsupported value type"
@@ -301,7 +454,6 @@ rowToJSON r =
 rowFromJSON :: A.Value -> Parser Row
 rowFromJSON (A.Object o) = mapM toPair (KM.toList o)
   where
-    -- \| 解一个键值对
     toPair (k, v) = do
         val <- valueFromJSON v
         pure (K.toString k, val)
@@ -356,12 +508,23 @@ doListCatalog = ask "list_catalog" ReqListCatalog $ \resp -> case resp of
     RespCatalog xs -> Just xs
     _ -> Nothing
 
--- | 按某一列的索引取一行
-doLookupByColumn :: String -> String -> Int -> IO (Either String IndexResult)
+-- | 按某一列的索引取一行（键可以是整数或字符串）
+doLookupByColumn :: String -> String -> Value -> IO (Either String IndexResult)
 doLookupByColumn t c k = ask "lookup_by_index" (ReqLookupByColumn t c k) $ \resp -> case resp of
-    RespRows [] -> Just (IndexRow Nothing)
-    RespRows (r : _) -> Just (IndexRow (Just r))
+    RespRows rows -> Just (IndexRows rows)
     RespNoIndex -> Just NoIndex
+    _ -> Nothing
+
+-- | 范围扫描：没有可用索引就回 Nothing，让上层退回扫描
+doScanRange ::
+    String ->
+    String ->
+    Maybe (Value, Bool) ->
+    Maybe (Value, Bool) ->
+    IO (Either String (Maybe [Row]))
+doScanRange t c lo hi = ask "range_by_index" (ReqRangeByIndex t c lo hi) $ \resp -> case resp of
+    RespRows rows -> Just (Just rows)
+    RespNoIndex -> Just Nothing
     _ -> Nothing
 
 -- | 发 DescribeTable
@@ -382,6 +545,10 @@ doDropIndex t c = ask "drop_index" (ReqDropIndex t c) okOnly
 doDropColumn :: String -> String -> IO (Either String ())
 doDropColumn t c = ask "drop_column" (ReqDropColumn t c) okOnly
 
+-- | 发 ReplaceSchema（ALTER 用）
+doReplaceSchema :: String -> [SchemaColumn] -> [Row] -> IO (Either String ())
+doReplaceSchema t cols rs = ask "replace_schema" (ReqReplaceSchema t cols rs) okOnly
+
 -- | 发 CreateTable
 doCreateTable :: String -> [SchemaColumn] -> IO (Either String ())
 doCreateTable t cols = ask "create_table" (ReqCreateTable t cols) okOnly
@@ -392,16 +559,48 @@ doDropTable t = ask "drop_table" (ReqDropTable t) okOnly
 
 -- | 线上 schema 转本地列
 schemaToColumns :: [SchemaColumn] -> [(String, Column)]
-schemaToColumns = map go
-  where
-    go (SchemaColumn n "int") = (n, TInt)
-    go (SchemaColumn n "str") = (n, TStr)
-    go (SchemaColumn n "bool") = (n, TBool)
-    go (SchemaColumn n _) = (n, TStr)
+schemaToColumns = map toColumn
+
+toColumn :: SchemaColumn -> (String, Column)
+toColumn sc =
+    ( scName sc
+    , Column
+        { columnType = fromMaybe CStr (parseColumnType (scType sc))
+        , columnNullable = scNullable sc
+        , columnDefault = scDefault sc
+        , columnAutoIncrement = scAutoIncrement sc
+        , columnUnique = scUnique sc
+        , columnPrimaryKey = scPrimaryKey sc
+        , columnCheck = scCheck sc
+        }
+    )
+
+-- | 本地列转线上 schema
+toWire :: (String, Column) -> SchemaColumn
+toWire (n, c) =
+    SchemaColumn
+        { scName = n
+        , scType = typeName (columnType c)
+        , scNullable = columnNullable c
+        , scDefault = columnDefault c
+        , scAutoIncrement = columnAutoIncrement c
+        , scPrimaryKey = columnPrimaryKey c
+        , scUnique = columnUnique c
+        , scCheck = columnCheck c
+        }
 
 instance MonadStorage IPCStorage where
+    createDatabase name = IPCStorage (ask "create_database" (ReqDatabase "create_database" name) okOnly)
+    dropDatabase name = IPCStorage (ask "drop_database" (ReqDatabase "drop_database" name) okOnly)
+    useDatabase name = IPCStorage (ask "use_database" (ReqDatabase "use_database" name) okOnly)
+    listDatabases = IPCStorage $ ask "list_databases" (ReqDatabase "list_databases" "") $ \resp -> case resp of
+        RespTables names -> Just names
+        _ -> Nothing
     -- \| 发 Scan
     scan t = IPCStorage (doScan t)
+    scanColumns t cols = IPCStorage $ ask "scan" (ReqScanColumns t cols) $ \resp -> case resp of
+        RespRows rows -> Just [[(c, v) | c <- cols, Just v <- [lookup c row]] | row <- rows]
+        _ -> Nothing
 
     -- \| 发 Insert（索引由存储层自己维护）
     insert t r = IPCStorage (doInsert t r)
@@ -418,13 +617,14 @@ instance MonadStorage IPCStorage where
     -- \| 按某一列的索引取一行（没有索引就回 NoIndex）
     lookupByColumn t c k = IPCStorage (doLookupByColumn t c k)
 
+    -- \| 范围扫描（没有索引就回 Nothing）
+    scanRange t c lo hi = IPCStorage (doScanRange t c lo hi)
+
     -- \| 发 CreateTable
     createTable name cols = IPCStorage (doCreateTable name (map toWire cols))
-      where
-        -- \| 本地列类型转线上字符串
-        toWire (n, TInt) = SchemaColumn n "int"
-        toWire (n, TStr) = SchemaColumn n "str"
-        toWire (n, TBool) = SchemaColumn n "bool"
+
+    -- \| ALTER：整表换列定义与全部行
+    replaceSchema name cols rows = IPCStorage (doReplaceSchema name (map toWire cols) rows)
 
     -- \| 发 DropTable
     dropTable name = IPCStorage (doDropTable name)
@@ -445,7 +645,6 @@ instance MonadStorage IPCStorage where
             Left _ -> pure []
             Right xs -> mapM loadEntry xs
       where
-        -- \| 加载一张表，行来自 scan
         loadEntry info = do
             rows <- doScan (tiTable info)
             pure
@@ -455,7 +654,9 @@ instance MonadStorage IPCStorage where
 
     -- \| 只问数据字典要结构，一行数据都不拉过来
     schema = IPCStorage $ do
-        result <- doListCatalog
+        result <- ask "all_catalogs" ReqAllCatalog $ \resp -> case resp of
+            RespCatalog infos -> Just infos
+            _ -> Nothing
         pure $ case result of
             Left _ -> []
             Right xs ->

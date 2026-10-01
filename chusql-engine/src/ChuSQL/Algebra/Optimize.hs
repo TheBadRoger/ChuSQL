@@ -1,27 +1,33 @@
-module ChuSQL.Algebra.Optimize (optimize, pushProject) where
+module ChuSQL.Algebra.Optimize (optimize, pushProject, relOpCols) where
 
 import ChuSQL.Algebra.Expr (colsInExpr, evalExpr)
 import ChuSQL.Algebra.Op (RelOp (..))
 import ChuSQL.Model
-import ChuSQL.Syntax.AST (Expr (..))
+import ChuSQL.Syntax.AST (Expr (..), JoinKind (..))
+import Data.List (nub)
 
 -- 查询优化：谓词下推 + 投影下推 + 常量折叠，跑到不动点。
 
 -- | 算子会产出哪些列
 relOpCols :: Database -> RelOp -> [String]
-relOpCols db (Scan mAlias tbl) =
+relOpCols _ Unit = []
+relOpCols _ (Compute items _) = map fst items
+relOpCols _ (Aggregate keys aggs _) = keys ++ map fst aggs
+relOpCols _ (Scan mAlias _ (Just cols)) = map (qualify mAlias) cols
+relOpCols db (Scan mAlias tbl Nothing) =
     case lookup tbl db of
         Nothing -> []
         Just t -> map (prefix ++) (colNames t)
   where
     prefix = maybe "" (++ ".") mAlias
-relOpCols db (Lookup mAlias tbl _ _) = relOpCols db (Scan mAlias tbl)
+relOpCols db (Lookup mAlias tbl _ _) = relOpCols db (Scan mAlias tbl Nothing)
+relOpCols db (Range mAlias tbl _ _ _) = relOpCols db (Scan mAlias tbl Nothing)
 relOpCols db (Filter _ x) = relOpCols db x
 relOpCols _ (Project ["*"] _) = ["*"]
 relOpCols _ (Project cols _) = cols
 relOpCols db (Sort _ x) = relOpCols db x
 relOpCols db (Limit _ x) = relOpCols db x
-relOpCols db (Join l r _) = relOpCols db l ++ relOpCols db r
+relOpCols db (Join _ l r _) = relOpCols db l ++ relOpCols db r
 
 -- | need 是否都在 have 里
 isSubsetOf :: [String] -> [String] -> Bool
@@ -51,7 +57,7 @@ applyFilters :: [Expr] -> RelOp -> RelOp
 applyFilters [] op = op
 applyFilters (e : es) op = applyFilters es (Filter e op)
 
--- | Filter 压在 Join 上时下推
+-- | Filter 压在内连接上时下推
 pushJoin :: Database -> Expr -> RelOp -> RelOp -> Expr -> RelOp
 pushJoin db p l r c =
     let preds = splitConj p
@@ -61,16 +67,55 @@ pushJoin db p l r c =
         (rPs, bothPs) = partitionPred rCols rest1
         l' = applyFilters lPs l
         r' = applyFilters rPs r
-        joined = Join l' r' c
+        joined = Join InnerJoin l' r' c
      in case combineConj bothPs of
+            Nothing -> joined
+            Just p' -> Filter p' joined
+
+-- | Filter 压在左连接上时，只把纯左表的谓词下推到左表；
+-- 右表没配上会补 NULL，右表谓词不能提前算。
+pushLeftJoin :: Database -> Expr -> RelOp -> RelOp -> Expr -> RelOp
+pushLeftJoin db p l r c =
+    let (lPs, rest) = partitionPred (relOpCols db l) (splitConj p)
+        joined = Join LeftJoin (applyFilters lPs l) r c
+     in case combineConj rest of
             Nothing -> joined
             Just p' -> Filter p' joined
 
 -- | 合并两层 Filter 或挪到 Sort 下
 pushOne :: Database -> RelOp -> RelOp
-pushOne _ (Filter p (Filter q x)) = Filter (And p q) x
-pushOne _ (Filter p (Sort spec x)) = Sort spec (Filter p x)
+pushOne _ (Filter p (Filter q x))
+    | not (hasDivision p || hasDivision q) = Filter (And p q) x
+pushOne _ (Filter p (Sort spec x))
+    | not (hasDivision p) = Sort spec (Filter p x)
 pushOne _ op = op
+
+-- | 除法可能报错，不能提前或延后求值
+hasDivision :: Expr -> Bool
+hasDivision e = case e of
+    Div _ _ -> True
+    Neg a -> hasDivision a
+    Add a b -> both a b
+    Sub a b -> both a b
+    Mul a b -> both a b
+    Gt a b -> both a b
+    Lt a b -> both a b
+    Eq a b -> both a b
+    And a b -> both a b
+    Or a b -> both a b
+    _ -> False
+  where
+    both a b = hasDivision a || hasDivision b
+
+-- | 检查子计划中可能报错的除法
+planHasDivision :: RelOp -> Bool
+planHasDivision (Filter p x) = hasDivision p || planHasDivision x
+planHasDivision (Join _ l r c) = hasDivision c || planHasDivision l || planHasDivision r
+planHasDivision (Compute items x) = any (hasDivision . snd) items || planHasDivision x
+planHasDivision (Project _ x) = planHasDivision x
+planHasDivision (Sort _ x) = planHasDivision x
+planHasDivision (Limit _ x) = planHasDivision x
+planHasDivision _ = False
 
 -- | 是否要全部列
 needsAll :: [String] -> Bool
@@ -85,29 +130,39 @@ pushProjectLeaf db need leaf
 
 -- | 把需要哪些列往下传
 pushProject :: Database -> [String] -> RelOp -> RelOp
+pushProject _ _ Unit = Unit
+pushProject db _ (Compute items x) = Compute items (pushProject db (concatMap (colsInExpr . snd) items) x)
+pushProject db _ (Aggregate keys aggs x) =
+    Aggregate keys aggs (pushProject db (keys ++ concatMap (colsInExpr . snd) aggs) x)
 pushProject db _ (Project cols x) = case pushProject db cols x of
     Project cols' y | cols' == cols -> Project cols y
     other -> Project cols other
 pushProject db need (Filter p x) = Filter p (pushProject db (need ++ colsInExpr p) x)
 pushProject db need (Sort spec x) = Sort spec (pushProject db (need ++ map fst spec) x)
 pushProject db need (Limit n x) = Limit n (pushProject db need x)
-pushProject db need (Join l r c)
-    | needsAll need = Join (pushProject db need l) (pushProject db need r) c
+pushProject db need (Join kind l r c)
+    | needsAll need = Join kind (pushProject db need l) (pushProject db need r) c
     | otherwise =
         let tot = need ++ colsInExpr c
             lCols = relOpCols db l
             rCols = relOpCols db r
             lNeed = if needsAll lCols then ["*"] else [x | x <- tot, x `elem` lCols]
             rNeed = if needsAll rCols then ["*"] else [x | x <- tot, x `elem` rCols]
-         in Join (pushProject db lNeed l) (pushProject db rNeed r) c
-pushProject db need leaf@(Scan _ _) = pushProjectLeaf db need leaf
+         in Join kind (pushProject db lNeed l) (pushProject db rNeed r) c
+pushProject db need leaf@(Scan a t _)
+    | needsAll need = leaf
+    | all (`elem` need) (relOpCols db leaf) = leaf
+    | otherwise = Scan a t (Just (nub (map (unqualify a) need)))
 pushProject db need leaf@(Lookup _ _ _ _) = pushProjectLeaf db need leaf
+pushProject db need leaf@(Range _ _ _ _ _) = pushProjectLeaf db need leaf
 
 -- | 折一个表达式节点
 foldNode :: Expr -> Expr
 foldNode e
     | null (colsInExpr e) = case evalExpr e [] of
+        Right VNull -> LitNull
         Right (VInt n) -> LitInt n
+        Right (VFloat d) -> LitFloat d
         Right (VStr s) -> LitStr s
         Right (VBool b) -> LitBool b
         Left _ -> e
@@ -115,6 +170,11 @@ foldNode e
 
 -- | 自底向上折整棵表达式
 foldConstants :: Expr -> Expr
+foldConstants (Add a b) = foldNode (Add (foldConstants a) (foldConstants b))
+foldConstants (Sub a b) = foldNode (Sub (foldConstants a) (foldConstants b))
+foldConstants (Mul a b) = foldNode (Mul (foldConstants a) (foldConstants b))
+foldConstants (Div a b) = foldNode (Div (foldConstants a) (foldConstants b))
+foldConstants (Neg a) = foldNode (Neg (foldConstants a))
 foldConstants (Gt a b) = foldNode (Gt (foldConstants a) (foldConstants b))
 foldConstants (Lt a b) = foldNode (Lt (foldConstants a) (foldConstants b))
 foldConstants (Eq a b) = foldNode (Eq (foldConstants a) (foldConstants b))
@@ -124,13 +184,32 @@ foldConstants e = e
 
 -- | 单节点重写
 rewriteNode :: Database -> RelOp -> RelOp
-rewriteNode _ (Filter (Eq (Col k) (LitInt v)) (Scan mAlias t)) =
-    Lookup mAlias t (unqualify mAlias k) v
-rewriteNode db (Filter p (Join l r c)) = pushJoin db p l r c
+rewriteNode _ (Filter (Eq (Col k) (LitInt v)) (Scan mAlias t Nothing)) =
+    Lookup mAlias t (unqualify mAlias k) (VInt v)
+rewriteNode _ (Filter (Eq (Col k) (LitStr v)) (Scan mAlias t Nothing)) =
+    Lookup mAlias t (unqualify mAlias k) (VStr v)
+rewriteNode _ (Filter (And (Gt (Col k1) (LitInt lo)) (Lt (Col k2) (LitInt hi))) (Scan mAlias t Nothing))
+    | k1 == k2 = Range mAlias t (unqualify mAlias k1) (Just (VInt lo, False)) (Just (VInt hi, False))
+rewriteNode _ (Filter (And (Gt (Col k1) (LitStr lo)) (Lt (Col k2) (LitStr hi))) (Scan mAlias t Nothing))
+    | k1 == k2 = Range mAlias t (unqualify mAlias k1) (Just (VStr lo, False)) (Just (VStr hi, False))
+rewriteNode _ (Filter (Gt (Col k) (LitInt v)) (Scan mAlias t Nothing)) =
+    Range mAlias t (unqualify mAlias k) (Just (VInt v, False)) Nothing
+rewriteNode _ (Filter (Gt (Col k) (LitStr v)) (Scan mAlias t Nothing)) =
+    Range mAlias t (unqualify mAlias k) (Just (VStr v, False)) Nothing
+rewriteNode _ (Filter (Lt (Col k) (LitInt v)) (Scan mAlias t Nothing)) =
+    Range mAlias t (unqualify mAlias k) Nothing (Just (VInt v, False))
+rewriteNode _ (Filter (Lt (Col k) (LitStr v)) (Scan mAlias t Nothing)) =
+    Range mAlias t (unqualify mAlias k) Nothing (Just (VStr v, False))
+rewriteNode db (Filter p (Join kind l r c))
+    | not (hasDivision p || planHasDivision (Join kind l r c)) =
+        case kind of
+            InnerJoin -> pushJoin db p l r c
+            LeftJoin -> pushLeftJoin db p l r c
 rewriteNode db (Filter p x) = case foldConstants p of
     LitBool True -> x
     p' -> pushOne db (Filter p' x)
 rewriteNode _ (Project ["*"] x) = x
+rewriteNode _ (Compute items x) = Compute [(label, foldConstants e) | (label, e) <- items] x
 rewriteNode db op = pushOne db op
 
 -- | 自底向上遍历一次
@@ -139,9 +218,11 @@ optimizeRelOp db = rewriteNode db . descend
   where
     descend (Filter p x) = Filter p (optimizeRelOp db x)
     descend (Project cols x) = Project cols (optimizeRelOp db x)
+    descend (Compute items x) = Compute items (optimizeRelOp db x)
+    descend (Aggregate keys aggs x) = Aggregate keys aggs (optimizeRelOp db x)
     descend (Sort spec x) = Sort spec (optimizeRelOp db x)
     descend (Limit n x) = Limit n (optimizeRelOp db x)
-    descend (Join l r c) = Join (optimizeRelOp db l) (optimizeRelOp db r) c
+    descend (Join kind l r c) = Join kind (optimizeRelOp db l) (optimizeRelOp db r) c
     descend x = x
 
 -- | 反复跑到不动点

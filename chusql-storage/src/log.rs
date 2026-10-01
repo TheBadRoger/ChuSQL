@@ -82,7 +82,9 @@ impl Level {
 
 static LEVEL: AtomicU8 = AtomicU8::new(Level::Info as u8);
 
-static COLOR: OnceLock<bool> = OnceLock::new();
+static COLOR_STDERR: OnceLock<bool> = OnceLock::new();
+
+static COLOR_STDOUT: OnceLock<bool> = OnceLock::new();
 
 /// 设置全局等级
 pub fn set_level(level: Level) {
@@ -100,22 +102,29 @@ pub fn init() {
     enable_vt();
 }
 
-/// 写出一行
+/// 写出一行：warn / error 走 stderr，info / debug 走 stdout。
 pub fn write(channel: Channel, level: Level, args: fmt::Arguments) {
     let msg = args.to_string();
-    let line = render(level, channel, color_enabled(), &now(), &msg);
-    let stderr = std::io::stderr();
-    let mut out = stderr.lock();
-    let _ = writeln!(out, "{}", line);
+    let to_stderr = streams_to_stderr(level);
+    let line = render(level, channel, color_enabled(to_stderr), &now(), &msg);
+    if to_stderr {
+        let mut out = std::io::stderr().lock();
+        let _ = writeln!(out, "{}", line);
+    } else {
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "{}", line);
+    }
 }
 
-/// 是否着色（终端或强制）
-fn color_enabled() -> bool {
-    *COLOR.get_or_init(|| match std::env::var("CHUSQL_LOG_COLOR").as_deref().map(str::trim) {
-        Ok("always") | Ok("yes") | Ok("1") => true,
-        Ok("never") | Ok("no") | Ok("0") => false,
-        _ => std::io::stderr().is_terminal(),
-    })
+/// 这个等级写 stderr 吗：warn / error 是，info / debug 写 stdout
+fn streams_to_stderr(level: Level) -> bool {
+    matches!(level, Level::Error | Level::Warn)
+}
+
+/// 是否着色：只按要写的那条流是不是终端判断，没有环境变量开关
+fn color_enabled(to_stderr: bool) -> bool {
+    let cached = if to_stderr { &COLOR_STDERR } else { &COLOR_STDOUT };
+    *cached.get_or_init(|| if to_stderr { std::io::stderr().is_terminal() } else { std::io::stdout().is_terminal() })
 }
 
 /// 拼一行（纯函数，可测）
@@ -203,8 +212,8 @@ fn now() -> Stamp {
     let (year, month, day) = civil_from_days((secs / 86_400) as i64);
     Stamp {
         year: year as u16,
-        month: month as u16,
-        day: day as u16,
+        month,
+        day,
         hour: ((secs % 86_400) / 3600) as u16,
         minute: ((secs % 3_600) / 60) as u16,
         second: (secs % 60) as u16,
@@ -346,19 +355,10 @@ mod tests {
     }
 
     #[test]
-    fn render_without_color_is_plain() {
-        let stamp = Stamp {
-            year: 2026,
-            month: 9,
-            day: 24,
-            hour: 1,
-            minute: 2,
-            second: 3,
-            milli: 4,
-        };
-        assert_eq!(
-            render(Level::Error, Channel::Core, false, &stamp, "boom"),
-            "[ERROR 2026-09-24 01:02:03.004] [core] boom"
-        );
+    fn warnings_and_errors_go_to_stderr() {
+        assert!(streams_to_stderr(Level::Error));
+        assert!(streams_to_stderr(Level::Warn));
+        assert!(!streams_to_stderr(Level::Info));
+        assert!(!streams_to_stderr(Level::Debug));
     }
 }

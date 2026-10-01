@@ -2,22 +2,25 @@
 
 module Main (main) where
 
-import ChuSQL.Web.Api (AppEnv (..), Live (..), newAppEnv, setLive, webApp)
-import ChuSQL.Web.Auth (SessionPolicy (..), newSessionStore)
+import ChuSQL.Web.API (AppEnv (..), Live (..), newAppEnvAt, setLive, webApp)
+import ChuSQL.Web.Auth (Credential (..), SessionPolicy (..), newSessionStore)
 import ChuSQL.Web.Backend (Backend, ipcBackend)
 import ChuSQL.Web.Demo (SeedReport (..), seedDemo)
 import ChuSQL.Web.Config (
     WebConfig (..),
     defaultPassword,
     defaultUser,
-    loadWebConfig,
+    loadWebConfigAt,
     resolveCredential,
+    resolvePipeName,
     resolveStaticDir,
     staticDirCandidates,
     usingDefaultCredentials,
  )
 import ChuSQL.Web.RateLimit (newRateLimiter)
-import ChuSQL.Web.Settings (effectiveSettings)
+import ChuSQL.Storage.IPC (setPipeName)
+import ChuSQL.Web.Settings (effectiveSettings, readSettingsFile)
+import ChuSQL.Web.TOML (resolveConfigPath)
 import ChuSQL.Web.StorageProcess (
     StorageProcess (..),
     findStorageServer,
@@ -25,8 +28,9 @@ import ChuSQL.Web.StorageProcess (
     stopStorageProcess,
     waitForStorage,
  )
-import Control.Exception (IOException, bracket, try)
+import Control.Exception (IOException, bracket, onException, try)
 import Data.Char (toLower)
+import qualified Data.Map.Strict as Map
 import Data.String (fromString)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -42,7 +46,8 @@ import Text.Read (readMaybe)
 -- Web 管理端入口：读配置、备凭据、拉起存储进程，最后起 Warp。
 
 data Options = Options
-    { optHost :: Maybe String
+    { optConfig :: Maybe FilePath
+    , optHost :: Maybe String
     , optPort :: Maybe Int
     , optStatic :: Maybe FilePath
     , optStorage :: Maybe FilePath
@@ -65,7 +70,8 @@ data Options = Options
 emptyOptions :: Options
 emptyOptions =
     Options
-        { optHost = Nothing
+        { optConfig = Nothing
+        , optHost = Nothing
         , optPort = Nothing
         , optStatic = Nothing
         , optStorage = Nothing
@@ -91,6 +97,7 @@ parseArgs = go emptyOptions
     go opts [] = Right opts
     go opts ("--help" : rest) = go opts{optHelp = True} rest
     go opts ("-h" : rest) = go opts{optHelp = True} rest
+    go opts ("--config" : v : rest) = go opts{optConfig = Just v} rest
     go opts ("--host" : v : rest) = go opts{optHost = Just v} rest
     go opts ("--static" : v : rest) = go opts{optStatic = Just v} rest
     go opts ("--storage" : v : rest) = go opts{optStorage = Just v} rest
@@ -109,11 +116,9 @@ parseArgs = go emptyOptions
     go opts ("--cookie-secure" : v : rest) = go opts{optCookieSecure = Just (isTrue v)} rest
     go _ (a : _) = Left ("unrecognized argument or missing value: " ++ a)
 
-    -- | 读一个整数开关
     withInt :: String -> String -> (Int -> Either String Options) -> Either String Options
     withInt name v k = maybe (Left (name ++ " needs an integer, got: " ++ v)) k (readMaybe v)
 
-    -- | 布尔开关认 1/true/yes/on
     isTrue :: String -> Bool
     isTrue s = map toLower s `elem` ["1", "true", "yes", "on"]
 
@@ -122,27 +127,36 @@ usage :: IO ()
 usage = do
     putStrLn "usage: chusql-web [options]"
     putStrLn ""
-    putStrLn "  --host H               listen address              (CHUSQL_WEB_HOST, default 127.0.0.1)"
-    putStrLn "  --port N               listen port                 (CHUSQL_WEB_PORT, default 7777)"
-    putStrLn "  --static DIR           static asset directory      (CHUSQL_WEB_STATIC, default static)"
-    putStrLn "  --user NAME            account name                (CHUSQL_WEB_USER, default admin)"
-    putStrLn "  --storage SERVER       Rust storage exe to spawn   (CHUSQL_STORAGE_SERVER)"
-    putStrLn "  --cookie-secure BOOL   add Secure to the cookie    (CHUSQL_WEB_COOKIE_SECURE, default false)"
-    putStrLn "  --body-limit N         max request body bytes      (CHUSQL_WEB_BODY_LIMIT, default 65536)"
-    putStrLn "  --session-idle N       session idle timeout, sec   (CHUSQL_WEB_SESSION_IDLE, default 28800)"
-    putStrLn "  --session-max N        session max age, sec        (CHUSQL_WEB_SESSION_MAX, default 86400)"
-    putStrLn "  --login-max-attempts N failed logins before 429    (CHUSQL_WEB_LOGIN_MAX_ATTEMPTS, default 5)"
-    putStrLn "  --login-window N       lockout window, sec         (CHUSQL_WEB_LOGIN_WINDOW, default 300)"
-    putStrLn "  --page-size N          rows per page by default    (CHUSQL_WEB_PAGE_SIZE, default 25)"
-    putStrLn "  --max-page-size N      rows per page ceiling       (CHUSQL_WEB_MAX_PAGE_SIZE, default 500)"
-    putStrLn "  --max-rows N           rows returned per query     (CHUSQL_WEB_MAX_ROWS, default 1000)"
-    putStrLn "  --max-sql-length N     max SQL characters          (CHUSQL_WEB_MAX_SQL_LENGTH, default 20000)"
-    putStrLn "  --seed BOOL            load demo data when the db is empty (CHUSQL_WEB_SEED, default false)"
+    putStrLn "config: chusql.toml sits at a fixed place and its sections hold every knob below;"
+    putStrLn "        Windows: %APPDATA%\\ChuSQL\\chusql.toml"
+    putStrLn "        other:   $XDG_CONFIG_HOME/ChuSQL/chusql.toml (or ~/.config/ChuSQL/chusql.toml)"
+    putStrLn "        [web] host/port/static_dir/user/password and the limits; [server] pipe_name;"
+    putStrLn "        [storage] data_dir; [page] size; [btree] order; [buffer] pool_size; [log] level"
     putStrLn ""
-    putStrLn "password: CHUSQL_WEB_PASSWORD_HASH > CHUSQL_WEB_PASSWORD > built-in demo password"
-    putStrLn ("without any of them the demo account is " ++ T.unpack defaultUser ++ " / " ++ T.unpack defaultPassword)
-    putStrLn "storage knobs for the spawned process: CHUSQL_PAGE_SIZE / CHUSQL_BTREE_ORDER /"
-    putStrLn "  CHUSQL_BUFFER_POOL_SIZE / CHUSQL_LOG / CHUSQL_PIPE / CHUSQL_DATA_DIR"
+    putStrLn "  --config FILE          read that config file instead ([web] host ...)"
+    putStrLn "  --host H               listen address              ([web] host, default 127.0.0.1)"
+    putStrLn "  --port N               listen port                 ([web] port, default 7777)"
+    putStrLn "  --static DIR           static asset directory      ([web] static_dir, default static)"
+    putStrLn "  --user NAME            administrator name          ([web] user, default root)"
+    putStrLn "  --storage SERVER       Rust storage exe to spawn   ([web] storage_server)"
+    putStrLn "  --cookie-secure BOOL   add Secure to the cookie    ([web] cookie_secure, default false)"
+    putStrLn "  --body-limit N         max request body bytes      ([web] body_limit, default 65536)"
+    putStrLn "  --session-idle N       session idle timeout, sec   ([web] session_idle, default 28800)"
+    putStrLn "  --session-max N        session max age, sec        ([web] session_max, default 86400)"
+    putStrLn "  --login-max-attempts N failed logins before 429    ([web] login_max_attempts, default 5)"
+    putStrLn "  --login-window N       lockout window, sec         ([web] login_window, default 300)"
+    putStrLn "  --page-size N          rows per page by default    ([web] rows_per_page, default 25)"
+    putStrLn "  --max-page-size N      rows per page ceiling       ([web] max_page_size, default 500)"
+    putStrLn "  --max-rows N           rows returned per query     ([web] max_rows, default 1000)"
+    putStrLn "  --max-sql-length N     max SQL characters          ([web] max_sql_length, default 20000)"
+    putStrLn "  --seed BOOL            load demo data when the db is empty ([web] seed, default false)"
+    putStrLn ""
+    putStrLn "administrator password: user / password in the [web] section of chusql.toml, else the built-in demo"
+    putStrLn "  an empty password means the administrator signs in with no password; ordinary accounts are then refused"
+    putStrLn ("without either the demo administrator is " ++ T.unpack defaultUser ++ " / " ++ T.unpack defaultPassword)
+    putStrLn "ordinary accounts: CREATE USER / ALTER USER / DROP USER from the SQL console (administrator only)"
+    putStrLn "storage process: [server] pipe_name says where to talk and where a spawned one listens;"
+    putStrLn "  [storage] data_dir, [page] size, [btree] order, [buffer] pool_size and [log] level are its own"
 
 -- | 命令行覆盖配置
 applyOptions :: WebConfig -> Options -> WebConfig
@@ -168,20 +182,19 @@ applyOptions cfg opts =
         , wcSeedDemo = orElse (optSeedDemo opts) (wcSeedDemo cfg)
         }
   where
-    -- | 开关给了用开关的，否则保留原值
     orElse :: Maybe a -> a -> a
     orElse (Just x) _ = x
     orElse Nothing y = y
 
 -- | 配了存储进程路径就拉起来，没配就假设外面已经跑着
-startStorageIfWanted :: WebConfig -> IO (Either String (Maybe StorageProcess))
-startStorageIfWanted cfg = case wcStorageServer cfg of
+startStorageIfWanted :: WebConfig -> FilePath -> IO (Either String (Maybe StorageProcess))
+startStorageIfWanted cfg configPath = case wcStorageServer cfg of
     Nothing -> pure (Right Nothing)
     Just given -> do
         found <- findStorageServer (Just given)
         case found of
             Left e -> pure (Left e)
-            Right bin -> fmap (fmap Just) (startStorageProcess bin)
+            Right bin -> fmap (fmap Just) (startStorageProcess bin configPath)
 
 -- | 入口
 main :: IO ()
@@ -200,16 +213,20 @@ main = do
 -- | 起服务
 run :: Options -> IO ()
 run opts = do
-    base <- loadWebConfig
+    configPath <- resolveConfigPath (optConfig opts)
+    base <- loadWebConfigAt configPath
     let cfg = applyOptions base opts
+    setPipeName (resolvePipeName cfg)
     foundStatic <- resolveStaticDir (wcStaticDir cfg)
     case foundStatic of
         Nothing -> do
             putStrLn ("static directory not found; looked in: " ++ unwords (staticDirCandidates (wcStaticDir cfg)))
             exitFailure
         Just staticDir -> do
-            cred <- resolveCredential cfg
-            storage <- startStorageIfWanted cfg
+            let settingsFile = configPath
+            saved <- readSettingsFile settingsFile
+            cred <- resolveCredential cfg saved
+            storage <- startStorageIfWanted cfg configPath
             case storage of
                 Left err -> do
                     putStrLn err
@@ -226,17 +243,18 @@ run opts = do
                             getCurrentTime
                             (wcLoginMaxAttempts cfg)
                             (fromIntegral (wcLoginWindow cfg))
-                    env0 <- newAppEnv backend sessions cred limiter staticDir
+                    env0 <- newAppEnvAt settingsFile backend sessions cred limiter staticDir
+                        `onException` maybe (pure ()) stopStorageProcess maybeStorage
                     let env =
                             env0
                                 { aeCookieSecure = wcCookieSecure cfg
                                 , aeEffective = effectiveSettings cfg
-                                , aeLog = \msg -> TIO.putStrLn ("[web] " <> msg)
+                                , aeLog = TIO.putStrLn
                                 }
                     setLive env (liveFromConfig cfg)
                     app <- webApp env
-                    printBanner cfg staticDir maybeStorage
-                    reportCredential cfg
+                    printBanner cfg configPath staticDir maybeStorage
+                    reportCredential cred saved
                     waitForStorageReport
                     seedIfWanted cfg backend
                     let settings =
@@ -273,15 +291,17 @@ serve settings app = do
             exitFailure
 
 -- | 口令是从哪来的（用了内置默认口令就明确警告）
-reportCredential :: WebConfig -> IO ()
-reportCredential cfg
-    | usingDefaultCredentials cfg = do
+reportCredential :: Credential -> Map.Map Text Text -> IO ()
+reportCredential cred saved
+    | usingDefaultCredentials saved = do
         putStrLn ""
-        putStrLn "  !! DEMO CREDENTIALS IN USE:"
-        putStrLn ("  !!   user " ++ T.unpack (wcUser cfg) ++ " / password " ++ T.unpack defaultPassword)
-        putStrLn "  !!   set CHUSQL_WEB_PASSWORD (or CHUSQL_WEB_PASSWORD_HASH) before exposing this server."
+        putStrLn "  !! Administrator credentials are not configured; the built-in demo password is in use:"
+        putStrLn ("  !!   user " ++ T.unpack (credUser cred) ++ " / password " ++ T.unpack defaultPassword)
+        putStrLn "  !!   set user / password in the [web] section of chusql.toml and restart"
         putStrLn ""
-    | otherwise = putStrLn ("password:     from CHUSQL_WEB_PASSWORD(_HASH)   (user " ++ T.unpack (wcUser cfg) ++ ")")
+    | T.null (credEncoded cred) =
+        putStrLn ("administrator: " ++ T.unpack (credUser cred) ++ " (passwordless: only the administrator may sign in)")
+    | otherwise = putStrLn ("administrator: " ++ T.unpack (credUser cred) ++ " (credentials come from the settings file only)")
 
 -- | 配了 seed 就补一份演示数据
 seedIfWanted :: WebConfig -> Backend -> IO ()
@@ -290,10 +310,10 @@ seedIfWanted cfg backend
     | otherwise = do
         result <- seedDemo backend
         case result of
-            Left e -> TIO.putStrLn ("[web] demo data skipped: " <> T.pack e)
+            Left e -> TIO.putStrLn ("demo data skipped: " <> T.pack e)
             Right report ->
                 TIO.putStrLn
-                    ( "[web] demo data: "
+                    ( "demo data: "
                         <> (if null (srCreated report) then "already present" else "created " <> T.pack (unwords (srCreated report)))
                         <> (if null (srSkipped report) then "" else ", kept " <> T.pack (unwords (srSkipped report)))
                         <> (if null (srIndexes report) then "" else ", index on " <> T.pack (unwords (srIndexes report)))
@@ -305,15 +325,16 @@ waitForStorageReport = do
     up <- waitForStorage 20
     putStrLn
         ( if up
-            then "storage:      up (named pipe answered ping)"
+            then "storage:      up (endpoint answered ping)"
             else "storage:      DOWN (no ping reply; start the Rust storage process or pass --storage)"
         )
 
 -- | 启动横幅
-printBanner :: WebConfig -> FilePath -> Maybe StorageProcess -> IO ()
-printBanner cfg staticDir maybeStorage = do
+printBanner :: WebConfig -> FilePath -> FilePath -> Maybe StorageProcess -> IO ()
+printBanner cfg configPath staticDir maybeStorage = do
     putStrLn "==================== ChuSQL Web ===================="
     putStrLn ("url:          http://" ++ wcHost cfg ++ ":" ++ show (wcPort cfg) ++ "/")
+    putStrLn ("config file:  " ++ configPath)
     putStrLn ("static dir:   " ++ staticDir)
     putStrLn
         ( "limits:       body "
@@ -340,5 +361,5 @@ printBanner cfg staticDir maybeStorage = do
             ++ "s"
         )
     case maybeStorage of
-        Just sp -> putStrLn ("storage proc: " ++ spPipe sp ++ "  data dir " ++ spDataDir sp)
-        Nothing -> putStrLn "storage proc: assumed to run elsewhere (pipe name from CHUSQL_PIPE)"
+        Just sp -> putStrLn ("storage proc: spawned, talking on pipe " ++ spPipe sp)
+        Nothing -> putStrLn "storage proc: assumed to run elsewhere (pipe name from [server] pipe_name)"

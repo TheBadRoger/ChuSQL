@@ -5,9 +5,8 @@ module ChuSQL.Web.Settings (
     settingCatalogue,
     findItem,
     isRootOnly,
+    isLockedSetting,
     isRestartRequired,
-    settingsFileCandidates,
-    resolveSettingsFile,
     readSettingsFile,
     writeSettingsFile,
     applySettings,
@@ -16,72 +15,93 @@ module ChuSQL.Web.Settings (
     effectiveSettings,
 ) where
 
-import ChuSQL.Web.Config (WebConfig (..))
-import qualified Data.Aeson as A
-import qualified Data.Aeson.Key as K
-import qualified Data.Aeson.KeyMap as KM
-import qualified Data.ByteString as BS
-import qualified Data.ByteString.Lazy as BL
+import ChuSQL.Web.Config (WebConfig (..), canonicalSettingKeys, defaultUser)
+import ChuSQL.Web.TOML (readSection, writeSection)
+import Data.List (nub)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
-import Control.Exception (IOException, try)
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist)
-import System.FilePath (takeDirectory, (</>))
 
--- Web 配置项目录，与启动脚本共用一份设置文件，支持热改与重启生效。
+-- Web 配置项目录，与启动脚本共用一份全局 chusql.toml；
+-- 每个键只写在它所属的那一段里，web 不再复制存储层的键。
 
 data SettingItem = SettingItem
     { siKey :: Text
     , siLabel :: Text
     , siGroup :: Text
     , siKind :: Text
-    , siEnv :: Text
     , siDefault :: Text
     , siRootOnly :: Bool
     , siRestart :: Bool
+    , siSection :: Text
+    , siTomlKey :: Text
     }
     deriving (Show, Eq)
 
 -- | 全部可配置项（顺序即界面里的顺序）
 settingCatalogue :: [SettingItem]
 settingCatalogue =
-    [ item "port" "HTTP port" "server" "int" "CHUSQL_WEB_PORT" "7777" True True
-    , item "host" "Listen address" "server" "text" "CHUSQL_WEB_HOST" "127.0.0.1" True True
-    , item "static-dir" "Static directory" "server" "text" "CHUSQL_WEB_STATIC" "static" True True
-    , item "cookie-secure" "Secure cookie (behind TLS)" "server" "bool" "CHUSQL_WEB_COOKIE_SECURE" "0" True False
-    , item "body-limit" "Max request body (bytes)" "limits" "int" "CHUSQL_WEB_BODY_LIMIT" "65536" False False
-    , item "session-idle" "Session idle timeout (s)" "limits" "int" "CHUSQL_WEB_SESSION_IDLE" "28800" False False
-    , item "session-max" "Session max age (s)" "limits" "int" "CHUSQL_WEB_SESSION_MAX" "86400" False False
-    , item "login-max-attempts" "Failed logins before lockout" "limits" "int" "CHUSQL_WEB_LOGIN_MAX_ATTEMPTS" "5" False False
-    , item "login-window" "Lockout window (s)" "limits" "int" "CHUSQL_WEB_LOGIN_WINDOW" "300" False False
-    , item "rows-per-page" "Rows per page" "limits" "int" "CHUSQL_WEB_PAGE_SIZE" "25" False False
-    , item "max-page-size" "Rows per page ceiling" "limits" "int" "CHUSQL_WEB_MAX_PAGE_SIZE" "500" False False
-    , item "max-rows" "Rows per query" "limits" "int" "CHUSQL_WEB_MAX_ROWS" "1000" False False
-    , item "max-sql-length" "Max SQL characters" "limits" "int" "CHUSQL_WEB_MAX_SQL_LENGTH" "20000" False False
-    , item "user" "Account name" "auth" "text" "CHUSQL_WEB_USER" "root" True True
-    , item "password" "Password (plain, hashed at start)" "auth" "secret" "CHUSQL_WEB_PASSWORD" "" True True
-    , item "password-hash" "Password hash (pbkdf2)" "auth" "secret" "CHUSQL_WEB_PASSWORD_HASH" "" True True
-    , item "data-dir" "Data directory" "storage" "text" "CHUSQL_DATA_DIR" "" True True
-    , item "pipe-name" "Named pipe" "storage" "text" "CHUSQL_PIPE" "" True True
-    , item "storage-page-size" "Storage page size" "storage" "int" "CHUSQL_PAGE_SIZE" "4096" True True
-    , item "storage-btree-order" "Storage B+tree order" "storage" "int" "CHUSQL_BTREE_ORDER" "4" True True
-    , item "storage-buffer-pool" "Storage buffer pool pages" "storage" "int" "CHUSQL_BUFFER_POOL_SIZE" "1024" True True
-    , item "storage-log" "Storage log level" "storage" "text" "CHUSQL_LOG" "info" True True
-    , item "seed" "Seed demo data on start" "storage" "bool" "CHUSQL_WEB_SEED" "1" True True
+    [ item "port" "HTTP port" "server" "int" "7777" True True
+    , item "host" "Listen address" "server" "text" "127.0.0.1" True True
+    , item "static-dir" "Static directory" "server" "text" "static" True True
+    , item "cookie-secure" "Secure cookie (behind TLS)" "server" "bool" "0" True False
+    , item "body-limit" "Max request body (bytes)" "limits" "int" "65536" False False
+    , item "session-idle" "Session idle timeout (s)" "limits" "int" "28800" False False
+    , item "session-max" "Session max age (s)" "limits" "int" "86400" False False
+    , item "login-max-attempts" "Failed logins before lockout" "limits" "int" "5" False False
+    , item "login-window" "Lockout window (s)" "limits" "int" "300" False False
+    , item "rows-per-page" "Rows per page" "limits" "int" "25" False False
+    , item "max-page-size" "Rows per page ceiling" "limits" "int" "500" False False
+    , item "max-rows" "Rows per query" "limits" "int" "1000" False False
+    , item "max-sql-length" "Max SQL characters" "limits" "int" "20000" False False
+    , item "user" "管理员账号（设置文件）" "auth" "text" "root" True True
+    , item "password" "管理员口令（设置文件，明文）" "auth" "secret" "" True True
+    , item "password-min-length" "口令最短长度" "auth" "int" "12" True False
+    , item "password-classes" "口令字符类别数" "auth" "int" "2" True False
+    , owned "data-dir" "Data directory" "storage" "text" "" "storage" "data_dir"
+    , owned "pipe-name" "Endpoint name" "storage" "text" "" "server" "pipe_name"
+    , owned "storage-page-size" "Storage page size" "storage" "int" "4096" "page" "size"
+    , owned "storage-btree-order" "Storage B+tree order" "storage" "int" "4" "btree" "order"
+    , owned "storage-buffer-pool" "Storage buffer pool pages" "storage" "int" "1024" "buffer" "pool_size"
+    , owned "storage-log" "Storage log level" "storage" "text" "info" "log" "level"
+    , item "storage-server" "Storage server executable" "storage" "text" "" True True
+    , item "seed" "Seed demo data on start" "storage" "bool" "1" True True
     ]
   where
-    item k l g kind env def rootOnly restart =
+    -- web 自己的键：分区写死 [web]，TOML 键名就是界面键名
+    item k l g kind def rootOnly restart =
         SettingItem
             { siKey = k
             , siLabel = l
             , siGroup = g
             , siKind = kind
-            , siEnv = env
             , siDefault = def
             , siRootOnly = rootOnly
             , siRestart = restart
+            , siSection = webSection
+            , siTomlKey = k
             }
+    -- 存储层的键：只读自己那段
+    owned k l g kind def section tomlKey =
+        SettingItem
+            { siKey = k
+            , siLabel = l
+            , siGroup = g
+            , siKind = kind
+            , siDefault = def
+            , siRootOnly = True
+            , siRestart = True
+            , siSection = section
+            , siTomlKey = tomlKey
+            }
+
+-- | web 自己那段
+webSection :: Text
+webSection = "web"
+
+-- | 目录里涉及的分区（按出现顺序，去重）
+catalogueSections :: [Text]
+catalogueSections = nub [siSection i | i <- settingCatalogue]
 
 -- | 按 key 找一项
 findItem :: Text -> Maybe SettingItem
@@ -93,6 +113,14 @@ findItem key = case [i | i <- settingCatalogue, siKey i == key] of
 isRootOnly :: Text -> Bool
 isRootOnly key = maybe False siRootOnly (findItem key)
 
+-- | 只读项：root 凭据只认设置文件里的明文，网页端不能改（改文件后重启生效）
+lockedKeys :: [Text]
+lockedKeys = ["user", "password"]
+
+-- | 这项在界面上是不是只读
+isLockedSetting :: Text -> Bool
+isLockedSetting = (`elem` lockedKeys)
+
 -- | 这项是不是要重启才生效
 isRestartRequired :: Text -> Bool
 isRestartRequired key = maybe False siRestart (findItem key)
@@ -100,7 +128,8 @@ isRestartRequired key = maybe False siRestart (findItem key)
 -- | 改完立刻生效的配置键
 liveKeys :: [Text]
 liveKeys =
-    [ "body-limit"
+    [ "password-min-length", "password-classes"
+    , "body-limit"
     , "session-idle"
     , "session-max"
     , "login-max-attempts"
@@ -111,87 +140,42 @@ liveKeys =
     , "max-sql-length"
     ]
 
--- | 设置文件的候选位置
-settingsFileCandidates :: [FilePath]
-settingsFileCandidates =
-    [ "script" </> "chusql.settings.json"
-    , ".." </> "script" </> "chusql.settings.json"
-    , "chusql.settings.json"
-    ]
-
--- | 找现成的设置文件，否则挑目录已存在的候选
-resolveSettingsFile :: IO FilePath
-resolveSettingsFile = do
-    found <- firstExistingFile settingsFileCandidates
-    case found of
-        Just path -> pure path
-        Nothing -> do
-            ready <- firstExistingDir settingsFileCandidates
-            pure (maybe (headOr settingsFileCandidates "chusql.settings.json") id ready)
-  where
-    firstExistingFile [] = pure Nothing
-    firstExistingFile (p : ps) = do
-        ok <- doesFileExist p
-        if ok then pure (Just p) else firstExistingFile ps
-
-    -- | 候选所在目录是否已存在
-    firstExistingDir [] = pure Nothing
-    firstExistingDir (p : ps) = do
-        let dir = takeDirectory p
-        ok <- if null dir then pure True else doesDirectoryExist dir
-        if ok then pure (Just p) else firstExistingDir ps
-
--- | 候选列表里的第一个
-headOr :: [a] -> a -> a
-headOr (x : _) _ = x
-headOr [] d = d
-
--- | 读设置文件：键 -> 字符串值（文件不存在或坏掉都当空）
+-- | 读目录里用到的每个分区，摊成界面键；只有 [web] 统一成连字符写法
 readSettingsFile :: FilePath -> IO (Map.Map Text Text)
-readSettingsFile path = do
-    exists <- doesFileExist path
-    if not exists
-        then pure Map.empty
-        else do
-            raw <- readFileUtf8 path
-            pure $ case A.eitherDecodeStrict' raw of
-                Left _ -> Map.empty
-                Right (A.Object o) -> Map.fromList [(K.toText k, jsonToText v) | (k, v) <- KM.toList o]
-                Right _ -> Map.empty
+readSettingsFile path = fmap Map.unions (mapM readSectionOf catalogueSections)
   where
-    -- | JSON 值当字符串看
-    jsonToText v = case v of
-        A.String s -> s
-        A.Number n -> T.pack (show n)
-        A.Bool b -> if b then "1" else "0"
-        _ -> ""
+    readSectionOf section = do
+        raw <- readSection path section
+        let values = if section == webSection then canonicalSettingKeys raw else raw
+        pure
+            ( Map.fromList
+                [ (siKey i, value)
+                | i <- settingCatalogue
+                , siSection i == section
+                , Just value <- [Map.lookup (siTomlKey i) values]
+                ]
+            )
 
--- | 读文件（UTF-8 字节读，避免依赖系统编码）
-readFileUtf8 :: FilePath -> IO BS.ByteString
-readFileUtf8 = BS.readFile
-
--- | 写设置文件，只写非空值
+-- | 按分区写回：每个键落进自己的段，别的分区与注释原样保留
 writeSettingsFile :: FilePath -> Map.Map Text Text -> IO (Either String ())
-writeSettingsFile path values = do
-    let dir = takeDirectory path
-    prepared <- try (ensureDir dir) :: IO (Either IOException ())
-    case prepared of
-        Left e -> pure (Left ("cannot create the settings directory " ++ dir ++ ": " ++ show e))
-        Right () -> do
-            let encoded =
-                    A.encode
-                        ( A.Object
-                            ( KM.fromList
-                                [ (K.fromText k, A.String v)
-                                | (k, v) <- Map.toList values
-                                , not (T.null v)
-                                ]
-                            )
-                        )
-            written <- try (BS.writeFile path (BL.toStrict encoded)) :: IO (Either IOException ())
-            pure (either (Left . \e -> "cannot write " ++ path ++ ": " ++ show e) Right written)
+writeSettingsFile path values = writeSections catalogueSections
   where
-    ensureDir dir = if null dir then pure () else createDirectoryIfMissing True dir
+    writeSections [] = pure (Right ())
+    writeSections (section : rest) = do
+        let entries =
+                Map.fromList
+                    [ (siTomlKey i, value)
+                    | i <- settingCatalogue
+                    , siSection i == section
+                    , Just value <- [Map.lookup (siKey i) values]
+                    ]
+        if Map.null entries
+            then writeSections rest
+            else do
+                written <- writeSection path section entries
+                case written of
+                    Left err -> pure (Left err)
+                    Right () -> writeSections rest
 
 -- | 把界面上传来的值合并进现有文件内容（只接受目录里有的键）
 applySettings :: Map.Map Text Text -> Map.Map Text Text -> Either String (Map.Map Text Text)
@@ -209,6 +193,10 @@ applySettings current = go (Right current) . Map.toList
 checkKind :: SettingItem -> Text -> Either String ()
 checkKind spec value
     | T.null (T.strip value) = Right ()
+    | Just (lo, hi) <- lookup (siKey spec) [("password-min-length", (8, 256)), ("password-classes", (1, 4))] =
+        case reads (T.unpack (T.strip value)) :: [(Int, String)] of
+            [(n, "")] | n >= lo && n <= hi -> Right ()
+            _ -> Left (T.unpack (siKey spec) ++ " is outside the permitted range")
     | siKind spec == "int" = case reads (T.unpack (T.strip value)) :: [(Int, String)] of
         [(_, "")] -> Right ()
         _ -> Left (T.unpack (siKey spec) ++ " needs an integer, got: " ++ T.unpack value)
@@ -238,7 +226,7 @@ effectiveSettings cfg =
         , ("max-page-size", tshow (wcMaxPageSize cfg))
         , ("max-rows", tshow (wcMaxRows cfg))
         , ("max-sql-length", tshow (wcMaxSqlLength cfg))
-        , ("user", wcUser cfg)
+        , ("user", if T.null (T.strip (wcUser cfg)) then defaultUser else T.strip (wcUser cfg))
         , ("seed", boolText (wcSeedDemo cfg))
         , ("data-dir", maybe "" T.pack (wcDataDir cfg))
         , ("pipe-name", maybe "" T.pack (wcPipeName cfg))

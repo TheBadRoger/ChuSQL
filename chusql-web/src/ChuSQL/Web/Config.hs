@@ -6,22 +6,31 @@ module ChuSQL.Web.Config (
     defaultUser,
     defaultPassword,
     usingDefaultCredentials,
-    loadWebConfig,
+    loadWebConfigAt,
     resolveCredential,
     resolveStaticDir,
     staticDirCandidates,
+    rootUserName,
+    canonicalSettingKeys,
+    resolvePipeName,
 ) where
 
+import ChuSQL.Storage.IPC (defaultPipeName)
 import ChuSQL.Web.Auth (Credential (..), hashPassword)
+import ChuSQL.Web.TOML (readSection)
 import Data.Char (toLower)
+import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import System.Directory (doesDirectoryExist)
-import System.Environment (lookupEnv)
 import Text.Read (readMaybe)
 
--- 运行参数：命令行 > 环境变量 > 内置默认；默认只听本机 127.0.0.1:7777。
+-- 运行参数：命令行 > 全局 chusql.toml 的分区 > 内置默认，不看环境变量。
+-- 配置文件位置是固定的（安装时定下，见 ChuSQL.Web.TOML.defaultConfigFile），
+-- 想读别处的文件只能在命令行用 --config 指。
+-- 自己那段是 [web]；管名与数据目录取自 [server] pipe_name / [storage] data_dir，
+-- 因为它们是存储进程的事实，前端只当端点读。root 凭据只认 [web] 里的明文。
 
 -- | 默认账号名
 defaultUser :: Text
@@ -36,8 +45,6 @@ data WebConfig = WebConfig
     , wcPort :: Int
     , wcStaticDir :: FilePath
     , wcUser :: Text
-    , wcPasswordHash :: Maybe Text
-    , wcPassword :: Maybe Text
     , wcStorageServer :: Maybe FilePath
     , wcPipeName :: Maybe String
     , wcDataDir :: Maybe FilePath
@@ -62,9 +69,7 @@ defaultWebConfig =
         { wcHost = "127.0.0.1"
         , wcPort = 7777
         , wcStaticDir = "static"
-        , wcUser = defaultUser
-        , wcPasswordHash = Nothing
-        , wcPassword = Nothing
+        , wcUser = ""
         , wcStorageServer = Nothing
         , wcPipeName = Nothing
         , wcDataDir = Nothing
@@ -81,68 +86,114 @@ defaultWebConfig =
         , wcSeedDemo = False
         }
 
--- | 这份配置用的还是内置默认口令吗
-usingDefaultCredentials :: WebConfig -> Bool
-usingDefaultCredentials cfg = wcPasswordHash cfg == Nothing && wcPassword cfg == Nothing
+-- | [web] 分区里的键统一成连字符写法（scripts/chusql.toml 用的是下划线）
+--   两种写法同时出现时，连字符（设置页写的规范形式）优先。
+canonicalSettingKeys :: Map.Map Text Text -> Map.Map Text Text
+canonicalSettingKeys saved =
+    foldr (\(key, value) acc -> Map.insert (canonicalKey key) value acc) Map.empty (Map.toList saved)
+  where
+    canonicalKey key = fromMaybe key (lookup key keyAliases)
 
--- | 备一份凭据：哈希 > 明文 > 内置默认
-resolveCredential :: WebConfig -> IO Credential
-resolveCredential cfg = case (wcPasswordHash cfg, wcPassword cfg) of
-    (Just encoded, _) -> pure (Credential (wcUser cfg) encoded)
-    (Nothing, Just plain) -> do
-        encoded <- hashPassword plain
-        pure (Credential (wcUser cfg) encoded)
-    (Nothing, Nothing) -> do
-        encoded <- hashPassword defaultPassword
-        pure (Credential (wcUser cfg) encoded)
+-- | 下划线写法到连字符写法的别名
+keyAliases :: [(Text, Text)]
+keyAliases =
+    [ ("static_dir", "static-dir")
+    , ("session_idle", "session-idle")
+    , ("session_max", "session-max")
+    , ("login_max_attempts", "login-max-attempts")
+    , ("login_window", "login-window")
+    , ("body_limit", "body-limit")
+    , ("rows_per_page", "rows-per-page")
+    , ("max_page_size", "max-page-size")
+    , ("max_rows", "max-rows")
+    , ("max_sql_length", "max-sql-length")
+    , ("password_min_length", "password-min-length")
+    , ("password_classes", "password-classes")
+    , ("storage_server", "storage-server")
+    ]
 
--- | 从环境变量读配置，缺省用内置默认
-loadWebConfig :: IO WebConfig
-loadWebConfig = do
-    let d = defaultWebConfig
-    host <- envOr "CHUSQL_WEB_HOST" (wcHost d)
-    port <- envInt "CHUSQL_WEB_PORT" (wcPort d)
-    staticDir <- envOr "CHUSQL_WEB_STATIC" (wcStaticDir d)
-    user <- T.pack <$> envOr "CHUSQL_WEB_USER" (T.unpack (wcUser d))
-    passwordHash <- envText "CHUSQL_WEB_PASSWORD_HASH"
-    password <- envText "CHUSQL_WEB_PASSWORD"
-    server <- envMaybe "CHUSQL_STORAGE_SERVER"
-    pipe <- envMaybe "CHUSQL_PIPE"
-    dataDir <- envMaybe "CHUSQL_DATA_DIR"
-    secure <- envBool "CHUSQL_WEB_COOKIE_SECURE" (wcCookieSecure d)
-    limit <- envInt "CHUSQL_WEB_BODY_LIMIT" (wcBodyLimit d)
-    idle <- envInt "CHUSQL_WEB_SESSION_IDLE" (wcSessionIdle d)
-    sessionMax <- envInt "CHUSQL_WEB_SESSION_MAX" (wcSessionMax d)
-    loginMax <- envInt "CHUSQL_WEB_LOGIN_MAX_ATTEMPTS" (wcLoginMaxAttempts d)
-    loginWindow <- envInt "CHUSQL_WEB_LOGIN_WINDOW" (wcLoginWindow d)
-    pageSize <- envInt "CHUSQL_WEB_PAGE_SIZE" (wcPageSize d)
-    maxPageSize <- envInt "CHUSQL_WEB_MAX_PAGE_SIZE" (wcMaxPageSize d)
-    maxRows <- envInt "CHUSQL_WEB_MAX_ROWS" (wcMaxRows d)
-    maxSqlLength <- envInt "CHUSQL_WEB_MAX_SQL_LENGTH" (wcMaxSqlLength d)
-    seedDemo <- envBool "CHUSQL_WEB_SEED" (wcSeedDemo d)
-    pure
-        WebConfig
-            { wcHost = host
-            , wcPort = port
-            , wcStaticDir = staticDir
-            , wcUser = user
-            , wcPasswordHash = passwordHash
-            , wcPassword = password
-            , wcStorageServer = server
-            , wcPipeName = pipe
-            , wcDataDir = dataDir
-            , wcCookieSecure = secure
-            , wcBodyLimit = limit
-            , wcSessionIdle = idle
-            , wcSessionMax = sessionMax
-            , wcLoginMaxAttempts = loginMax
-            , wcLoginWindow = loginWindow
-            , wcPageSize = pageSize
-            , wcMaxPageSize = maxPageSize
-            , wcMaxRows = maxRows
-            , wcMaxSqlLength = maxSqlLength
-            , wcSeedDemo = seedDemo
-            }
+-- | 这份配置用的还是内置默认口令吗。
+--   显式留空（password = ""）是"只允许管理员免密登录"，算已经配置过。
+usingDefaultCredentials :: Map.Map Text Text -> Bool
+usingDefaultCredentials saved = Map.notMember "password" saved
+
+-- | 设置文件里某个键的非空值
+nonEmptyValue :: Text -> Map.Map Text Text -> Maybe Text
+nonEmptyValue key saved = case T.strip <$> Map.lookup key saved of
+    Just value | not (T.null value) -> Just value
+    _ -> Nothing
+
+-- | root 凭据只认设置文件里的明文：给了明文就哈希它；显式留空就是免密（空编码串）；
+--   没配这一项才回落到内置演示口令。
+resolveCredential :: WebConfig -> Map.Map Text Text -> IO Credential
+resolveCredential cfg saved = do
+    encoded <- case Map.lookup "password" saved of
+        Just plain | not (T.null (T.strip plain)) -> hashPassword (T.strip plain)
+        Just _ -> pure ""
+        Nothing -> hashPassword defaultPassword
+    pure (Credential (rootUserName cfg saved) encoded)
+
+-- | 管理员名字：命令行 --user > 设置文件 user > 内置默认
+rootUserName :: WebConfig -> Map.Map Text Text -> Text
+rootUserName cfg saved
+    | not (T.null (T.strip (wcUser cfg))) = T.strip (wcUser cfg)
+    | otherwise = fromMaybe defaultUser (nonEmptyValue "user" saved)
+
+-- | 读配置：内置默认 < [web] 分区（端点取自 [server] / [storage]）。
+--   user / password 不在这里读：它们由 rootUserName / resolveCredential 直接看设置文件。
+loadWebConfigAt :: FilePath -> IO WebConfig
+loadWebConfigAt path = do
+    raw <- readSection path "web"
+    server <- readSection path "server"
+    storage <- readSection path "storage"
+    pure (withEndpoint server storage (webConfigFromSection (canonicalSettingKeys raw)))
+
+-- | 端点：存储进程 bind 的管名与它用的数据目录，前端只读不改
+withEndpoint :: Map.Map Text Text -> Map.Map Text Text -> WebConfig -> WebConfig
+withEndpoint server storage cfg =
+    cfg
+        { wcPipeName = T.unpack <$> nonEmptyValue "pipe_name" server
+        , wcDataDir = T.unpack <$> nonEmptyValue "data_dir" storage
+        }
+
+-- | 实际要连的管名：配置里没有就用与存储层一致的默认值
+resolvePipeName :: WebConfig -> String
+resolvePipeName cfg = fromMaybe defaultPipeName (wcPipeName cfg)
+
+-- | [web] 分区里的启动参数，缺失或坏值一律回到内置默认
+webConfigFromSection :: Map.Map Text Text -> WebConfig
+webConfigFromSection saved =
+    defaultWebConfig
+        { wcHost = T.unpack (sectionText "host" saved (T.pack (wcHost defaultWebConfig)))
+        , wcPort = sectionInt "port" saved (wcPort defaultWebConfig)
+        , wcStaticDir = T.unpack (sectionText "static-dir" saved (T.pack (wcStaticDir defaultWebConfig)))
+        , wcCookieSecure = sectionBool "cookie-secure" saved (wcCookieSecure defaultWebConfig)
+        , wcBodyLimit = sectionInt "body-limit" saved (wcBodyLimit defaultWebConfig)
+        , wcSessionIdle = sectionInt "session-idle" saved (wcSessionIdle defaultWebConfig)
+        , wcSessionMax = sectionInt "session-max" saved (wcSessionMax defaultWebConfig)
+        , wcLoginMaxAttempts = sectionInt "login-max-attempts" saved (wcLoginMaxAttempts defaultWebConfig)
+        , wcLoginWindow = sectionInt "login-window" saved (wcLoginWindow defaultWebConfig)
+        , wcPageSize = sectionInt "rows-per-page" saved (wcPageSize defaultWebConfig)
+        , wcMaxPageSize = sectionInt "max-page-size" saved (wcMaxPageSize defaultWebConfig)
+        , wcMaxRows = sectionInt "max-rows" saved (wcMaxRows defaultWebConfig)
+        , wcMaxSqlLength = sectionInt "max-sql-length" saved (wcMaxSqlLength defaultWebConfig)
+        , wcSeedDemo = sectionBool "seed" saved (wcSeedDemo defaultWebConfig)
+        , wcStorageServer = T.unpack <$> nonEmptyValue "storage-server" saved
+        }
+
+-- | 分区里一个键的非空字符串值
+sectionText :: Text -> Map.Map Text Text -> Text -> Text
+sectionText key saved def = fromMaybe def (nonEmptyValue key saved)
+
+-- | 分区里的整数，解析不出来就用内置默认
+sectionInt :: Text -> Map.Map Text Text -> Int -> Int
+sectionInt key saved def = fromMaybe def (nonEmptyValue key saved >>= readMaybe . T.unpack)
+
+-- | 分区里的布尔（1/true/yes/on 都算真）
+sectionBool :: Text -> Map.Map Text Text -> Bool -> Bool
+sectionBool key saved def = case nonEmptyValue key saved of
+    Nothing -> def
+    Just value -> map toLower (T.unpack value) `elem` ["1", "true", "yes", "on"]
 
 -- | 静态目录候选位置，按顺序取第一个存在的
 staticDirCandidates :: FilePath -> [FilePath]
@@ -157,31 +208,3 @@ resolveStaticDir given = go (staticDirCandidates given)
     go (d : ds) = do
         ok <- doesDirectoryExist d
         if ok then pure (Just d) else go ds
-
--- | 读一个字符串，缺省给默认值
-envOr :: String -> String -> IO String
-envOr name def = fromMaybe def <$> lookupEnv name
-
--- | 读一个环境变量（空串当没设）
-envMaybe :: String -> IO (Maybe String)
-envMaybe name = do
-    v <- lookupEnv name
-    pure (case v of Just s | not (null s) -> Just s; _ -> Nothing)
-
--- | 读成 Text
-envText :: String -> IO (Maybe Text)
-envText name = fmap (fmap T.pack) (envMaybe name)
-
--- | 读成整数，解析不出来就用默认值
-envInt :: String -> Int -> IO Int
-envInt name def = do
-    v <- envMaybe name
-    pure (fromMaybe def (v >>= \s -> readMaybe s))
-
--- | 读成布尔（1/true/yes/on 都算真）
-envBool :: String -> Bool -> IO Bool
-envBool name def = do
-    v <- envMaybe name
-    pure $ case v of
-        Nothing -> def
-        Just s -> map toLower s `elem` ["1", "true", "yes", "on"]

@@ -33,7 +33,6 @@ safeRelative t
     | map toLower (takeExtension (T.unpack t)) `notElem` allowedExtensions = Nothing
     | otherwise = Just (T.unpack t)
   where
-    -- | 只允许字母数字与 ._-
     badChar c = not (isAsciiLower c || isAsciiUpper c || isDigit c || c `elem` ("._-" :: String))
 
 -- | 读一个静态文件；不存在（或是目录）给 Nothing

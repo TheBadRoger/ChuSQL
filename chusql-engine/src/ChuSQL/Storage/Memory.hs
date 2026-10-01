@@ -74,6 +74,11 @@ instance MonadStorage MemoryStorage where
     -- \| 原样返回当前库
     snapshot = MemoryStorage $ \db -> Right (db, db)
 
+    -- \| 改表结构：列定义与行一起换
+    replaceSchema name cols rows = MemoryStorage $ \db -> case lookup name db of
+        Nothing -> Right (Left ("unknown table: " ++ name), db)
+        Just tbl -> Right (Right (), replaceTable name tbl{tableCols = cols, tableRows = rows} db)
+
 -- | 用给定表替换同名表
 replaceTable :: String -> Table -> Database -> Database
 replaceTable name table =

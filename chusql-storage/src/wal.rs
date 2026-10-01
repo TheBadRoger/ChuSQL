@@ -5,7 +5,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::Row;
+use crate::protocol::{Account, Row, SchemaColumn, USERS_TABLE};
 
 // 预写日志：先记操作并 fsync，再改数据；重启重放残留。
 
@@ -14,9 +14,16 @@ const OP_REPLACE_ALL: u8 = 2;
 const OP_INSERT_BATCH: u8 = 3;
 const OP_DELETE_KEYS: u8 = 4;
 const OP_DROP_COLUMN: u8 = 5;
+const OP_ACCOUNTS: u8 = 6;
+const OP_REPLACE_SCHEMA: u8 = 7;
+const OP_HIDE_COLUMN: u8 = 8;
+const OP_COMPACT: u8 = 9;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum WalOp {
+    HideColumn { table: String, column: String },
+    Compact { table: String, rows: Vec<Row> },
+    Accounts { accounts: Vec<Account> },
     Insert {
         table: String,
         row: Row,
@@ -38,11 +45,22 @@ pub enum WalOp {
         column: String,
         rows: Vec<Row>,
     },
+    ReplaceSchema {
+        table: String,
+        columns: Vec<SchemaColumn>,
+        rows: Vec<Row>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct DropColumnPayload {
     column: String,
+    rows: Vec<Row>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ReplaceSchemaPayload {
+    columns: Vec<SchemaColumn>,
     rows: Vec<Row>,
 }
 
@@ -134,6 +152,14 @@ fn truncate(f: &mut File) -> io::Result<()> {
 /// 把操作编成字节
 fn encode(op: &WalOp) -> io::Result<Vec<u8>> {
     let (op_type, table, payload) = match op {
+        WalOp::HideColumn { table, column } => (OP_HIDE_COLUMN, table.clone(),
+            serde_json::to_vec(column).map_err(io::Error::other)?),
+        WalOp::Compact { table, rows } => {
+            let p = serde_json::to_vec(rows).map_err(io::Error::other)?;
+            (OP_COMPACT, table.clone(), p)
+        }
+        WalOp::Accounts { accounts } => (OP_ACCOUNTS, USERS_TABLE.to_string(),
+            serde_json::to_vec(accounts).map_err(io::Error::other)?),
         WalOp::Insert { table, row } => {
             let p = serde_json::to_vec(row).map_err(io::Error::other)?;
             (OP_INSERT, table.clone(), p)
@@ -157,6 +183,14 @@ fn encode(op: &WalOp) -> io::Result<Vec<u8>> {
             })
             .map_err(io::Error::other)?;
             (OP_DROP_COLUMN, table.clone(), p)
+        }
+        WalOp::ReplaceSchema { table, columns, rows } => {
+            let p = serde_json::to_vec(&ReplaceSchemaPayload {
+                columns: columns.clone(),
+                rows: rows.clone(),
+            })
+            .map_err(io::Error::other)?;
+            (OP_REPLACE_SCHEMA, table.clone(), p)
         }
     };
 
@@ -202,6 +236,22 @@ fn decode(buf: &[u8]) -> Result<Option<WalOp>, String> {
     let payload = &body[11 + table_len..];
 
     let op = match op_type {
+        OP_HIDE_COLUMN => {
+            let column = serde_json::from_slice(payload)
+                .map_err(|e| format!("bad hide_column payload: {e}"))?;
+            WalOp::HideColumn { table, column }
+        }
+        OP_COMPACT => {
+            let rows: Vec<Row> = serde_json::from_slice(payload)
+                .map_err(|e| format!("bad compact payload: {e}"))?;
+            WalOp::Compact { table, rows }
+        }
+        OP_ACCOUNTS => {
+            if table != USERS_TABLE { return Err("invalid account WAL table".into()); }
+            let accounts = serde_json::from_slice(payload)
+                .map_err(|e| format!("bad account payload: {e}"))?;
+            WalOp::Accounts { accounts }
+        }
         OP_INSERT => {
             let row: Row =
                 serde_json::from_slice(payload).map_err(|e| format!("bad insert payload: {}", e))?;
@@ -228,6 +278,15 @@ fn decode(buf: &[u8]) -> Result<Option<WalOp>, String> {
             WalOp::DropColumn {
                 table,
                 column: p.column,
+                rows: p.rows,
+            }
+        }
+        OP_REPLACE_SCHEMA => {
+            let p: ReplaceSchemaPayload = serde_json::from_slice(payload)
+                .map_err(|e| format!("bad replace_schema payload: {}", e))?;
+            WalOp::ReplaceSchema {
+                table,
+                columns: p.columns,
                 rows: p.rows,
             }
         }

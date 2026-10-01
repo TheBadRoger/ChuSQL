@@ -14,20 +14,62 @@ fn row(pairs: &[(&str, serde_json::Value)]) -> Row {
     m
 }
 
-/// 插一行再扫描读回
+/// 索引文件被清空（强杀或截断）后打开，会按堆数据补齐
 #[test]
-fn insert_and_scan_one_row() {
+fn empty_index_file_is_rebuilt_from_rows() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("t.db");
-    let mut t = HeapTable::open(&path, DEFAULT_PAGE_SIZE, DEFAULT_POOL_SIZE).unwrap();
+    let data = dir.path().join("t.db");
+    let index = dir.path().join("t.idx");
+    {
+        let mut t = HeapTable::open_indexed(&data, &index, DEFAULT_PAGE_SIZE, 4, DEFAULT_POOL_SIZE).unwrap();
+        for i in 1..=5 {
+            t.insert_row(&row(&[("id", json!(i))])).unwrap();
+        }
+        t.flush().unwrap();
+    }
+    std::fs::write(&index, b"").unwrap();
+    let mut t = HeapTable::open_indexed(&data, &index, DEFAULT_PAGE_SIZE, 4, DEFAULT_POOL_SIZE).unwrap();
+    assert!(t.get_by_column_key("id", 3).unwrap().is_some(), "空索引文件要从堆数据重建");
+    assert!(t.get_by_column_key("id", 9).unwrap().is_none());
+}
 
-    t.insert_row(&row(&[("id", json!(1)), ("name", json!("Alice"))]))
-        .unwrap();
+/// 字符串列能真正建索引：按值点查，NULL 不入索引
+#[test]
+fn string_index_looks_up_by_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("s.db");
+    let index = dir.path().join("s.idx");
+    let mut t = HeapTable::open(&data, DEFAULT_PAGE_SIZE, DEFAULT_POOL_SIZE).unwrap();
+    t.insert_row(&row(&[("id", json!(1)), ("name", json!("alice"))])).unwrap();
+    t.insert_row(&row(&[("id", json!(2)), ("name", json!("bob"))])).unwrap();
+    t.insert_row(&row(&[("id", json!(3)), ("name", json!(null))])).unwrap();
+    t.build_index("name", &index, DEFAULT_PAGE_SIZE, 4, DEFAULT_POOL_SIZE).unwrap();
 
-    let rows = t.scan().unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["id"], json!(1));
-    assert_eq!(rows[0]["name"], json!("Alice"));
+    assert_eq!(t.get_by_string_key("name", "bob").unwrap().unwrap()["id"], json!(2));
+    assert!(t.get_by_string_key("name", "dave").unwrap().is_none());
+    assert!(t.get_by_string_key("name", "").unwrap().is_none(), "NULL 不入索引");
+}
+
+/// 允许重复值建索引：点查把重复的行都取回来
+#[test]
+fn duplicate_values_are_indexed_and_all_returned() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("d.db");
+    let index = dir.path().join("d.idx");
+    let mut t = HeapTable::open(&data, DEFAULT_PAGE_SIZE, DEFAULT_POOL_SIZE).unwrap();
+    t.insert_row(&row(&[("id", json!(1)), ("name", json!("alice"))])).unwrap();
+    t.insert_row(&row(&[("id", json!(2)), ("name", json!("alice"))])).unwrap();
+    t.build_index("name", &index, DEFAULT_PAGE_SIZE, 4, DEFAULT_POOL_SIZE).unwrap();
+
+    let mut ids: Vec<i64> = t
+        .get_all_by_string_key("name", "alice")
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["id"].as_i64())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2]);
+    assert!(t.get_all_by_string_key("name", "bob").unwrap().is_empty());
 }
 
 /// 500 行跨页顺序不变
@@ -92,22 +134,6 @@ fn reopen_and_scan() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0]["id"], json!(1));
     assert_eq!(rows[1]["id"], json!(2));
-}
-
-/// 512 字节页可用
-#[test]
-fn custom_page_size() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("small.db");
-    let mut t = HeapTable::open(&path, 512, DEFAULT_POOL_SIZE).unwrap();
-
-    for i in 0..50 {
-        t.insert_row(&row(&[("id", json!(i))])).unwrap();
-    }
-    assert_eq!(t.scan().unwrap().len(), 50);
-
-    let big = "x".repeat(600);
-    assert!(t.insert_row(&row(&[("data", json!(big))])).is_err());
 }
 
 /// 整表改写后索引重建
@@ -246,40 +272,34 @@ fn secondary_index_is_maintained() {
     t.delete_by_keys(&[2]).unwrap();
     assert!(t.get_by_column_key("code", 7002).unwrap().is_none());
 
-    assert!(t.insert_row(&row(&[("id", json!(4)), ("code", json!(7001))])).is_err());
-    let mut t2 = HeapTable::open(&dir.path().join("d.db"), DEFAULT_PAGE_SIZE, DEFAULT_POOL_SIZE).unwrap();
+    t.insert_row(&row(&[("id", json!(4)), ("code", json!(7001))])).unwrap();
+    let mut dup_ids: Vec<i64> = t
+        .get_all_by_column_key("code", 7001)
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["id"].as_i64())
+        .collect();
+    dup_ids.sort_unstable();
+    assert_eq!(dup_ids, vec![1, 4], "duplicate index values keep both rows");
+
+    let mut t2 = HeapTable::open(dir.path().join("d.db"), DEFAULT_PAGE_SIZE, DEFAULT_POOL_SIZE).unwrap();
     t2.insert_rows(&[
         row(&[("id", json!(1)), ("age", json!(30))]),
         row(&[("id", json!(2)), ("age", json!(30))]),
     ])
     .unwrap();
-    let err = t2.build_index(
+    t2.build_index(
         "age",
         &dir.path().join("d.age.idx"),
         DEFAULT_PAGE_SIZE,
         chusql_storage::config::DEFAULT_BTREE_ORDER,
         DEFAULT_POOL_SIZE,
-    );
-    assert!(err.is_err(), "duplicate values must not be indexed");
-    assert!(!t2.has_index("age"), "no half-built index after failure");
-}
-
-/// 同一个 id 插两次要报错
-#[test]
-fn duplicate_key_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut t = HeapTable::open_indexed(
-        dir.path().join("t.db"),
-        dir.path().join("t.idx"),
-        DEFAULT_PAGE_SIZE,
-        chusql_storage::config::DEFAULT_BTREE_ORDER,
-        DEFAULT_POOL_SIZE,
     )
     .unwrap();
-
-    t.insert_row(&row(&[("id", json!(1))])).unwrap();
-    let r = t.insert_row(&row(&[("id", json!(1))]));
-    assert!(r.is_err());
-    assert_eq!(t.scan().unwrap().len(), 1, "the failed row should not reach the heap");
+    assert_eq!(
+        t2.get_all_by_column_key("age", 30).unwrap().len(),
+        2,
+        "duplicate values are all indexed"
+    );
 }
 

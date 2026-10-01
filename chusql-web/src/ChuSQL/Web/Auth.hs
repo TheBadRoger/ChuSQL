@@ -14,9 +14,10 @@ module ChuSQL.Web.Auth (
     sessionPolicy,
     setSessionPolicy,
     createSession,
+    createVersionedSession,
+    lookupVersionedSession,
     lookupSession,
     deleteSession,
-    deleteOtherSessions,
     sessionToken,
 ) where
 
@@ -118,6 +119,7 @@ data Session = Session
     { sessUser :: Text
     , sessCreated :: UTCTime
     , sessSeen :: UTCTime
+    , sessRevision :: Maybe Integer
     }
 
 data SessionPolicy = SessionPolicy
@@ -166,33 +168,31 @@ sessionToken = hexEncode <$> getRandomBytes 32
 
 -- | 开一条会话，返回令牌
 createSession :: SessionStore -> Text -> IO Text
-createSession store user = do
+createSession store user = createVersionedSession store user Nothing
+
+createVersionedSession :: SessionStore -> Text -> Maybe Integer -> IO Text
+createVersionedSession store user revision = do
     token <- sessionToken
     now <- storeClock store
     pol <- sessionPolicy store
     modifyMVar_ (storeMap store) $ \m ->
-        pure (Map.insert token (Session user now now) (prune now pol m))
+        pure (Map.insert token (Session user now now revision) (prune now pol m))
     pure token
 
 -- | 查令牌并刷新最后活动时间
 lookupSession :: SessionStore -> Text -> IO (Maybe Text)
-lookupSession store token = do
+lookupSession store token = fmap (fmap fst) (lookupVersionedSession store token)
+
+lookupVersionedSession :: SessionStore -> Text -> IO (Maybe (Text, Maybe Integer))
+lookupVersionedSession store token = do
     now <- storeClock store
     pol <- sessionPolicy store
     modifyMVar (storeMap store) $ \m -> do
         let kept = prune now pol m
         pure $ case Map.lookup token kept of
             Nothing -> (kept, Nothing)
-            Just s -> (Map.insert token s{sessSeen = now} kept, Just (sessUser s))
+            Just s -> (Map.insert token s{sessSeen = now} kept, Just (sessUser s, sessRevision s))
 
 -- | 删掉一条会话（退出登录）
 deleteSession :: SessionStore -> Text -> IO ()
 deleteSession store token = modifyMVar_ (storeMap store) (pure . Map.delete token)
-
--- | 删掉除这条外的全部会话，返回条数
-deleteOtherSessions :: SessionStore -> Text -> IO Int
-deleteOtherSessions store keep = do
-    removed <- modifyMVar (storeMap store) $ \m -> do
-        let kept = Map.filterWithKey (\k _ -> k == keep) m
-        pure (kept, Map.size m - Map.size kept)
-    pure removed

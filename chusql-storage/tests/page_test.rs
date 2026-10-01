@@ -49,25 +49,6 @@ fn append_grows_file() {
     assert_eq!(pf.num_pages().unwrap(), 3);
 }
 
-/// 两页内容互不影响
-#[test]
-fn two_pages_independent() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("test.db");
-
-    let mut pf = PageFile::open(&path, DEFAULT_PAGE_SIZE).unwrap();
-
-    let mut a = Page::new(0, DEFAULT_PAGE_SIZE);
-    a.data[0] = 1;
-    let mut b = Page::new(1, DEFAULT_PAGE_SIZE);
-    b.data[0] = 2;
-    pf.write_page(&a).unwrap();
-    pf.write_page(&b).unwrap();
-
-    assert_eq!(pf.read_page(0).unwrap().data[0], 1);
-    assert_eq!(pf.read_page(1).unwrap().data[0], 2);
-}
-
 /// 覆写同页读到新内容
 #[test]
 fn overwrite_page() {

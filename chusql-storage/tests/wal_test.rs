@@ -13,77 +13,51 @@ fn row(pairs: &[(&str, serde_json::Value)]) -> Row {
     m
 }
 
-/// 写读 Insert 操作
+/// 三种操作写完都能原样读回
 #[test]
-fn append_and_read_insert() {
+fn append_and_read_round_trips() {
     let dir = tempfile::tempdir().unwrap();
     let wal = Wal::new(dir.path().join("wal.log"));
 
-    let op = WalOp::Insert {
-        table: "users".into(),
-        row: row(&[("id", json!(1)), ("name", json!("Alice"))]),
-    };
-    wal.append(&op).unwrap();
-
-    let back = wal.read().unwrap().unwrap();
-    assert_eq!(back, op);
+    let ops = [
+        WalOp::Insert {
+            table: "users".into(),
+            row: row(&[("id", json!(1)), ("name", json!("Alice"))]),
+        },
+        WalOp::ReplaceAll {
+            table: "users".into(),
+            rows: vec![
+                row(&[("id", json!(1)), ("name", json!("Alice"))]),
+                row(&[("id", json!(2)), ("name", json!("Bob"))]),
+            ],
+        },
+        WalOp::DropColumn {
+            table: "users".into(),
+            column: "age".into(),
+            rows: vec![
+                row(&[("id", json!(1)), ("name", json!("Alice"))]),
+                row(&[("id", json!(2)), ("name", json!("Bob"))]),
+            ],
+        },
+    ];
+    for op in ops {
+        wal.clear().unwrap();
+        wal.append(&op).unwrap();
+        assert_eq!(wal.read().unwrap().unwrap(), op);
+    }
 }
 
-/// 写读 ReplaceAll 操作
+/// 文件不存在或为空都返回 None
 #[test]
-fn append_and_read_replace_all() {
+fn read_without_content_returns_none() {
     let dir = tempfile::tempdir().unwrap();
-    let wal = Wal::new(dir.path().join("wal.log"));
+    let missing = Wal::new(dir.path().join("missing.log"));
+    assert!(missing.read().unwrap().is_none());
 
-    let op = WalOp::ReplaceAll {
-        table: "users".into(),
-        rows: vec![
-            row(&[("id", json!(1)), ("name", json!("Alice"))]),
-            row(&[("id", json!(2)), ("name", json!("Bob"))]),
-        ],
-    };
-    wal.append(&op).unwrap();
-
-    let back = wal.read().unwrap().unwrap();
-    assert_eq!(back, op);
-}
-
-/// 写读 DropColumn 操作，行随日志落盘
-#[test]
-fn append_and_read_drop_column() {
-    let dir = tempfile::tempdir().unwrap();
-    let wal = Wal::new(dir.path().join("wal.log"));
-
-    let op = WalOp::DropColumn {
-        table: "users".into(),
-        column: "age".into(),
-        rows: vec![
-            row(&[("id", json!(1)), ("name", json!("Alice"))]),
-            row(&[("id", json!(2)), ("name", json!("Bob"))]),
-        ],
-    };
-    wal.append(&op).unwrap();
-
-    let back = wal.read().unwrap().unwrap();
-    assert_eq!(back, op);
-}
-
-/// 文件不存在返回 None
-#[test]
-fn missing_file_returns_none() {
-    let dir = tempfile::tempdir().unwrap();
-    let wal = Wal::new(dir.path().join("wal.log"));
-    assert!(wal.read().unwrap().is_none());
-}
-
-/// 空文件返回 None
-#[test]
-fn empty_file_returns_none() {
-    let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("wal.log");
     std::fs::write(&path, b"").unwrap();
-    let wal = Wal::new(&path);
-    assert!(wal.read().unwrap().is_none());
+    let empty = Wal::new(&path);
+    assert!(empty.read().unwrap().is_none());
 }
 
 /// 清空后读不到
@@ -122,20 +96,5 @@ fn truncated_tail_is_ignored() {
     std::fs::write(&path, &full[..full.len() - 5]).unwrap();
 
     assert!(wal.read().unwrap().is_none());
-}
-
-/// 第二次追加会覆盖
-#[test]
-fn overwrite_on_second_append_is_visible() {
-    let dir = tempfile::tempdir().unwrap();
-    let wal = Wal::new(dir.path().join("wal.log"));
-
-    wal.append(&WalOp::Insert {
-        table: "t".into(),
-        row: row(&[("id", json!(1))]),
-    })
-    .unwrap();
-    let first = wal.read().unwrap().unwrap();
-    assert!(matches!(first, WalOp::Insert { .. }));
 }
 

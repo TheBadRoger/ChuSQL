@@ -10,17 +10,20 @@ build-type:     Simple
 library
     hs-source-dirs:   src
     exposed-modules:  ChuSQL.Web.Actions
-                      ChuSQL.Web.Api
+                      ChuSQL.Web.Accounts
+                      ChuSQL.Web.API
                       ChuSQL.Web.Auth
                       ChuSQL.Web.Backend
                       ChuSQL.Web.Config
                       ChuSQL.Web.Demo
+                      ChuSQL.Web.Privileges
                       ChuSQL.Web.RateLimit
                       ChuSQL.Web.Secure
                       ChuSQL.Web.Settings
                       ChuSQL.Web.Static
                       ChuSQL.Web.StorageProcess
-                      ChuSQL.Web.UiSettings
+                      ChuSQL.Web.TOML
+                      ChuSQL.Web.UISettings
     build-depends:    base >= 4.14 && < 5
                     , aeson
                     , bytestring
@@ -48,6 +51,7 @@ executable chusql-web
                     , bytestring
                     , chusql-engine
                     , chusql-web
+                    , containers
                     , crypton
                     , directory
                     , filepath

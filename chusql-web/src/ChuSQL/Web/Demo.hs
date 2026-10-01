@@ -106,7 +106,6 @@ seedDemo backend = do
                                     (const (SeedReport (map T.unpack missingNames) skipped (map (T.unpack . snd) wantedIndexes)))
                                     indexes
   where
-    -- | 逐条执行，遇到错就停
     runAll :: [Either String String] -> IO (Either String ())
     runAll [] = pure (Right ())
     runAll (sql : rest) = case sql of
@@ -117,7 +116,6 @@ seedDemo backend = do
                 Left e -> pure (Left e)
                 Right _ -> runAll rest
 
-    -- | 这张表上是否还没有这个索引
     indexMissing :: [TableInfo] -> T.Text -> T.Text -> Bool
     indexMissing infos t c = case lookup (T.unpack t) [(tiTable i, tiIndexes i) | i <- infos] of
         Nothing -> True

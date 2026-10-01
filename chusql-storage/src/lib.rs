@@ -2,7 +2,9 @@
 
 pub mod btree;
 pub mod config;
+pub mod endpoint;
 pub mod heap;
+pub mod initsql;
 pub mod log;
 pub mod page;
 pub mod protocol;

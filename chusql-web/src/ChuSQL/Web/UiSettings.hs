@@ -1,11 +1,11 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module ChuSQL.Web.UiSettings (
+module ChuSQL.Web.UISettings (
     uiSettingsFileCandidates,
-    resolveUiSettingsFile,
-    validateUiSettings,
-    readUiSettings,
-    writeUiSettings,
+    resolveUISettingsFile,
+    validateUISettings,
+    readUISettings,
+    writeUISettings,
 ) where
 
 import Control.Exception (IOException, try)
@@ -22,19 +22,19 @@ import qualified Data.Vector as V
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist)
 import System.FilePath (takeDirectory, (</>))
 
--- 前端 IDE 设置单独存一份文件，与启动配置 chusql.settings.json 互不干扰。
+-- 前端 IDE 设置单独存一份文件，与全局启动配置 chusql.toml 互不干扰。
 
 -- | IDE 设置文件的候选位置
 uiSettingsFileCandidates :: [FilePath]
 uiSettingsFileCandidates =
-    [ "script" </> "chusql.ui.settings.json"
-    , ".." </> "script" </> "chusql.ui.settings.json"
+    [ "scripts" </> "chusql.ui.settings.json"
+    , ".." </> "scripts" </> "chusql.ui.settings.json"
     , "chusql.ui.settings.json"
     ]
 
 -- | 找现成的设置文件，否则挑目录已存在的候选
-resolveUiSettingsFile :: IO FilePath
-resolveUiSettingsFile = do
+resolveUISettingsFile :: IO FilePath
+resolveUISettingsFile = do
     found <- firstExistingFile uiSettingsFileCandidates
     case found of
         Just path -> pure path
@@ -42,7 +42,6 @@ resolveUiSettingsFile = do
             ready <- firstExistingDir uiSettingsFileCandidates
             pure (maybe firstCandidate id ready)
   where
-    -- | 候选清单里的第一个
     firstCandidate = case uiSettingsFileCandidates of
         (p : _) -> p
         [] -> "chusql.ui.settings.json"
@@ -52,7 +51,6 @@ resolveUiSettingsFile = do
         ok <- doesFileExist p
         if ok then pure (Just p) else firstExistingFile ps
 
-    -- | 候选所在目录是否已存在
     firstExistingDir [] = pure Nothing
     firstExistingDir (p : ps) = do
         let dir = takeDirectory p
@@ -60,8 +58,8 @@ resolveUiSettingsFile = do
         if ok then pure (Just p) else firstExistingDir ps
 
 -- | 校验一份 IDE 设置，未知键与越界都给错
-validateUiSettings :: A.Value -> Either String (Map.Map Text A.Value)
-validateUiSettings (A.Object o) = Map.fromList <$> mapM checkField (KM.toList o)
+validateUISettings :: A.Value -> Either String (Map.Map Text A.Value)
+validateUISettings (A.Object o) = Map.fromList <$> mapM checkField (KM.toList o)
   where
     checkField (rawKey, value) =
         let key = K.toText rawKey
@@ -84,7 +82,7 @@ validateUiSettings (A.Object o) = Map.fromList <$> mapM checkField (KM.toList o)
 
     pair key value = (key, value)
 
-validateUiSettings _ = Left "settings must be a JSON object"
+validateUISettings _ = Left "settings must be a JSON object"
 
 fontChainMax :: Int
 fontChainMax = 10
@@ -150,8 +148,8 @@ boolValue key value = case value of
     _ -> Left (T.unpack key ++ " expects a boolean")
 
 -- | 读 IDE 设置文件，缺文件或坏内容都给空对象
-readUiSettings :: FilePath -> IO A.Value
-readUiSettings path = do
+readUISettings :: FilePath -> IO A.Value
+readUISettings path = do
     exists <- doesFileExist path
     if not exists
         then pure emptyObject
@@ -166,8 +164,8 @@ readUiSettings path = do
     emptyObject = A.Object KM.empty
 
 -- | 写 IDE 设置文件，先建目录再落盘
-writeUiSettings :: FilePath -> Map.Map Text A.Value -> IO (Either String ())
-writeUiSettings path values = do
+writeUISettings :: FilePath -> Map.Map Text A.Value -> IO (Either String ())
+writeUISettings path values = do
     prepared <- try (ensureDir (takeDirectory path)) :: IO (Either IOException ())
     case prepared of
         Left e -> pure (Left ("cannot create the settings directory " ++ takeDirectory path ++ ": " ++ show e))

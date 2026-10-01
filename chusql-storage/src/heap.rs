@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::io;
 use std::path::Path;
+use serde::de::{IgnoredAny, MapAccess, Visitor};
+use serde::Deserializer;
 
 use crate::btree::DiskBTree;
 use crate::page::PageId;
@@ -12,6 +14,32 @@ use crate::protocol::Row;
 const HEADER_SIZE: usize = 2;
 const SLOT_SIZE: usize = 8;
 const SLOT_DIR_START: usize = HEADER_SIZE;
+
+/// 未选字段只校验并跳过，不分配值。
+fn decode_row(bytes: &[u8], columns: Option<&[String]>, hidden: &HashSet<String>) -> io::Result<Row> {
+    struct RowVisitor<'a>(Option<&'a [String]>, &'a HashSet<String>);
+    impl<'de> Visitor<'de> for RowVisitor<'_> {
+        type Value = Row;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a row object")
+        }
+        fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Row, M::Error> {
+            let mut row = Row::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if !self.1.contains(&key) && self.0.is_none_or(|cols| cols.contains(&key)) {
+                    row.insert(key, map.next_value()?);
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(row)
+        }
+    }
+    let mut decoder = serde_json::Deserializer::from_slice(bytes);
+    let row = decoder.deserialize_map(RowVisitor(columns, hidden)).map_err(io::Error::other)?;
+    decoder.end().map_err(io::Error::other)?;
+    Ok(row)
+}
 
 /// 读一个小端 u16
 fn read_u16(buf: &[u8], off: usize) -> u16 {
@@ -49,6 +77,26 @@ fn row_int(row: &Row, column: &str) -> Option<i64> {
         Some(serde_json::Value::Number(n)) => n.as_i64(),
         _ => None,
     }
+}
+
+/// i64 键 → 8 字节大端（保序，负数也在前）
+fn key_of(value: i64) -> [u8; 8] {
+    (value as u64 ^ (1u64 << 63)).to_be_bytes()
+}
+
+/// JSON 值 → 索引键字节（与写索引时同一套编码）
+fn value_key(v: &serde_json::Value) -> Option<Vec<u8>> {
+    match v {
+        serde_json::Value::Number(n) => n.as_i64().map(|k| key_of(k).to_vec()),
+        serde_json::Value::String(s) => Some(s.as_bytes().to_vec()),
+        serde_json::Value::Bool(b) => Some(vec![u8::from(*b)]),
+        _ => None,
+    }
+}
+
+/// 取行里某一列的索引键；NULL 与缺列不入索引
+fn row_key(row: &Row, column: &str) -> Option<Vec<u8>> {
+    row.get(column).and_then(value_key)
 }
 
 pub struct HeapPage;
@@ -146,6 +194,7 @@ struct NamedIndex {
 }
 
 pub struct HeapTable {
+    hidden_columns: HashSet<String>,
     file: PageFile,
     indexes: Vec<NamedIndex>,
 }
@@ -154,6 +203,7 @@ impl HeapTable {
     /// 打开表（不带索引）
     pub fn open<P: AsRef<Path>>(path: P, page_size: usize, pool_size: usize) -> io::Result<Self> {
         Ok(HeapTable {
+            hidden_columns: HashSet::new(),
             file: PageFile::with_options(path, page_size, pool_size)?,
             indexes: Vec::new(),
         })
@@ -167,12 +217,13 @@ impl HeapTable {
         btree_order: usize,
         pool_size: usize,
     ) -> io::Result<Self> {
-        let mut t = HeapTable {
-            file: PageFile::with_options(path, page_size, pool_size)?,
-            indexes: Vec::new(),
-        };
-        t.attach_index("id", index_path, page_size, btree_order, pool_size)?;
-        Ok(t)
+        Self::open_with_indexes(
+            path,
+            &[("id".to_string(), index_path.as_ref().to_path_buf())],
+            page_size,
+            btree_order,
+            pool_size,
+        )
     }
 
     /// 打开表并挂上多组索引
@@ -184,11 +235,29 @@ impl HeapTable {
         pool_size: usize,
     ) -> io::Result<Self> {
         let mut t = HeapTable {
+            hidden_columns: HashSet::new(),
             file: PageFile::with_options(path, page_size, pool_size)?,
             indexes: Vec::new(),
         };
+        let mut filled = false;
         for (col, p) in indexes {
-            t.attach_index(col, p, page_size, btree_order, pool_size)?;
+            match t.attach_index(col, p, page_size, btree_order, pool_size) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::InvalidData => {
+                    // 格式不兼容（例如上一版落的索引文件）：删掉重开
+                    let _ = std::fs::remove_file(p);
+                    t.attach_index(col, p, page_size, btree_order, pool_size)?;
+                }
+                Err(err) => return Err(err),
+            }
+            // 空索引（新文件、被截断、强杀留下）都按堆数据补齐
+            if t.index_empty(col)? {
+                t.fill_index(col)?;
+                filled = true;
+            }
+        }
+        if filled {
+            t.flush()?;
         }
         Ok(t)
     }
@@ -231,19 +300,17 @@ impl HeapTable {
             ));
         }
 
-        let mut seen: HashSet<i64> = HashSet::new();
-        let mut entries: Vec<(i64, u64)> = Vec::new();
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        let mut entries: Vec<(Vec<u8>, u64)> = Vec::new();
         for (page_id, slot, r) in self.scan_with_positions()? {
-            let Some(k) = row_int(&r, column) else {
+            let Some(k) = row_key(&r, column) else {
                 continue;
             };
-            if !seen.insert(k) {
+            // 行身份索引仍然唯一；其余列允许重复值
+            if column == "id" && !seen.insert(k.clone()) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!(
-                        "column \"{}\" has duplicate value {} -- non-unique indexes are not supported yet",
-                        column, k
-                    ),
+                    format!("column \"{}\" has duplicate values", column),
                 ));
             }
             entries.push((k, pack_position(page_id, slot)));
@@ -253,7 +320,31 @@ impl HeapTable {
         let i = self.indexes.len() - 1;
         self.indexes[i].tree.clear()?;
         for (k, pos) in entries {
-            self.indexes[i].tree.insert(k, pos)?;
+            self.indexes[i].tree.insert(&k, pos)?;
+        }
+        Ok(())
+    }
+
+    /// 这一列的索引是空的吗
+    fn index_empty(&mut self, column: &str) -> io::Result<bool> {
+        match self.indexes.iter_mut().find(|i| i.column == column) {
+            Some(idx) => idx.tree.is_empty(),
+            None => Ok(false),
+        }
+    }
+
+    /// 按堆里的行把某一列索引补齐
+    fn fill_index(&mut self, column: &str) -> io::Result<()> {
+        let rows = self.scan_with_positions()?;
+        let Some(i) = self.indexes.iter().position(|idx| idx.column == column) else {
+            return Ok(());
+        };
+        for (page_id, slot, row) in rows {
+            if let Some(k) = row_key(&row, column) {
+                self.indexes[i]
+                    .tree
+                    .insert(&k, pack_position(page_id, slot))?;
+            }
         }
         Ok(())
     }
@@ -269,6 +360,15 @@ impl HeapTable {
         }
     }
 
+    pub fn set_hidden_columns(&mut self, columns: HashSet<String>) {
+        self.hidden_columns = columns;
+    }
+
+    pub fn hide_column(&mut self, column: &str) {
+        self.detach_index(column);
+        self.hidden_columns.insert(column.to_string());
+    }
+
     /// 插入一行，并顺手写各索引
     pub fn insert_row(&mut self, row: &Row) -> io::Result<()> {
         self.insert_row_returning_position(row).map(|_| ())
@@ -276,15 +376,15 @@ impl HeapTable {
 
     /// 插入一行并返回它的位置
     pub fn insert_row_returning_position(&mut self, row: &Row) -> io::Result<(PageId, u16)> {
-        let mut pending: Vec<(usize, i64)> = Vec::new();
+        let mut pending: Vec<(usize, Vec<u8>)> = Vec::new();
         for (i, idx) in self.indexes.iter_mut().enumerate() {
-            let Some(k) = row_int(row, &idx.column) else {
+            let Some(k) = row_key(row, &idx.column) else {
                 continue;
             };
-            if idx.tree.get(k)?.is_some() {
+            if idx.column == "id" && idx.tree.get(&k)?.is_some() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("duplicate key {} on indexed column \"{}\"", k, idx.column),
+                    "duplicate value on the id index".to_string(),
                 ));
             }
             pending.push((i, k));
@@ -293,7 +393,7 @@ impl HeapTable {
         let (page_id, slot) = self.insert_returning_position(row)?;
         let pos = pack_position(page_id, slot);
         for (i, k) in pending {
-            self.indexes[i].tree.insert(k, pos)?;
+            self.indexes[i].tree.insert(&k, pos)?;
         }
         Ok((page_id, slot))
     }
@@ -306,17 +406,22 @@ impl HeapTable {
         Ok(())
     }
 
-    /// 插入一行，只进堆表、不碰索引
-    fn insert_returning_position(&mut self, row: &Row) -> io::Result<(PageId, u16)> {
+    /// 编码并验证一行能放进页
+    pub fn encode_row(row: &Row, page_size: usize) -> io::Result<Vec<u8>> {
         let tuple = serde_json::to_vec(row).map_err(io::Error::other)?;
 
-        if HEADER_SIZE + SLOT_SIZE + tuple.len() > self.file.page_size() {
+        if HEADER_SIZE + SLOT_SIZE + tuple.len() > page_size {
             return Err(io::Error::other(format!(
                 "tuple too large: {} bytes",
                 tuple.len()
             )));
         }
+        Ok(tuple)
+    }
 
+    /// 插入一行，只进堆表、不碰索引
+    fn insert_returning_position(&mut self, row: &Row) -> io::Result<(PageId, u16)> {
+        let tuple = Self::encode_row(row, self.file.page_size())?;
         let n = self.file.num_pages()?;
         if n > 0 {
             let last_id = n - 1;
@@ -341,16 +446,84 @@ impl HeapTable {
         self.get_by_column_key("id", key)
     }
 
-    /// 按某一列的索引取一行
+    /// 按某一列的整数索引取一行
     pub fn get_by_column_key(&mut self, column: &str, key: i64) -> io::Result<Option<Row>> {
+        self.get_by_bytes(column, &key_of(key))
+    }
+
+    /// 按某一列的字符串索引取一行
+    pub fn get_by_string_key(&mut self, column: &str, key: &str) -> io::Result<Option<Row>> {
+        self.get_by_bytes(column, key.as_bytes())
+    }
+
+    /// 按某一列的整数索引取全部行
+    pub fn get_all_by_column_key(&mut self, column: &str, key: i64) -> io::Result<Vec<Row>> {
+        self.get_all_by_bytes(column, &key_of(key))
+    }
+
+    /// 按某一列的字符串索引取全部行
+    pub fn get_all_by_string_key(&mut self, column: &str, key: &str) -> io::Result<Vec<Row>> {
+        self.get_all_by_bytes(column, key.as_bytes())
+    }
+
+    /// 按索引键的字节取第一行
+    fn get_by_bytes(&mut self, column: &str, key: &[u8]) -> io::Result<Option<Row>> {
+        Ok(self.get_all_by_bytes(column, key)?.into_iter().next())
+    }
+
+    /// 按索引键的字节取全部行（重复值都给出来）
+    fn get_all_by_bytes(&mut self, column: &str, key: &[u8]) -> io::Result<Vec<Row>> {
         let Some(idx) = self.indexes.iter_mut().find(|i| i.column == column) else {
+            return Ok(Vec::new());
+        };
+        let positions = idx.tree.get_all(key)?;
+        let mut rows = Vec::new();
+        for pos in positions {
+            let (page_id, slot) = unpack_position(pos);
+            if let Some(row) = self.read_at(page_id, slot)? {
+                rows.push(row);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// 范围扫描：某一列有索引就走叶子链，没有索引返回 None（上层退回全表扫描）
+    pub fn scan_range(
+        &mut self,
+        column: &str,
+        lo: Option<(&serde_json::Value, bool)>,
+        hi: Option<(&serde_json::Value, bool)>,
+    ) -> io::Result<Option<Vec<Row>>> {
+        let Some(i) = self.indexes.iter().position(|idx| idx.column == column) else {
             return Ok(None);
         };
-        let Some(pos) = idx.tree.get(key)? else {
-            return Ok(None);
-        };
-        let (page_id, slot) = unpack_position(pos);
-        self.read_at(page_id, slot)
+        let lo_bound = lo.and_then(|(v, inclusive)| value_key(v).map(|k| (k, inclusive)));
+        let hi_bound = hi.and_then(|(v, inclusive)| value_key(v).map(|k| (k, inclusive)));
+        // 树按闭区间取，排他端在取回来之后再筛
+        let pairs = self.indexes[i].tree.scan(
+            lo_bound.as_ref().map(|(k, _)| k.as_slice()),
+            hi_bound.as_ref().map(|(k, _)| k.as_slice()),
+        )?;
+        let mut rows = Vec::new();
+        for (key, pos) in pairs {
+            if let Some((bound, inclusive)) = &lo_bound {
+                let outside = if *inclusive { &key < bound } else { &key <= bound };
+                if outside {
+                    continue;
+                }
+            }
+            if let Some((bound, inclusive)) = &hi_bound {
+                let outside = if *inclusive { &key > bound } else { &key >= bound };
+                if outside {
+                    continue;
+                }
+            }
+            let (page_id, slot) = unpack_position(pos);
+            if let Some(row) = self.read_at(page_id, slot)? {
+                rows.push(row);
+            }
+        }
+        Ok(Some(rows))
     }
 
     /// 按位置读一行
@@ -359,7 +532,7 @@ impl HeapTable {
         match bytes {
             None => Ok(None),
             Some(bytes) => {
-                let row: Row = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+                let row = decode_row(&bytes, None, &self.hidden_columns)?;
                 Ok(Some(row))
             }
         }
@@ -373,9 +546,10 @@ impl HeapTable {
             return Ok(None);
         }
         if let Some(r) = &row {
+            let pos = pack_position(page_id, slot);
             for idx in &mut self.indexes {
-                if let Some(k) = row_int(r, &idx.column) {
-                    idx.tree.delete(k)?;
+                if let Some(k) = row_key(r, &idx.column) {
+                    idx.tree.delete(&k, pos)?;
                 }
             }
         }
@@ -392,7 +566,7 @@ impl HeapTable {
                     .indexes
                     .iter_mut()
                     .find(|i| i.column == "id")
-                    .and_then(|i| i.tree.get(k).ok().flatten());
+                    .and_then(|i| i.tree.get(&key_of(k)).ok().flatten());
                 if let Some(p) = pos {
                     positions.push(unpack_position(p));
                 }
@@ -401,10 +575,8 @@ impl HeapTable {
             let mut wanted: Vec<i64> = keys.to_vec();
             wanted.sort_unstable();
             for (page_id, slot, r) in self.scan_with_positions()? {
-                if let Some(k) = row_int(&r, "id") {
-                    if wanted.binary_search(&k).is_ok() {
-                        positions.push((page_id, slot));
-                    }
+                if row_int(&r, "id").is_some_and(|k| wanted.binary_search(&k).is_ok()) {
+                    positions.push((page_id, slot));
                 }
             }
         }
@@ -420,8 +592,12 @@ impl HeapTable {
 
     /// 全表扫描
     pub fn scan(&mut self) -> io::Result<Vec<Row>> {
+        self.scan_columns(None)
+    }
+
+    pub fn scan_columns(&mut self, columns: Option<&[String]>) -> io::Result<Vec<Row>> {
         Ok(self
-            .scan_with_positions()?
+            .scan_projected_with_positions(columns)?
             .into_iter()
             .map(|(_, _, r)| r)
             .collect())
@@ -429,6 +605,10 @@ impl HeapTable {
 
     /// 全表扫描，同时给出每行的位置（建索引用）
     pub fn scan_with_positions(&mut self) -> io::Result<Vec<(PageId, u16, Row)>> {
+        self.scan_projected_with_positions(None)
+    }
+
+    fn scan_projected_with_positions(&mut self, columns: Option<&[String]>) -> io::Result<Vec<(PageId, u16, Row)>> {
         let n = self.file.num_pages()?;
         let mut out = Vec::new();
         for i in 0..n {
@@ -442,7 +622,7 @@ impl HeapTable {
                 v
             })?;
             for (slot, bytes) in tuples {
-                let row: Row = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+                let row = decode_row(&bytes, columns, &self.hidden_columns)?;
                 out.push((i, slot, row));
             }
         }
@@ -459,8 +639,8 @@ impl HeapTable {
             let (page_id, slot) = self.insert_returning_position(r)?;
             let pos = pack_position(page_id, slot);
             for idx in &mut self.indexes {
-                if let Some(k) = row_int(r, &idx.column) {
-                    idx.tree.insert(k, pos)?;
+                if let Some(k) = row_key(r, &idx.column) {
+                    idx.tree.insert(&k, pos)?;
                 }
             }
         }

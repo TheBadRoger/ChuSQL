@@ -4,20 +4,102 @@ use serde::Deserialize;
 
 use crate::log::Level;
 
-// 配置：环境变量优先于 TOML，最后回退内置默认值。
+// 全局配置：只从 TOML 文件读，没写的项回退内置默认值。
+//
+// 这个文件是整条链路的唯一配置文件，按分区各管各的：
+// 存储只看 [page]/[btree]/[buffer]/[storage]/[server]/[log]，
+// 其他分区（例如 web 的 [web]）由对应的层自己读，这里既不校验也不关心。
+// 位置是安装时定下的固定路径，只有命令行 --config 能覆盖；没有任何环境变量通道。
+// （唯一跟环境变量有关的是路径的默认值：配置文件和默认数据目录都按平台惯例算，
+//   见 default_config_path / default_data_dir，它们只是算默认位置，不是配置通道。）
+// 读一次就关，不长期占着文件句柄。
 
-pub const DEFAULT_CONFIG_PATH: &str = "chusql-storage.toml";
+/// 配置文件名
+pub const CONFIG_FILE_NAME: &str = "chusql.toml";
+/// 配置目录名（随系统惯例放在用户配置目录下）
+pub const APP_DIR_NAME: &str = "ChuSQL";
+/// Unix 下的数据目录名（XDG 惯例小写，跟安装脚本的默认安装目录一致）
+pub const UNIX_APP_DIR_NAME: &str = "chusql";
+/// 数据子目录名
+pub const DATA_DIR_NAME: &str = "data";
 
 pub const DEFAULT_POOL_SIZE: usize = 1024;
 pub const DEFAULT_PAGE_SIZE: usize = 4096;
 pub const DEFAULT_BTREE_ORDER: usize = 4;
-pub const DEFAULT_DATA_DIR: &str = "../localdata";
-pub const DEFAULT_PIPE_NAME: &str = "chusql-storage";
+pub const DEFAULT_PIPE_NAME: &str = "chusql-joint";
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 
 const MIN_PAGE_SIZE: usize = 512;
 const MAX_PAGE_SIZE: usize = 65536;
 const MIN_BTREE_ORDER: usize = 3;
+
+/// 安装后的固定配置路径：Windows 用 %APPDATA%，其它平台用 XDG 惯例。
+/// 环境变量缺失时退回相对路径 ChuSQL/chusql.toml。
+pub fn default_config_path() -> PathBuf {
+    #[cfg(windows)]
+    {
+        let appdata = std::env::var_os("APPDATA").filter(|v| !v.is_empty());
+        if let Some(appdata) = appdata {
+            return PathBuf::from(appdata).join(APP_DIR_NAME).join(CONFIG_FILE_NAME);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let xdg = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty());
+        if let Some(xdg) = xdg {
+            return PathBuf::from(xdg).join(APP_DIR_NAME).join(CONFIG_FILE_NAME);
+        }
+        let home = std::env::var_os("HOME").filter(|v| !v.is_empty());
+        if let Some(home) = home {
+            return PathBuf::from(home)
+                .join(".config")
+                .join(APP_DIR_NAME)
+                .join(CONFIG_FILE_NAME);
+        }
+    }
+    PathBuf::from(APP_DIR_NAME).join(CONFIG_FILE_NAME)
+}
+
+/// [storage] data_dir 没写时的默认数据目录，按各平台惯例自动切换：
+///
+///   Windows  %LOCALAPPDATA%\ChuSQL\data（没设就退 %APPDATA%）
+///   Unix     $XDG_DATA_HOME/chusql/data（没设就是 ~/.local/share/chusql/data）
+///
+/// 跟安装脚本的默认数据目录是同一处：install.ps1 默认装到 %LOCALAPPDATA%\ChuSQL、
+/// 数据放它下面的 data\；install.sh 默认装到 ~/.local/share/chusql、数据放它下面的 data/。
+/// 环境变量都缺时才退回相对路径（跟 default_config_path 的兜底风格一致）。
+#[cfg(windows)]
+pub fn default_data_dir() -> PathBuf {
+    let local = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty());
+    if let Some(local) = local {
+        return PathBuf::from(local).join(APP_DIR_NAME).join(DATA_DIR_NAME);
+    }
+    let roaming = std::env::var_os("APPDATA").filter(|v| !v.is_empty());
+    if let Some(roaming) = roaming {
+        return PathBuf::from(roaming).join(APP_DIR_NAME).join(DATA_DIR_NAME);
+    }
+    PathBuf::from(APP_DIR_NAME).join(DATA_DIR_NAME)
+}
+
+/// 见 Windows 版本的注释：这里走 XDG 惯例。
+#[cfg(not(windows))]
+pub fn default_data_dir() -> PathBuf {
+    let xdg = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty());
+    if let Some(xdg) = xdg {
+        return PathBuf::from(xdg)
+            .join(UNIX_APP_DIR_NAME)
+            .join(DATA_DIR_NAME);
+    }
+    let home = std::env::var_os("HOME").filter(|v| !v.is_empty());
+    if let Some(home) = home {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join(UNIX_APP_DIR_NAME)
+            .join(DATA_DIR_NAME);
+    }
+    PathBuf::from(UNIX_APP_DIR_NAME).join(DATA_DIR_NAME)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -35,7 +117,7 @@ impl Default for Config {
             page_size: DEFAULT_PAGE_SIZE,
             btree_order: DEFAULT_BTREE_ORDER,
             pool_size: DEFAULT_POOL_SIZE,
-            data_dir: PathBuf::from(DEFAULT_DATA_DIR),
+            data_dir: default_data_dir(),
             pipe_name: DEFAULT_PIPE_NAME.to_string(),
             log_level: Level::Info,
         }
@@ -46,7 +128,6 @@ impl Default for Config {
 pub enum Origin {
     Default,
     File(PathBuf),
-    Env(&'static str),
 }
 
 impl Origin {
@@ -55,7 +136,6 @@ impl Origin {
         match self {
             Origin::Default => "default".to_string(),
             Origin::File(p) => format!("file {}", p.display()),
-            Origin::Env(k) => format!("env {}", k),
         }
     }
 }
@@ -68,7 +148,6 @@ pub struct Loaded {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct FileConfig {
     page: Option<FilePage>,
     btree: Option<FileBtree>,
@@ -114,12 +193,19 @@ struct FileLog {
     level: Option<String>,
 }
 
-/// 按真实环境加载
-pub fn load() -> Result<Loaded, String> {
-    let path = match std::env::var("CHUSQL_CONFIG") {
-        Ok(p) if !p.trim().is_empty() => Some(PathBuf::from(p)),
-        _ => {
-            let p = PathBuf::from(DEFAULT_CONFIG_PATH);
+/// 加载配置：explicit 有值就用它（读不到要报错），否则用固定安装路径（存在才读）
+pub fn load(explicit: Option<&str>) -> Result<Loaded, String> {
+    let explicit = explicit.map(str::trim).filter(|p| !p.is_empty());
+    let path = match explicit {
+        Some(p) => {
+            let p = PathBuf::from(p);
+            if !p.is_file() {
+                return Err(format!("config file not found: {}", p.display()));
+            }
+            Some(p)
+        }
+        None => {
+            let p = default_config_path();
             if p.is_file() { Some(p) } else { None }
         }
     };
@@ -130,15 +216,11 @@ pub fn load() -> Result<Loaded, String> {
         ),
         None => None,
     };
-    resolve(text.as_deref(), path, &|k| std::env::var(k).ok())
+    resolve(text.as_deref(), path)
 }
 
-/// 解析文本并套环境变量
-pub fn resolve(
-    text: Option<&str>,
-    path: Option<PathBuf>,
-    env: &dyn Fn(&str) -> Option<String>,
-) -> Result<Loaded, String> {
+/// 解析文本：文件 -> 默认
+pub fn resolve(text: Option<&str>, path: Option<PathBuf>) -> Result<Loaded, String> {
     let file: FileConfig = match text {
         None => FileConfig::default(),
         Some(t) => toml::from_str(t).map_err(|e| match &path {
@@ -148,70 +230,44 @@ pub fn resolve(
     };
 
     let file_origin = Origin::File(
-        path.clone()
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH)),
+        path.clone().unwrap_or_else(default_config_path),
     );
 
     let (page_size, page_origin) = pick(
-        "CHUSQL_PAGE_SIZE",
         file.page.and_then(|p| p.size),
         DEFAULT_PAGE_SIZE,
         &file_origin,
-        env,
-        |s| {
-            s.trim()
-                .parse::<usize>()
-                .map_err(|_| format!("not a number: {}", s))
-        },
-    )?;
+    );
     let (btree_order, order_origin) = pick(
-        "CHUSQL_BTREE_ORDER",
         file.btree.and_then(|b| b.order),
         DEFAULT_BTREE_ORDER,
         &file_origin,
-        env,
-        |s| {
-            s.trim()
-                .parse::<usize>()
-                .map_err(|_| format!("not a number: {}", s))
-        },
-    )?;
+    );
     let (pool_size, pool_origin) = pick(
-        "CHUSQL_POOL_SIZE",
         file.buffer.and_then(|b| b.pool_size),
         DEFAULT_POOL_SIZE,
         &file_origin,
-        env,
-        |s| {
-            s.trim()
-                .parse::<usize>()
-                .map_err(|_| format!("not a number: {}", s))
-        },
-    )?;
+    );
     let (data_dir, dir_origin) = pick(
-        "CHUSQL_DATA_DIR",
         file.storage.and_then(|s| s.data_dir),
-        DEFAULT_DATA_DIR.to_string(),
+        default_data_dir().to_string_lossy().into_owned(),
         &file_origin,
-        env,
-        |s| Ok(s.trim().to_string()),
-    )?;
+    );
     let (pipe_name, pipe_origin) = pick(
-        "CHUSQL_PIPE",
         file.server.and_then(|s| s.pipe_name),
         DEFAULT_PIPE_NAME.to_string(),
         &file_origin,
-        env,
-        |s| Ok(s.trim().to_string()),
-    )?;
+    );
     let (log_level, log_origin) = pick(
-        "CHUSQL_LOG",
         file.log.and_then(|l| l.level),
         DEFAULT_LOG_LEVEL.to_string(),
         &file_origin,
-        env,
-        |s| Ok(s.trim().to_string()),
-    )?;
+    );
+
+    let data_dir = data_dir.trim().to_string();
+    let pipe_name = pipe_name.trim().to_string();
+    let log_level = log_level.trim().to_string();
+
     let log_level = Level::parse(&log_level)
         .ok_or_else(|| format!("log.level is not one of off/error/warn/info/debug: {}", log_level))?;
 
@@ -248,23 +304,12 @@ pub fn resolve(
     })
 }
 
-/// 取一项：env -> 文件 -> 默认
-fn pick<T: Clone>(
-    env_key: &'static str,
-    file_value: Option<T>,
-    default: T,
-    file_origin: &Origin,
-    env: &dyn Fn(&str) -> Option<String>,
-    parse: impl Fn(&str) -> Result<T, String>,
-) -> Result<(T, Origin), String> {
-    if let Some(raw) = env(env_key) {
-        let value = parse(&raw).map_err(|e| format!("{}: {}", env_key, e))?;
-        return Ok((value, Origin::Env(env_key)));
-    }
+/// 取一项：文件 -> 默认
+fn pick<T>(file_value: Option<T>, default: T, file_origin: &Origin) -> (T, Origin) {
     if let Some(value) = file_value {
-        return Ok((value, file_origin.clone()));
+        return (value, file_origin.clone());
     }
-    Ok((default, Origin::Default))
+    (default, Origin::Default)
 }
 
 /// 检查选项是否自洽
@@ -290,4 +335,35 @@ fn validate_layout(page_size: usize, btree_order: usize) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 全局配置里别的层（例如 web）的分区不能被存储层当成错误
+    #[test]
+    fn ignores_sections_owned_by_other_layers() {
+        let text = r#"
+[page]
+size = 8192
+
+[storage]
+data_dir = "../data"
+
+[web]
+port = 7777
+user = "root"
+"#;
+        let loaded = resolve(Some(text), Some(PathBuf::from("chusql.toml"))).unwrap();
+        assert_eq!(loaded.config.page_size, 8192);
+        assert_eq!(loaded.config.data_dir, PathBuf::from("../data"));
+    }
+
+    /// 自己分区里的拼写错误仍然要报错
+    #[test]
+    fn still_rejects_typos_inside_its_own_sections() {
+        let text = "[page]\npage_size = 8192\n";
+        assert!(resolve(Some(text), None).is_err());
+    }
 }

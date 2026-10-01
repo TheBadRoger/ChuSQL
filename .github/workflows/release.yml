@@ -1,0 +1,221 @@
+# 发版流水线：打 tag（v*）时为四个平台各出 web / cli 两个发行包，附 sha256，挂到 Release。
+#
+# 资源命名（install.sh 按 <os>-<arch> 挑资源，见 scripts/install.sh）：
+#   chusql-web-linux-x86_64.tar.gz     chusql-cli-linux-x86_64.tar.gz
+#   chusql-web-windows-x86_64.zip      chusql-cli-windows-x86_64.zip
+#   chusql-web-macos-x86_64.tar.gz     chusql-cli-macos-x86_64.tar.gz
+#   chusql-web-macos-arm64.tar.gz      chusql-cli-macos-arm64.tar.gz
+#
+# 装的人拿到的就是编好的二进制，不需要 GHC / Rust：
+#   curl -fsSL https://raw.githubusercontent.com/TheBadRoger/ChuSQL/main/scripts/install.sh \
+#       | sh -s -- --component web
+# 没有对应平台的资源时，同一个脚本可以退回本地编译：
+#   sh scripts/install.sh --component web --from-source
+#
+# 说明：macOS 两个 runner 会让总时长变长（每个 job 都要 cargo + stack 各编一遍）；
+# 不需要 Intel mac 的包就把 macos-13 那两行删掉。
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'tag to build and publish (must already exist)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.platform }} / ${{ matrix.component }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, platform: linux-x86_64 }
+          - { os: windows-latest, platform: windows-x86_64 }
+          - { os: macos-13, platform: macos-x86_64 }
+          - { os: macos-14, platform: macos-arm64 }
+        component: [web, cli]
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------- 工具链 ----------
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            chusql-storage/target
+          key: ${{ runner.os }}-${{ matrix.platform }}-cargo-${{ hashFiles('chusql-storage/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Haskell toolchain
+        uses: haskell-actions/setup@v2
+        with:
+          ghc-version: '9.10.3'
+          enable-stack: true
+          stack-version: '3.11.1'
+
+      - name: Cache stack
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.stack
+            chusql-engine/.stack-work
+            chusql-web/.stack-work
+            chusql-cli/.stack-work
+          key: ${{ runner.os }}-${{ matrix.platform }}-stack-${{ hashFiles('**/stack.yaml', '**/stack.yaml.lock') }}
+          restore-keys: ${{ runner.os }}-stack-
+
+      # ---------- 构建 ----------
+      - name: build storage (Rust)
+        working-directory: chusql-storage
+        run: cargo build --release
+
+      - name: build web front end
+        if: matrix.component == 'web'
+        working-directory: chusql-cli
+        run: stack build --fast chusql-web:exe:chusql-web
+
+      - name: build cli
+        if: matrix.component == 'cli'
+        working-directory: chusql-cli
+        run: stack build --fast chusql-cli:exe:csql
+
+      # ---------- 装配 + 打归档（原来放在一个独立的打包脚本里，那个脚本已经删掉）----------
+      # 归档里是包内容本身（bin/、scripts/、static/、install.sh 就在根上），安装脚本按这个布局找文件。
+      - name: package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -eu
+          component='${{ matrix.component }}'
+          name="chusql-$component-${{ matrix.platform }}"
+          stage="dist/$name"
+          rm -rf "$stage"
+          mkdir -p "$stage/bin" "$stage/scripts"
+
+          cp chusql-storage/target/release/chusql-storage "$stage/bin/"
+
+          stack_root="$(cd chusql-cli && stack path --local-install-root | tail -n 1 | tr -d '\r')"
+          if [ "$component" = web ]; then front_name=chusql-web; else front_name=csql; fi
+          front="$stack_root/bin/$front_name"
+          if [ ! -f "$front" ]; then
+            front="$(find chusql-web/.stack-work chusql-cli/.stack-work -name "$front_name" -type f 2>/dev/null | head -n 1 || true)"
+          fi
+          [ -n "$front" ] && [ -f "$front" ] || { echo "front end binary not found: $front_name" >&2; exit 1; }
+          cp "$front" "$stage/bin/"
+
+          # Haskell 一般静态链接，靶目录里真有共享库就一起带上
+          for lib in chusql-storage/target/release/*.so chusql-storage/target/release/*.dylib; do
+            [ -f "$lib" ] && cp "$lib" "$stage/bin/"
+          done
+
+          cp scripts/chusql.toml scripts/init.sql "$stage/scripts/"
+          cp scripts/install.ps1 scripts/install.sh "$stage/"
+          if [ "$component" = web ]; then
+            mkdir -p "$stage/static"
+            cp -R chusql-web/static/. "$stage/static/"
+            cp scripts/csql-web.sh "$stage/"
+            if [ -f scripts/csql-web.ps1 ]; then cp scripts/csql-web.ps1 "$stage/"; fi
+          fi
+
+          chmod +x "$stage/install.sh"
+          if [ -f "$stage/csql-web.sh" ]; then chmod +x "$stage/csql-web.sh"; fi
+
+          mkdir -p dist
+          tar -czf "dist/$name.tar.gz" -C "$stage" .
+          rm -rf "$stage"
+          ls -l "dist/$name.tar.gz"
+
+      - name: package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $component = '${{ matrix.component }}'
+          $name = "chusql-$component-${{ matrix.platform }}"
+          $stage = "dist/$name"
+          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+          New-Item -ItemType Directory -Force -Path "$stage/bin", "$stage/scripts" | Out-Null
+
+          Copy-Item 'chusql-storage/target/release/chusql-storage.exe' "$stage/bin/"
+
+          $stackRoot = (& stack path --local-install-root | Select-Object -Last 1).Trim()
+          $frontName = if ($component -eq 'web') { 'chusql-web.exe' } else { 'csql.exe' }
+          $front = Join-Path $stackRoot "bin/$frontName"
+          if (-not (Test-Path $front)) {
+            $front = Get-ChildItem -Path 'chusql-web/.stack-work', 'chusql-cli/.stack-work' -Recurse -Filter $frontName -File -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $front -or -not (Test-Path $front)) { throw "front end binary not found: $frontName" }
+          Copy-Item $front "$stage/bin/"
+
+          Get-ChildItem 'chusql-storage/target/release' -Filter '*.dll' -File -ErrorAction SilentlyContinue |
+            ForEach-Object { Copy-Item $_.FullName "$stage/bin/" }
+
+          Copy-Item 'scripts/chusql.toml', 'scripts/init.sql' "$stage/scripts/"
+          Copy-Item 'scripts/install.ps1', 'scripts/install.sh' $stage
+          if ($component -eq 'web') {
+            New-Item -ItemType Directory -Force -Path "$stage/static" | Out-Null
+            Copy-Item 'chusql-web/static/*' "$stage/static" -Recurse
+            Copy-Item 'scripts/csql-web.sh' $stage
+            if (Test-Path 'scripts/csql-web.ps1') { Copy-Item 'scripts/csql-web.ps1' $stage }
+          }
+
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/$name.zip" -Force
+          Remove-Item -Recurse -Force $stage
+          Get-Item "dist/$name.zip" | Select-Object Name, Length | Format-Table
+
+      - name: checksum
+        shell: pwsh
+        run: |
+          Get-ChildItem dist -File | Where-Object { $_.Name -match '\.(zip|tar\.gz)$' } | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)" | Set-Content -NoNewline "$($_.FullName).sha256"
+            Write-Host "$($_.Name)  $hash"
+          }
+
+      - name: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}-${{ matrix.component }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: attach assets to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          ls -l dist
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "ChuSQL $TAG" --generate-notes
+          gh release upload "$TAG" dist/* --clobber

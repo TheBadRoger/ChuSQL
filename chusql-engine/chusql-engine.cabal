@@ -28,6 +28,7 @@ library
                     , bytestring
                     , hashable
                     , megaparsec
+                    , network
                     , parser-combinators
                     , scientific
                     , text

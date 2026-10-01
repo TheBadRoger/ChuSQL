@@ -4,27 +4,45 @@ module ChuSQL.Web.Backend (
     StatementResult (..),
     Backend (..),
     columnsFromStatement,
+    currentStamp,
+    exprTables,
+    inDatabase,
+    internalTable,
+    grantsTable,
     ipcBackend,
     memoryBackend,
+    membersTable,
+    rolesTable,
+    statementNeedsDatabase,
+    statementTables,
+    systemDatabaseName,
     tableInfoOf,
+    tableRefsOf,
 ) where
 
 import ChuSQL.Engine (runStatement, runStatementM)
 import ChuSQL.Model
+import ChuSQL.Semantic (prepare)
 import ChuSQL.Storage (MonadStorage (schema))
 import ChuSQL.Storage.IPC (
+    Account (..),
     IPCStorage (..),
     Request (..),
     Response (..),
     SchemaColumn (..),
     TableInfo (..),
-    doListCatalog,
     sendRequest,
  )
 import ChuSQL.Syntax.AST
 import ChuSQL.Syntax.Parser (parseStatement)
 import Control.Concurrent.MVar (MVar, modifyMVar, newMVar, readMVar, withMVar)
 import Data.List (nub)
+import Data.Text (Text)
+import Data.Time (getCurrentTime)
+import Data.Time.Format (defaultTimeLocale, formatTime)
+import qualified Data.Aeson as A
+import qualified Data.ByteString.Lazy.Char8 as BL
+import qualified Data.Text as T
 
 -- 后端：跑一条语句与取数据字典，分 IPC（真存储）和内存（测试）两套。
 
@@ -37,40 +55,52 @@ data Backend = Backend
     { beStatement :: String -> IO (Either String StatementResult)
     , beCatalog :: IO (Either String [TableInfo])
     , bePing :: IO Bool
+    , beAccounts :: Request -> IO (Either String [Account])
+    , beWithDatabase :: String -> Backend
+    , beDatabases :: IO (Either String [String])
     }
 
 -- | 按给定列名取列，固定列顺序
 columnsFromStatement :: Database -> Statement -> [String]
-columnsFromStatement db stmt = case stmt of
-    Select cols from _ _ _
-        | cols == [allColumns] -> wildcard from
-        | otherwise -> cols
+columnsFromStatement db stmt = case prepare db stmt of
+    Right (Select cols _ _ _ _ _) -> cols
+    Right (SelectExpr items _ _ _ _ _) -> map fst items
     _ -> []
-  where
-    -- | 展开 *：单表按列序，JOIN 左表在前
-    wildcard (FromTable mAlias tbl) = case lookup tbl db of
-        Nothing -> []
-        Just t -> [qualify mAlias c | c <- colNames t]
-    wildcard (FromJoin left mAlias tbl _) = wildcard left ++ wildcard (FromTable mAlias tbl)
 
--- | 走命名管道的后端（真存储）
+-- | 走本地端点的后端（真存储：Windows 具名管道 / Unix 套接字）
 ipcBackend :: IO Backend
 ipcBackend = do
     lock <- newMVar ()
-    pure
-        Backend
-            { beStatement = \sql -> withMVar lock $ \_ -> runIpc sql
+    let backend current = Backend
+            { beStatement = \sql -> withMVar lock $ \_ -> runIpc current sql
             , beCatalog = withMVar lock $ \_ -> do
-                result <- doListCatalog
-                pure (either Left Right result)
+                response <- sendRequest (ReqInDatabase current ReqListCatalog)
+                pure $ case response of
+                    RespCatalog infos -> Right infos
+                    RespError err -> Left err
+                    _ -> Left "unexpected catalog response"
             , bePing = withMVar lock $ \_ -> do
                 resp <- sendRequest ReqPing
                 pure (case resp of RespPong -> True; _ -> False)
+            , beAccounts = \req -> withMVar lock $ \_ -> do
+                response <- sendRequest req
+                pure $ case response of
+                    RespAccounts accounts -> Right accounts
+                    RespError err -> Left err
+                    _ -> Left "unexpected account response"
+            , beWithDatabase = backend
+            , beDatabases = withMVar lock $ \_ -> do
+                response <- sendRequest (ReqDatabase "list_databases" "")
+                pure $ case response of
+                    RespTables names -> Right names
+                    RespError err -> Left err
+                    _ -> Left "unexpected database response"
             }
+    -- 没有默认库：没选库时 current 是空串，任何请求都得先选库
+    pure (backend "")
   where
-    -- | 解析并执行，空结果时补一次表头
-    runIpc :: String -> IO (Either String StatementResult)
-    runIpc sql = case parseStatement sql of
+    runIpc :: String -> String -> IO (Either String StatementResult)
+    runIpc current sql = case fmap (inDatabase current) (parseStatement sql) of
         Left e -> pure (Left e)
         Right stmt -> do
             result <- runIPCStorage (runStatementM stmt)
@@ -84,42 +114,287 @@ ipcBackend = do
                         (r : _) -> pure (map fst r)
                     pure (Right (StatementResult cols rows))
 
--- | 内存后端（测试）：状态就是一个 `Database`
-memoryBackend :: MVar Database -> Backend
-memoryBackend ref =
+-- | 内存后端（测试）：状态就是一个 `Database`，名字是它代表的库
+memoryBackend :: String -> MVar Database -> Backend
+memoryBackend = memoryBackendWith False
+
+-- | 同一份内存状态可以按普通库（trusted=False）或系统库（trusted=True）视角跑：
+--   系统库要能读写角色/授权表，普通库连看都不许看。
+memoryBackendWith :: Bool -> String -> MVar Database -> Backend
+memoryBackendWith trusted name ref =
     Backend
-        { beStatement = \sql -> modifyMVar ref $ \db -> case parseStatement sql of
-            Left e -> pure (db, Left e)
-            Right stmt -> case runStatement db stmt of
+        { beStatement = \sql -> case parseStatement sql of
+            Left e -> pure (Left e)
+            -- 内存夹具也有"库"的概念：USE 只能切到它有的两个名字（自己 + system），
+            -- 与 beDatabases 口径一致；引擎的内存存储不实现库管理，所以拦在这里。
+            Right (UseDatabase target)
+                | target == name || target == systemDatabaseName -> pure (Right (StatementResult [] []))
+                | otherwise -> pure (Left ("unknown database: " ++ target))
+            Right stmt -> modifyMVar ref $ \db -> case runStatement (scoped db) stmt of
                 Left e -> pure (db, Left e)
-                Right (db', rows) -> pure (db', Right (StatementResult (colsOf db stmt rows) rows))
+                Right (db', rows)
+                    | any (hidden . fst) db' -> pure (db, Left "reserved system table")
+                    | otherwise -> pure (filter (hidden . fst) db ++ db', Right (StatementResult (colsOf (scoped db) stmt rows) rows))
         , beCatalog = do
             db <- readMVar ref
-            pure (Right (map tableInfoOf db))
+            pure (Right (map tableInfoOf (filter (not . internalTable . fst) db)))
         , bePing = pure True
+        , beAccounts = \req -> do
+            stamp <- currentStamp
+            modifyMVar ref $ \db -> case memoryAccounts db stamp req of
+                Left err -> pure (db, Left err)
+                Right accounts -> pure ((usersTable, Table usersTable [("account", TStr)]
+                    [[("account", VStr (BL.unpack (A.encode a))) ] | a <- accounts]) : filter ((/= usersTable) . fst) db, Right accounts)
+        , beWithDatabase = withDatabase
+        , beDatabases = pure (Right (nub [name, systemDatabaseName]))
         }
   where
-    -- | 有行用行上的键，空结果回退语法树
+    scoped = if trusted then filter (not . reserved . fst) else visible
+    hidden = if trusted then reserved else internalTable
     colsOf db stmt rows = case rows of
         [] -> columnsFromStatement db stmt
         (r : _) -> map fst r
+
+    -- 系统库视角给权限服务用；夹具自己的库走普通视角；没选库时只放行不碰表的语句
+    withDatabase target
+        | target == systemDatabaseName = memoryBackendWith True name ref
+        | target == name = memoryBackendWith False name ref
+        | null target = noDatabaseBackend (memoryBackendWith False name ref)
+        | otherwise = unavailableDatabase ("unknown database: " ++ target) (memoryBackendWith False name ref)
+
+unavailableDatabase :: String -> Backend -> Backend
+unavailableDatabase message backend = backend
+    { beStatement = \_ -> pure (Left message)
+    , beCatalog = pure (Left message)
+    }
+
+-- | 没选库时的视角：不碰表的语句（USE、建库、账号与角色）照跑，
+--   一旦语句里出现裸表名就报 no database selected。
+--   与存储层口径一致：`db.table` 这种限定名不需要先选库。
+noDatabaseBackend :: Backend -> Backend
+noDatabaseBackend backend = backend
+    { beStatement = \sql -> case parseStatement sql of
+        Left e -> pure (Left e)
+        Right stmt
+            | statementNeedsDatabase stmt -> pure (Left "no database selected")
+            | otherwise -> beStatement backend sql
+    , beCatalog = pure (Left "no database selected")
+    }
+
+-- | Database context is an immutable request value, never shared connection state.
+--   子查询里出现的表名同样要带上数据库前缀，否则会落到错误的库里。
+inDatabase :: String -> Statement -> Statement
+inDatabase current = walk
+  where
+    walk :: Statement -> Statement
+    walk stmt = case stmt of
+        q@Select{} ->
+            q
+                { selectFrom = source (selectFrom q)
+                , selectWhere = fmap expr (selectWhere q)
+                }
+        q@SelectExpr{} ->
+            q
+                { selectItems = [(label, expr e) | (label, e) <- selectItems q]
+                , selectFrom = source (selectFrom q)
+                , selectWhere = fmap expr (selectWhere q)
+                }
+        Insert t cols rows -> Insert (table t) cols (map (map expr) rows)
+        Delete t cond -> Delete (table t) (fmap expr cond)
+        Update t assigns cond -> Update (table t) [(c, expr e) | (c, e) <- assigns] (fmap expr cond)
+        CreateTable t cols -> CreateTable (table t) cols
+        DropTable t -> DropTable (table t)
+        CreateIndex t c -> CreateIndex (table t) c
+        DropIndex t c -> DropIndex (table t) c
+        DropColumn t c -> DropColumn (table t) c
+        AddColumn t def -> AddColumn (table t) def
+        RenameColumn t old new -> RenameColumn (table t) old new
+        AlterColumnType t c ty -> AlterColumnType (table t) c ty
+        AlterColumnDefault t c v -> AlterColumnDefault (table t) c v
+        AlterColumnNull t c b -> AlterColumnNull (table t) c b
+        other -> other
+
+    table t | '.' `elem` t || null current = t
+            | otherwise = current ++ "." ++ t
+
+    source FromUnit = FromUnit
+    source (FromTable a t) = FromTable a (table t)
+    source (FromJoin k l a t e) = FromJoin k (source l) a (table t) (expr e)
+
+    -- 表达式里的子查询也要一起改写
+    expr (ScalarSub sq) = ScalarSub (sub sq)
+    expr (ExistsSub sq neg) = ExistsSub (sub sq) neg
+    expr (InSub a sq neg) = InSub (expr a) (sub sq) neg
+    expr (InList a items neg) = InList (expr a) (map expr items) neg
+    expr (Add a b) = Add (expr a) (expr b)
+    expr (Sub a b) = Sub (expr a) (expr b)
+    expr (Mul a b) = Mul (expr a) (expr b)
+    expr (Div a b) = Div (expr a) (expr b)
+    expr (Neg a) = Neg (expr a)
+    expr (Gt a b) = Gt (expr a) (expr b)
+    expr (Lt a b) = Lt (expr a) (expr b)
+    expr (Eq a b) = Eq (expr a) (expr b)
+    expr (And a b) = And (expr a) (expr b)
+    expr (Or a b) = Or (expr a) (expr b)
+    expr (IsNull a) = IsNull (expr a)
+    expr (IsNotNull a) = IsNotNull (expr a)
+    expr (CountOf a) = CountOf (expr a)
+    expr (SumOf a) = SumOf (expr a)
+    expr (AvgOf a) = AvgOf (expr a)
+    expr (MinOf a) = MinOf (expr a)
+    expr (MaxOf a) = MaxOf (expr a)
+    expr other = other
+
+    sub sq = sq {subqueryStatement = walk (subqueryStatement sq)}
+
+-- | 语句里出现的表（含 JOIN、子查询、INSERT/UPDATE/DELETE 的目标）
+statementTables :: Statement -> [Text]
+statementTables stmt = nub (case stmt of
+    Select{} ->
+        tableRefsOf (selectFrom stmt)
+            ++ concatMap exprTables (maybe [] (: []) (selectWhere stmt))
+    SelectExpr{} ->
+        tableRefsOf (selectFrom stmt)
+            ++ concatMap exprTables (maybe [] (: []) (selectWhere stmt) ++ map snd (selectItems stmt))
+    Insert table _ rows -> T.pack table : concatMap exprTables (concat rows)
+    Update table assigns cond -> T.pack table : concatMap exprTables (map snd assigns ++ maybe [] (: []) cond)
+    Delete table cond -> T.pack table : concatMap exprTables (maybe [] (: []) cond)
+    CreateTable table _ -> [T.pack table]
+    DropTable table -> [T.pack table]
+    CreateIndex table _ -> [T.pack table]
+    DropIndex table _ -> [T.pack table]
+    DropColumn table _ -> [T.pack table]
+    AddColumn table _ -> [T.pack table]
+    RenameColumn table _ _ -> [T.pack table]
+    AlterColumnType table _ _ -> [T.pack table]
+    AlterColumnDefault table _ _ -> [T.pack table]
+    AlterColumnNull table _ _ -> [T.pack table]
+    _ -> [])
+
+-- | 语句需不需要一个当前库：出现的表里有没写库名的就必须要
+statementNeedsDatabase :: Statement -> Bool
+statementNeedsDatabase stmt = any (not . T.any (== '.')) (statementTables stmt)
+
+-- | FROM 子句里的所有表
+tableRefsOf :: FromClause -> [Text]
+tableRefsOf FromUnit = []
+tableRefsOf (FromTable _ name) = [T.pack name]
+tableRefsOf (FromJoin _ left _ name cond) = tableRefsOf left ++ [T.pack name] ++ exprTables cond
+
+-- | 表达式里出现的表（子查询是唯一的来路）
+exprTables :: Expr -> [Text]
+exprTables expr = case expr of
+    ScalarSub sub -> statementTables (subqueryStatement sub)
+    ExistsSub sub _ -> statementTables (subqueryStatement sub)
+    InSub value sub _ -> exprTables value ++ statementTables (subqueryStatement sub)
+    InList value items _ -> concatMap exprTables (value : items)
+    Add a b -> both a b
+    Sub a b -> both a b
+    Mul a b -> both a b
+    Div a b -> both a b
+    Gt a b -> both a b
+    Lt a b -> both a b
+    Eq a b -> both a b
+    And a b -> both a b
+    Or a b -> both a b
+    Neg a -> exprTables a
+    IsNull a -> exprTables a
+    IsNotNull a -> exprTables a
+    CountOf a -> exprTables a
+    SumOf a -> exprTables a
+    AvgOf a -> exprTables a
+    MinOf a -> exprTables a
+    MaxOf a -> exprTables a
+    _ -> []
+  where
+    both a b = exprTables a ++ exprTables b
 
 -- | 一张表的线上信息（内存实现：没有索引，统计现算）
 tableInfoOf :: (String, Table) -> TableInfo
 tableInfoOf (name, tbl) =
     TableInfo
         { tiTable = name
-        , tiColumns = [SchemaColumn c (wireType ty) | (c, ty) <- tableCols tbl]
+        , tiColumns = [wireColumn c ty | (c, ty) <- tableCols tbl]
         , tiRows = length (tableRows tbl)
         , tiIndexes = []
         , tiStats = [(c, distinctOf c, False) | (c, _) <- tableCols tbl]
         }
   where
-    -- | 某一列有几个不同值
     distinctOf c = length (nub [v | r <- tableRows tbl, Just v <- [lookup c r]])
 
 -- | 本地列类型转线上字符串（和 IPC 那边同一套写法）
 wireType :: Column -> String
-wireType TInt = "int"
-wireType TStr = "str"
-wireType TBool = "bool"
+wireType = typeName . columnType
+
+-- | 本地列转线上 schema
+wireColumn :: String -> Column -> SchemaColumn
+wireColumn name col =
+    SchemaColumn
+        { scName = name
+        , scType = wireType col
+        , scNullable = columnNullable col
+        , scDefault = columnDefault col
+        , scAutoIncrement = columnAutoIncrement col
+        , scPrimaryKey = columnPrimaryKey col
+        , scUnique = columnUnique col
+        , scCheck = columnCheck col
+        }
+
+-- | 系统库：账号、角色与授权表住在这里，其中的表都是系统表，只给管理员
+systemDatabaseName :: String
+systemDatabaseName = "system"
+
+usersTable :: String
+usersTable = "__chusql_users"
+
+-- | 角色与授权表：住在 system 库，名字不带 `__chusql_` 前缀（Rust 存储层拒收那个前缀）
+rolesTable :: String
+rolesTable = "sys_roles"
+
+grantsTable :: String
+grantsTable = "sys_grants"
+
+membersTable :: String
+membersTable = "sys_members"
+
+internalNames :: [String]
+internalNames = [rolesTable, grantsTable, membersTable]
+
+reserved :: String -> Bool
+reserved = T.isPrefixOf "__chusql_" . T.toLower . T.pack
+
+-- | 服务自己的内部表：目录里不出现，普通作用域读写都拒（系统作用域才放行角色/授权表）
+internalTable :: String -> Bool
+internalTable name = reserved name || T.unpack (T.toLower (T.pack name)) `elem` internalNames
+
+visible :: Database -> Database
+visible = filter (not . internalTable . fst)
+
+-- | 当前 UTC 时间，写法与引擎的 timestamp 一致
+currentStamp :: IO T.Text
+currentStamp = T.pack . formatTime defaultTimeLocale "%Y-%m-%d %H:%M:%S" <$> getCurrentTime
+
+memoryAccounts :: Database -> T.Text -> Request -> Either String [Account]
+memoryAccounts db stamp req = do
+    accounts <- case lookup usersTable db of
+        Nothing -> Right []
+        Just table -> mapM decodeAccount (tableRows table)
+    case req of
+        ReqAccountsList -> Right accounts
+        ReqAccountCreate u h
+            | any ((== T.toLower u) . accountUser) accounts -> Left "account already exists"
+            | otherwise -> Right (accounts ++ [Account (1 + maximum (0 : map accountId accounts)) (T.toLower u) h 1 stamp Nothing])
+        ReqAccountReset u h -> case filter ((== T.toLower u) . accountUser) accounts of
+            [_] -> Right [if accountUser x == T.toLower u then x{accountHash = h, accountRevision = accountRevision x + 1} else x | x <- accounts]
+            _ -> Left "unknown account"
+        ReqAccountLogin u at -> case filter ((== T.toLower u) . accountUser) accounts of
+            [_] -> Right [if accountUser x == T.toLower u then x{accountLastLoginAt = at} else x | x <- accounts]
+            _ -> Left "unknown account"
+        ReqAccountDrop u -> case filter ((== T.toLower u) . accountUser) accounts of
+            [] -> Left "unknown account"
+            _ -> Right [x | x <- accounts, accountUser x /= T.toLower u]
+        _ -> Left "invalid account request"
+  where
+    decodeAccount row = case lookup "account" row of
+        Just (VStr encoded) -> A.eitherDecode (BL.pack encoded)
+        _ -> Left "invalid account record"

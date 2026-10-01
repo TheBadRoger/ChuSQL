@@ -1,0 +1,55 @@
+# ChuSQL 全局配置。
+#
+# 整条链路共用这一份文件，按分区各管各的，互不影响：
+#   存储进程：[page] [btree] [buffer] [storage] [server] [log]
+#   Web / 命令行：[web]（账号口令、会话、分页上限、静态目录、存储进程路径）
+# 端点也在这里：[server] pipe_name 是管名，[storage] data_dir 是数据目录，
+# 谁需要谁读，不再靠环境变量传递。data_dir 这行是安装时会替换的占位：
+# 不写就按平台惯例（Windows %LOCALAPPDATA%\ChuSQL\data，
+# Unix ${XDG_DATA_HOME:-$HOME/.local/share}/chusql/data）。
+# 每一层只读自己那几段，读完就关，不长期占着文件句柄，别的层照样能读。
+# 只有这一份文件说了算：没有任何环境变量覆盖。
+# 位置是固定的：Windows 在 %APPDATA%\ChuSQL\chusql.toml，其它平台在
+# $XDG_CONFIG_HOME/ChuSQL/chusql.toml（没设就是 ~/.config/ChuSQL/chusql.toml）。
+# 想临时读别处，三个可执行文件都认命令行 --config <path>。
+
+[page]
+size = 4096
+
+[btree]
+order = 4
+
+[buffer]
+pool_size = 1024
+
+[storage]
+# 安装时被替换成实际数据目录（--data-dir / -DataDir）；不写就按平台惯例：
+# Windows %LOCALAPPDATA%\ChuSQL\data，Unix ${XDG_DATA_HOME:-$HOME/.local/share}/chusql/data
+data_dir = "../localdata"
+
+[server]
+pipe_name = "chusql-joint"
+
+[log]
+level = "info"
+
+[web]
+host = "127.0.0.1"
+port = 7777
+static_dir = "static"
+# 存储进程的可执行文件；留空表示存储已在别处运行，只按 [server] pipe_name 去连
+storage_server = ""
+# 管理员账号与口令。口令留空表示"只允许管理员免密登录"，普通账号一律不能登录。
+user = "root"
+password = ""
+# 会话与登录限流
+session_idle = 28800
+session_max = 86400
+login_max_attempts = 5
+login_window = 300
+# 请求与分页上限
+body_limit = 65536
+rows_per_page = 25
+max_page_size = 500
+max_rows = 1000
+max_sql_length = 20000

@@ -1,4 +1,4 @@
-module ChuSQL.Algebra.Sort (sortRows) where
+module ChuSQL.Algebra.Sort (sortRows, compareValue) where
 
 import ChuSQL.Model
 import ChuSQL.Syntax.AST
@@ -12,9 +12,15 @@ flipOrdering LT = GT
 flipOrdering GT = LT
 flipOrdering EQ = EQ
 
--- | 比较两个值
+-- | 比较两个值：NULL 最小，数值跨整数与小数比较
 compareValue :: Value -> Value -> Ordering
+compareValue VNull VNull = EQ
+compareValue VNull _ = LT
+compareValue _ VNull = GT
 compareValue (VInt a) (VInt b) = compare a b
+compareValue (VFloat a) (VFloat b) = compare a b
+compareValue (VInt a) (VFloat b) = compare (fromIntegral a) b
+compareValue (VFloat a) (VInt b) = compare a (fromIntegral b)
 compareValue (VStr a) (VStr b) = compare a b
 compareValue (VBool a) (VBool b) = compare a b
 compareValue _ _ = EQ

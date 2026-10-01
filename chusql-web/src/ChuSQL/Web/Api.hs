@@ -1,33 +1,42 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module ChuSQL.Web.Api (
+module ChuSQL.Web.API (
     AppEnv (..),
     Live (..),
     defaultLive,
     setLive,
     readLive,
     applyLiveKeys,
+    configurePasswordPolicy,
     webApp,
     sessionCookieName,
     parseCookieHeader,
     isIdentifier,
     renderRow,
     tableInfoJson,
+    systemTableInfo,
     apiErrorJson,
     newAppEnv,
+    newAppEnvAt,
 ) where
 
-import ChuSQL.Model (Column (..), Row, Value (..))
-import ChuSQL.Storage.IPC (SchemaColumn (..), TableInfo (..))
+import ChuSQL.Model (Row, Value (..))
+import ChuSQL.Semantic (check)
+import ChuSQL.Storage.IPC (Account (..), SchemaColumn (..), TableInfo (..))
+import ChuSQL.Syntax.AST (Statement (..))
+import ChuSQL.Syntax.Parser (parseStatement)
+import ChuSQL.Web.Accounts
 import ChuSQL.Web.Actions (
     ColumnSpec (..),
     CreateTableSpec (..),
     coerceValue,
     columnTypeOf,
+    createDatabaseSql,
     createIndexSql,
     createTableSql,
     deleteRowSql,
     dropColumnSql,
+    dropDatabaseSql,
     dropIndexSql,
     dropTableSql,
     insertRowSql,
@@ -39,38 +48,46 @@ import ChuSQL.Web.Auth (
     Credential (..),
     SessionPolicy (..),
     SessionStore,
-    createSession,
-    deleteOtherSessions,
     deleteSession,
-    hashLooksValid,
-    hashPassword,
-    lookupSession,
     setSessionPolicy,
     sessionToken,
-    verifyPassword,
  )
-import ChuSQL.Web.Backend (Backend, StatementResult (..), beCatalog, bePing, beStatement)
+import ChuSQL.Web.Backend (Backend, StatementResult (..), beCatalog, bePing, beStatement, beWithDatabase, beDatabases, statementNeedsDatabase)
 import ChuSQL.Web.Demo (SeedReport (..), seedDemo)
+import ChuSQL.Web.Privileges (
+    Grant (..),
+    PrivilegeCommand (..),
+    PrivilegeError (..),
+    Privileges,
+    RoleView (..),
+    authorize,
+    authorizeTables,
+    filterTables,
+    listRoleViews,
+    newPrivileges,
+    privilegeCommand,
+    runPrivilegeCommand,
+ )
 import ChuSQL.Web.RateLimit (RateLimiter, rateLimitBlock, rateLimitClear, rateLimitRecord, setRateLimit)
 import ChuSQL.Web.Secure (bodyLimitDynamic, sameOriginOnly, securityHeaders, contentSecurityPolicy)
 import ChuSQL.Web.Settings (
     SettingItem (..),
     applySettings,
     defaultOf,
+    isLockedSetting,
     liveKeys,
     readSettingsFile,
-    resolveSettingsFile,
     settingCatalogue,
-    settingsFileCandidates,
     writeSettingsFile,
  )
 import ChuSQL.Web.Static (contentTypeOf, readStatic, safeRelative)
-import ChuSQL.Web.UiSettings (
-    readUiSettings,
-    resolveUiSettingsFile,
+import ChuSQL.Web.TOML (defaultConfigFile)
+import ChuSQL.Web.UISettings (
+    readUISettings,
+    resolveUISettingsFile,
     uiSettingsFileCandidates,
-    validateUiSettings,
-    writeUiSettings,
+    validateUISettings,
+    writeUISettings,
  )
 import Control.Exception (IOException, try)
 import Data.Aeson (FromJSON (..), eitherDecode, object, withObject, (.:), (.=))
@@ -80,16 +97,17 @@ import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString as BS
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.List (sortBy)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe)
+import Data.Scientific (fromFloatDigits)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.Lazy as TL
 import qualified Data.Vector as V
-import Network.HTTP.Types (status204, status400, status401, status403, status404, status413, status429, status500)
+import Network.HTTP.Types (status204, status400, status401, status403, status404, status409, status413, status429, status500)
 import Network.Wai (Application)
-import System.Environment (lookupEnv)
 import Text.Read (readMaybe)
 import Web.Scotty
 
@@ -126,14 +144,16 @@ defaultLive =
 data AppEnv = AppEnv
     { aeBackend :: Backend
     , aeSessions :: SessionStore
-    , aeCredential :: IORef Credential
+    , aeAccounts :: Accounts
+    , aePrivileges :: Privileges
     , aeLimiter :: RateLimiter
     , aeStaticDir :: FilePath
     , aeCookieSecure :: Bool
     , aeLive :: IORef Live
     , aeSettingsFile :: FilePath
-    , aeUiSettingsFile :: FilePath
+    , aeUISettingsFile :: FilePath
     , aeEffective :: Map.Map Text Text
+    , aeDatabase :: Text
     , aeLog :: Text -> IO ()
     }
 
@@ -141,47 +161,77 @@ data AppEnv = AppEnv
 sessionCookieName :: Text
 sessionCookieName = "chusql_session"
 
--- | 参数齐全地造一份环境（各项上限用内置默认，调用方按配置改）
+-- | 参数齐全地造一份环境（各项上限用内置默认，调用方按配置改）；配置文件用固定路径
 newAppEnv :: Backend -> SessionStore -> Credential -> RateLimiter -> FilePath -> IO AppEnv
 newAppEnv backend sessions cred limiter staticDir = do
-    credRef <- newIORef cred
-    liveRef <- newIORef defaultLive
     settingsFile <- resolveSettingsFileSafe
-    uiSettingsFile <- resolveUiSettingsFileSafe
+    newAppEnvAt settingsFile backend sessions cred limiter staticDir
+
+-- | 同上，但明说读写哪份配置文件（--config 走这里，保证读写的和启动读的是同一份）
+newAppEnvAt :: FilePath -> Backend -> SessionStore -> Credential -> RateLimiter -> FilePath -> IO AppEnv
+newAppEnvAt settingsFile backend sessions cred limiter staticDir = do
+    accounts <- newAccounts backend sessions cred
+    privileges <- newPrivileges backend
+    liveRef <- newIORef defaultLive
+    configurePasswordPolicy accounts settingsFile
+    uiSettingsFile <- resolveUISettingsFileSafe
     pure
         AppEnv
             { aeBackend = backend
             , aeSessions = sessions
-            , aeCredential = credRef
+            , aeAccounts = accounts
+            , aePrivileges = privileges
             , aeLimiter = limiter
             , aeStaticDir = staticDir
             , aeCookieSecure = False
             , aeLive = liveRef
             , aeSettingsFile = settingsFile
-            , aeUiSettingsFile = uiSettingsFile
+            , aeUISettingsFile = uiSettingsFile
             , aeEffective = Map.empty
+            , aeDatabase = ""
             , aeLog = const (pure ())
             }
 
--- | 定位设置文件，找不到就定下首个候选路径
+-- | 系统库：账号表住在这里，其中的表都是系统表，只有管理员能进。
+systemDatabase :: Text
+systemDatabase = "system"
+
+-- | 保留库：只有系统库删不掉、也建不了。
+reservedDatabase :: Text -> Bool
+reservedDatabase name = name == systemDatabase
+
+configurePasswordPolicy :: Accounts -> FilePath -> IO ()
+configurePasswordPolicy accounts path = do
+    saved <- readSettingsFile path
+    let values = Map.fromList [(key, Map.findWithDefault (defaultOf key) key saved) | key <- passwordKeys]
+    case applySettings Map.empty values of
+        Left err -> ioError (userError err)
+        Right valid -> setAccountsPolicy accounts (policyFromValues defaultPasswordPolicy valid)
+
+passwordKeys :: [Text]
+passwordKeys = ["password-min-length", "password-classes"]
+
+policyFromValues :: PasswordPolicy -> Map.Map Text Text -> PasswordPolicy
+policyFromValues before values = PasswordPolicy
+    (number "password-min-length" (ppMinLength before)) (number "password-classes" (ppClasses before))
+  where
+    number key fallback = case Map.lookup key values of
+        Nothing -> fallback
+        Just value -> fromMaybe fallback (readMaybe (T.unpack (if T.null value then defaultOf key else value)))
+
+-- | 配置文件位置是固定的，这里只兜住「拿不到用户目录」的极端情况
 resolveSettingsFileSafe :: IO FilePath
 resolveSettingsFileSafe = do
-    found <- try resolveSettingsFile :: IO (Either IOException FilePath)
-    pure (either (const fallbackSettingsFile) id found)
-  where
-    -- | 候选清单里的第一个
-    fallbackSettingsFile = case settingsFileCandidates of
-        (p : _) -> p
-        [] -> "chusql.settings.json"
+    found <- try defaultConfigFile :: IO (Either IOException FilePath)
+    pure (either (const "chusql.toml") id found)
 
 -- | 定位 IDE 设置文件，找不到就定下首个候选路径
-resolveUiSettingsFileSafe :: IO FilePath
-resolveUiSettingsFileSafe = do
-    found <- try resolveUiSettingsFile :: IO (Either IOException FilePath)
-    pure (either (const fallbackUiSettingsFile) id found)
+resolveUISettingsFileSafe :: IO FilePath
+resolveUISettingsFileSafe = do
+    found <- try resolveUISettingsFile :: IO (Either IOException FilePath)
+    pure (either (const fallbackUISettingsFile) id found)
   where
-    -- | 候选清单里的第一个
-    fallbackUiSettingsFile = case uiSettingsFileCandidates of
+    fallbackUISettingsFile = case uiSettingsFileCandidates of
         (p : _) -> p
         [] -> "chusql.ui.settings.json"
 
@@ -216,22 +266,85 @@ routes env = do
     get "/api/settings" (settingsH env)
     put "/api/settings" (putSettingsH env)
     get "/api/ui-settings" (uiSettingsH env)
-    put "/api/ui-settings" (putUiSettingsH env)
-    post "/api/account/password" (changePasswordH env)
-    get "/api/tables" (tablesH env)
-    post "/api/tables" (createTableH env)
-    delete "/api/tables/:t" (dropTableH env)
-    get "/api/tables/:t" (tableH env)
-    get "/api/tables/:t/rows" (rowsH env)
-    post "/api/tables/:t/rows" (insertRowH env)
-    patch "/api/tables/:t/rows/:id" (updateRowH env)
-    delete "/api/tables/:t/rows/:id" (deleteRowH env)
-    post "/api/tables/:t/indexes" (createIndexH env)
-    delete "/api/tables/:t/indexes/:col" (dropIndexH env)
-    delete "/api/tables/:t/columns/:col" (dropColumnH env)
-    post "/api/demo-data" (demoDataH env)
-    post "/api/query" (queryH env)
+    put "/api/ui-settings" (putUISettingsH env)
+    get "/api/databases" (databasesH env)
+    post "/api/databases" (withDatabase env createDatabaseH)
+    delete "/api/databases/:name" (withDatabase env dropDatabaseH)
+    get "/api/tables" (withDatabase env tablesH)
+    post "/api/tables" (withDatabase env createTableH)
+    delete "/api/tables/:t" (withDatabase env dropTableH)
+    get "/api/tables/:t" (withDatabase env tableH)
+    get "/api/tables/:t/rows" (withDatabase env rowsH)
+    post "/api/tables/:t/rows" (withDatabase env insertRowH)
+    patch "/api/tables/:t/rows/:id" (withDatabase env updateRowH)
+    delete "/api/tables/:t/rows/:id" (withDatabase env deleteRowH)
+    post "/api/tables/:t/indexes" (withDatabase env createIndexH)
+    delete "/api/tables/:t/indexes/:col" (withDatabase env dropIndexH)
+    delete "/api/tables/:t/columns/:col" (withDatabase env dropColumnH)
+    post "/api/demo-data" (withDatabase env demoDataH)
+    get "/api/roles" (withDatabase env rolesH)
+    post "/api/roles" (withDatabase env createRoleH)
+    delete "/api/roles/:name" (withDatabase env dropRoleH)
+    post "/api/roles/:name/grants" (withDatabase env grantRoleH)
+    delete "/api/roles/:name/grants" (withDatabase env revokeRoleH)
+    post "/api/roles/:name/members" (withDatabase env addRoleMemberH)
+    delete "/api/roles/:name/members/:user" (withDatabase env removeRoleMemberH)
+    post "/api/query" (withDatabase env queryH)
     notFound (notFoundH env)
+
+-- | A request carries its own immutable database context; shared IPC never stores USE state.
+--   没带 `X-ChuSQL-Database` 就是"没选库"：绑定空库，需要库的接口自己报 no database selected。
+withDatabase :: AppEnv -> (AppEnv -> ActionM ()) -> ActionM ()
+withDatabase env action = do
+    principal <- requirePrincipal env
+    chosen <- maybe "" (T.toLower . TL.toStrict) <$> header "X-ChuSQL-Database"
+    if T.null chosen
+        then action env{aeBackend = beWithDatabase (aeBackend env) "", aeDatabase = ""}
+        else
+            if not (isIdentifier chosen) || T.length chosen > 64
+                then reply400 "bad_request" "invalid database name"
+                else
+                    if chosen == systemDatabase && not (principalIsRoot principal)
+                        then reply403 "the system database is only available to the administrator"
+                        else action env {aeBackend = beWithDatabase (aeBackend env) (T.unpack chosen), aeDatabase = chosen}
+
+-- | 需要当前库的接口先过这一关（裸表名/建表都要先选库）。
+--   走 accountError 而不是 reply400：它会 finish，否则 handler 还会往下跑并覆盖这个错误。
+requireDatabase :: AppEnv -> ActionM ()
+requireDatabase env =
+    if T.null (aeDatabase env)
+        then accountError (AccountError "no_database" "no database selected")
+        else pure ()
+
+-- | 数据库清单；系统库 system 只给管理员看。
+databasesH :: AppEnv -> ActionM ()
+databasesH env = do
+    principal <- requirePrincipal env
+    result <- liftIO (beDatabases (aeBackend env))
+    case result of
+        Left e -> engineError e
+        Right names -> json (if principalIsRoot principal then names else filter (/= T.unpack systemDatabase) names)
+
+-- | 新建数据库：名字过标识符白名单，真正建库交给存储层。
+createDatabaseH :: AppEnv -> ActionM ()
+createDatabaseH env = do
+    requireAdmin env
+    withJsonObject env $ \o -> case textField "name" o of
+        Left err -> reply400 "bad_request" err
+        Right name -> case createDatabaseSql name of
+            Left err -> reply400 "bad_request" (T.pack err)
+            Right sql -> runWrite env sql
+
+-- | 删除数据库；系统库 system 一律拒绝。
+dropDatabaseH :: AppEnv -> ActionM ()
+dropDatabaseH env = do
+    requireAdmin env
+    name <- pathParam "name"
+    if reservedDatabase name
+        then reply400 "bad_request" "the system database cannot be dropped"
+        else case dropDatabaseSql name of
+            Left err -> reply400 "bad_request" (T.pack err)
+            Right sql -> runWrite env sql
 
 -- | 首页：登录与管理界面同一个 HTML
 indexH :: AppEnv -> ActionM ()
@@ -295,8 +408,9 @@ loginH env = do
             Right reqBody -> do
                 let user = T.strip (lrUser reqBody)
                     password = lrPassword reqBody
-                if T.null user || T.length user > 64 || T.null password || T.length password > 256
-                    then reply400 "bad_request" "user name or password is empty or too long"
+                -- 口令允许为空：配置里口令留空时管理员就是免密登录
+                if T.null user || T.length user > 64 || T.length password > 256
+                    then reply400 "bad_request" "user name is empty or too long"
                     else do
                         blocked <- liftIO (rateLimitBlock (aeLimiter env) user)
                         case blocked of
@@ -305,18 +419,16 @@ loginH env = do
                                 status status429
                                 json (apiErrorJson "too_many_attempts" "too many failed sign-in attempts, try again later")
                             Nothing -> do
-                                cred <- liftIO (readCredential env)
                                 live <- liftIO (readLive env)
-                                let hashOk = verifyPassword (credEncoded cred) password
-                                    userOk = T.toLower user == T.toLower (credUser cred)
-                                if userOk && hashOk
-                                    then do
+                                result <- liftIO (authenticate (aeAccounts env) user password)
+                                case result of
+                                    Right token -> do
                                         liftIO (rateLimitClear (aeLimiter env) user)
-                                        token <- liftIO (createSession (aeSessions env) (credUser cred))
                                         setHeader "Set-Cookie" (TL.fromStrict (sessionCookie env token (Just (lvSessionMax live))))
-                                        liftIO (aeLog env ("sign-in ok user=" <> credUser cred))
+                                        liftIO (aeLog env ("sign-in ok user=" <> user))
                                         status status204
-                                    else do
+                                    Left err@(AccountError code _) | code /= "unauthorized" -> accountError err
+                                    Left _ -> do
                                         liftIO (rateLimitRecord (aeLimiter env) user)
                                         liftIO (aeLog env ("sign-in failed user=" <> user))
                                         status status401
@@ -335,29 +447,29 @@ logoutH env = do
 -- | 当前登录的是谁
 sessionH :: AppEnv -> ActionM ()
 sessionH env = do
-    user <- requireUser env
-    json (object ["user" .= user])
+    principal <- requirePrincipal env
+    policy <- liftIO (accountsPolicy (aeAccounts env))
+    json (object ["user" .= principalName principal, "administrator" .= principalIsRoot principal,
+        "policy" .= object ["minLength" .= ppMinLength policy, "classes" .= ppClasses policy]])
 
 -- | 读设置：文件值、启动生效值与内置默认一起给出
 settingsH :: AppEnv -> ActionM ()
 settingsH env = do
-    user <- requireUser env
-    cred <- liftIO (readCredential env)
+    principal <- requirePrincipal env
     fileValues <- liftIO (readSettingsFile (aeSettingsFile env))
-    envSet <- liftIO (mapM (isSetEnv . siEnv) settingCatalogue)
-    let owner = sameAccount user (credUser cred)
+    let owner = principalIsRoot principal
     json
         ( object
             [ "file" .= aeSettingsFile env
-            , "account" .= credUser cred
+            , "account" .= principalName principal
             , "owner" .= owner
-            , "items" .= zipWith (itemJson (aeEffective env) fileValues owner) settingCatalogue envSet
+            , "items" .= map (itemJson (aeEffective env) fileValues owner) settingCatalogue
             ]
         )
 
 -- | 一个配置项在界面上的样子
-itemJson :: Map.Map Text Text -> Map.Map Text Text -> Bool -> SettingItem -> Bool -> A.Value
-itemJson effectiveValues fileValues owner spec envSet =
+itemJson :: Map.Map Text Text -> Map.Map Text Text -> Bool -> SettingItem -> A.Value
+itemJson effectiveValues fileValues owner spec =
     object
         [ "key" .= siKey spec
         , "label" .= siLabel spec
@@ -367,7 +479,8 @@ itemJson effectiveValues fileValues owner spec envSet =
         , "value" .= shownValue
         , "source" .= source
         , "rootOnly" .= siRootOnly spec
-        , "editable" .= (owner || not (siRootOnly spec))
+        , "editable" .= (not (isLockedSetting (siKey spec)) && (owner || not (siRootOnly spec)))
+        , "locked" .= isLockedSetting (siKey spec)
         , "restart" .= siRestart spec
         , "live" .= (siKey spec `elem` liveKeys)
         , "set" .= hasValue
@@ -378,19 +491,12 @@ itemJson effectiveValues fileValues owner spec envSet =
     fromProcess = Map.lookup (siKey spec) effectiveValues
     effectiveValue = fromMaybe (defaultOf (siKey spec)) fromProcess
     shownValue = if secret then "" else fromMaybe effectiveValue fromFile
-    hasValue = fromFile /= Nothing || envSet
+    hasValue = fromFile /= Nothing
     source :: Text
     source
         | secret = if hasValue then "configured" else "not set"
         | fromFile /= Nothing = "settings file"
-        | envSet = "environment"
         | otherwise = "default"
-
--- | 这个环境变量现在是设着的吗
-isSetEnv :: Text -> IO Bool
-isSetEnv name = do
-    found <- lookupEnv (T.unpack name)
-    pure (maybe False (not . null) found)
 
 -- | 改设置：写配置文件并让可热改项立即生效
 putSettingsH :: AppEnv -> ActionM ()
@@ -399,46 +505,50 @@ putSettingsH env = do
     withJsonObject env $ \o -> case settingsUpdates o of
         Left err -> reply400 "bad_request" err
         Right updates -> do
-            cred <- liftIO (readCredential env)
-            let forbidden =
+            principal <- requirePrincipal env
+            let locked = [k | k <- Map.keys updates, isLockedSetting k]
+                forbidden =
                     [ k
                     | k <- Map.keys updates
                     , maybe False siRootOnly (findSetting k)
-                    , not (sameAccount user (credUser cred))
+                    , not (principalIsRoot principal)
                     ]
-            if not (null forbidden)
-                then reply403 ("only the configured account (" <> credUser cred <> ") may change: " <> T.intercalate ", " forbidden)
-                else do
-                    current <- liftIO (readSettingsFile (aeSettingsFile env))
-                    case applySettings current updates of
-                        Left err -> reply400 "bad_request" (T.pack err)
-                        Right merged -> do
-                            written <- liftIO (writeSettingsFile (aeSettingsFile env) merged)
-                            case written of
-                                Left err -> reply500 (T.pack err)
-                                Right () -> do
-                                    applied <- liftIO (applyLiveKeys env updates)
-                                    let needsRestart = [k | k <- Map.keys updates, not (k `elem` applied), not (T.null (Map.findWithDefault "" k updates))]
-                                    liftIO (aeLog env ("settings updated by " <> user <> ": " <> T.intercalate ", " (Map.keys updates)))
-                                    json
-                                        ( object
-                                            [ "ok" .= True
-                                            , "file" .= aeSettingsFile env
-                                            , "applied" .= applied
-                                            , "restartRequired" .= needsRestart
-                                            ]
-                                        )
+            if not (null locked)
+                then reply403 ("administrator credentials live in the settings file and cannot be changed here: " <> T.intercalate ", " locked)
+                else
+                    if not (null forbidden)
+                        then reply403 ("administrator required to change: " <> T.intercalate ", " forbidden)
+                        else do
+                            current <- liftIO (readSettingsFile (aeSettingsFile env))
+                            case applySettings current updates of
+                                Left err -> reply400 "bad_request" (T.pack err)
+                                Right merged -> do
+                                    written <- liftIO (writeSettingsFile (aeSettingsFile env) merged)
+                                    case written of
+                                        Left err -> reply500 (T.pack err)
+                                        Right () -> do
+                                            applied <- liftIO (applyLiveKeys env updates)
+                                            let needsRestart = [k | k <- Map.keys updates, not (k `elem` applied), not (T.null (Map.findWithDefault "" k updates))]
+                                            liftIO (aeLog env ("settings updated by " <> user <> ": " <> T.intercalate ", " (Map.keys updates)))
+                                            json
+                                                ( object
+                                                    [ "ok" .= True
+                                                    , "file" .= aeSettingsFile env
+                                                    , "applied" .= applied
+                                                    , "restartRequired" .= needsRestart
+                                                    ]
+                                                )
 
 -- | 读前端 IDE 设置（放在自己的文件里，与服务配置无关）
 uiSettingsH :: AppEnv -> ActionM ()
 uiSettingsH env = do
     _ <- requireUser env
-    value <- liftIO (readUiSettings (aeUiSettingsFile env))
+    value <- liftIO (readUISettings (aeUISettingsFile env))
     json value
 
 -- | 整份覆盖前端 IDE 设置，校验不过一律 400
-putUiSettingsH :: AppEnv -> ActionM ()
-putUiSettingsH env = do
+putUISettingsH :: AppEnv -> ActionM ()
+putUISettingsH env = do
     _ <- requireUser env
     rawBody <- body
     limit <- liftIO (liveBodyLimit env)
@@ -446,63 +556,223 @@ putUiSettingsH env = do
         then reply413
         else case eitherDecode rawBody of
             Left _ -> reply400 "bad_request" "request body is not valid JSON"
-            Right payload -> case validateUiSettings payload of
+            Right payload -> case validateUISettings payload of
                 Left err -> reply400 "bad_request" (T.pack err)
                 Right valid -> do
-                    written <- liftIO (writeUiSettings (aeUiSettingsFile env) valid)
+                    written <- liftIO (writeUISettings (aeUISettingsFile env) valid)
                     case written of
                         Left err -> reply500 (T.pack err)
                         Right () -> status status204
 
--- | 改口令：验原口令，并踢掉其它会话
-changePasswordH :: AppEnv -> ActionM ()
-changePasswordH env = do
-    user <- requireUser env
-    token <- requestSessionToken
-    withJsonObject env $ \o -> do
-        cred <- liftIO (readCredential env)
-        case (textField "current" o, textField "next" o) of
-            (Left err, _) -> reply400 "bad_request" err
-            (_, Left err) -> reply400 "bad_request" err
-            (Right current, Right newPassword)
-                | not (sameAccount user (credUser cred)) -> reply403 "only the configured account can change its password"
-                | not (verifyPassword (credEncoded cred) current) -> reply400 "bad_password" "the current password is incorrect"
-                | T.length newPassword < minPasswordLength -> reply400 "bad_request" (T.pack ("the new password must be at least " ++ show minPasswordLength ++ " characters"))
-                | T.length newPassword > 256 -> reply400 "bad_request" "the new password is too long"
-                | newPassword == current -> reply400 "bad_request" "the new password must differ from the current one"
-                | otherwise -> do
-                    encoded <- liftIO (hashPassword newPassword)
-                    if not (hashLooksValid encoded)
-                        then reply500 "could not hash the new password"
-                        else do
-                            currentFile <- liftIO (readSettingsFile (aeSettingsFile env))
-                            let merged = Map.insert "password-hash" encoded (Map.insert "password" "" currentFile)
-                            written <- liftIO (writeSettingsFile (aeSettingsFile env) merged)
-                            case written of
-                                Left err -> reply500 (T.pack err)
-                                Right () -> do
-                                    liftIO (writeCredential env cred{credEncoded = encoded})
-                                    removed <- case token of
-                                        Nothing -> pure 0
-                                        Just t -> liftIO (deleteOtherSessions (aeSessions env) t)
-                                    liftIO (aeLog env ("password changed by " <> user <> " (" <> T.pack (show removed) <> " other sessions signed out)"))
-                                    status status204
+-- | 账号表的名字：网页里像普通表一样浏览与编辑，但写入走账号命令
+accountTableName :: String
+accountTableName = "__chusql_users"
 
--- | 口令最短长度（太短的口令不值得存）
-minPasswordLength :: Int
-minPasswordLength = 8
+-- | 这张表是不是账号表
+isAccountTable :: Text -> Bool
+isAccountTable name = T.toLower name == T.pack accountTableName
 
--- | 两个账号名是不是同一个（大小写不敏感）
-sameAccount :: Text -> Text -> Bool
-sameAccount a b = T.toLower a == T.toLower b
+-- | 账号表只住在系统库 system 里：在别的库上点名它一律 400。
+accountRoute :: AppEnv -> Text -> ActionM Bool
+accountRoute env name
+    | not (isAccountTable name) = pure False
+    | aeDatabase env /= systemDatabase = do
+        reply400 "bad_request" "the account table lives in the system database"
+        finish
+    | otherwise = pure True
 
--- | 现在用的凭据
-readCredential :: AppEnv -> IO Credential
-readCredential = readIORef . aeCredential
+-- | 口令列：密文只在服务端产生，界面不支持排序与筛选
+passwordColumn :: String
+passwordColumn = "password"
 
--- | 换掉进程里的凭据（改口令）
-writeCredential :: AppEnv -> Credential -> IO ()
-writeCredential env = writeIORef (aeCredential env)
+-- | 账号表的列：id 主键、用户名唯一索引、口令密文、注册时间与最近登录时间
+accountColumns :: [SchemaColumn]
+accountColumns =
+    [ accountColumnSpec "id" "int" False True True False
+    , accountColumnSpec "user" "varchar(64)" False False False True
+    , accountColumnSpec passwordColumn "varchar(256)" False False False False
+    , accountColumnSpec "registered_at" "timestamp" False False False False
+    , accountColumnSpec "last_login_at" "timestamp" True False False False
+    ]
+
+-- | 账号表的列（约束由账号服务管）
+accountColumnSpec :: String -> String -> Bool -> Bool -> Bool -> Bool -> SchemaColumn
+accountColumnSpec name ty nullable autoIncrement primary unique =
+    SchemaColumn name ty nullable Nothing autoIncrement primary unique Nothing
+
+-- | 账号行：平铺的各列
+accountRowsOf :: [Account] -> [Row]
+accountRowsOf = map accountRow
+  where
+    accountRow a =
+        [ ("id", VInt (fromIntegral (accountId a)))
+        , ("user", VStr (T.unpack (accountUser a)))
+        , (passwordColumn, VStr (T.unpack (accountHash a)))
+        , ("registered_at", VStr (T.unpack (accountRegisteredAt a)))
+        , ("last_login_at", maybe VNull (VStr . T.unpack) (accountLastLoginAt a))
+        ]
+
+-- | 账号表的线上信息（列与普通表同构）
+systemTableJson :: Int -> A.Value
+systemTableJson count =
+    object
+        [ "table" .= (accountTableName :: String)
+        , "kind" .= ("system" :: Text)
+        , "rowCount" .= count
+        , "indexes" .= [object ["column" .= ("user" :: Text), "builtIn" .= False]]
+        , "columns" .= map accountColumnJson accountColumns
+        ]
+  where
+    accountColumnJson sc =
+        object
+            [ "name" .= scName sc
+            , "type" .= scType sc
+            , "primaryKey" .= scPrimaryKey sc
+            , "indexed" .= (scPrimaryKey sc || scUnique sc)
+            , "prime" .= (scPrimaryKey sc || scUnique sc)
+            , "unique" .= scUnique sc
+            , "nullable" .= scNullable sc
+            , "distinct" .= (-1 :: Int)
+            , "statsCapped" .= False
+            , "secret" .= (scName sc == passwordColumn)
+            ]
+
+-- | 读一遍账号表，读不到就 500
+requireAccounts :: AppEnv -> ActionM [Account]
+requireAccounts env = do
+    result <- liftIO (listAccounts (aeAccounts env))
+    either accountError pure result
+
+-- | 口令列不接受排序与筛选
+rejectSecretColumn :: Maybe (Text, Bool) -> [(Text, Value)] -> Either Text ()
+rejectSecretColumn order filters
+    | Just (col, _) <- order, col == T.pack passwordColumn = Left "the password column cannot be sorted"
+    | any ((== T.pack passwordColumn) . fst) filters = Left "the password column cannot be filtered"
+    | otherwise = Right ()
+
+-- | 只有管理员能用账号表
+rootOnly :: Principal -> ActionM ()
+rootOnly principal =
+    if principalIsRoot principal
+        then pure ()
+        else accountError (AccountError "forbidden" "administrator required")
+
+-- | 账号表的一页数据（排序与筛选都在内存里做）
+baseRowsH :: AppEnv -> ActionM ()
+baseRowsH env = do
+    principal <- requirePrincipal env
+    rootOnly principal
+    live <- liftIO (readLive env)
+    limit <- intParam "limit" (lvPageSize live) 1 (lvMaxPageSize live)
+    offset <- intParam "offset" 0 0 1000000
+    rawFilter <- (queryParamMaybe "filter" :: ActionM (Maybe Text))
+    order <- sortParam systemTableInfo
+    case (order, parseFilters systemTableInfo rawFilter) of
+        (Left err, _) -> reply400 "bad_request" err
+        (_, Left err) -> reply400 "bad_request" err
+        (Right sortOrder, Right filters) -> case rejectSecretColumn sortOrder filters of
+            Left err -> reply400 "bad_request" err
+            Right () -> do
+                accounts <- requireAccounts env
+                let rows = filterAccountRows filters (sortAccountRows sortOrder (accountRowsOf accounts))
+                    page = take limit (drop offset rows)
+                    cols = map scName accountColumns
+                    (sortColumn, ascending) = splitSort sortOrder
+                json
+                    ( object
+                        [ "table" .= accountTableName
+                        , "columns" .= cols
+                        , "rows" .= map (renderRow cols) page
+                        , "total" .= length rows
+                        , "limit" .= limit
+                        , "offset" .= offset
+                        , "sort" .= maybe A.Null A.String sortColumn
+                        , "dir" .= (if ascending then "asc" else "desc" :: Text)
+                        , "filters" .= map fst filters
+                        ]
+                    )
+
+-- | 账号表的结构（排序校验用）
+systemTableInfo :: TableInfo
+systemTableInfo = TableInfo accountTableName accountColumns 0 [] []
+
+-- | 按用户名排序（其余列不支持排序）
+sortAccountRows :: Maybe (Text, Bool) -> [Row] -> [Row]
+sortAccountRows Nothing rows = rows
+sortAccountRows (Just (column, ascending)) rows =
+    sortBy compareUser rows
+  where
+    compareUser a b = case (accountCell a column, accountCell b column) of
+        (Just x, Just y) -> if ascending then compare x y else compare y x
+        _ -> EQ
+    accountCell row name = case lookup (T.unpack name) row of
+        Just VNull -> Just ""
+        Just (VStr s) -> Just s
+        Just (VInt n) -> Just (show n)
+        Just (VFloat d) -> Just (show d)
+        _ -> Nothing
+
+-- | 按等值条件筛账号行
+filterAccountRows :: [(Text, Value)] -> [Row] -> [Row]
+filterAccountRows [] rows = rows
+filterAccountRows filters rows = [r | r <- rows, all (matches r) filters]
+  where
+    matches row (column, wanted) = case lookup (T.unpack column) row of
+        Just value -> value == wanted
+        Nothing -> False
+
+-- | 账号表写入：插一行 = CREATE USER
+baseInsertH :: AppEnv -> ActionM ()
+baseInsertH env = do
+    principal <- requirePrincipal env
+    rootOnly principal
+    withJsonObject env $ \o -> case valuesField o >>= readRowValues False accountColumns of
+        Left err -> reply400 "bad_request" err
+        Right values -> case (lookupValue "user" values, lookupValue (T.pack passwordColumn) values) of
+            (Just (VStr user), Just (VStr password)) -> runAccountWrite env principal (CreateAccount (T.pack user) (T.pack password))
+            _ -> reply400 "bad_request" "user and password are required"
+
+-- | 账号表写入：改一行 = ALTER USER（只改口令，不许改名）
+baseUpdateH :: AppEnv -> Text -> ActionM ()
+baseUpdateH env target = do
+    principal <- requirePrincipal env
+    rootOnly principal
+    withJsonObject env $ \o -> case valuesField o >>= readRowValues False accountColumns of
+        Left err -> reply400 "bad_request" err
+        Right values -> case (values, lookupValue (T.pack passwordColumn) values) of
+            ([(_, VStr password)], Just _) -> runAccountWrite env principal (ResetAccountPassword target (T.pack password))
+            _ -> reply400 "bad_request" "only the password of an existing account can be changed"
+
+-- | 账号表写入：删一行 = DROP USER
+baseDeleteH :: AppEnv -> Text -> ActionM ()
+baseDeleteH env target = do
+    principal <- requirePrincipal env
+    rootOnly principal
+    runAccountWrite env principal (DropAccount target)
+
+-- | 账号写入：SQL 控制台与基表行接口共用的执行路径
+runAccountWrite :: AppEnv -> Principal -> AccountCommand -> ActionM ()
+runAccountWrite env principal command = do
+    result <- liftIO (runAccountCommand (aeAccounts env) principal command)
+    case result of
+        Left err -> accountError err
+        Right () -> json (object ["ok" .= True])
+
+-- | 取一个列值
+lookupValue :: Text -> [(String, Value)] -> Maybe Value
+lookupValue name values = lookup (T.unpack name) values
+
+accountError :: AccountError -> ActionM a
+accountError (AccountError code message) = do
+    status $ case code of
+        "unauthorized" -> status401
+        "forbidden" -> status403
+        "not_found" -> status404
+        "conflict" -> status409
+        "storage_error" -> status500
+        _ -> status400
+    json (apiErrorJson code message)
+    finish
 
 -- | 按 key 找目录项
 findSetting :: Text -> Maybe SettingItem
@@ -513,6 +783,8 @@ findSetting key = case [i | i <- settingCatalogue, siKey i == key] of
 -- | 把能热改的设置应用到当前进程
 applyLiveKeys :: AppEnv -> Map.Map Text Text -> IO [Text]
 applyLiveKeys env updates = do
+    beforePolicy <- accountsPolicy (aeAccounts env)
+    setAccountsPolicy (aeAccounts env) (policyFromValues beforePolicy updates)
     before <- readLive env
     let wanted = [k | k <- liveKeys, Map.member k updates]
         intOf key = case T.strip (Map.findWithDefault "" key updates) of
@@ -545,75 +817,105 @@ effectiveValueOf effectiveValues key = fromMaybe (defaultOf key) (Map.lookup key
 intFromText :: Text -> Int
 intFromText given = fromMaybe 0 (readMaybe (T.unpack (T.strip given)))
 
--- | 表清单（列 / 行数 / 索引 / 列统计）
+-- | 表清单（列 / 行数 / 索引 / 列统计）；普通身份只看得到自己有 SELECT 的表，管理员额外看到账号表
 tablesH :: AppEnv -> ActionM ()
 tablesH env = do
-    _ <- requireUser env
+    requireDatabase env
+    principal <- requirePrincipal env
     result <- liftIO (beCatalog (aeBackend env))
     case result of
         Left e -> engineError e
-        Right infos -> json (map tableInfoJson infos)
+        Right infos -> do
+            readable <- readableTables env principal infos
+            extra <- if aeDatabase env == systemDatabase && principalIsRoot principal
+                then (: []) . systemTableJson . length <$> requireAccounts env
+                else pure []
+            json (map tableInfoJson readable ++ extra)
+
+-- | 普通身份的表清单按 SELECT 权限过滤
+readableTables :: AppEnv -> Principal -> [TableInfo] -> ActionM [TableInfo]
+readableTables env principal infos
+    | principalIsRoot principal = pure infos
+    | otherwise = do
+        result <- liftIO (filterTables (aePrivileges env) principal (aeDatabase env) (map (T.pack . tiTable) infos))
+        case result of
+            Left err -> privilegeError err
+            Right allowed -> pure (filter (\info -> T.pack (tiTable info) `elem` allowed) infos)
 
 -- | 单表结构
 tableH :: AppEnv -> ActionM ()
 tableH env = do
-    _ <- requireUser env
+    requireDatabase env
+    principal <- requirePrincipal env
     name <- pathParam "t"
-    if not (isIdentifier name)
-        then reply400 "bad_request" "invalid table name"
-        else do
-            result <- liftIO (beCatalog (aeBackend env))
-            case result of
-                Left e -> engineError e
-                Right infos -> case findTable name infos of
-                    Nothing -> reply404
-                    Just info -> json (tableInfoJson info)
+    account <- accountRoute env name
+    if account
+        then do
+            rootOnly principal
+            accounts <- requireAccounts env
+            json (systemTableJson (length accounts))
+        else
+            if not (isIdentifier name)
+                then reply400 "bad_request" "invalid table name"
+                else do
+                    requirePrivilege env [(name, "select")]
+                    result <- liftIO (beCatalog (aeBackend env))
+                    case result of
+                        Left e -> engineError e
+                        Right infos -> case findTable name infos of
+                            Nothing -> reply404
+                            Just info -> json (tableInfoJson info)
 
--- | 分页浏览一张表，支持排序与等值过滤
+-- | 分页浏览一张表，支持排序与等值过滤；账号表走内存里的账号行
 rowsH :: AppEnv -> ActionM ()
 rowsH env = do
-    _ <- requireUser env
+    requireDatabase env
     name <- pathParam "t"
-    if not (isIdentifier name)
-        then reply400 "bad_request" "invalid table name"
+    account <- accountRoute env name
+    if account
+        then baseRowsH env
         else do
-            catalogResult <- liftIO (beCatalog (aeBackend env))
-            case catalogResult of
-                Left e -> engineError e
-                Right infos -> case findTable name infos of
-                    Nothing -> reply404
-                    Just info -> do
-                        live <- liftIO (readLive env)
-                        limit <- intParam "limit" (lvPageSize live) 1 (lvMaxPageSize live)
-                        offset <- intParam "offset" 0 0 1000000
-                        rawFilter <- (queryParamMaybe "filter" :: ActionM (Maybe Text))
-                        order <- sortParam info
-                        case (order, parseFilters info rawFilter) of
-                            (Left err, _) -> reply400 "bad_request" err
-                            (_, Left err) -> reply400 "bad_request" err
-                            (Right sortOrder, Right filters) -> case selectRowsSql name sortOrder filters of
-                                Left err -> reply400 "bad_request" (T.pack err)
-                                Right sql -> do
-                                    result <- liftIO (beStatement (aeBackend env) sql)
-                                    case result of
-                                        Left e -> engineError e
-                                        Right res -> do
-                                            let cols = map scName (tiColumns info)
-                                                page = take limit (drop offset (srRows res))
-                                                (sortColumn, ascending) = splitSort sortOrder
-                                            json
-                                                ( object
-                                                    [ "table" .= tiTable info
-                                                    , "columns" .= cols
-                                                    , "rows" .= map (renderRow cols) page
-                                                    , "total" .= length (srRows res)
-                                                    , "limit" .= limit
-                                                    , "offset" .= offset
-                                                    , "sort" .= maybe A.Null A.String sortColumn
-                                                    , "dir" .= (if ascending then "asc" else "desc" :: Text)
-                                                    , "filters" .= map fst filters
-                                                    ]
-                                                )
+            requirePrivilege env [(name, "select")]
+            if not (isIdentifier name)
+                then reply400 "bad_request" "invalid table name"
+                else do
+                    catalogResult <- liftIO (beCatalog (aeBackend env))
+                    case catalogResult of
+                        Left e -> engineError e
+                        Right infos -> case findTable name infos of
+                            Nothing -> reply404
+                            Just info -> do
+                                live <- liftIO (readLive env)
+                                limit <- intParam "limit" (lvPageSize live) 1 (lvMaxPageSize live)
+                                offset <- intParam "offset" 0 0 1000000
+                                rawFilter <- (queryParamMaybe "filter" :: ActionM (Maybe Text))
+                                order <- sortParam info
+                                case (order, parseFilters info rawFilter) of
+                                    (Left err, _) -> reply400 "bad_request" err
+                                    (_, Left err) -> reply400 "bad_request" err
+                                    (Right sortOrder, Right filters) -> case selectRowsSql name sortOrder filters of
+                                        Left err -> reply400 "bad_request" (T.pack err)
+                                        Right sql -> do
+                                            result <- liftIO (beStatement (aeBackend env) sql)
+                                            case result of
+                                                Left e -> engineError e
+                                                Right res -> do
+                                                    let cols = map scName (tiColumns info)
+                                                        page = take limit (drop offset (srRows res))
+                                                        (sortColumn, ascending) = splitSort sortOrder
+                                                    json
+                                                        ( object
+                                                            [ "table" .= tiTable info
+                                                            , "columns" .= cols
+                                                            , "rows" .= map (renderRow cols) page
+                                                            , "total" .= length (srRows res)
+                                                            , "limit" .= limit
+                                                            , "offset" .= offset
+                                                            , "sort" .= maybe A.Null A.String sortColumn
+                                                            , "dir" .= (if ascending then "asc" else "desc" :: Text)
+                                                            , "filters" .= map fst filters
+                                                            ]
+                                                        )
 
 data RowFilter = RowFilter Text Text
 
@@ -657,7 +959,6 @@ sortParam info = do
             | column `notElem` map (T.pack . scName) (tiColumns info) -> Left ("unknown column: " <> column)
             | otherwise -> Right (Just (column, dirOf rawDir))
   where
-    -- | 只认 asc/desc，否则算 asc
     dirOf given = case fmap (T.toLower . T.strip) given of
         Just "desc" -> False
         _ -> True
@@ -665,104 +966,142 @@ sortParam info = do
 -- | 建表：按列结构拼 CREATE TABLE
 createTableH :: AppEnv -> ActionM ()
 createTableH env = do
-    _ <- requireUser env
+    requireDatabase env
+    requireAdmin env
     withJsonObject env $ \o -> case decodeCreateTable o of
         Left err -> reply400 "bad_request" err
         Right spec -> case createTableSql spec of
             Left err -> reply400 "bad_request" (T.pack err)
             Right sql -> runWrite env sql
 
--- | 删表
+-- | 删表；账号表不许删
 dropTableH :: AppEnv -> ActionM ()
 dropTableH env = do
-    _ <- requireUser env
+    requireDatabase env
+    requireAdmin env
     name <- pathParam "t"
-    case dropTableSql name of
-        Left err -> reply400 "bad_request" (T.pack err)
-        Right sql -> runWrite env sql
+    account <- accountRoute env name
+    if account
+        then reply400 "bad_request" "the account table cannot be dropped"
+        else case dropTableSql name of
+            Left err -> reply400 "bad_request" (T.pack err)
+            Right sql -> runWrite env sql
 
--- | 插一行，所有列必须给全
+-- | 插一行，所有列必须给全；账号表上等于 CREATE USER
 insertRowH :: AppEnv -> ActionM ()
 insertRowH env = do
-    _ <- requireUser env
+    requireDatabase env
     name <- pathParam "t"
-    info <- requireTable env name
-    withJsonObject env $ \o -> case valuesField o >>= readRowValues True (tiColumns info) of
-        Left err -> reply400 "bad_request" err
-        Right row -> case insertRowSql name row of
-            Left err -> reply400 "bad_request" (T.pack err)
-            Right sql -> runWrite env sql
-
--- | 改一行，只改给出来的列
-updateRowH :: AppEnv -> ActionM ()
-updateRowH env = do
-    _ <- requireUser env
-    name <- pathParam "t"
-    key <- rowIdParam
-    info <- requireTable env name
-    withJsonObject env $ \o -> case valuesField o >>= readRowValues False (tiColumns info) of
-        Left err -> reply400 "bad_request" err
-        Right assigns -> case updateRowSql name key assigns of
-            Left err -> reply400 "bad_request" (T.pack err)
-            Right sql -> runWrite env sql
-
--- | 删一行
-deleteRowH :: AppEnv -> ActionM ()
-deleteRowH env = do
-    _ <- requireUser env
-    name <- pathParam "t"
-    key <- rowIdParam
-    _ <- requireTable env name
-    case deleteRowSql name key of
-        Left err -> reply400 "bad_request" (T.pack err)
-        Right sql -> runWrite env sql
-
--- | 建索引，索引列必须整数且唯一
-createIndexH :: AppEnv -> ActionM ()
-createIndexH env = do
-    _ <- requireUser env
-    name <- pathParam "t"
-    info <- requireTable env name
-    withJsonObject env $ \o -> case textField "column" o of
-        Left err -> reply400 "bad_request" err
-        Right column -> case columnTypeOf (columnTypeText (tiColumns info) column) of
-            Nothing -> reply400 "bad_request" ("unknown column: " <> column)
-            Just ty
-                | ty /= TInt -> reply400 "bad_request" "only integer columns can be indexed"
-                | otherwise -> case createIndexSql name column of
+    account <- accountRoute env name
+    if account
+        then baseInsertH env
+        else do
+            requirePrivilege env [(name, "insert")]
+            info <- requireTable env name
+            withJsonObject env $ \o -> case valuesField o >>= readRowValues False (tiColumns info) of
+                Left err -> reply400 "bad_request" err
+                Right row -> case insertRowSql name row of
                     Left err -> reply400 "bad_request" (T.pack err)
                     Right sql -> runWrite env sql
+
+-- | 改一行，只改给出来的列；账号表上等于 ALTER USER（只改口令）
+updateRowH :: AppEnv -> ActionM ()
+updateRowH env = do
+    requireDatabase env
+    name <- pathParam "t"
+    account <- accountRoute env name
+    if account
+        then do
+            target <- pathParam "id"
+            baseUpdateH env target
+        else do
+            requirePrivilege env [(name, "update")]
+            key <- rowIdParam
+            info <- requireTable env name
+            withJsonObject env $ \o -> case valuesField o >>= readRowValues False (tiColumns info) of
+                Left err -> reply400 "bad_request" err
+                Right assigns -> case updateRowSql name key assigns of
+                    Left err -> reply400 "bad_request" (T.pack err)
+                    Right sql -> runWrite env sql
+
+-- | 删一行；账号表上等于 DROP USER
+deleteRowH :: AppEnv -> ActionM ()
+deleteRowH env = do
+    requireDatabase env
+    name <- pathParam "t"
+    account <- accountRoute env name
+    if account
+        then do
+            target <- pathParam "id"
+            baseDeleteH env target
+        else do
+            requirePrivilege env [(name, "delete")]
+            key <- rowIdParam
+            _ <- requireTable env name
+            case deleteRowSql name key of
+                Left err -> reply400 "bad_request" (T.pack err)
+                Right sql -> runWrite env sql
+
+-- | 建索引，索引列必须整数且唯一；账号表没有索引可建
+createIndexH :: AppEnv -> ActionM ()
+createIndexH env = do
+    requireDatabase env
+    requireAdmin env
+    name <- pathParam "t"
+    account <- accountRoute env name
+    if account
+        then reply400 "bad_request" "the account table has no indexes"
+        else do
+            info <- requireTable env name
+            withJsonObject env $ \o -> case textField "column" o of
+                Left err -> reply400 "bad_request" err
+                Right column -> case columnTypeOf (columnTypeText (tiColumns info) column) of
+                    Nothing -> reply400 "bad_request" ("unknown column: " <> column)
+                    Just _ -> case createIndexSql name column of
+                        Left err -> reply400 "bad_request" (T.pack err)
+                        Right sql -> runWrite env sql
 
 -- | 删索引（内建索引不放行：存储层也会拒，这里先给一句清楚的话）
 dropIndexH :: AppEnv -> ActionM ()
 dropIndexH env = do
-    _ <- requireUser env
+    requireDatabase env
+    requireAdmin env
     name <- pathParam "t"
     column <- pathParam "col"
-    _ <- requireTable env name
-    if column == T.pack builtInIndexColumn
-        then reply400 "bad_request" "the built-in id index cannot be dropped"
-        else case dropIndexSql name column of
-            Left err -> reply400 "bad_request" (T.pack err)
-            Right sql -> runWrite env sql
+    account <- accountRoute env name
+    if account
+        then reply400 "bad_request" "the account table has no indexes"
+        else do
+            _ <- requireTable env name
+            if column == T.pack builtInIndexColumn
+                then reply400 "bad_request" "the built-in id index cannot be dropped"
+                else case dropIndexSql name column of
+                    Left err -> reply400 "bad_request" (T.pack err)
+                    Right sql -> runWrite env sql
 
--- | 删列，内建 id 列不放行
+-- | 删列，内建 id 列不放行；账号表的列是固定的
 dropColumnH :: AppEnv -> ActionM ()
 dropColumnH env = do
-    _ <- requireUser env
+    requireDatabase env
+    requireAdmin env
     name <- pathParam "t"
     column <- pathParam "col"
-    _ <- requireTable env name
-    if column == T.pack builtInIndexColumn
-        then reply400 "bad_request" "the built-in id column cannot be dropped"
-        else case dropColumnSql name column of
-            Left err -> reply400 "bad_request" (T.pack err)
-            Right sql -> runWrite env sql
+    account <- accountRoute env name
+    if account
+        then reply400 "bad_request" "the account table has no columns to drop"
+        else do
+            _ <- requireTable env name
+            if column == T.pack builtInIndexColumn
+                then reply400 "bad_request" "the built-in id column cannot be dropped"
+                else case dropColumnSql name column of
+                    Left err -> reply400 "bad_request" (T.pack err)
+                    Right sql -> runWrite env sql
 
 -- | 一键灌演示数据（缺什么补什么，可以反复点）
 demoDataH :: AppEnv -> ActionM ()
 demoDataH env = do
-    _ <- requireUser env
+    requireDatabase env
+    requireAdmin env
     result <- liftIO (seedDemo (aeBackend env))
     case result of
         Left e -> reply500 (T.pack e)
@@ -775,6 +1114,116 @@ demoDataH env = do
                     , "indexes" .= srIndexes report
                     ]
                 )
+
+-- | 角色总览：只有管理员能看
+rolesH :: AppEnv -> ActionM ()
+rolesH env = do
+    principal <- requirePrincipal env
+    rootOnly principal
+    result <- liftIO (listRoleViews (aePrivileges env))
+    case result of
+        Left err -> privilegeError err
+        Right views -> json (map roleViewJson views)
+
+roleViewJson :: RoleView -> A.Value
+roleViewJson view =
+    object
+        [ "name" .= roleName view
+        , "grants" .= map grantJson (roleGrants view)
+        , "members" .= roleMembers view
+        ]
+
+grantJson :: Grant -> A.Value
+grantJson grant =
+    object
+        [ "privilege" .= grantPrivilege grant
+        , "object" .= grantObject grant
+        ]
+
+-- | 建角色
+createRoleH :: AppEnv -> ActionM ()
+createRoleH env = withJsonObject env $ \o -> case textField "name" o of
+    Left err -> reply400 "bad_request" err
+    Right name -> runPrivilegeWrite env (CreateRoleCommand name)
+
+-- | 删角色（连带清掉它的授权与成员）
+dropRoleH :: AppEnv -> ActionM ()
+dropRoleH env = pathParam "name" >>= \name -> runPrivilegeWrite env (DropRoleCommand name)
+
+-- | 给角色加权限
+grantRoleH :: AppEnv -> ActionM ()
+grantRoleH env = do
+    role <- pathParam "name"
+    withJsonObject env $ \o -> case grantFields o of
+        Left err -> reply400 "bad_request" err
+        Right (privileges, objectName) -> runPrivilegeWrite env (GrantPrivilegesCommand privileges objectName role)
+
+-- | 收角色的权限
+revokeRoleH :: AppEnv -> ActionM ()
+revokeRoleH env = do
+    role <- pathParam "name"
+    withJsonObject env $ \o -> case grantFields o of
+        Left err -> reply400 "bad_request" err
+        Right (privileges, objectName) -> runPrivilegeWrite env (RevokePrivilegesCommand privileges objectName role)
+
+-- | 把用户加进角色
+addRoleMemberH :: AppEnv -> ActionM ()
+addRoleMemberH env = do
+    role <- pathParam "name"
+    withJsonObject env $ \o -> case memberFields o of
+        Left err -> reply400 "bad_request" err
+        Right users -> runPrivilegeWrite env (GrantRoleCommand role users)
+
+-- | 把用户移出角色
+removeRoleMemberH :: AppEnv -> ActionM ()
+removeRoleMemberH env = do
+    role <- pathParam "name"
+    user <- pathParam "user"
+    runPrivilegeWrite env (RevokeRoleCommand role [user])
+
+-- | 权限（一条或一串）与对象
+grantFields :: A.Object -> Either Text ([Text], Text)
+grantFields o = do
+    objectName <- textField "object" o
+    privileges <- case KM.lookup "privileges" o of
+        Just (A.Array xs) -> mapM stringValue (V.toList xs)
+        _ -> Left "missing or non-array field: privileges"
+    if null privileges then Left "at least one privilege is required" else pure (privileges, objectName)
+
+-- | 成员（一条或一串）
+memberFields :: A.Object -> Either Text [Text]
+memberFields o = case (KM.lookup "user" o, KM.lookup "users" o) of
+    (Just (A.String one), _) -> Right [one]
+    (_, Just (A.Array xs)) -> mapM stringValue (V.toList xs)
+    _ -> Left "missing or non-string field: user"
+
+stringValue :: A.Value -> Either Text Text
+stringValue (A.String value) = Right value
+stringValue _ = Left "values must be strings"
+
+-- | 角色命令：只有管理员能跑
+runPrivilegeWrite :: AppEnv -> PrivilegeCommand -> ActionM ()
+runPrivilegeWrite env command = do
+    principal <- requirePrincipal env
+    result <- liftIO (runPrivilegeCommand (aePrivileges env) principal (aeDatabase env) command)
+    case result of
+        Left err -> privilegeError err
+        Right () -> json (object ["ok" .= True])
+
+-- | 权限错误与账号错误共用一套状态码映射
+privilegeError :: PrivilegeError -> ActionM a
+privilegeError (PrivilegeError code message) = accountError (AccountError code message)
+
+-- | 一键接口的权限门：普通身份必须持有对应的 (表, 权限)
+requirePrivilege :: AppEnv -> [(Text, Text)] -> ActionM ()
+requirePrivilege env needed = do
+    principal <- requirePrincipal env
+    allowed <- liftIO (authorizeTables (aePrivileges env) principal (aeDatabase env) needed)
+    either privilegeError pure allowed
+
+-- | 管理员专属操作（建库 / 建表 / 索引 / 列 / 演示数据）
+requireAdmin :: AppEnv -> ActionM ()
+requireAdmin env = requirePrincipal env >>= rootOnly
 
 -- | 写操作统一回执
 runWrite :: AppEnv -> String -> ActionM ()
@@ -889,10 +1338,11 @@ columnTypeText cols name = case [c | c <- cols, scName c == T.unpack name] of
     (c : _) -> T.pack (scType c)
     [] -> ""
 
--- | 执行任意一条语句
+-- | 执行任意一条语句：管理语句走各自的服务，其余先过权限门
 queryH :: AppEnv -> ActionM ()
 queryH env = do
-    user <- requireUser env
+    principal <- requirePrincipal env
+    let user = principalName principal
     rawBody <- body
     live <- liftIO (readLive env)
     if BL.length rawBody > fromIntegral (lvBodyLimit live)
@@ -908,33 +1358,92 @@ queryH env = do
                             then reply413
                             else do
                                 liftIO (aeLog env ("query user=" <> user <> " sql=" <> sql))
-                                result <- liftIO (beStatement (aeBackend env) (T.unpack sql))
-                                case result of
-                                    Left e -> engineError e
-                                    Right res -> do
-                                        let shown = take (lvMaxRows live) (srRows res)
-                                        json
-                                            ( object
-                                                [ "columns" .= srColumns res
-                                                , "rows" .= map (renderRow (srColumns res)) shown
-                                                , "rowCount" .= length (srRows res)
-                                                , "truncated" .= (length (srRows res) > lvMaxRows live)
-                                                ]
-                                            )
+                                case parseStatement (T.unpack sql) of
+                                    Left _ -> executeSql env live sql
+                                    Right stmt -> case accountCommand stmt of
+                                        Just command -> runAccountSql env stmt command
+                                        Nothing -> case privilegeCommand stmt of
+                                            Just command -> runPrivilegeSql env stmt command
+                                            Nothing -> do
+                                                if T.null (aeDatabase env) && statementNeedsDatabase stmt
+                                                    then reply400 "no_database" "no database selected"
+                                                    else do
+                                                        allowed <- liftIO (authorize (aePrivileges env) principal (aeDatabase env) stmt)
+                                                        case allowed of
+                                                            Left err -> privilegeError err
+                                                            Right () -> executeSql env live sql
+
+-- | 把 SQL 交给引擎，结果按控制台口径回执
+executeSql :: AppEnv -> Live -> Text -> ActionM ()
+executeSql env live sql = do
+    result <- liftIO (beStatement (aeBackend env) (T.unpack sql))
+    case result of
+        Left e -> engineError e
+        Right res -> do
+            let shown = take (lvMaxRows live) (srRows res)
+            json
+                ( object
+                    [ "columns" .= srColumns res
+                    , "rows" .= map (renderRow (srColumns res)) shown
+                    , "rowCount" .= length (srRows res)
+                    , "truncated" .= (length (srRows res) > lvMaxRows live)
+                    , "database" .= (case parseStatement (T.unpack sql) of
+                        Right (UseDatabase name) -> Just (T.toLower (T.pack name))
+                        _ -> Nothing :: Maybe Text)
+                    ]
+                )
+
+-- | 执行账号管理语句：只有管理员能跑
+runAccountSql :: AppEnv -> Statement -> AccountCommand -> ActionM ()
+runAccountSql env stmt command = case check [] stmt of
+    Left e -> engineError e
+    Right () -> do
+        principal <- requirePrincipal env
+        result <- liftIO (runAccountCommand (aeAccounts env) principal command)
+        case result of
+            Left err -> accountError err
+            Right () ->
+                json
+                    ( object
+                        [ "columns" .= ([] :: [Text])
+                        , "rows" .= ([] :: [A.Value])
+                        , "rowCount" .= (0 :: Int)
+                        , "truncated" .= False
+                        ]
+                    )
+
+-- | 执行角色与授权语句：只有管理员能跑
+runPrivilegeSql :: AppEnv -> Statement -> PrivilegeCommand -> ActionM ()
+runPrivilegeSql env stmt command = case check [] stmt of
+    Left e -> engineError e
+    Right () -> do
+        principal <- requirePrincipal env
+        result <- liftIO (runPrivilegeCommand (aePrivileges env) principal (aeDatabase env) command)
+        case result of
+            Left err -> privilegeError err
+            Right () ->
+                json
+                    ( object
+                        [ "columns" .= ([] :: [Text])
+                        , "rows" .= ([] :: [A.Value])
+                        , "rowCount" .= (0 :: Int)
+                        , "truncated" .= False
+                        ]
+                    )
 
 -- | 拿当前 Session 用户；没有就 401
 requireUser :: AppEnv -> ActionM Text
-requireUser env = do
-    token <- requestSessionToken
-    found <- case token of
-        Nothing -> pure Nothing
-        Just t -> liftIO (lookupSession (aeSessions env) t)
-    case found of
-        Just user -> pure user
-        Nothing -> do
-            status status401
-            json (apiErrorJson "unauthorized" "sign in first")
-            finish
+requireUser env = principalName <$> requirePrincipal env
+
+-- | 当前身份；没有会话就 401
+requirePrincipal :: AppEnv -> ActionM Principal
+requirePrincipal env = do
+    token <- requireToken
+    found <- liftIO (currentPrincipal (aeAccounts env) token)
+    either accountError pure found
+
+requireToken :: ActionM Text
+requireToken = requestSessionToken >>= maybe (accountError (AccountError "unauthorized" "sign in first")) pure
 
 -- | 请求里的会话令牌
 requestSessionToken :: ActionM (Maybe Text)
@@ -948,7 +1457,6 @@ parseCookieHeader name headerValue = case [v | part <- T.splitOn ";" headerValue
     (v : _) -> Just v
     [] -> Nothing
   where
-    -- | 这一对是不是 name=value，是且值非空就取出值
     valueOf key part =
         let (k, rest) = T.breakOn "=" part
             value = T.strip (T.drop 1 rest)
@@ -985,21 +1493,23 @@ renderRow cols row = [maybe A.Null valueJson (lookup c row) | c <- cols]
 
 -- | 一个值转 JSON
 valueJson :: Value -> A.Value
+valueJson VNull = A.Null
 valueJson (VInt n) = A.Number (fromIntegral n)
+valueJson (VFloat d) = A.Number (fromFloatDigits d)
 valueJson (VStr s) = A.String (T.pack s)
 valueJson (VBool b) = A.Bool b
 
--- | 一张表的线上信息：列、行数、索引与统计
+-- | 一张表的线上信息：列、行数、索引与统计（普通表 kind = table）
 tableInfoJson :: TableInfo -> A.Value
 tableInfoJson info =
     object
         [ "table" .= tiTable info
+        , "kind" .= ("table" :: Text)
         , "rowCount" .= tiRows info
         , "indexes" .= [object ["column" .= c, "builtIn" .= (c == builtInIndexColumn)] | c <- tiIndexes info]
         , "columns" .= map columnJson (tiColumns info)
         ]
   where
-    -- | 一列的完整描述：角色与统计
     columnJson sc =
         object
             [ "name" .= scName sc
@@ -1009,10 +1519,16 @@ tableInfoJson info =
             , "prime" .= (isPrimaryKey || isIndexed)
             , "distinct" .= distinctCount
             , "statsCapped" .= statsCapped
+            , "secret" .= False
+            , "nullable" .= scNullable sc
+            , "default" .= fmap valueJson (scDefault sc)
+            , "autoIncrement" .= scAutoIncrement sc
+            , "unique" .= scUnique sc
+            , "check" .= scCheck sc
             ]
       where
         name = scName sc
-        isPrimaryKey = name == builtInIndexColumn && scType sc == "int"
+        isPrimaryKey = scPrimaryKey sc || (name == builtInIndexColumn && scType sc == "int")
         isIndexed = name `elem` tiIndexes info
         stat = [s | s@(n, _, _) <- tiStats info, n == name]
         distinctCount = case stat of

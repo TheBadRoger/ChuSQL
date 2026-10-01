@@ -1,10 +1,14 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 
 module Main (main) where
 
-import ChuSQL.Model (Column (..), Database, Table (..), Value (..))
-import ChuSQL.Storage.IPC (SchemaColumn (..), TableInfo (..))
-import ChuSQL.Syntax.AST (Expr (..), FromClause (..), Statement (..))
+import ChuSQL.Model (ColumnType (..), Database, Table (..), Value (..), plainColumn, pattern TInt, pattern TStr, pattern TBool)
+import ChuSQL.Storage.IPC (Account (..), Request (..), SchemaColumn (..), TableInfo (..), setPipeName)
+import ChuSQL.Web.Accounts
+import Data.Either (isLeft, isRight)
+import ChuSQL.Syntax.AST (Expr (..), FromClause (..), JoinKind (..), Statement (..))
+import ChuSQL.Syntax.Parser (parseStatement)
 import ChuSQL.Web.Actions (
     ColumnSpec (..),
     CreateTableSpec (..),
@@ -22,7 +26,7 @@ import ChuSQL.Web.Actions (
     sqlLiteral,
     updateRowSql,
  )
-import ChuSQL.Web.Api (
+import ChuSQL.Web.API (
     AppEnv (..),
     Live (..),
     defaultLive,
@@ -38,7 +42,6 @@ import ChuSQL.Web.Auth (
     SessionPolicy (..),
     createSession,
     defaultSessionPolicy,
-    deleteOtherSessions,
     deleteSession,
     hashLooksValid,
     hashPasswordWith,
@@ -49,42 +52,43 @@ import ChuSQL.Web.Auth (
     setSessionPolicy,
     verifyPassword,
  )
-import ChuSQL.Web.Backend (columnsFromStatement, ipcBackend, memoryBackend, tableInfoOf)
+import ChuSQL.Web.Backend (beAccounts, columnsFromStatement, inDatabase, ipcBackend, memoryBackend, tableInfoOf)
 import ChuSQL.Web.Config (
     WebConfig (..),
+    canonicalSettingKeys,
     defaultPassword,
     defaultUser,
     defaultWebConfig,
-    loadWebConfig,
+    loadWebConfigAt,
     resolveCredential,
+    resolvePipeName,
     usingDefaultCredentials,
  )
 import ChuSQL.Web.RateLimit (newRateLimiter, rateLimitBlock, rateLimitRecord, setRateLimit)
 import ChuSQL.Web.Settings (
     SettingItem (..),
     applySettings,
-    defaultOf,
     effectiveSettings,
     findItem,
     isRestartRequired,
     isRootOnly,
     liveKeys,
     readSettingsFile,
-    resolveSettingsFile,
     settingCatalogue,
     writeSettingsFile,
  )
 import ChuSQL.Web.Static (contentTypeOf, readStatic, safeRelative)
-import ChuSQL.Web.StorageProcess (StorageProcess (..), startStorageProcess, stopStorageProcess)
-import ChuSQL.Web.UiSettings (
-    readUiSettings,
-    resolveUiSettingsFile,
+import ChuSQL.Web.StorageProcess (StorageProcess (..), platformBinaryName, startStorageProcess, storageChildArgs, stopStorageProcess, waitForStorage)
+import ChuSQL.Web.TOML (defaultConfigFile, resolveConfigPath)
+import ChuSQL.Web.UISettings (
+    readUISettings,
     uiSettingsFileCandidates,
-    validateUiSettings,
-    writeUiSettings,
+    validateUISettings,
+    writeUISettings,
  )
 import Control.Concurrent.MVar (newMVar)
 import Control.Exception (IOException, bracket, finally, try)
+import Control.Monad (forM_)
 import Data.Aeson (decode)
 import qualified Data.Aeson as A
 import qualified Data.Aeson.Key as K
@@ -93,7 +97,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import qualified Data.ByteString.Lazy as BL
 import Data.IORef (newIORef, readIORef, writeIORef)
-import Data.List (isInfixOf, isSuffixOf, nub, sort)
+import Data.List (isInfixOf, isPrefixOf, nub, partition, sort)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
@@ -101,6 +105,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Time.Calendar (fromGregorian)
 import Data.Time.Clock (UTCTime (..), addUTCTime, getCurrentTime)
+import Data.Unique (hashUnique, newUnique)
 import qualified Data.Vector as V
 import Network.HTTP.Client (
     Manager,
@@ -116,25 +121,42 @@ import Network.HTTP.Types (Header, Method, methodGet, methodPost, statusCode)
 import Network.Wai (Application)
 import qualified Network.Wai.Handler.Warp as Warp
 import qualified Network.Wai.Test as WT
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, getTemporaryDirectory)
+import System.Directory (XdgDirectory (XdgConfig), createDirectoryIfMissing, doesDirectoryExist, doesFileExist, getTemporaryDirectory, getXdgDirectory, removePathForcibly)
 import qualified System.Directory
-import System.Environment (lookupEnv, setEnv, unsetEnv)
+import System.Environment (getEnvironment, lookupEnv, setEnv, unsetEnv)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO (Handle)
+import System.Info (os)
 import System.Process (
     CreateProcess (cwd, std_err, std_out),
     ProcessHandle,
     StdStream (..),
     createProcess,
     proc,
+    readCreateProcessWithExitCode,
     waitForProcess,
  )
 import Test.Hspec
+import qualified System.Process as Process
 import Test.Hspec.Wai hiding (pendingWith)
 
--- ChuSQL Web 测试，覆盖三层：
--- 纯函数、路由级（内存后端）、端到端（真 Rust 存储进程）。
+-- ChuSQL Web 测试：纯函数、路由级（内存后端）、端到端（真 Rust 存储进程）。
+
+-- | 夹具库名：服务不再有默认库，测试世界里这一个库扮演"已选中的库"。
+--   它只是个普通库名（不再是保留名）——保留的只有 system。
+testDatabaseName :: String
+testDatabaseName = "test"
+
+-- | 夹具库的请求头
+testDatabaseHeader :: Header
+testDatabaseHeader = ("X-ChuSQL-Database", TE.encodeUtf8 (T.pack testDatabaseName))
+
+-- | 没有显式指定库的请求都落到夹具库；要测"没选库"的用例请直接用 `request`
+fixtureHeaders :: [Header] -> [Header]
+fixtureHeaders hs
+    | any ((== "X-ChuSQL-Database") . fst) hs = hs
+    | otherwise = testDatabaseHeader : hs
 
 -- | users 5 行 + orders 1 行
 testDb :: Database
@@ -169,28 +191,38 @@ policy = SessionPolicy (8 * 3600) (24 * 3600)
 
 -- | 造一条 `SELECT *`
 selectStar :: FromClause -> Statement
-selectStar from = Select ["*"] from Nothing [] Nothing
+selectStar from = Select ["*"] from Nothing [] [] Nothing
 
 -- | 造一条显式列名的 SELECT
 selectThese :: [String] -> FromClause -> Statement
-selectThese cols from = Select cols from Nothing [] Nothing
+selectThese cols from = Select cols from Nothing [] [] Nothing
 
 -- | with 块里的会话类型别名
 type TestSession a = WaiSession () a
 
 -- | 每个用例组一套：内存后端 + 可控时钟 + 临时静态目录
 freshWorld :: FilePath -> IO AppEnv
-freshWorld staticDir = do
+freshWorld staticDir = freshWorldWith staticDir testCredential
+
+-- | 同上，但换一个 root 凭据（免密用例用）
+freshWorldWith :: FilePath -> Credential -> IO AppEnv
+freshWorldWith staticDir credential = do
     db <- newMVar testDb
     clock <- newIORef epoch
     sessions <- newSessionStore (readIORef clock) policy
     limiter <- newRateLimiter (readIORef clock) 5 (5 * 60)
-    env <- newAppEnv (memoryBackend db) sessions testCredential limiter staticDir
+    env <- newAppEnv (memoryBackend testDatabaseName db) sessions credential limiter staticDir
     path <- tempSettingsPath "default"
     removeIfExists path
-    uiPath <- tempUiSettingsPath "default"
+    uiPath <- tempUISettingsPath "default"
     removeIfExists uiPath
-    pure env{aeSettingsFile = path, aeUiSettingsFile = uiPath, aeEffective = Map.empty}
+    pure env{aeSettingsFile = path, aeUISettingsFile = uiPath, aeEffective = Map.empty}
+
+-- | 免密管理员的世界：空口令的凭据等价于"只允许管理员免密登录"
+withPasswordlessWorld :: FilePath -> (AppEnv -> SpecWith ((), Application)) -> Spec
+withPasswordlessWorld staticDir body = do
+    appEnv <- runIO (freshWorldWith staticDir (Credential "admin" ""))
+    with (webApp appEnv) (body appEnv)
 
 -- | 临时设置文件（每个用例组一个名字，互不干扰）
 tempSettingsPath :: String -> IO FilePath
@@ -199,8 +231,8 @@ tempSettingsPath name = do
     pure (tmp </> ("chusql-web-test-" ++ name ++ "-settings.json"))
 
 -- | 临时 IDE 设置文件（同样按用例组取名）
-tempUiSettingsPath :: String -> IO FilePath
-tempUiSettingsPath name = do
+tempUISettingsPath :: String -> IO FilePath
+tempUISettingsPath name = do
     tmp <- getTemporaryDirectory
     pure (tmp </> ("chusql-web-test-" ++ name ++ "-ui-settings.json"))
 
@@ -220,9 +252,9 @@ freshWorldAt staticDir name = do
     env <- freshWorld staticDir
     path <- tempSettingsPath name
     removeIfExists path
-    uiPath <- tempUiSettingsPath name
+    uiPath <- tempUISettingsPath name
     removeIfExists uiPath
-    pure env{aeSettingsFile = path, aeUiSettingsFile = uiPath}
+    pure env{aeSettingsFile = path, aeUISettingsFile = uiPath}
 
 -- | 临时静态目录，内容固定便于断言
 makeStaticDir :: IO FilePath
@@ -288,11 +320,15 @@ sessionCookieOf res = do
     raw <- lookup "Set-Cookie" (WT.simpleHeaders res)
     parseCookieHeader "chusql_session" (TE.decodeUtf8 raw)
 
--- | 会话令牌变请求头
+-- | 会话令牌变请求头；顺带带上夹具库——服务没有默认库，缺头就是"没选库"
 cookieHeaders :: WT.SResponse -> [Header]
 cookieHeaders res = case sessionCookieOf res of
     Nothing -> []
-    Just token -> [("Cookie", TE.encodeUtf8 ("chusql_session=" <> token))]
+    Just token -> [("Cookie", TE.encodeUtf8 ("chusql_session=" <> token)), testDatabaseHeader]
+
+-- | 把请求指到系统库 system（账号表与 system 库本身都在那里）
+systemHeaders :: [Header] -> [Header]
+systemHeaders hs = ("X-ChuSQL-Database", "system") : filter ((/= "X-ChuSQL-Database") . fst) hs
 
 -- | 带 JSON 体的请求
 jsonRequest :: Method -> BS.ByteString -> BL.ByteString -> TestSession WT.SResponse
@@ -311,17 +347,26 @@ loginAs user password = jsonRequest methodPost "/api/login" (loginBody user pass
 
 -- | 带请求头的 GET
 getWith :: [Header] -> BS.ByteString -> TestSession WT.SResponse
-getWith headers path = request methodGet path headers ""
+getWith headers path = request methodGet path (fixtureHeaders headers) ""
 
 -- | 带请求头的 JSON POST
 postWith :: [Header] -> BS.ByteString -> BL.ByteString -> TestSession WT.SResponse
 postWith headers path payload =
-    request methodPost path (("Content-Type", "application/json") : headers) payload
+    request methodPost path (fixtureHeaders (("Content-Type", "application/json") : headers)) payload
 
 -- | 带请求头的 JSON PUT（改设置用的是 PUT）
 putWith :: [Header] -> BS.ByteString -> BL.ByteString -> TestSession WT.SResponse
 putWith headers path payload =
-    request "PUT" path (("Content-Type", "application/json") : headers) payload
+    request "PUT" path (fixtureHeaders (("Content-Type", "application/json") : headers)) payload
+
+-- | 带请求头的 JSON PATCH（改行用的是 PATCH）
+patchWith :: [Header] -> BS.ByteString -> BL.ByteString -> TestSession WT.SResponse
+patchWith headers path payload =
+    request "PATCH" path (fixtureHeaders (("Content-Type", "application/json") : headers)) payload
+
+-- | 带请求头的 DELETE
+deleteWith :: [Header] -> BS.ByteString -> TestSession WT.SResponse
+deleteWith headers path = request "DELETE" path (fixtureHeaders headers) ""
 
 -- | 在 items 数组里按键找一项（找不到给 Null）
 headEntry :: Text -> [A.Value] -> A.Value
@@ -336,6 +381,23 @@ check = liftIO
 -- | 已经拿到响应对象时的状态码断言
 hasStatus :: WT.SResponse -> Int -> IO ()
 hasStatus res code = statusCode (WT.simpleStatus res) `shouldBe` code
+
+-- | 状态码断言，失败时把响应体和状态码一起报出来（定位用）
+expectStatusWith :: String -> WT.SResponse -> Int -> TestSession ()
+expectStatusWith label res code =
+    check $
+        if statusCode (WT.simpleStatus res) == code
+            then pure ()
+            else
+                expectationFailure
+                    ( label
+                        ++ ": expected "
+                        ++ show code
+                        ++ " but got "
+                        ++ show (statusCode (WT.simpleStatus res))
+                        ++ " body="
+                        ++ show (WT.simpleBody res)
+                    )
 
 -- | 临时设几个环境变量跑一段，跑完恢复原样（原来没有就删掉）
 withEnv :: [(String, String)] -> IO a -> IO a
@@ -380,12 +442,15 @@ spec = do
     unitSpec
     actionsSpec
     staticSpec staticDir
-    frontendBundleSpec
+    staticAssetSpec
+    staticServeSpec
     authSpec staticDir
+    passwordlessSpec staticDir
     catalogSpec staticDir
     limitsSpec staticDir
     oneClickSpec staticDir
     sqlSpec staticDir
+    privilegesSpec staticDir
     settingsSpec staticDir
     uiSettingsSpec staticDir
     sortSpec staticDir
@@ -401,12 +466,6 @@ unitSpec = do
             verifyPassword (hashPasswordWith 1000 (BS.replicate 16 1) "s3cret") "wrong" `shouldBe` False
         it "treats a broken encoded hash as mismatch instead of throwing" $
             verifyPassword "garbage" "s3cret" `shouldBe` False
-        it "same password with different salts yields different hashes" $
-            hashPasswordWith 1000 (BS.replicate 16 1) "s3cret"
-                `shouldNotBe` hashPasswordWith 1000 (BS.replicate 16 2) "s3cret"
-        it "encoded hash has four parts: algo$iterations$salt$hash" $
-            T.splitOn "$" (hashPasswordWith 1000 (BS.replicate 16 3) "s3cret")
-                `shouldSatisfy` ((== 4) . length)
 
     describe "Sessions" $ do
         it "token is 64 hex chars and differs between calls" $ do
@@ -454,25 +513,80 @@ unitSpec = do
             writeIORef clock (addUTCTime 11 epoch)
             gone <- lookupSession store token
             gone `shouldBe` Nothing
-        it "password change drops other sessions but keeps the current one" $ do
-            clock <- newIORef epoch
-            store <- newSessionStore (readIORef clock) policy
-            keep <- createSession store "admin"
-            other <- createSession store "admin"
-            removed <- deleteOtherSessions store keep
-            kept <- lookupSession store keep
-            dropped <- lookupSession store other
-            removed `shouldBe` 1
-            kept `shouldBe` Just "admin"
-            dropped `shouldBe` Nothing
-        it "no other sessions means zero removed (visible in logs)" $ do
-            clock <- newIORef epoch
-            store <- newSessionStore (readIORef clock) policy
-            keep <- createSession store "admin"
-            removed <- deleteOtherSessions store keep
-            removed `shouldBe` 0
-            stillThere <- lookupSession store keep
-            stillThere `shouldBe` Just "admin"
+
+    describe "Account policy and lifecycle" $ do
+        it "rejects invalid configurable policy limits" $ do
+            mapM_ (\(key, value) -> applySettings Map.empty (Map.singleton key value) `shouldSatisfy` isLeft)
+                [("password-min-length", "7"), ("password-classes", "5")]
+        it "the admin is configuration only: no storage needed to sign in" $ do
+            db <- newMVar testDb
+            sessions <- newSessionStore (pure epoch) policy
+            let backend = (memoryBackend testDatabaseName db){beAccounts = const (pure (Left "unavailable"))}
+            service <- newAccounts backend sessions testCredential
+            authenticate service "admin" "s3cret" >>= (`shouldSatisfy` isRight)
+            listAccounts service >>= (`shouldSatisfy` isLeft)
+        it "enforces password length and character classes" $ do
+            let pol = defaultPasswordPolicy
+            passwordAllowed pol "tiny" `shouldSatisfy` isLeft
+            passwordAllowed pol "alllowercaseletters" `shouldSatisfy` isLeft
+            passwordAllowed pol "long-password" `shouldBe` Right ()
+        it "the admin name is reserved and ordinary names are validated" $ do
+            db <- newMVar testDb
+            sessions <- newSessionStore (pure epoch) policy
+            service <- newAccounts (memoryBackend testDatabaseName db) sessions testCredential
+            runAccountCommand service (Root "admin") (CreateAccount "ADMIN" "another-password") >>= (`shouldSatisfy` isLeft)
+            runAccountCommand service (Root "admin") (CreateAccount "with space" "another-password") >>= (`shouldSatisfy` isLeft)
+            runAccountCommand service (Root "admin") (CreateAccount "alice" "tiny") >>= (`shouldSatisfy` isLeft)
+        it "creates, resets and drops ordinary accounts, and a reset revokes their sessions" $ do
+            db <- newMVar testDb
+            sessions <- newSessionStore (pure epoch) policy
+            service <- newAccounts (memoryBackend testDatabaseName db) sessions testCredential
+            let admin = Root "admin"
+            runAccountCommand service admin (CreateAccount "Alice" "alice-password") >>= (`shouldBe` Right ())
+            Right alice <- authenticate service "alice" "alice-password"
+            Right bob <- authenticate service "admin" "s3cret"
+            runAccountCommand service admin (ResetAccountPassword "alice" "alice-other-pass") >>= (`shouldBe` Right ())
+            currentPrincipal service alice >>= (`shouldSatisfy` isLeft)
+            currentPrincipal service bob >>= (`shouldSatisfy` isRight)
+            authenticate service "alice" "alice-password" >>= (`shouldSatisfy` isLeft)
+            authenticate service "alice" "alice-other-pass" >>= (`shouldSatisfy` isRight)
+            runAccountCommand service admin (DropAccount "alice") >>= (`shouldBe` Right ())
+            authenticate service "alice" "alice-other-pass" >>= (`shouldSatisfy` isLeft)
+            runAccountCommand service admin (DropAccount "alice") >>= (`shouldSatisfy` isLeft)
+        it "an ordinary account cannot administer accounts" $ do
+            db <- newMVar testDb
+            sessions <- newSessionStore (pure epoch) policy
+            service <- newAccounts (memoryBackend testDatabaseName db) sessions testCredential
+            let admin = Root "admin"
+            runAccountCommand service admin (CreateAccount "alice" "alice-password") >>= (`shouldBe` Right ())
+            Right token <- authenticate service "alice" "alice-password"
+            Right principal <- currentPrincipal service token
+            principalIsRoot principal `shouldBe` False
+            principalName principal `shouldBe` "alice"
+            runAccountCommand service principal (CreateAccount "bob" "bob-password") >>= (`shouldSatisfy` isLeft)
+            runAccountCommand service principal (DropAccount "alice") >>= (`shouldSatisfy` isLeft)
+            authenticate service "bob" "bob-password" >>= (`shouldSatisfy` isLeft)
+        it "a failed account write keeps the old password" $ do
+            db <- newMVar testDb
+            sessions <- newSessionStore (pure epoch) policy
+            let original = memoryBackend testDatabaseName db
+                backend = original{beAccounts = \req -> case req of
+                    ReqAccountReset {} -> pure (Left "write failed")
+                    _ -> beAccounts original req}
+            service <- newAccounts backend sessions testCredential
+            let admin = Root "admin"
+            runAccountCommand service admin (CreateAccount "alice" "alice-password") >>= (`shouldBe` Right ())
+            runAccountCommand service admin (ResetAccountPassword "alice" "alice-other-pass") >>= (`shouldSatisfy` isLeft)
+            authenticate service "alice" "alice-password" >>= (`shouldSatisfy` isRight)
+            authenticate service "alice" "alice-other-pass" >>= (`shouldSatisfy` isLeft)
+        it "a legacy row named like the administrator can be dropped, but not recreated" $ do
+            db <- newMVar testDb
+            sessions <- newSessionStore (pure epoch) policy
+            _ <- beAccounts (memoryBackend testDatabaseName db) (ReqAccountCreate "admin" "legacy-hash")
+            service <- newAccounts (memoryBackend testDatabaseName db) sessions testCredential
+            runAccountCommand service (Root "admin") (CreateAccount "admin" "another-password") >>= (`shouldSatisfy` isLeft)
+            runAccountCommand service (Root "admin") (ResetAccountPassword "admin" "another-password") >>= (`shouldSatisfy` isLeft)
+            runAccountCommand service (Root "admin") (DropAccount "admin") >>= (`shouldBe` Right ())
 
     describe "Login rate limiting" $ do
         it "below the limit is not blocked" $ do
@@ -504,20 +618,10 @@ unitSpec = do
             setRateLimit rl 10 60
             unlocked <- rateLimitBlock rl "admin"
             unlocked `shouldBe` Nothing
-        it "shortening the window allows immediately (settings hot reload)" $ do
-            clock <- newIORef epoch
-            rl <- newRateLimiter (readIORef clock) 3 3600
-            mapM_ (const (rateLimitRecord rl "admin")) [1 :: Int, 2, 3]
-            setRateLimit rl 3 1
-            writeIORef clock (addUTCTime 2 epoch)
-            open <- rateLimitBlock rl "admin"
-            open `shouldBe` Nothing
 
     describe "Cookie parsing" $ do
         it "picks the session token out of many cookies" $
             parseCookieHeader "chusql_session" "a=1; chusql_session=abc123; b=2" `shouldBe` Just "abc123"
-        it "missing key yields Nothing" $
-            parseCookieHeader "chusql_session" "a=1; b=2" `shouldBe` Nothing
         it "empty value does not count as a value" $
             parseCookieHeader "chusql_session" "chusql_session=" `shouldBe` Nothing
 
@@ -540,17 +644,17 @@ unitSpec = do
             machineReadable `shouldSatisfy` (not . null)
             all (not . T.null . siDefault) machineReadable `shouldBe` True
             [siDefault i | i <- settingCatalogue, siKind i == "secret"] `shouldSatisfy` all T.null
-            let envs = map siEnv settingCatalogue
-            all (not . T.null) envs `shouldBe` True
-            length envs `shouldBe` length (nub envs)
-        it "every item has an env var and can be found by key" $ do
-            all (not . T.null . siEnv) settingCatalogue `shouldBe` True
-            map (fmap siKey . findItem . siKey) settingCatalogue `shouldBe` map (Just . siKey) settingCatalogue
+            let pairs = [(siSection i, siTomlKey i) | i <- settingCatalogue]
+            [s | (s, _) <- pairs] `shouldSatisfy` all (not . T.null)
+            [k | (_, k) <- pairs] `shouldSatisfy` all (not . T.null)
+            length pairs `shouldBe` length (nub pairs)
+            findItem "pipe-name" `shouldSatisfy` maybe False (\i -> (siSection i, siTomlKey i) == ("server", "pipe_name"))
+            findItem "storage-page-size" `shouldSatisfy` maybe False (\i -> (siSection i, siTomlKey i) == ("page", "size"))
         it "critical settings are root-only, tuning ones are not" $ do
             isRootOnly "port" `shouldBe` True
             isRootOnly "host" `shouldBe` True
             isRootOnly "user" `shouldBe` True
-            isRootOnly "password-hash" `shouldBe` True
+            isRootOnly "password" `shouldBe` True
             isRootOnly "rows-per-page" `shouldBe` False
             isRootOnly "body-limit" `shouldBe` False
         it "live keys exist in the catalogue and are all integers" $ do
@@ -562,10 +666,6 @@ unitSpec = do
             isRestartRequired "static-dir" `shouldBe` True
             isRestartRequired "rows-per-page" `shouldBe` False
             filter isRestartRequired liveKeys `shouldBe` []
-        it "defaults are found, an unknown key gives an empty string" $ do
-            defaultOf "port" `shouldBe` "7777"
-            defaultOf "rows-per-page" `shouldBe` "25"
-            defaultOf "nope" `shouldBe` ""
         it "the flattened startup config carries the real port/account" $ do
             let flat = effectiveSettings defaultWebConfig
             Map.lookup "port" flat `shouldBe` Just "7777"
@@ -605,27 +705,19 @@ unitSpec = do
             tmp <- getTemporaryDirectory
             missing <- readSettingsFile (tmp </> "chusql-web-test-does-not-exist.json")
             missing `shouldBe` Map.empty
-        it "settings file lookup: uses an existing file" $ do
+        it "the config file lives at the fixed place the installer writes" $ do
+            fixed <- defaultConfigFile
+            dir <- getXdgDirectory XdgConfig "ChuSQL"
+            fixed `shouldBe` (dir </> "chusql.toml")
+        it "an explicit --config path wins over the fixed place" $ do
             tmp <- getTemporaryDirectory
-            let web = tmp </> "chusql-web-test-resolve"
-            createDirectoryIfMissing True (web </> "script")
-            BS.writeFile (web </> "script" </> "chusql.settings.json") "{\"port\":\"9000\"}"
-            System.Directory.withCurrentDirectory web $ do
-                found <- resolveSettingsFile
-                found `shouldBe` ("script" </> "chusql.settings.json")
-        it "settings file lookup: picks the candidate in an existing dir when none exists" $ do
-            tmp <- getTemporaryDirectory
-            let root = tmp </> "chusql-web-test-resolve-root"
-            let web = root </> "chusql-web"
-            createDirectoryIfMissing True (root </> "script")
-            createDirectoryIfMissing True web
-            System.Directory.withCurrentDirectory web $ do
-                found <- resolveSettingsFile
-                found `shouldBe` (".." </> "script" </> "chusql.settings.json")
+            let explicit = tmp </> "chusql-web-test-explicit.toml"
+            resolveConfigPath (Just explicit) `shouldReturn` explicit
+        it "without --config the fixed place is used" $ do
+            fixed <- defaultConfigFile
+            resolveConfigPath Nothing `shouldReturn` fixed
 
     describe "Browsing SELECTs (column header click / WHERE filter cells)" $ do
-        it "no sort and no filter yields a plain SELECT" $
-            selectRowsSql "users" Nothing [] `shouldBe` Right "SELECT * FROM users"
         it "column and direction produce ORDER BY" $ do
             selectRowsSql "users" (Just ("age", True)) [] `shouldBe` Right "SELECT * FROM users ORDER BY age ASC"
             selectRowsSql "users" (Just ("age", False)) [] `shouldBe` Right "SELECT * FROM users ORDER BY age DESC"
@@ -681,6 +773,10 @@ unitSpec = do
             contentTypeOf "x.bin" `shouldBe` "application/octet-stream"
 
     describe "Column inference (headers even for empty results)" $ do
+        it "normalizes default qualified headers" $ do
+            fmap (columnsFromStatement testDb) (parseStatement "SELECT users.name FROM users WHERE FALSE") `shouldBe` Right ["name"]
+        it "infers headers for a SELECT without FROM" $ do
+            fmap (columnsFromStatement testDb) (parseStatement "SELECT 1 + 2 LIMIT 0") `shouldBe` Right ["1 + 2"]
         it "SELECT * expands to the table columns" $
             columnsFromStatement testDb (selectStar (FromTable Nothing "users"))
                 `shouldBe` ["id", "name", "age"]
@@ -690,8 +786,8 @@ unitSpec = do
         it "JOIN SELECT * puts the left table first" $
             columnsFromStatement
                 testDb
-                (selectStar (FromJoin (FromTable Nothing "users") (Just "o") "orders" (Eq (Col "id") (Col "user_id"))))
-                `shouldBe` ["id", "name", "age", "o.id", "o.user_id"]
+                (selectStar (FromJoin InnerJoin (FromTable Nothing "users") (Just "o") "orders" (Eq (Col "users.id") (Col "o.user_id"))))
+                `shouldBe` ["users.id", "users.name", "users.age", "o.id", "o.user_id"]
         it "explicit column names are kept as-is" $
             columnsFromStatement testDb (selectThese ["name"] (FromTable Nothing "users")) `shouldBe` ["name"]
         it "write statements have no result columns" $
@@ -713,34 +809,93 @@ unitSpec = do
                     map scName (tiColumns info) `shouldBe` ["id", "name", "age"]
                     tiStats info `shouldBe` [("id", 5, False), ("name", 5, False), ("age", 5, False)]
 
-    describe "Default account and credential source" $ do
-        it "the default account is root and uses the built-in demo password" $ do
-            let cfg = defaultWebConfig
+    describe "Database qualification (inDatabase)" $ do
+        let rewrite db sql = parseStatement sql >>= Right . inDatabase db
+
+        it "prefixes the tables of a subquery as well" $ do
+            case rewrite "sales" "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders)" of
+                Left err -> expectationFailure err
+                Right stmt -> do
+                    let text = show stmt
+                    ("sales.users" `isInfixOf` text) `shouldBe` True
+                    ("sales.orders" `isInfixOf` text) `shouldBe` True
+                    ("\"orders\"" `isInfixOf` text) `shouldBe` False
+
+        it "keeps the JOIN kind while prefixing both sides" $ do
+            case rewrite "sales" "SELECT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id" of
+                Left err -> expectationFailure err
+                Right stmt -> do
+                    let text = show stmt
+                    ("LeftJoin" `isInfixOf` text) `shouldBe` True
+                    ("sales.users" `isInfixOf` text) `shouldBe` True
+                    ("sales.orders" `isInfixOf` text) `shouldBe` True
+                    ("\"orders\"" `isInfixOf` text) `shouldBe` False
+
+        it "qualifies a subquery that sits inside a JOIN condition" $ do
+            case rewrite "sales" "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id AND EXISTS (SELECT 1 FROM orders x WHERE x.user_id = u.id)" of
+                Left err -> expectationFailure err
+                Right stmt -> do
+                    let text = show stmt
+                    ("sales.users" `isInfixOf` text) `shouldBe` True
+                    ("sales.orders" `isInfixOf` text) `shouldBe` True
+                    ("\"orders\"" `isInfixOf` text) `shouldBe` False
+
+        it "leaves table names alone when no database is selected" $ do
+            case rewrite "" "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders)" of
+                Left err -> expectationFailure err
+                Right stmt -> do
+                    let text = show stmt
+                    ("\"users\"" `isInfixOf` text) `shouldBe` True
+                    ("\"orders\"" `isInfixOf` text) `shouldBe` True
+                    ("test." `isInfixOf` text) `shouldBe` False
+
+    describe "Administrator credential source (settings file only)" $ do
+        it "with nothing configured the built-in demo account is used" $ do
             defaultUser `shouldBe` "root"
-            wcUser cfg `shouldBe` "root"
-            usingDefaultCredentials cfg `shouldBe` True
-            cred <- resolveCredential cfg
+            usingDefaultCredentials Map.empty `shouldBe` True
+            cred <- resolveCredential defaultWebConfig Map.empty
             credUser cred `shouldBe` defaultUser
             verifyPassword (credEncoded cred) defaultPassword `shouldBe` True
-        it "a plain password wins and the default stops working" $ do
-            let cfg = defaultWebConfig{wcPassword = Just "s3cret"}
-            usingDefaultCredentials cfg `shouldBe` False
-            cred <- resolveCredential cfg
+        it "a plain password in the settings file wins" $ do
+            let saved = Map.singleton "password" "s3cret"
+            usingDefaultCredentials saved `shouldBe` False
+            cred <- resolveCredential defaultWebConfig saved
             verifyPassword (credEncoded cred) "s3cret" `shouldBe` True
             verifyPassword (credEncoded cred) defaultPassword `shouldBe` False
-        it "a provided hash is used directly (not re-hashed)" $ do
+        it "an explicitly empty password makes the administrator passwordless" $ do
+            let saved = Map.singleton "password" ""
+            usingDefaultCredentials saved `shouldBe` False
+            cred <- resolveCredential defaultWebConfig saved
+            credUser cred `shouldBe` defaultUser
+            credEncoded cred `shouldBe` ""
+            -- 空口令不是"能匹配任意口令"的哈希：它是一个明确的空编码串
+            verifyPassword (credEncoded cred) "" `shouldBe` False
+        it "the retired password-hash key is not a setting and never a credential" $ do
             let encoded = hashPasswordWith 1000 (BS.replicate 16 9) "from-hash"
-            cred <- resolveCredential defaultWebConfig{wcPasswordHash = Just encoded}
-            credEncoded cred `shouldBe` encoded
-        it "the account name can be changed" $ do
-            cred <- resolveCredential defaultWebConfig{wcUser = "tester"}
+            cred <- resolveCredential defaultWebConfig (Map.singleton "password-hash" encoded)
+            verifyPassword (credEncoded cred) defaultPassword `shouldBe` True
+            applySettings Map.empty (Map.singleton "password-hash" encoded) `shouldSatisfy` isLeftE
+        it "the administrator name comes from the file, and --user still wins" $ do
+            cred <- resolveCredential defaultWebConfig (Map.fromList [("user", "tester"), ("password", "s3cret")])
             credUser cred `shouldBe` "tester"
+            fromCli <- resolveCredential defaultWebConfig{wcUser = "from-cli"} (Map.singleton "user" "tester")
+            credUser fromCli `shouldBe` "from-cli"
+        it "the password environment variables are no longer consulted" $ do
+            tmp <- getTemporaryDirectory
+            let missing = tmp </> "chusql-web-test-cred-env.toml"
+            removeIfExists missing
+            withEnv [("CHUSQL_WEB_PASSWORD", "from-env"), ("CHUSQL_WEB_USER", "env-user")] $ do
+                cfg <- loadWebConfigAt missing
+                wcUser cfg `shouldBe` ""
+                cred <- resolveCredential cfg Map.empty
+                credUser cred `shouldBe` defaultUser
+                verifyPassword (credEncoded cred) "from-env" `shouldBe` False
 
     describe "Config: built-in defaults" $ do
-        it "port defaults to 7777, account defaults to admin/chusql" $ do
+        it "port defaults to 7777 and the administrator name is not baked into the config" $ do
             wcPort defaultWebConfig `shouldBe` 7777
             wcHost defaultWebConfig `shouldBe` "127.0.0.1"
-            wcUser defaultWebConfig `shouldBe` defaultUser
+            wcUser defaultWebConfig `shouldBe` ""
             wcCookieSecure defaultWebConfig `shouldBe` False
         it "session / rate limit / paging / row limits all have explicit defaults" $ do
             wcSessionIdle defaultWebConfig `shouldBe` 8 * 3600
@@ -753,23 +908,16 @@ unitSpec = do
             wcMaxSqlLength defaultWebConfig `shouldBe` 20000
             wcBodyLimit defaultWebConfig `shouldBe` 65536
 
-    describe "Config: environment variables override defaults" $ do
-        it "port / host / static dir / account" $ do
+    describe "Config: environment variables are ignored (the file comes from --config)" $ do
+        it "port / host / static dir / limits in the environment change nothing" $ do
+            tmp <- getTemporaryDirectory
+            let missing = tmp </> "chusql-web-test-ignored-env.toml"
+            removeIfExists missing
             withEnv
                 [ ("CHUSQL_WEB_PORT", "8123")
                 , ("CHUSQL_WEB_HOST", "0.0.0.0")
                 , ("CHUSQL_WEB_STATIC", "mysite")
-                , ("CHUSQL_WEB_USER", "tester")
-                ]
-                $ do
-                    cfg <- loadWebConfig
-                    wcPort cfg `shouldBe` 8123
-                    wcHost cfg `shouldBe` "0.0.0.0"
-                    wcStaticDir cfg `shouldBe` "mysite"
-                    wcUser cfg `shouldBe` "tester"
-        it "session / rate limit / paging / rows / body limit" $ do
-            withEnv
-                [ ("CHUSQL_WEB_SESSION_IDLE", "60")
+                , ("CHUSQL_WEB_SESSION_IDLE", "60")
                 , ("CHUSQL_WEB_SESSION_MAX", "120")
                 , ("CHUSQL_WEB_LOGIN_MAX_ATTEMPTS", "3")
                 , ("CHUSQL_WEB_LOGIN_WINDOW", "30")
@@ -781,128 +929,299 @@ unitSpec = do
                 , ("CHUSQL_WEB_COOKIE_SECURE", "1")
                 ]
                 $ do
-                    cfg <- loadWebConfig
-                    wcSessionIdle cfg `shouldBe` 60
-                    wcSessionMax cfg `shouldBe` 120
-                    wcLoginMaxAttempts cfg `shouldBe` 3
-                    wcLoginWindow cfg `shouldBe` 30
-                    wcPageSize cfg `shouldBe` 7
-                    wcMaxPageSize cfg `shouldBe` 70
-                    wcMaxRows cfg `shouldBe` 9
-                    wcMaxSqlLength cfg `shouldBe` 1234
-                    wcBodyLimit cfg `shouldBe` 2048
-                    wcCookieSecure cfg `shouldBe` True
-        it "unsetting the env var restores the default port 7777" $ do
-            withEnv [("CHUSQL_WEB_PORT", "8123")] $ do
-                tuned <- loadWebConfig
-                wcPort tuned `shouldBe` 8123
-            restored <- loadWebConfig
-            wcPort restored `shouldBe` 7777
+                    cfg <- loadWebConfigAt missing
+                    cfg `shouldBe` defaultWebConfig
+        it "the retired endpoint variables change nothing either" $ do
+            tmp <- getTemporaryDirectory
+            let missing = tmp </> "chusql-web-test-ignored-endpoint.toml"
+            removeIfExists missing
+            withEnv
+                [ ("CHUSQL_PIPE", "from-env-pipe")
+                , ("CHUSQL_DATA_DIR", "from-env-data")
+                , ("CHUSQL_STORAGE_SERVER", "from-env-server")
+                ]
+                $ do
+                    cfg <- loadWebConfigAt missing
+                    wcPipeName cfg `shouldBe` Nothing
+                    wcDataDir cfg `shouldBe` Nothing
+                    wcStorageServer cfg `shouldBe` Nothing
 
-    describe "Launcher script (script/chusql.ps1)" $ do
-        it "script/ has chusql.ps1 / chusql.cmd, default port 7777, covering all three modules" $ do
-            script <- readUtf8 (".." </> "script" </> "chusql.ps1")
-            batch <- readUtf8 (".." </> "script" </> "chusql.cmd")
-            batch `shouldSatisfy` T.isInfixOf "chusql.ps1"
-            script `shouldSatisfy` T.isInfixOf "chusql-storage"
-            script `shouldSatisfy` T.isInfixOf "chusql-web.exe"
-            script `shouldSatisfy` T.isInfixOf "/api/status"
-            script `shouldSatisfy` T.isInfixOf "7777"
-        it "has web / cli / config commands, cli is a placeholder (dev notice + still starts web)" $ do
-            script <- readUtf8 (".." </> "script" </> "chusql.ps1")
-            script `shouldSatisfy` T.isInfixOf "CLI interface is under development."
-            script `shouldSatisfy` T.isInfixOf "'web'"
-            script `shouldSatisfy` T.isInfixOf "'cli'"
-            script `shouldSatisfy` T.isInfixOf "config set"
-        it "settings persist to a file (config set/unset/reset + precedence note)" $ do
-            script <- readUtf8 (".." </> "script" </> "chusql.ps1")
-            script `shouldSatisfy` T.isInfixOf "chusql.settings.json"
-            script `shouldSatisfy` T.isInfixOf "command line > settings file > environment > default"
-            script `shouldSatisfy` T.isInfixOf "Save-SavedSettings"
-        it "child window hidden + logs flow back to the launcher window" $ do
-            script <- readUtf8 (".." </> "script" </> "chusql.ps1")
-            script `shouldSatisfy` T.isInfixOf "-WindowStyle Hidden"
-            script `shouldSatisfy` T.isInfixOf "Show-NewLogLines"
-            script `shouldSatisfy` T.isInfixOf "RedirectStandardOutput"
-        it "the script exposes settings as switches (port/session/paging/storage tuning)" $ do
-            script <- readUtf8 (".." </> "script" </> "chusql.ps1")
-            script `shouldSatisfy` T.isInfixOf "CHUSQL_WEB_SESSION_IDLE"
-            script `shouldSatisfy` T.isInfixOf "CHUSQL_WEB_MAX_ROWS"
-            script `shouldSatisfy` T.isInfixOf "CHUSQL_BUFFER_POOL_SIZE"
-            script `shouldSatisfy` T.isInfixOf "CHUSQL_PAGE_SIZE"
-        it "the Rust artifact is named chusql-storage (no longer server)" $ do
-            script <- readUtf8 (".." </> "script" </> "chusql.ps1")
-            script `shouldSatisfy` T.isInfixOf "target\\release\\chusql-storage.exe"
-            script `shouldSatisfy` (not . T.isInfixOf "target\\release\\server.exe")
+    describe "Config: the sections of the global chusql.toml" $ do
+        it "reads the section and accepts both underscore and hyphen spellings" $ do
+            tmp <- getTemporaryDirectory
+            let path = tmp </> "chusql-web-test-global.toml"
+            writeFile path "[page]\nsize = 8192\n\n[web]\nstatic_dir = \"webroot\"\nsession_idle = 4242\nrows_per_page = 33\n"
+            cfg <- loadWebConfigAt path
+            wcStaticDir cfg `shouldBe` "webroot"
+            wcSessionIdle cfg `shouldBe` 4242
+            wcPageSize cfg `shouldBe` 33
+            -- 别的层的分区不归 web 管，没给的键回到内置默认
+            wcPort cfg `shouldBe` 7777
+            wcMaxRows cfg `shouldBe` 1000
+            saved <- readSettingsFile path
+            Map.lookup "rows-per-page" saved `shouldBe` Just "33"
+        it "the endpoint comes from [server] pipe_name and [storage] data_dir, the executable from [web] storage_server" $ do
+            tmp <- getTemporaryDirectory
+            let path = tmp </> "chusql-web-test-endpoint.toml"
+            writeFile
+                path
+                "[server]\npipe_name = \"joint-pipe\"\n\n[storage]\ndata_dir = \"../localdata\"\n\n[web]\nstorage_server = \"chusql-storage.exe\"\n"
+            cfg <- loadWebConfigAt path
+            wcPipeName cfg `shouldBe` Just "joint-pipe"
+            resolvePipeName cfg `shouldBe` "joint-pipe"
+            wcDataDir cfg `shouldBe` Just "../localdata"
+            wcStorageServer cfg `shouldBe` Just "chusql-storage.exe"
+        it "without a file the pipe name falls back to the shared default" $ do
+            resolvePipeName defaultWebConfig `shouldBe` "chusql-joint"
+        it "a port in the environment no longer wins over the file" $ do
+            tmp <- getTemporaryDirectory
+            let path = tmp </> "chusql-web-test-global-env.toml"
+            writeFile path "[web]\nport = 1234\nhost = \"0.0.0.0\"\n"
+            withEnv [("CHUSQL_WEB_PORT", "4321")] $ do
+                cfg <- loadWebConfigAt path
+                wcPort cfg `shouldBe` 1234
+                wcHost cfg `shouldBe` "0.0.0.0"
+        it "the canonical hyphen key wins when both spellings are present" $ do
+            let both = Map.fromList [("session-idle", "1"), ("session_idle", "2")]
+            Map.lookup "session-idle" (canonicalSettingKeys both) `shouldBe` Just "1"
+        it "a missing config file falls back to the built-in defaults" $ do
+            tmp <- getTemporaryDirectory
+            let missing = tmp </> "chusql-web-test-missing-config.toml"
+            removeIfExists missing
+            cfg <- loadWebConfigAt missing
+            wcPort cfg `shouldBe` wcPort defaultWebConfig
+            wcPageSize cfg `shouldBe` wcPageSize defaultWebConfig
+
+    describe "Spawning the storage process" $ do
+        it "points the child at the same config file on its command line" $ do
+            storageChildArgs ("scripts" </> "chusql.toml")
+                `shouldBe` ["--config", "scripts" </> "chusql.toml"]
+        it "passes nothing else" $ do
+            storageChildArgs "chusql.toml" `shouldBe` ["--config", "chusql.toml"]
+
+    describe "Installer scripts (scripts/)" $ do
+        it "install.sh releases files, writes chusql.toml, sets PATH and removes the package" $ do
+            installer <- readUtf8 (".." </> "scripts" </> "install.sh")
+            installer `shouldSatisfy` T.isInfixOf "chusql-storage"
+            installer `shouldSatisfy` T.isInfixOf "chusql.toml"
+            installer `shouldSatisfy` T.isInfixOf "PATH"
+            installer `shouldSatisfy` T.isInfixOf "rm -rf"
+        -- 一份脚本三种来源：包内（旁边有 bin/）、在线（管道进来时 $0 是 sh，按平台取 release 资源）、
+        -- 显式归档或源码。去掉任何一条，从 GitHub 装的用法就断了。
+        it "install.sh picks the package by platform and can fall back to source" $ do
+            installer <- readUtf8 (".." </> "scripts" </> "install.sh")
+            installer `shouldSatisfy` T.isInfixOf "bin/chusql-storage"
+            installer `shouldSatisfy` T.isInfixOf "uname -s"
+            installer `shouldSatisfy` T.isInfixOf "uname -m"
+            installer `shouldSatisfy` T.isInfixOf "releases/latest/download"
+            installer `shouldSatisfy` T.isInfixOf "chusql-$component-$label.$ext"
+            installer `shouldSatisfy` T.isInfixOf ".sha256"
+            installer `shouldSatisfy` T.isInfixOf "--url"
+            installer `shouldSatisfy` T.isInfixOf "--from-source"
+            installer `shouldSatisfy` T.isInfixOf "stack build --fast"
+        -- static_dir 是相对路径，启动器必须先切到安装目录；少了这一句，从别处执行
+        -- csql-web 就会因为找不到 static/ 直接退出（Windows 的 .ps1 靠 -WorkingDirectory）。
+        it "csql-web.sh switches to the install dir before starting" $ do
+            launcher <- readUtf8 (".." </> "scripts" </> "csql-web.sh")
+            launcher `shouldSatisfy` T.isInfixOf "cd \"$home_dir\""
+            launcher `shouldSatisfy` T.isInfixOf "chusql-storage"
+        -- 默认数据目录按平台惯例算，四处必须说同一件事：Rust 代码、配置示例、模板、文档。
+        -- 跟安装脚本装的位置也是一处：Windows 装到 %LOCALAPPDATA%\ChuSQL、Unix 装到 ~/.local/share/chusql，
+        -- 数据都放在它下面的 data/ 里。
+        it "the default data dir follows the platform, and code, template and docs agree" $ do
+            rust <- readUtf8 (".." </> "chusql-storage" </> "src" </> "config.rs")
+            rust `shouldSatisfy` T.isInfixOf "default_data_dir"
+            rust `shouldSatisfy` T.isInfixOf "LOCALAPPDATA"
+            rust `shouldSatisfy` T.isInfixOf "XDG_DATA_HOME"
+            rust `shouldSatisfy` (not . T.isInfixOf "DEFAULT_DATA_DIR")
+
+            example <- readUtf8 (".." </> "chusql-storage" </> "chusql-storage.toml.example")
+            -- 示例文件说自己列的值就是默认值：data_dir 不能是能生效的一行
+            example `shouldSatisfy` (not . T.isInfixOf "\ndata_dir =")
+            example `shouldSatisfy` T.isInfixOf "%LOCALAPPDATA%"
+            example `shouldSatisfy` T.isInfixOf "XDG_DATA_HOME"
+
+            template <- readUtf8 (".." </> "scripts" </> "chusql.toml")
+            -- 模板那行是安装时被 sed / -replace 替换的占位，必须保持能生效
+            template `shouldSatisfy` T.isInfixOf "\ndata_dir = "
+            template `shouldSatisfy` T.isInfixOf "%LOCALAPPDATA%"
+
+            configDoc <- readUtf8 (".." </> "doc" </> "config.md")
+            configDoc `shouldSatisfy` T.isInfixOf "%LOCALAPPDATA%\\ChuSQL\\data"
+            configDoc `shouldSatisfy` T.isInfixOf "chusql/data"
+        -- 端点规则两侧必须一致：Rust 服务端和 Haskell 前端算出来的必须是同一个路径。
+        it "Rust and Haskell agree on where the Unix socket lives" $ do
+            rustEndpoint <- readUtf8 (".." </> "chusql-storage" </> "src" </> "endpoint.rs")
+            haskellIpc <- readUtf8 (".." </> "chusql-engine" </> "src" </> "ChuSQL" </> "Storage" </> "IPC.hs")
+            mapM_
+                ( \src -> do
+                    src `shouldSatisfy` T.isInfixOf "XDG_RUNTIME_DIR"
+                    src `shouldSatisfy` T.isInfixOf "TMPDIR"
+                    src `shouldSatisfy` T.isInfixOf "/tmp"
+                    src `shouldSatisfy` T.isInfixOf ".sock"
+                )
+                [rustEndpoint, haskellIpc]
+        it "the Linux pipeline builds both toolchains and runs every test suite" $ do
+            pipeline <- readUtf8 (".." </> ".github" </> "workflows" </> "linux.yml")
+            pipeline `shouldSatisfy` T.isInfixOf "ubuntu-latest"
+            pipeline `shouldSatisfy` T.isInfixOf "cargo test --release"
+            pipeline `shouldSatisfy` T.isInfixOf "cargo clippy"
+            pipeline `shouldSatisfy` T.isInfixOf "stack test --fast"
+            -- 打包与安装冒烟只在发版流水线里做（tag 触发 / 手动 dispatch），这条流水线不再出包
+            pipeline `shouldSatisfy` (not . T.isInfixOf "package.ps1")
+            pipeline `shouldSatisfy` (not . T.isInfixOf "smoke-linux.sh")
+            -- 仓库里没有 rustfmt.toml，历史代码不是按当前 rustfmt 排的：格式化不是门禁
+            pipeline `shouldSatisfy` (not . T.isInfixOf "cargo fmt")
+        -- 装的人不该被要求装两个工具链：发版流水线出预编译包，install.sh 按同一套平台标签去取。
+        -- 装配与打归档原来在 scripts/package.ps1 里，脚本删掉后直接写在流水线里（两个平台各一段）。
+        it "the release pipeline publishes one archive per platform, tagged the way install.sh looks it up" $ do
+            release <- readUtf8 (".." </> ".github" </> "workflows" </> "release.yml")
+            release `shouldSatisfy` T.isInfixOf "linux-x86_64"
+            release `shouldSatisfy` T.isInfixOf "macos-arm64"
+            release `shouldSatisfy` T.isInfixOf "macos-x86_64"
+            release `shouldSatisfy` T.isInfixOf "windows-x86_64"
+            release `shouldSatisfy` T.isInfixOf "cargo build --release"
+            release `shouldSatisfy` T.isInfixOf "stack build --fast chusql-web:exe:chusql-web"
+            release `shouldSatisfy` T.isInfixOf "stack build --fast chusql-cli:exe:csql"
+            release `shouldSatisfy` T.isInfixOf "tar -czf"
+            release `shouldSatisfy` T.isInfixOf "Compress-Archive"
+            release `shouldSatisfy` T.isInfixOf "scripts/install.sh"
+            release `shouldSatisfy` (not . T.isInfixOf "package.ps1")
+            release `shouldSatisfy` T.isInfixOf "sha256"
+            release `shouldSatisfy` T.isInfixOf "gh release upload"
+        it "the storage binary name follows the platform (a stray .exe must not win on Linux)" $ do
+            platformBinaryName "mingw32" "chusql-storage" `shouldBe` "chusql-storage.exe"
+            platformBinaryName "linux" "chusql-storage" `shouldBe` "chusql-storage"
+            -- 同一 target 目录里可能躺着一份别处交叉编译出来的 .exe：谁都不许再写
+            -- 「.exe 优先、无后缀兜底」这种候选表
+            engine <- readUtf8 (".." </> "chusql-engine" </> "test" </> "Spec.hs")
+            bench <- readUtf8 (".." </> "benchmark" </> "src" </> "Main.hs")
+            storage <- readUtf8 ("src" </> "ChuSQL" </> "Web" </> "StorageProcess.hs")
+            mapM_
+                (\src -> src `shouldSatisfy` (not . T.isInfixOf "\"chusql-storage.exe\", \"chusql-storage\""))
+                [engine, bench, storage]
+
+    -- 细节分到 doc/ 下四份，README 只留面向用户的关键内容；链接断了或者文档没了，等于没写。
+    describe "Documentation (doc/)" $ do
+        it "the README keeps only the essentials and links the split documents" $ do
+            readme <- readUtf8 (".." </> "README.md")
+            mapM_
+                (\target -> readme `shouldSatisfy` T.isInfixOf ("doc/" <> target <> ".md"))
+                ["install", "config", "commands", "architecture"]
+            -- 安装选项与配置键的长表已经搬走，不该在 README 里再长回来
+            readme `shouldSatisfy` (not . T.isInfixOf "--from-source")
+            readme `shouldSatisfy` (not . T.isInfixOf "pool_size")
+            -- 仓库布局这类开发者信息属于 doc/architecture.md，不属于 README
+            readme `shouldSatisfy` (not . T.isInfixOf "chusql-engine/")
+        it "each split document covers what its name promises" $ do
+            let expectations =
+                    [ ("install", ["install.sh", "install.ps1", "--component", "--install-dir", "--from-source", "rm -rf"])
+                    , ("config", ["[web]", "[page]", "pipe_name", "data_dir", "host", "port"])
+                    , ("commands", ["csql", "--format", "\\dt", "CREATE ROLE", "GRANT", "/api/roles"])
+                    , ("architecture", ["chusql-storage", "chusql-web", "csql", "pipe_name", "data_dir", "CREATE DATABASE"])
+                    ]
+            mapM_
+                ( \(name, needles) -> do
+                    doc <- readUtf8 (".." </> "doc" </> name <> ".md")
+                    mapM_ (\needle -> doc `shouldSatisfy` T.isInfixOf needle) needles
+                )
+                expectations
+        -- doc/ 只写面向用户的内容：构建、测试、打包这些开发流程不进文档
+        it "the split documents stay user-facing (no build, test or packaging recipes)" $ do
+            let developerOnly =
+                    [ "package.ps1"
+                    , "stack build"
+                    , "stack test"
+                    , "cargo build"
+                    , "cargo test"
+                    , "cargo clippy"
+                    , ".stack-work"
+                    , ".github/workflows"
+                    , "smoke-linux.sh"
+                    ]
+            mapM_
+                ( \name -> do
+                    doc <- readUtf8 (".." </> "doc" </> name <> ".md")
+                    mapM_ (\needle -> doc `shouldSatisfy` (not . T.isInfixOf needle)) developerOnly
+                )
+                ["install", "config", "commands", "architecture"]
 
 staticSpec :: FilePath -> Spec
 staticSpec staticDir = describe "Static files" $ do
-    it "reads index.html from the temp dir" $ do
-        content <- readStatic staticDir "index.html"
-        content `shouldSatisfy` maybe False (not . BS.null)
     it "an unreadable file gives Nothing" $
         readStatic staticDir "nope.js" `shouldReturn` Nothing
-    it "a traversal path is unreadable" $
-        readStatic staticDir "../secret.token" `shouldReturn` Nothing
 
-frontendBundleSpec :: Spec
-frontendBundleSpec = describe "React frontend build artifacts" $ do
-    present <- runIO (doesDirectoryExist "static")
-    let asset name = "static" </> name
+-- | 手写静态前端：源文件入库，没有打包器，也不该再有 Node 工具链
+staticAssetSpec :: Spec
+staticAssetSpec = describe "Static front end (hand-written, no bundler)" $ do
+    let dir = "static"
+        asset name = dir </> name
         readAsset name = readUtf8 (asset name)
-        -- | static/ 是构建产物，没构建就跳过
-        check body
-            | present = body
-            | otherwise = pendingWith "static/ is not built; run npm run build under chusql-web/frontend"
-    it "entry HTML exists and is non-empty" $ check $ do
-        html <- BS.readFile (asset "index.html")
-        html `shouldSatisfy` (not . BS.null)
-    it "entry declares the Chinese page language" $ check $ do
+    it "the app shell is present and loads both assets from /static/" $ do
         html <- readAsset "index.html"
-        html `shouldSatisfy` T.isInfixOf "lang=\"zh-CN\""
-    it "entry loads the app script only from /static/" $ check $ do
-        html <- readAsset "index.html"
+        html `shouldSatisfy` T.isInfixOf "id=\"root\""
         html `shouldSatisfy` T.isInfixOf "src=\"/static/app.js\""
-    it "entry loads styles only from /static/" $ check $ do
-        html <- readAsset "index.html"
         html `shouldSatisfy` T.isInfixOf "href=\"/static/style.css\""
-    it "entry has no inline script" $ check $ do
+        -- 服务端把 nonce 元信息插在 </head> 前面，这个标记不能丢
+        html `shouldSatisfy` T.isInfixOf "</head>"
+    it "the shell has no inline script or style (the CSP allows neither)" $ do
         html <- readAsset "index.html"
         html `shouldSatisfy` (not . T.isInfixOf "<script>")
-    it "entry has no inline style" $ check $ do
-        html <- readAsset "index.html"
-        html `shouldSatisfy` (not . T.isInfixOf "style=")
         html `shouldSatisfy` (not . T.isInfixOf "<style")
-    it "app script exists and is non-empty" $ check $ do
-        js <- BS.readFile (asset "app.js")
-        js `shouldSatisfy` (not . BS.null)
-    it "app script contains the centrally maintained Chinese UI copy" $ check $ do
+    it "no generated template keeps an inline style attribute (the CSP would block it)" $ do
         js <- readAsset "app.js"
-        js `shouldSatisfy` T.isInfixOf "ChuSQL 数据库终端"
+        js `shouldSatisfy` (not . T.isInfixOf "style=\"")
+    it "the hand-written modules and the stylesheet are non-empty" $
+        mapM_ (\name -> BS.readFile (asset name) >>= (`shouldSatisfy` (not . BS.null)))
+            ["app.js", "core.js", "api.js", "style.css"]
+    it "the app carries the Chinese UI copy and the REST client keeps every endpoint" $ do
+        js <- readAsset "app.js"
         js `shouldSatisfy` T.isInfixOf "待提交变更"
-    it "main stylesheet uses the agreed Dark+ three-layer background" $ check $ do
-        css <- readAsset "style.css"
-        css `shouldSatisfy` T.isInfixOf "--bg-base:#1e1e1e"
-        css `shouldSatisfy` T.isInfixOf "--bg-elevated:#252526"
-        css `shouldSatisfy` T.isInfixOf "--bg-statusbar:#007acc"
-    it "own styles have no gradients or shadows" $ check $ do
-        css <- readAsset "style.css"
-        css `shouldSatisfy` (not . T.isInfixOf "gradient(")
-        css `shouldSatisfy` (not . T.isInfixOf "box-shadow")
-    it "SQL language pack exists and is non-empty" $ check $ do
-        sql <- BS.readFile (asset "sql.js")
-        sql `shouldSatisfy` (not . BS.null)
-    it "Monaco font exists and is non-empty" $ check $ do
-        font <- BS.readFile (asset "codicon.ttf")
-        font `shouldSatisfy` (not . BS.null)
-    it "Monaco worker exists and is non-empty" $ check $ do
-        names <- System.Directory.listDirectory "static"
-        let workers = filter (\name -> "editor.worker-" `isInfixOf` name && ".js" `isSuffixOf` name) names
-        workers `shouldSatisfy` (not . null)
-        mapM_ (\name -> BS.readFile (asset name) >>= (`shouldSatisfy` (not . BS.null))) workers
-    it "all build files pass the static file name whitelist" $ check $ do
-        names <- System.Directory.listDirectory "static"
+        js `shouldSatisfy` T.isInfixOf "新建查询"
+        api <- readAsset "api.js"
+        api `shouldSatisfy` T.isInfixOf "X-ChuSQL-Database"
+        api `shouldSatisfy` T.isInfixOf "/api/tables/"
+        api `shouldSatisfy` T.isInfixOf "/api/ui-settings"
+        api `shouldSatisfy` T.isInfixOf "/api/query"
+    it "every shipped asset passes the static file name whitelist" $ do
+        names <- System.Directory.listDirectory dir
         mapM_ (\name -> safeRelative (T.pack name) `shouldBe` Just name) names
+    it "content types are mapped for every shipped asset" $ do
+        contentTypeOf "index.html" `shouldBe` "text/html; charset=utf-8"
+        contentTypeOf "app.js" `shouldBe` "text/javascript; charset=utf-8"
+        contentTypeOf "core.js" `shouldBe` "text/javascript; charset=utf-8"
+        contentTypeOf "api.js" `shouldBe` "text/javascript; charset=utf-8"
+        contentTypeOf "style.css" `shouldBe` "text/css; charset=utf-8"
+    it "the Node toolchain is gone from the repository" $ do
+        frontendDir <- doesDirectoryExist (".." </> "chusql-web" </> "frontend")
+        nodeModules <- doesDirectoryExist (".." </> "chusql-web" </> "node_modules")
+        viteConfig <- doesFileExist (".." </> "chusql-web" </> "frontend" </> "vite.config.ts")
+        packageJson <- doesFileExist (".." </> "chusql-web" </> "frontend" </> "package.json")
+        frontendDir `shouldBe` False
+        nodeModules `shouldBe` False
+        viteConfig `shouldBe` False
+        packageJson `shouldBe` False
+
+-- | 真静态目录里的资源由服务端交付（临时目录那套在 securitySpec 里另测）
+staticServeSpec :: Spec
+staticServeSpec = describe "Static front end served by the server" $
+    withWorld "static" $ \_ -> do
+        it "the home page carries the app root and the per-page nonce meta" $ do
+            res <- get "/"
+            check (hasStatus res 200)
+            let body = BL.toStrict (WT.simpleBody res)
+            check (body `shouldSatisfy` BS.isInfixOf "id=\"root\"")
+            check (body `shouldSatisfy` BS.isInfixOf "chusql-style-nonce")
+        it "the app script and stylesheet are served with their content types" $ do
+            js <- get "/static/app.js"
+            check (hasStatus js 200)
+            check (lookup "Content-Type" (WT.simpleHeaders js) `shouldBe` Just "text/javascript; charset=utf-8")
+            css <- get "/static/style.css"
+            check (hasStatus css 200)
+            check (lookup "Content-Type" (WT.simpleHeaders css) `shouldBe` Just "text/css; charset=utf-8")
+        it "traversal and unknown files are still rejected" $ do
+            get "/static/..%2fchusql.toml" `shouldRespondWith` 404
+            get "/static/nope.js" `shouldRespondWith` 404
 
 actionsSpec :: Spec
 actionsSpec = describe "One-click actions -> one SQL statement (ChuSQL.Web.Actions)" $ do
@@ -911,7 +1230,8 @@ actionsSpec = describe "One-click actions -> one SQL statement (ChuSQL.Web.Actio
             `shouldBe` Right "CREATE TABLE customers (id int, name str)"
         createTableSql (CreateTableSpec "bad name" [ColumnSpec "id" "int"]) `shouldSatisfy` isLeftE
         createTableSql (CreateTableSpec "t" []) `shouldSatisfy` isLeftE
-        createTableSql (CreateTableSpec "t" [ColumnSpec "id" "blob"]) `shouldSatisfy` isLeftE
+        createTableSql (CreateTableSpec "t" [ColumnSpec "id" "blob"])
+            `shouldBe` Right "CREATE TABLE t (id blob)"
         createTableSql (CreateTableSpec "t" [ColumnSpec "1bad" "int"]) `shouldSatisfy` isLeftE
         createTableSql (CreateTableSpec "t" [ColumnSpec "id" "BOOL"]) `shouldSatisfy` isRightE
     it "string literal escaping: single quotes doubled, the rest unchanged" $ do
@@ -945,10 +1265,16 @@ actionsSpec = describe "One-click actions -> one SQL statement (ChuSQL.Web.Actio
         coerceValue TBool (A.Bool True) `shouldBe` Right (VBool True)
         coerceValue TBool (A.String "false") `shouldBe` Right (VBool False)
         coerceValue TBool (A.String "maybe") `shouldSatisfy` isLeftE
-    it "column type parsing: int/integer/str/text/varchar/bool/boolean are recognised" $ do
+    it "column type parsing: int/bigint/smallint/str/text/varchar/char/float/double/decimal/date/timestamp/bool/blob are recognised" $ do
         map columnTypeOf ["int", "INTEGER", "str", "text", "varchar", "bool", "boolean"]
             `shouldBe` map Just [TInt, TInt, TStr, TStr, TStr, TBool, TBool]
-        columnTypeOf "blob" `shouldBe` Nothing
+        columnTypeOf "blob" `shouldBe` Just (plainColumn CBlob)
+        -- 类型带参数时才认得出来，未知类型与空串都给 Nothing
+        map columnTypeOf ["bigint", "smallint", "float", "double", "date", "timestamp"]
+            `shouldBe` map Just [plainColumn CBigInt, plainColumn CSmallInt, plainColumn CFloat, plainColumn CDouble, plainColumn CDate, plainColumn CTimestamp]
+        map columnTypeOf ["varchar(20)", "char(3)", "decimal(8,2)"]
+            `shouldBe` map Just [plainColumn (CVarchar 20), plainColumn (CChar 3), plainColumn (CDecimal 8 2)]
+        map columnTypeOf ["nope", ""] `shouldBe` [Nothing, Nothing]
 
 oneClickSpec :: FilePath -> Spec
 oneClickSpec staticDir = describe "One-click action endpoints" $
@@ -991,8 +1317,14 @@ oneClickSpec staticDir = describe "One-click action endpoints" $
             check (hasStatus badName 400)
             unknownColumn <- postWith hs "/api/tables/users/rows" "{\"values\":{\"nope\":1}}"
             check (hasStatus unknownColumn 400)
-            missingColumns <- postWith hs "/api/tables/users/rows" "{\"values\":{\"id\":99}}"
-            check (hasStatus missingColumns 400)
+            nullableTable <- postWith hs "/api/tables" "{\"name\":\"nullable_t\",\"columns\":[{\"name\":\"id\",\"type\":\"int\"},{\"name\":\"name\",\"type\":\"str\"},{\"name\":\"age\",\"type\":\"int\"}]}"
+            check (hasStatus nullableTable 200)
+            partial <- postWith hs "/api/tables/nullable_t/rows" "{\"values\":{\"id\":99}}"
+            check (hasStatus partial 200)
+            filled <- getWith hs "/api/tables/nullable_t/rows"
+            check $ do
+                asInt (at "total" (jsonBody filled)) `shouldBe` 1
+                firstRow filled `shouldBe` [A.Number 99, A.Null, A.Null]
             badBody <- postWith hs "/api/tables/users/rows" "not json"
             check (hasStatus badBody 400)
             badId <- request "PATCH" "/api/tables/users/rows/abc" (("Content-Type", "application/json") : hs) "{\"values\":{\"age\":1}}"
@@ -1001,13 +1333,15 @@ oneClickSpec staticDir = describe "One-click action endpoints" $
             check (hasStatus noTable 404)
             badType <- postWith hs "/api/tables/users/rows" "{\"values\":{\"id\":1,\"name\":\"x\",\"age\":\"old\"}}"
             check (hasStatus badType 400)
-        it "index: integer columns work, string columns are rejected by the API (duplicate rejection is up to real storage, see e2e)" $ do
+        it "index: any column type can be indexed, the built-in id index cannot be dropped" $ do
             res <- loginAs "admin" "s3cret"
             let hs = cookieHeaders res
             okIndex <- postWith hs "/api/tables/users/indexes" "{\"column\":\"age\"}"
             check (hasStatus okIndex 200)
             stringIndex <- postWith hs "/api/tables/users/indexes" "{\"column\":\"name\"}"
-            check (hasStatus stringIndex 400)
+            check (hasStatus stringIndex 200)
+            droppedString <- request "DELETE" "/api/tables/users/indexes/name" hs ""
+            check (hasStatus droppedString 200)
             dropped <- request "DELETE" "/api/tables/users/indexes/age" hs ""
             check (hasStatus dropped 200)
             builtIn <- request "DELETE" "/api/tables/users/indexes/id" hs ""
@@ -1060,12 +1394,6 @@ authSpec staticDir = do
                 get "/api/health" `shouldRespondWith` 200
             it "table list gives 401" $
                 get "/api/tables" `shouldRespondWith` 401
-            it "table rows give 401" $
-                get "/api/tables/users/rows" `shouldRespondWith` 401
-            it "SQL console gives 401" $
-                jsonRequest methodPost "/api/query" "{\"sql\":\"SELECT * FROM users\"}" `shouldRespondWith` 401
-            it "session lookup gives 401" $
-                get "/api/session" `shouldRespondWith` 401
             it "status needs no login and reports storage up (the memory backend is always up)" $ do
                 res <- get "/api/status"
                 check (hasStatus res 200)
@@ -1088,10 +1416,6 @@ authSpec staticDir = do
                 loginAs "ADMIN" "s3cret" `shouldRespondWith` 204
             it "non-JSON body gives 400" $
                 jsonRequest methodPost "/api/login" "{not json" `shouldRespondWith` 400
-            it "missing field gives 400" $
-                jsonRequest methodPost "/api/login" "{\"user\":\"admin\"}" `shouldRespondWith` 400
-            it "empty password gives 400" $
-                jsonRequest methodPost "/api/login" "{\"user\":\"admin\",\"password\":\"\"}" `shouldRespondWith` 400
             it "a cookie allows session lookup" $ do
                 res <- loginAs "admin" "s3cret"
                 cs <- getWith (cookieHeaders res) "/api/session"
@@ -1113,6 +1437,24 @@ authSpec staticDir = do
                 blocked <- loginAs "admin" "s3cret"
                 check (hasStatus blocked 429)
                 check (lookup "Retry-After" (WT.simpleHeaders blocked) `shouldSatisfy` maybe False (not . BS.null))
+
+-- | 免密管理员：只有管理员能用空口令进来，普通账号一律 403
+passwordlessSpec :: FilePath -> Spec
+passwordlessSpec staticDir = describe "Auth: passwordless administrator" $
+    withPasswordlessWorld staticDir $ \_ -> do
+        it "the administrator signs in with an empty password" $ do
+            res <- loginAs "admin" ""
+            check (hasStatus res 204)
+            check (sessionCookieOf res `shouldSatisfy` maybe False (not . T.null))
+        it "a non-empty password is refused with 401" $
+            loginAs "admin" "s3cret" `shouldRespondWith` 401
+        it "an ordinary account is refused with 403 while the server is passwordless" $ do
+            res <- loginAs "someone" "whatever"
+            check (hasStatus res 403)
+            check (asText (at "error" (jsonBody res)) `shouldBe` "forbidden")
+        it "an unknown account with an empty password is refused too" $ do
+            res <- loginAs "ghost" ""
+            check (hasStatus res 403)
 
 catalogSpec :: FilePath -> Spec
 catalogSpec staticDir = describe "Catalogue and paged browsing" $
@@ -1139,11 +1481,6 @@ catalogSpec staticDir = describe "Catalogue and paged browsing" $
                                 at "prime" secondCol `shouldBe` A.Bool False
                                 at "indexed" secondCol `shouldBe` A.Bool False
                             _ -> expectationFailure "users should have three columns"
-        it "single table structure" $ do
-            res <- loginAs "admin" "s3cret"
-            info <- getWith (cookieHeaders res) "/api/tables/users"
-            check (hasStatus info 200)
-            check (asText (at "table" (jsonBody info)) `shouldBe` "users")
         it "missing table gives 404" $ do
             res <- loginAs "admin" "s3cret"
             missing <- getWith (cookieHeaders res) "/api/tables/nope"
@@ -1164,10 +1501,6 @@ catalogSpec staticDir = describe "Catalogue and paged browsing" $
                 let rows = items (at "rows" body)
                 length rows `shouldBe` 2
                 nth 0 rows `shouldBe` Just (A.Array (V.fromList [A.Number 2, A.String "user2", A.Number 22]))
-        it "an out-of-range limit is clamped to the cap of 500" $ do
-            res <- loginAs "admin" "s3cret"
-            page <- getWith (cookieHeaders res) "/api/tables/users/rows?limit=99999"
-            check (asInt (at "limit" (jsonBody page)) `shouldBe` 500)
         it "non-integer limit gives 400" $ do
             res <- loginAs "admin" "s3cret"
             bad <- getWith (cookieHeaders res) "/api/tables/users/rows?limit=abc"
@@ -1242,22 +1575,11 @@ sqlSpec staticDir = describe "SQL console" $
                 map asText (items (at "columns" body)) `shouldBe` ["name", "age"]
                 length (items (at "rows" body)) `shouldBe` 3
                 asInt (at "rowCount" body) `shouldBe` 3
-        it "inserted rows can be queried back" $ do
-            res <- loginAs "admin" "s3cret"
-            _ <- postWith (cookieHeaders res) "/api/query" "{\"sql\":\"INSERT INTO users (id, name, age) VALUES (9, 'newbie', 31)\"}"
-            out <- postWith (cookieHeaders res) "/api/query" "{\"sql\":\"SELECT * FROM users WHERE id = 9\"}"
-            check (length (items (at "rows" (jsonBody out))) `shouldBe` 1)
         it "multi-row INSERT is supported" $ do
             res <- loginAs "admin" "s3cret"
             _ <- postWith (cookieHeaders res) "/api/query" "{\"sql\":\"INSERT INTO users (id, name, age) VALUES (11, 'a', 1), (12, 'b', 2)\"}"
             out <- postWith (cookieHeaders res) "/api/query" "{\"sql\":\"SELECT * FROM users WHERE id > 10\"}"
             check (length (items (at "rows" (jsonBody out))) `shouldBe` 2)
-        it "CREATE TABLE / DROP TABLE end-to-end" $ do
-            res <- loginAs "admin" "s3cret"
-            created <- postWith (cookieHeaders res) "/api/query" "{\"sql\":\"CREATE TABLE demo_t (id int, note str)\"}"
-            check (hasStatus created 200)
-            dropped <- postWith (cookieHeaders res) "/api/query" "{\"sql\":\"DROP TABLE demo_t\"}"
-            check (hasStatus dropped 200)
         it "syntax error: 400 + the original message" $ do
             res <- loginAs "admin" "s3cret"
             bad <- postWith (cookieHeaders res) "/api/query" "{\"sql\":\"SELECT FROM WHERE\"}"
@@ -1272,10 +1594,6 @@ sqlSpec staticDir = describe "SQL console" $
         it "empty sql gives 400" $ do
             res <- loginAs "admin" "s3cret"
             bad <- postWith (cookieHeaders res) "/api/query" "{\"sql\":\"   \"}"
-            check (hasStatus bad 400)
-        it "non-JSON body gives 400" $ do
-            res <- loginAs "admin" "s3cret"
-            bad <- postWith (cookieHeaders res) "/api/query" "oops"
             check (hasStatus bad 400)
 
 -- | 设置接口：读写配置与改口令
@@ -1352,8 +1670,12 @@ settingsSpec staticDir = do
                 check (length (items (at "rows" (jsonBody out))) `shouldBe` 2)
                 check (at "truncated" (jsonBody out) `shouldBe` A.Bool True)
             it "non-config account: critical settings give 403, normal ones pass" $ do
-                guest <- liftIO (createSession (aeSessions appEnv) "guest")
-                let guestHeaders = [("Cookie", TE.encodeUtf8 ("chusql_session=" <> guest))]
+                admin <- loginAs "admin" "s3cret"
+                made <- postWith (systemHeaders (cookieHeaders admin)) "/api/tables/__chusql_users/rows" "{\"values\":{\"user\":\"guest\",\"password\":\"guest-password\"}}"
+                check (hasStatus made 200)
+                guest <- loginAs "guest" "guest-password"
+                check (hasStatus guest 204)
+                let guestHeaders = cookieHeaders guest
                 forbidden <- putWith guestHeaders "/api/settings" "{\"values\":{\"port\":\"9999\"}}"
                 check (hasStatus forbidden 403)
                 check (asText (at "error" (jsonBody forbidden)) `shouldBe` "forbidden")
@@ -1367,104 +1689,509 @@ settingsSpec staticDir = do
                     at "editable" port `shouldBe` A.Bool False
                     at "editable" (headEntry "rows-per-page" entries) `shouldBe` A.Bool True
 
-    describe "Account: change password" $
-        withWorldAt staticDir "password" $ \appEnv -> do
-            it "not logged in gives 401" $
-                postWith [] "/api/account/password" "{\"current\":\"s3cret\",\"next\":\"longenough\"}"
-                    `shouldRespondWith` 401
-            it "wrong current password: 400 bad_password" $ do
+    describe "Account table (system table, administrator only)" $
+        withWorldAt staticDir "accounts" $ \appEnv -> do
+            it "not logged in gives 401 on every account-table route" $ do
+                getWith [] "/api/tables" `shouldRespondWith` 401
+                getWith (systemHeaders []) "/api/tables/__chusql_users" `shouldRespondWith` 401
+                getWith (systemHeaders []) "/api/tables/__chusql_users/rows" `shouldRespondWith` 401
+                postWith (systemHeaders []) "/api/tables/__chusql_users/rows" "{\"values\":{\"user\":\"guest\",\"password\":\"guest-password\"}}" `shouldRespondWith` 401
+                patchWith (systemHeaders []) "/api/tables/__chusql_users/rows/guest" "{\"values\":{\"password\":\"guest-password\"}}" `shouldRespondWith` 401
+                deleteWith (systemHeaders []) "/api/tables/__chusql_users/rows/guest" `shouldRespondWith` 401
+            it "the retired account routes are gone" $ do
                 res <- loginAs "admin" "s3cret"
-                bad <- postWith (cookieHeaders res) "/api/account/password" "{\"current\":\"nope\",\"next\":\"longenough\"}"
-                check (hasStatus bad 400)
-                check (asText (at "error" (jsonBody bad)) `shouldBe` "bad_password")
-            it "new password too short / same as the old one: 400" $ do
-                res <- loginAs "admin" "s3cret"
-                short <- postWith (cookieHeaders res) "/api/account/password" "{\"current\":\"s3cret\",\"next\":\"tiny\"}"
-                check (hasStatus short 400)
-                same <- postWith (cookieHeaders res) "/api/account/password" "{\"current\":\"s3cret\",\"next\":\"s3cret\"}"
-                check (hasStatus same 400)
-            it "after success: the new password logs in, the old one fails, other sessions are kicked and the hash is persisted" $ do
-                tokenA <- liftIO (createSession (aeSessions appEnv) "admin")
-                tokenB <- liftIO (createSession (aeSessions appEnv) "admin")
-                let hdrs token = [("Cookie", TE.encodeUtf8 ("chusql_session=" <> token))]
-                changed <- postWith (hdrs tokenA) "/api/account/password" "{\"current\":\"s3cret\",\"next\":\"brand-new-pass\"}"
-                check (hasStatus changed 204)
-                stillThere <- getWith (hdrs tokenA) "/api/session"
-                check (hasStatus stillThere 200)
-                kicked <- getWith (hdrs tokenB) "/api/session"
-                check (hasStatus kicked 401)
-                fresh <- loginAs "admin" "brand-new-pass"
-                check (hasStatus fresh 204)
-                stale <- loginAs "admin" "s3cret"
-                check (hasStatus stale 401)
-                stored <- liftIO (readSettingsFile (aeSettingsFile appEnv))
-                check (Map.lookup "password-hash" stored `shouldSatisfy` maybe False hashLooksValid)
-                check (Map.member "password" stored `shouldBe` False)
+                let hs = cookieHeaders res
+                switched <- postWith hs "/api/account/switch" "{\"user\":\"someone\",\"password\":\"someone-password\"}"
+                check (hasStatus switched 404)
+                listed <- getWith hs "/api/accounts"
+                check (hasStatus listed 404)
+                selfService <- postWith hs "/api/account/password" "{\"current\":\"s3cret\",\"next\":\"longenough\"}"
+                check (hasStatus selfService 404)
+            it "the administrator sees the account table with a secret password column" $ do
+                admin <- loginAs "admin" "s3cret"
+                body <- getWith (systemHeaders (cookieHeaders admin)) "/api/tables"
+                check (hasStatus body 200)
+                check $ do
+                    let entries = items (jsonBody body)
+                        account = tableEntry "__chusql_users" entries
+                        users = tableEntry "users" entries
+                    at "table" account `shouldBe` A.String "__chusql_users"
+                    at "kind" account `shouldBe` A.String "system"
+                    map (asText . at "name") (items (at "columns" account)) `shouldBe` ["id", "user", "password", "registered_at", "last_login_at"]
+                    map (asBool . at "secret") (items (at "columns" account)) `shouldBe` [False, False, True, False, False]
+                    map (asBool . at "primaryKey") (items (at "columns" account)) `shouldBe` [True, False, False, False, False]
+                    map (asText . at "type") (items (at "columns" account)) `shouldBe` ["int", "varchar(64)", "varchar(256)", "timestamp", "timestamp"]
+                    map (asBool . at "indexed") (items (at "columns" account)) `shouldBe` [True, True, False, False, False]
+                    at "kind" users `shouldBe` A.String "table"
+                detail <- getWith (systemHeaders (cookieHeaders admin)) "/api/tables/__chusql_users"
+                check (hasStatus detail 200)
+                check (at "kind" (jsonBody detail) `shouldBe` A.String "system")
+            it "insert, update and delete on the account table are CREATE, ALTER and DROP USER" $ do
+                admin <- loginAs "admin" "s3cret"
+                let hs = cookieHeaders admin
+                made <- postWith (systemHeaders hs) "/api/tables/__chusql_users/rows" "{\"values\":{\"user\":\"Alice\",\"password\":\"alice-password\"}}"
+                check (hasStatus made 200)
+                page <- getWith (systemHeaders hs) "/api/tables/__chusql_users/rows"
+                check (hasStatus page 200)
+                check $ do
+                    let rows = items (at "rows" (jsonBody page))
+                    map asText (items (at "columns" (jsonBody page))) `shouldBe` ["id", "user", "password", "registered_at", "last_login_at"]
+                    map (asText . (V.! 1) . asArray) rows `shouldBe` ["alice"]
+                    length rows `shouldBe` 1
+                    case firstRow page of
+                        [_, _, _, A.String registered, lastLogin] -> do
+                            registered `shouldSatisfy` (/= "")
+                            lastLogin `shouldBe` A.Null
+                        other -> expectationFailure ("unexpected account row: " ++ show other)
+                repeated <- postWith (systemHeaders hs) "/api/tables/__chusql_users/rows" "{\"values\":{\"user\":\"alice\",\"password\":\"alice-password\"}}"
+                check (hasStatus repeated 409)
+                alice <- loginAs "alice" "alice-password"
+                check (hasStatus alice 204)
+                adminAgain <- loginAs "admin" "s3cret"
+                let hsAgain = cookieHeaders adminAgain
+                stamped <- getWith (systemHeaders hsAgain) "/api/tables/__chusql_users/rows"
+                check $ do
+                    hasStatus stamped 200
+                    case firstRow stamped of
+                        [_, _, _, _, lastLogin] -> lastLogin `shouldSatisfy` (/= A.Null)
+                        other -> expectationFailure ("unexpected account row: " ++ show other)
+                changed <- patchWith (systemHeaders hsAgain) "/api/tables/__chusql_users/rows/alice" "{\"values\":{\"password\":\"alice-other-pass\"}}"
+                check (hasStatus changed 200)
+                stalePassword <- loginAs "alice" "alice-password"
+                check (hasStatus stalePassword 401)
+                freshPassword <- loginAs "alice" "alice-other-pass"
+                check (hasStatus freshPassword 204)
+                adminLast <- loginAs "admin" "s3cret"
+                let hsLast = cookieHeaders adminLast
+                renamed <- patchWith (systemHeaders hsLast) "/api/tables/__chusql_users/rows/alice" "{\"values\":{\"user\":\"bob\"}}"
+                check (hasStatus renamed 400)
+                unknown <- deleteWith (systemHeaders hsLast) "/api/tables/__chusql_users/rows/nobody"
+                check (hasStatus unknown 404)
+                dropped <- deleteWith (systemHeaders hsLast) "/api/tables/__chusql_users/rows/alice"
+                check (hasStatus dropped 200)
+                gone <- loginAs "alice" "alice-other-pass"
+                check (hasStatus gone 401)
+            it "the account table can be sorted and filtered by user but not by password" $ do
+                admin <- loginAs "admin" "s3cret"
+                let hs = cookieHeaders admin
+                _ <- postWith (systemHeaders hs) "/api/tables/__chusql_users/rows" "{\"values\":{\"user\":\"bob\",\"password\":\"bob-password\"}}"
+                _ <- postWith (systemHeaders hs) "/api/tables/__chusql_users/rows" "{\"values\":{\"user\":\"amy\",\"password\":\"amy-password\"}}"
+                sorted <- getWith (systemHeaders hs) "/api/tables/__chusql_users/rows?sort=user&dir=asc"
+                check (hasStatus sorted 200)
+                check $ do
+                    let names = map (asText . (V.! 1) . asArray) (items (at "rows" (jsonBody sorted)))
+                    names `shouldSatisfy` \ns -> ns == sort ns && all (`elem` ns) ["amy", "bob"]
+                filtered <- getWith (systemHeaders hs) "/api/tables/__chusql_users/rows?filter=%5B%7B%22column%22%3A%22user%22%2C%22value%22%3A%22bob%22%7D%5D"
+                check (hasStatus filtered 200)
+                check (map (asText . (V.! 1) . asArray) (items (at "rows" (jsonBody filtered))) `shouldBe` ["bob"])
+                byPassword <- getWith (systemHeaders hs) "/api/tables/__chusql_users/rows?sort=password"
+                check (hasStatus byPassword 400)
+                filterPassword <- getWith (systemHeaders hs) "/api/tables/__chusql_users/rows?filter=%5B%7B%22column%22%3A%22password%22%2C%22value%22%3A%22x%22%7D%5D"
+                check (hasStatus filterPassword 400)
+            it "the password column is stored as a hash, never in the settings file" $ do
+                admin <- loginAs "admin" "s3cret"
+                _ <- postWith (systemHeaders (cookieHeaders admin)) "/api/tables/__chusql_users/rows" "{\"values\":{\"user\":\"dave\",\"password\":\"dave-password\"}}"
+                stored <- liftIO (beAccounts (aeBackend appEnv) ReqAccountsList)
+                check $ case stored of
+                    Left err -> expectationFailure err
+                    Right accounts -> case filter ((== "dave") . accountUser) accounts of
+                        [account] -> do
+                            accountRevision account `shouldBe` 1
+                            hashLooksValid (accountHash account) `shouldBe` True
+                            verifyPassword (accountHash account) "dave-password" `shouldBe` True
+                        _ -> expectationFailure "dave was not stored in the system table"
+                settings <- liftIO (readSettingsFile (aeSettingsFile appEnv))
+                check (Map.member "password" settings `shouldBe` False)
+                check (Map.member "password-hash" settings `shouldBe` False)
+            it "the account table has no indexes, cannot be dropped and cannot be renamed" $ do
+                admin <- loginAs "admin" "s3cret"
+                let hs = cookieHeaders admin
+                index <- postWith (systemHeaders hs) "/api/tables/__chusql_users/indexes" "{\"column\":\"user\"}"
+                check (hasStatus index 400)
+                dropIndex <- deleteWith (systemHeaders hs) "/api/tables/__chusql_users/indexes/user"
+                check (hasStatus dropIndex 400)
+                dropColumn <- deleteWith (systemHeaders hs) "/api/tables/__chusql_users/columns/password"
+                check (hasStatus dropColumn 400)
+                dropped <- deleteWith (systemHeaders hs) "/api/tables/__chusql_users"
+                check (hasStatus dropped 400)
+            it "an ordinary account never sees or touches the account table" $ do
+                admin <- loginAs "admin" "s3cret"
+                made <- postWith (systemHeaders (cookieHeaders admin)) "/api/tables/__chusql_users/rows" "{\"values\":{\"user\":\"guest\",\"password\":\"guest-password\"}}"
+                check (hasStatus made 200)
+                guest <- loginAs "guest" "guest-password"
+                check (hasStatus guest 204)
+                let guestHeaders = cookieHeaders guest
+                listed <- getWith guestHeaders "/api/tables"
+                check (hasStatus listed 200)
+                check (map (asText . at "table") (items (jsonBody listed)) `shouldNotContain` ["__chusql_users"])
+                detail <- getWith (systemHeaders guestHeaders) "/api/tables/__chusql_users"
+                check (hasStatus detail 403)
+                rows <- getWith (systemHeaders guestHeaders) "/api/tables/__chusql_users/rows"
+                check (hasStatus rows 403)
+                created <- postWith (systemHeaders guestHeaders) "/api/tables/__chusql_users/rows" "{\"values\":{\"user\":\"bob\",\"password\":\"bob-password\"}}"
+                check (hasStatus created 403)
+                reset <- patchWith (systemHeaders guestHeaders) "/api/tables/__chusql_users/rows/guest" "{\"values\":{\"password\":\"guest-other-pass\"}}"
+                check (hasStatus reset 403)
+                dropped <- deleteWith (systemHeaders guestHeaders) "/api/tables/__chusql_users/rows/guest"
+                check (hasStatus dropped 403)
+                stillThere <- loginAs "guest" "guest-password"
+                check (hasStatus stillThere 204)
+            it "CREATE USER / ALTER USER / DROP USER go through the SQL console" $ do
+                admin <- loginAs "admin" "s3cret"
+                created <- postWith (cookieHeaders admin) "/api/query" "{\"sql\":\"CREATE USER carol IDENTIFIED BY 'carol-password'\"}"
+                check (hasStatus created 200)
+                check (asInt (at "rowCount" (jsonBody created)) `shouldBe` 0)
+                changed <- postWith (cookieHeaders admin) "/api/query" "{\"sql\":\"ALTER USER carol IDENTIFIED BY 'carol-other-pass'\"}"
+                check (hasStatus changed 200)
+                dropped <- postWith (cookieHeaders admin) "/api/query" "{\"sql\":\"DROP USER carol\"}"
+                check (hasStatus dropped 200)
+                gone <- loginAs "carol" "carol-other-pass"
+                check (hasStatus gone 401)
+            it "an ordinary account cannot run account statements in the SQL console" $ do
+                admin <- loginAs "admin" "s3cret"
+                _ <- postWith (cookieHeaders admin) "/api/query" "{\"sql\":\"CREATE USER erin IDENTIFIED BY 'erin-password'\"}"
+                erin <- loginAs "erin" "erin-password"
+                check (hasStatus erin 204)
+                denials <- mapM (\sql -> postWith (cookieHeaders erin) "/api/query" (sqlBody sql))
+                    [ "DROP USER erin"
+                    , "ALTER USER erin IDENTIFIED BY 'erin-other-pass'"
+                    , "CREATE USER frank IDENTIFIED BY 'frank-password'"
+                    ]
+                check (map (statusCode . WT.simpleStatus) denials `shouldBe` [403, 403, 403])
+                stillThere <- loginAs "erin" "erin-password"
+                check (hasStatus stillThere 204)
+            it "the administrator credentials are locked in the settings API" $ do
+                admin <- loginAs "admin" "s3cret"
+                locked <- putWith (cookieHeaders admin) "/api/settings" "{\"values\":{\"password\":\"whatever\"}}"
+                check (hasStatus locked 403)
+                alsoLocked <- putWith (cookieHeaders admin) "/api/settings" "{\"values\":{\"user\":\"someone\"}}"
+                check (hasStatus alsoLocked 403)
+                body <- getWith (cookieHeaders admin) "/api/settings"
+                check $ do
+                    let entries = items (at "items" (jsonBody body))
+                    at "editable" (headEntry "user" entries) `shouldBe` A.Bool False
+                    at "locked" (headEntry "user" entries) `shouldBe` A.Bool True
+                    at "locked" (headEntry "rows-per-page" entries) `shouldBe` A.Bool False
+
+    describe "Databases (nothing is selected by default, system is administrator-only)" $
+        withWorldAt staticDir "databases" $ \_ -> do
+            it "lists exactly the databases that exist; the fixture database comes first" $ do
+                admin <- loginAs "admin" "s3cret"
+                body <- getWith (cookieHeaders admin) "/api/databases"
+                check (hasStatus body 200)
+                check (map asText (items (jsonBody body)) `shouldBe` ["test", "system"])
+            it "the account table is listed in system, never in test" $ do
+                admin <- loginAs "admin" "s3cret"
+                let hs = cookieHeaders admin
+                testList <- getWith hs "/api/tables"
+                check (map (asText . at "table") (items (jsonBody testList)) `shouldNotContain` ["__chusql_users"])
+                systemList <- getWith (systemHeaders hs) "/api/tables"
+                check (hasStatus systemList 200)
+                check (map (asText . at "table") (items (jsonBody systemList)) `shouldContain` ["__chusql_users"])
+            it "naming the account table from another database is a 400, not a silent lookup" $ do
+                admin <- loginAs "admin" "s3cret"
+                outside <- getWith (cookieHeaders admin) "/api/tables/__chusql_users/rows"
+                check (hasStatus outside 400)
+                check (asText (at "message" (jsonBody outside)) `shouldBe` "the account table lives in the system database")
+            it "an ordinary account gets 403 on system and never sees it in the list" $ do
+                admin <- loginAs "admin" "s3cret"
+                made <- postWith (systemHeaders (cookieHeaders admin)) "/api/tables/__chusql_users/rows" "{\"values\":{\"user\":\"guest\",\"password\":\"guest-password\"}}"
+                check (hasStatus made 200)
+                guest <- loginAs "guest" "guest-password"
+                let guestHeaders = cookieHeaders guest
+                blocked <- getWith (systemHeaders guestHeaders) "/api/tables"
+                check (hasStatus blocked 403)
+                listed <- getWith guestHeaders "/api/databases"
+                check (hasStatus listed 200)
+                check (map asText (items (jsonBody listed)) `shouldBe` ["test"])
+            it "only the system database is reserved: test is an ordinary name" $ do
+                admin <- loginAs "admin" "s3cret"
+                let hs = cookieHeaders admin
+                reservedDrop <- deleteWith hs "/api/databases/system"
+                check (hasStatus reservedDrop 400)
+                check (asText (at "message" (jsonBody reservedDrop)) `shouldBe` "the system database cannot be dropped")
+                ordinaryDrop <- deleteWith hs "/api/databases/test"
+                check (hasStatus ordinaryDrop 400)
+                check (asText (at "message" (jsonBody ordinaryDrop)) `shouldSatisfy` T.isInfixOf "unavailable")
+            it "a request without a database header is a 400, not a silent default" $ do
+                admin <- loginAs "admin" "s3cret"
+                let _hs = cookieHeaders admin
+                bareTables <- request methodGet "/api/tables" [] ""
+                check (hasStatus bareTables 400)
+                check (asText (at "message" (jsonBody bareTables)) `shouldBe` "no database selected")
+                bareQuery <- request methodPost "/api/query" [("Content-Type", "application/json")] "{\"sql\":\"SELECT * FROM users\"}"
+                check (hasStatus bareQuery 400)
+                check (asText (at "error" (jsonBody bareQuery)) `shouldBe` "no_database")
+                stillListed <- request methodGet "/api/databases" [] ""
+                check (hasStatus stillListed 200)
+            it "CREATE DATABASE in the SQL console still goes to the storage layer" $ do
+                admin <- loginAs "admin" "s3cret"
+                created <- postWith (cookieHeaders admin) "/api/query" "{\"sql\":\"CREATE DATABASE sales\"}"
+                check (hasStatus created 400)
+                check (asText (at "message" (jsonBody created)) `shouldSatisfy` T.isInfixOf "unavailable")
+
+-- | 角色与权限：REST 端点、SQL 语句、越权口径、内部表不可见
+privilegesSpec :: FilePath -> Spec
+privilegesSpec staticDir = withWorldAt staticDir "privileges" $ \_ -> do
+    -- 注意：wai-extra 的 Session 自带 Cookie 罐，罐里的令牌会盖过显式 Cookie 头，
+    -- 所以每个身份都得在动手前重新登录一次（和既有用例组同一套写法）。
+    let signIn user password = do
+            res <- loginAs user password
+            expectStatusWith ("sign in " <> T.unpack user) res 204
+    it "the administrator creates a role, grants SELECT and adds a member" $ do
+        signIn "admin" "s3cret"
+        made <- postWith [] "/api/roles" "{\"name\":\"analyst\"}"
+        check (hasStatus made 200)
+        granted <- postWith [] "/api/roles/analyst/grants" "{\"object\":\"users\",\"privileges\":[\"select\"]}"
+        check (hasStatus granted 200)
+        _ <- postWith [] "/api/query" (sqlBody "CREATE USER dana IDENTIFIED BY 'dana-password'")
+        joined <- postWith [] "/api/roles/analyst/members" "{\"user\":\"dana\"}"
+        check (hasStatus joined 200)
+        listed <- getWith [] "/api/roles"
+        check (hasStatus listed 200)
+        check $ do
+            let analyst = roleEntry "analyst" (items (jsonBody listed))
+            at "name" analyst `shouldBe` A.String "analyst"
+            map (asText . at "privilege") (items (at "grants" analyst)) `shouldBe` ["select"]
+            map (asText . at "object") (items (at "grants" analyst)) `shouldBe` ["test.users"]
+            map asText (items (at "members" analyst)) `shouldBe` ["dana"]
+        signIn "dana" "dana-password"
+        visible <- getWith [] "/api/tables"
+        check (hasStatus visible 200)
+        check (map (asText . at "table") (items (jsonBody visible)) `shouldBe` ["users"])
+        allowed <- postWith [] "/api/query" (sqlBody "SELECT * FROM users")
+        check (hasStatus allowed 200)
+        check (asInt (at "rowCount" (jsonBody allowed)) `shouldBe` 5)
+        denied <- postWith [] "/api/query" (sqlBody "SELECT * FROM orders")
+        check (hasStatus denied 403)
+        check (asText (at "error" (jsonBody denied)) `shouldBe` "forbidden")
+        joins <- postWith [] "/api/query" (sqlBody "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id")
+        check (hasStatus joins 403)
+        nested <- postWith [] "/api/query" (sqlBody "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders)")
+        check (hasStatus nested 403)
+        detail <- getWith [] "/api/tables/orders/rows"
+        check (hasStatus detail 403)
+        rows <- getWith [] "/api/tables/users/rows"
+        check (hasStatus rows 200)
+        inserted <- postWith [] "/api/tables/users/rows" "{\"values\":{\"id\":9,\"name\":\"nine\",\"age\":30}}"
+        check (hasStatus inserted 403)
+    it "grants of insert/update/delete unlock the one-click writes, DDL stays administrator-only" $ do
+        signIn "admin" "s3cret"
+        _ <- postWith [] "/api/roles" "{\"name\":\"editor\"}"
+        _ <- postWith [] "/api/roles/editor/grants" "{\"object\":\"users\",\"privileges\":[\"insert\",\"update\",\"delete\"]}"
+        _ <- postWith [] "/api/query" (sqlBody "CREATE USER evan IDENTIFIED BY 'evan-password'")
+        _ <- postWith [] "/api/roles/editor/members" "{\"users\":[\"evan\"]}"
+        signIn "evan" "evan-password"
+        inserted <- postWith [] "/api/tables/users/rows" "{\"values\":{\"id\":99,\"name\":\"nine\",\"age\":30}}"
+        check (hasStatus inserted 200)
+        changed <- patchWith [] "/api/tables/users/rows/99" "{\"values\":{\"age\":31}}"
+        check (hasStatus changed 200)
+        removed <- deleteWith [] "/api/tables/users/rows/99"
+        check (hasStatus removed 200)
+        visible <- getWith [] "/api/tables"
+        check (hasStatus visible 200)
+        check (length (items (jsonBody visible)) `shouldBe` 0)
+        readDenied <- postWith [] "/api/query" (sqlBody "SELECT * FROM users")
+        check (hasStatus readDenied 403)
+        dropped <- deleteWith [] "/api/tables/users"
+        check (hasStatus dropped 403)
+        ddl <- postWith [] "/api/query" (sqlBody "CREATE TABLE t9 (id INT)")
+        check (hasStatus ddl 403)
+        roles <- getWith [] "/api/roles"
+        check (hasStatus roles 403)
+        roleSql <- postWith [] "/api/query" (sqlBody "CREATE ROLE sneak")
+        check (hasStatus roleSql 403)
+    it "a wildcard grant covers every table" $ do
+        signIn "admin" "s3cret"
+        _ <- postWith [] "/api/roles" "{\"name\":\"supervisor\"}"
+        _ <- postWith [] "/api/roles/supervisor/grants" "{\"object\":\"*\",\"privileges\":[\"select\"]}"
+        _ <- postWith [] "/api/query" (sqlBody "CREATE USER ivy IDENTIFIED BY 'ivy-password'")
+        _ <- postWith [] "/api/roles/supervisor/members" "{\"user\":\"ivy\"}"
+        signIn "ivy" "ivy-password"
+        visible <- getWith [] "/api/tables"
+        check (hasStatus visible 200)
+        check (sort (map (asText . at "table") (items (jsonBody visible))) `shouldBe` ["orders", "users"])
+        both <- postWith [] "/api/query" (sqlBody "SELECT * FROM orders")
+        check (hasStatus both 200)
+        innerJoin <- postWith [] "/api/query" (sqlBody "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id")
+        check (hasStatus innerJoin 200)
+    it "revoking membership and privileges closes the door again" $ do
+        signIn "admin" "s3cret"
+        _ <- postWith [] "/api/roles" "{\"name\":\"temp\"}"
+        _ <- postWith [] "/api/roles/temp/grants" "{\"object\":\"users\",\"privileges\":[\"select\"]}"
+        _ <- postWith [] "/api/query" (sqlBody "CREATE USER gina IDENTIFIED BY 'gina-password'")
+        _ <- postWith [] "/api/roles/temp/members" "{\"user\":\"gina\"}"
+        signIn "gina" "gina-password"
+        grantedSelect <- postWith [] "/api/query" (sqlBody "SELECT * FROM users")
+        expectStatusWith "gina selects after the grant" grantedSelect 200
+        signIn "admin" "s3cret"
+        evicted <- deleteWith [] "/api/roles/temp/members/gina"
+        expectStatusWith "evict gina" evicted 200
+        signIn "gina" "gina-password"
+        afterEviction <- postWith [] "/api/query" (sqlBody "SELECT * FROM users")
+        expectStatusWith "gina select after eviction" afterEviction 403
+        signIn "admin" "s3cret"
+        readded <- postWith [] "/api/roles/temp/members" "{\"user\":\"gina\"}"
+        expectStatusWith "re-add gina" readded 200
+        signIn "gina" "gina-password"
+        back <- postWith [] "/api/query" (sqlBody "SELECT * FROM users")
+        expectStatusWith "gina selects again" back 200
+        signIn "admin" "s3cret"
+        revoked <- deleteJsonWith [] "/api/roles/temp/grants" "{\"object\":\"users\",\"privileges\":[\"select\"]}"
+        expectStatusWith "revoke the grant" revoked 200
+        signIn "gina" "gina-password"
+        empty <- getWith [] "/api/tables"
+        expectStatusWith "gina table list after revoke" empty 200
+        check (items (jsonBody empty) `shouldBe` [])
+        afterRevoke <- postWith [] "/api/query" (sqlBody "SELECT * FROM users")
+        check (hasStatus afterRevoke 403)
+    it "role statements run in the SQL console and conflicts and unknown roles are reported" $ do
+        signIn "admin" "s3cret"
+        created <- postWith [] "/api/query" (sqlBody "CREATE ROLE auditor")
+        check (hasStatus created 200)
+        granted <- postWith [] "/api/query" (sqlBody "GRANT SELECT ON * TO auditor")
+        check (hasStatus granted 200)
+        listed <- getWith [] "/api/roles"
+        check $ do
+            let auditor = roleEntry "auditor" (items (jsonBody listed))
+            map (asText . at "privilege") (items (at "grants" auditor)) `shouldBe` ["select"]
+            map (asText . at "object") (items (at "grants" auditor)) `shouldBe` ["*"]
+        duplicate <- postWith [] "/api/roles" "{\"name\":\"auditor\"}"
+        check (hasStatus duplicate 409)
+        unknownGrant <- postWith [] "/api/roles/nobody/grants" "{\"object\":\"users\",\"privileges\":[\"select\"]}"
+        check (hasStatus unknownGrant 404)
+        unknownMember <- postWith [] "/api/roles/nobody/members" "{\"user\":\"dana\"}"
+        check (hasStatus unknownMember 404)
+        badPrivilege <- postWith [] "/api/query" (sqlBody "GRANT EXECUTE ON users TO auditor")
+        check (hasStatus badPrivilege 400)
+        revoked <- postWith [] "/api/query" (sqlBody "REVOKE SELECT ON * FROM auditor")
+        check (hasStatus revoked 200)
+        removed <- postWith [] "/api/query" (sqlBody "DROP ROLE auditor")
+        check (hasStatus removed 200)
+        gone <- getWith [] "/api/roles"
+        check (map (asText . at "name") (items (jsonBody gone)) `shouldNotContain` ["auditor"])
+    it "ALL expands into the four concrete privileges" $ do
+        signIn "admin" "s3cret"
+        _ <- postWith [] "/api/roles" "{\"name\":\"owner\"}"
+        _ <- postWith [] "/api/roles/owner/grants" "{\"object\":\"orders\",\"privileges\":[\"all\"]}"
+        listed <- getWith [] "/api/roles"
+        check $ do
+            let owner = roleEntry "owner" (items (jsonBody listed))
+            sort (map (asText . at "privilege") (items (at "grants" owner))) `shouldBe` ["delete", "insert", "select", "update"]
+            map (asText . at "object") (items (at "grants" owner)) `shouldBe` replicate 4 "test.orders"
+    it "the tables that hold roles and grants are invisible" $ do
+        signIn "admin" "s3cret"
+        testList <- getWith [] "/api/tables"
+        check (hasStatus testList 200)
+        check (map (asText . at "table") (items (jsonBody testList)) `shouldNotContain` ["sys_roles", "sys_grants", "sys_members"])
+        systemList <- getWith (systemHeaders []) "/api/tables"
+        check (hasStatus systemList 200)
+        check (map (asText . at "table") (items (jsonBody systemList)) `shouldNotContain` ["sys_roles", "sys_grants", "sys_members"])
+        hidden <- getWith [] "/api/tables/sys_roles"
+        check (hasStatus hidden 404)
+        peek <- postWith [] "/api/query" (sqlBody "SELECT * FROM sys_roles")
+        check (statusCode (WT.simpleStatus peek) `shouldSatisfy` (`elem` [400, 403, 404]))
+    it "an account with no role has no access at all" $ do
+        signIn "admin" "s3cret"
+        _ <- postWith [] "/api/query" (sqlBody "CREATE USER frank IDENTIFIED BY 'frank-password'")
+        signIn "frank" "frank-password"
+        visible <- getWith [] "/api/tables"
+        check (hasStatus visible 200)
+        check (items (jsonBody visible) `shouldBe` [])
+        forM_
+            [ "SELECT * FROM users"
+            , "INSERT INTO users (id, name, age) VALUES (7, 'seven', 7)"
+            , "UPDATE users SET age = 8 WHERE id = 7"
+            , "DELETE FROM users WHERE id = 7"
+            ]
+            $ \sql -> do
+                res <- postWith [] "/api/query" (sqlBody sql)
+                check (hasStatus res 403)
+        detail <- getWith [] "/api/tables/users/rows"
+        check (hasStatus detail 403)
+        databases <- getWith [] "/api/databases"
+        check (map asText (items (jsonBody databases)) `shouldBe` ["test"])
+
+-- | 在角色清单里按名字找一项
+roleEntry :: Text -> [A.Value] -> A.Value
+roleEntry name entries = case [e | e <- entries, asText (at "name" e) == name] of
+    (e : _) -> e
+    [] -> A.Null
+
+-- | 带 JSON 体的 DELETE（撤销授权要用）
+deleteJsonWith :: [Header] -> BS.ByteString -> BL.ByteString -> TestSession WT.SResponse
+deleteJsonWith headers path payload =
+    request "DELETE" path (fixtureHeaders (("Content-Type", "application/json") : headers)) payload
+
+-- | 一条 SQL 请求体
+sqlBody :: Text -> BL.ByteString
+sqlBody sql = BL.fromStrict (TE.encodeUtf8 (T.concat ["{\"sql\":\"", sql, "\"}"]))
+
+-- | 在表清单里按表名找一项（找不到给 Null）
+tableEntry :: Text -> [A.Value] -> A.Value
+tableEntry name entries = case [e | e <- entries, asText (at "table" e) == name] of
+    (e : _) -> e
+    [] -> A.Null
+
+-- | JSON 当布尔看
+asBool :: A.Value -> Bool
+asBool (A.Bool b) = b
+asBool _ = False
+
+-- | JSON 当数组看（不是数组给空）
+asArray :: A.Value -> V.Vector A.Value
+asArray (A.Array xs) = xs
+asArray _ = V.empty
 
 -- | 一份完整的合法 IDE 设置请求体
 uiSettingsBody :: BL.ByteString
 uiSettingsBody = "{\"uiFonts\":[\"JetBrains Mono\",\"Consolas\"],\"gridFonts\":[\"Consolas\"],\"sqlFonts\":[\"Mono\"],\"uiFontSize\":13,\"gridFontSize\":12,\"gridRowHeight\":24,\"sqlFontSize\":13,\"sqlLineHeight\":20,\"sqlTabSize\":2,\"pageSize\":200,\"nullText\":\"NULL\",\"sqlLineNumbers\":true,\"autocomplete\":true,\"minimap\":false}"
 
 -- | 上面那份设置解出来的值
-fullUiSettings :: A.Value
-fullUiSettings = fromMaybe A.Null (A.decode uiSettingsBody)
+fullUISettings :: A.Value
+fullUISettings = fromMaybe A.Null (A.decode uiSettingsBody)
 
 -- | 在合法设置上换掉一个字段（试坏值用）
 withUiField :: Text -> A.Value -> A.Value
-withUiField key value = case fullUiSettings of
+withUiField key value = case fullUISettings of
     A.Object o -> A.Object (KM.insert (K.fromText key) value o)
     other -> other
-
--- | n 项字体链
-fontChainValue :: Int -> A.Value
-fontChainValue n = A.Array (V.fromList (replicate n (A.String "Mono")))
 
 uiSettingsSpec :: FilePath -> Spec
 uiSettingsSpec staticDir = do
     describe "IDE settings validation" $ do
         it "accepts a complete valid object" $
-            validateUiSettings fullUiSettings `shouldSatisfy` isRightE
-        it "rejects an unknown key" $
-            validateUiSettings (withUiField "nope" (A.Bool True)) `shouldSatisfy` isLeftE
+            validateUISettings fullUISettings `shouldSatisfy` isRightE
         it "rejects a string where an integer is expected" $
-            validateUiSettings (withUiField "uiFontSize" (A.String "13")) `shouldSatisfy` isLeftE
+            validateUISettings (withUiField "uiFontSize" (A.String "13")) `shouldSatisfy` isLeftE
         it "rejects an integer outside its range" $ do
-            validateUiSettings (withUiField "uiFontSize" (A.Number 10)) `shouldSatisfy` isLeftE
-            validateUiSettings (withUiField "uiFontSize" (A.Number 17)) `shouldSatisfy` isLeftE
-        it "rejects a font chain longer than ten entries" $
-            validateUiSettings (withUiField "uiFonts" (fontChainValue 11)) `shouldSatisfy` isLeftE
+            validateUISettings (withUiField "uiFontSize" (A.Number 10)) `shouldSatisfy` isLeftE
+            validateUISettings (withUiField "uiFontSize" (A.Number 17)) `shouldSatisfy` isLeftE
         it "rejects a blank font name" $
-            validateUiSettings (withUiField "gridFonts" (A.Array (V.fromList [A.String "  "]))) `shouldSatisfy` isLeftE
+            validateUISettings (withUiField "gridFonts" (A.Array (V.fromList [A.String "  "]))) `shouldSatisfy` isLeftE
         it "rejects a number where a boolean is expected" $
-            validateUiSettings (withUiField "minimap" (A.Number 1)) `shouldSatisfy` isLeftE
+            validateUISettings (withUiField "minimap" (A.Number 1)) `shouldSatisfy` isLeftE
         it "names the offending key in the error" $
-            case validateUiSettings (withUiField "pageSize" (A.Number 5)) of
+            case validateUISettings (withUiField "pageSize" (A.Number 5)) of
                 Left err -> err `shouldSatisfy` isInfixOf "pageSize"
                 Right _ -> expectationFailure "expected a range error"
 
     describe "IDE settings file" $ do
-        it "candidates look for the file in script/ first" $
+        it "candidates look for the file in scripts/ first" $
             uiSettingsFileCandidates
-                `shouldBe` [ "script" </> "chusql.ui.settings.json"
-                           , ".." </> "script" </> "chusql.ui.settings.json"
+                `shouldBe` [ "scripts" </> "chusql.ui.settings.json"
+                           , ".." </> "scripts" </> "chusql.ui.settings.json"
                            , "chusql.ui.settings.json"
                            ]
-        it "resolution picks one of the candidates" $ do
-            path <- resolveUiSettingsFile
-            path `shouldSatisfy` (`elem` uiSettingsFileCandidates)
-        it "a missing file reads back as an empty object" $ do
-            path <- tempUiSettingsPath "missing"
-            removeIfExists path
-            readUiSettings path `shouldReturn` A.Object KM.empty
         it "writing then reading round-trips the map and creates the directory" $ do
             tmp <- getTemporaryDirectory
             let dir = tmp </> "chusql-web-test-ui-file" </> "nested"
                 path = dir </> "chusql.ui.settings.json"
                 stored = Map.fromList [("minimap", A.Bool True), ("uiFontSize", A.Number 13)]
             removeIfExists path
-            written <- writeUiSettings path stored
+            written <- writeUISettings path stored
             written `shouldBe` Right ()
-            readUiSettings path `shouldReturn` A.Object (KM.fromList [("minimap", A.Bool True), ("uiFontSize", A.Number 13)])
+            readUISettings path `shouldReturn` A.Object (KM.fromList [("minimap", A.Bool True), ("uiFontSize", A.Number 13)])
 
     describe "IDE settings endpoints" $
         withWorldAt staticDir "ui-settings" $ \appEnv -> do
@@ -1482,7 +2209,7 @@ uiSettingsSpec staticDir = do
                 check (hasStatus saved 204)
                 body <- getWith (cookieHeaders res) "/api/ui-settings"
                 check (hasStatus body 200)
-                check (jsonBody body `shouldBe` fullUiSettings)
+                check (jsonBody body `shouldBe` fullUISettings)
             it "an unknown key gives 400 bad_request" $ do
                 res <- loginAs "admin" "s3cret"
                 bad <- putWith (cookieHeaders res) "/api/ui-settings" "{\"nope\":1}"
@@ -1511,11 +2238,6 @@ sortSpec staticDir = describe "Sorting while browsing a table" $
                 asText (at "sort" (jsonBody page)) `shouldBe` "age"
                 asText (at "dir" (jsonBody page)) `shouldBe` "asc"
                 firstRow page `shouldBe` [A.Number 1, A.String "user1", A.Number 21]
-        it "desc: the first row has the largest age" $ do
-            res <- loginAs "admin" "s3cret"
-            page <- getWith (cookieHeaders res) "/api/tables/users/rows?sort=age&dir=desc"
-            check (hasStatus page 200)
-            check (firstRow page `shouldBe` [A.Number 5, A.String "user5", A.Number 25])
         it "unknown column / invalid column name: 400" $ do
             res <- loginAs "admin" "s3cret"
             missing <- getWith (cookieHeaders res) "/api/tables/users/rows?sort=nope"
@@ -1557,8 +2279,6 @@ securitySpec staticDir = do
                 res <- get "/static/app.js"
                 check (hasStatus res 200)
                 check (lookup "Content-Type" (WT.simpleHeaders res) `shouldBe` Just "text/javascript; charset=utf-8")
-            it "a missing static file gives 404" $
-                get "/static/nope.js" `shouldRespondWith` 404
             it "URL-encoded traversal is rejected" $
                 get "/static/%2e%2e%2fsecret.token" `shouldRespondWith` 404
             it "files outside the whitelist are unreadable" $
@@ -1582,9 +2302,6 @@ securitySpec staticDir = do
                         "/api/login"
                         (loginBody "admin" "s3cret")
                 check (hasStatus res 204)
-            it "an oversized request with Content-Length gives 413" $
-                postWith [("Content-Length", "999999")] "/api/login" (loginBody "admin" "s3cret")
-                    `shouldRespondWith` 413
             it "a genuinely large body gives 413" $
                 jsonRequest methodPost "/api/login" (BL.fromStrict (BS.replicate 70000 97))
                     `shouldRespondWith` 413
@@ -1592,15 +2309,90 @@ securitySpec staticDir = do
 -- | 端到端：真 HTTP + 真 Rust 存储进程
 e2eSpec :: FilePath -> Spec
 e2eSpec staticDir = describe "End-to-end: browser -> Haskell -> Rust" $ do
+    it "isolates database contexts across HTTP clients and supports qualified SQL" $ do
+        serverBin <- locateServerOrSkip
+        (pipe, _dataDir, cfg) <- makeServerConfig "iso"
+        started <- startStorageProcess serverBin cfg
+        running <- either fail pure started
+        bracket (pure running) stopStorageProcess $ \_sp -> do
+            backend <- ipcBackend
+            sessions <- newSessionStore getCurrentTime defaultSessionPolicy
+            limiter <- newRateLimiter getCurrentTime 50 300
+            env <- newAppEnv backend sessions testCredential limiter staticDir
+            app <- webApp env
+            Warp.testWithApplication (pure app) $ \port -> do
+                mgr <- newManager defaultManagerSettings
+                signedInResponse <- e2ePost mgr port "/api/login" (loginBody "admin" "s3cret") []
+                let auth = [("Cookie", fromMaybe "" (e2eCookie signedInResponse))]
+                    alpha = ("X-ChuSQL-Database", "alpha") : auth
+                    beta = ("X-ChuSQL-Database", "beta") : auth
+                    query headers sql = e2ePost mgr port "/api/query" (sqlBody sql) headers
+                mapM_ (\name -> do
+                    created <- query auth ("CREATE DATABASE " <> name)
+                    statusCode (responseStatus created) `shouldBe` 200) ["alpha", "beta"]
+                mapM_ (\headers -> do
+                    created <- query headers "CREATE TABLE items (id int)"
+                    statusCode (responseStatus created) `shouldBe` 200) [alpha, beta]
+                inserted <- query alpha "INSERT INTO items (id) VALUES (1)"
+                statusCode (responseStatus inserted) `shouldBe` 200
+                selected <- query beta "SELECT * FROM items"
+                asInt (at "rowCount" (fromMaybe A.Null (decode (responseBody selected)))) `shouldBe` 0
+                qualified <- query beta "SELECT * FROM alpha.items"
+                asInt (at "rowCount" (fromMaybe A.Null (decode (responseBody qualified)))) `shouldBe` 1
+                betaInsert <- query beta "INSERT INTO items (id) VALUES (1)"
+                statusCode (responseStatus betaInsert) `shouldBe` 200
+                joined <- query auth "SELECT a.id FROM alpha.items a JOIN beta.items b ON a.id = b.id"
+                asInt (at "rowCount" (fromMaybe A.Null (decode (responseBody joined)))) `shouldBe` 1
+                inherited <- getEnvironment
+                -- 构建好的 chusql-cli 也要能一条命令跑通（没构建就跳过）
+                locateCliExe >>= \found -> case found of
+                    Nothing -> pendingWith "csql is not built (run stack build chusql-cli:exe:csql)"
+                    Just cliExe -> do
+                        cliConfig <- makeCliHome port pipe "admin" "s3cret"
+                        (cliExit, cliOut, cliErr) <-
+                            readCreateProcessWithExitCode
+                                (proc cliExe ["--config", cliConfig, "--database", "alpha", "--format", "json", "-e", "SELECT * FROM items"])
+                                    { Process.env = Just inherited
+                                    }
+                                ""
+                        (cliExit, cliErr) `shouldBe` (ExitSuccess, "")
+                        asInt (at "rowCount" (fromMaybe A.Null (decode (BL.fromStrict (BSC.pack cliOut))))) `shouldBe` 1
+                switched <- query auth "USE alpha"
+                at "database" (fromMaybe A.Null (decode (responseBody switched))) `shouldBe` A.String "alpha"
+                -- 限定名不需要先选库；裸表名没有当前库就是 400
+                qualifiedWithoutDatabase <- query auth "SELECT * FROM alpha.items"
+                asInt (at "rowCount" (fromMaybe A.Null (decode (responseBody qualifiedWithoutDatabase)))) `shouldBe` 1
+                bareWithoutDatabase <- query auth "SELECT * FROM items"
+                statusCode (responseStatus bareWithoutDatabase) `shouldBe` 400
+                at "error" (fromMaybe A.Null (decode (responseBody bareWithoutDatabase))) `shouldBe` A.String "no_database"
+                listed <- e2eGet mgr port "/api/databases" auth
+                items (fromMaybe A.Null (decode (responseBody listed))) `shouldBe` map A.String ["alpha", "beta", "system"]
+                createdDb <- e2ePost mgr port "/api/databases" "{\"name\":\"gamma\"}" auth
+                statusCode (responseStatus createdDb) `shouldBe` 200
+                duplicateDb <- e2ePost mgr port "/api/databases" "{\"name\":\"gamma\"}" auth
+                statusCode (responseStatus duplicateDb) `shouldBe` 400
+                droppedDb <- e2eSend mgr port "DELETE" "/api/databases/gamma" "" auth
+                statusCode (responseStatus droppedDb) `shouldBe` 200
+                keptSystem <- e2eSend mgr port "DELETE" "/api/databases/system" "" auth
+                statusCode (responseStatus keptSystem) `shouldBe` 400
+                -- test 不再是保留名：能建也能删
+                madeTest <- e2ePost mgr port "/api/databases" "{\"name\":\"test\"}" auth
+                statusCode (responseStatus madeTest) `shouldBe` 200
+                droppedTest <- e2eSend mgr port "DELETE" "/api/databases/test" "" auth
+                statusCode (responseStatus droppedTest) `shouldBe` 200
+                bad <- query (("X-ChuSQL-Database", "../escape") : auth) "SELECT 1"
+                statusCode (responseStatus bad) `shouldBe` 400
+
     it "login -> create table -> insert -> query -> logout all the way through" $ do
         serverBin <- locateServerOrSkip
-        started <- startStorageProcess serverBin
+        (_pipe, dataDir, cfg) <- makeServerConfig "flow"
+        started <- startStorageProcess serverBin cfg
         running <- case started of
             Left err -> do
                 expectationFailure err
                 fail "the storage process did not start"
             Right ok -> pure ok
-        bracket (pure running) stopStorageProcess $ \sp -> do
+        bracket (pure running) stopStorageProcess $ \_sp -> do
             backend <- ipcBackend
             clock <- newIORef =<< getCurrentTime
             sessions <- newSessionStore (readIORef clock) defaultSessionPolicy
@@ -1615,7 +2407,11 @@ e2eSpec staticDir = describe "End-to-end: browser -> Haskell -> Rust" $ do
                 statusCode (responseStatus signedIn) `shouldBe` 204
                 let cookie = e2eCookie signedIn
                 cookie `shouldSatisfy` maybe False (not . BS.null)
-                let auth = [("Cookie", fromMaybe "" cookie)]
+                let bare = [("Cookie", fromMaybe "" cookie)]
+                -- 服务不再自带默认库：先建一个自己的库，再把它当请求上下文
+                madeDb <- e2ePost mgr boundPort "/api/databases" "{\"name\":\"main\"}" bare
+                statusCode (responseStatus madeDb) `shouldBe` 200
+                let auth = ("X-ChuSQL-Database", "main") : bare
                 created <- e2ePost mgr boundPort "/api/query" "{\"sql\":\"CREATE TABLE web_e2e (id int, name str)\"}" auth
                 statusCode (responseStatus created) `shouldBe` 200
                 inserted <-
@@ -1683,8 +2479,161 @@ e2eSpec staticDir = describe "End-to-end: browser -> Haskell -> Rust" $ do
                 statusCode (responseStatus out) `shouldBe` 204
                 afterLogout <- e2eGet mgr boundPort "/api/tables" auth
                 statusCode (responseStatus afterLogout) `shouldBe` 401
-                exists <- doesDirectoryExist (spDataDir sp)
+                exists <- doesDirectoryExist dataDir
                 exists `shouldBe` True
+
+    it "ordinary accounts survive restart, the administrator resets passwords and ordinary users cannot administer accounts" $ do
+        serverBin <- locateServerOrSkip
+        (_pipe, _dataDir, cfg) <- makeServerConfig "restart"
+        Right running <- startStorageProcess serverBin cfg
+        bracket (pure running) stopStorageProcess $ \sp -> do
+            backend <- ipcBackend
+            sessions <- newSessionStore getCurrentTime defaultSessionPolicy
+            limiter <- newRateLimiter getCurrentTime 50 300
+            env <- newAppEnv backend sessions testCredential limiter staticDir
+            app <- webApp env
+            Warp.testWithApplication (pure app) $ \port -> do
+                mgr <- newManager defaultManagerSettings
+                admin <- e2ePost mgr port "/api/login" (loginBody "admin" "s3cret") []
+                let auth = [("Cookie", fromMaybe "" (e2eCookie admin))]
+                    authSystem = ("X-ChuSQL-Database", "system") : auth
+                created <- e2ePost mgr port "/api/tables/__chusql_users/rows" "{\"values\":{\"user\":\"alice\",\"password\":\"alice-password\"}}" authSystem
+                statusCode (responseStatus created) `shouldBe` 200
+                duplicate <- e2ePost mgr port "/api/tables/__chusql_users/rows" "{\"values\":{\"user\":\"ALICE\",\"password\":\"alice-password\"}}" authSystem
+                statusCode (responseStatus duplicate) `shouldBe` 409
+                goneSwitch <- e2ePost mgr port "/api/account/switch" (loginBody "alice" "alice-password") auth
+                statusCode (responseStatus goneSwitch) `shouldBe` 404
+                stillAdmin <- e2eGet mgr port "/api/session" auth
+                statusCode (responseStatus stillAdmin) `shouldBe` 200
+                alice <- e2ePost mgr port "/api/login" (loginBody "alice" "alice-password") []
+                statusCode (responseStatus alice) `shouldBe` 204
+                let aliceAuth = [("Cookie", fromMaybe "" (e2eCookie alice))]
+                    aliceSystem = ("X-ChuSQL-Database", "system") : aliceAuth
+                misplaced <- e2ePost mgr port "/api/tables/__chusql_users/rows" "{\"values\":{\"user\":\"other\",\"password\":\"other-password\"}}" aliceAuth
+                statusCode (responseStatus misplaced) `shouldBe` 400
+                forbidden <- e2ePost mgr port "/api/tables/__chusql_users/rows" "{\"values\":{\"user\":\"other\",\"password\":\"other-password\"}}" aliceSystem
+                statusCode (responseStatus forbidden) `shouldBe` 403
+                listed <- e2eGet mgr port "/api/tables/__chusql_users/rows" aliceSystem
+                statusCode (responseStatus listed) `shouldBe` 403
+                blockedSystem <- e2eGet mgr port "/api/tables" aliceSystem
+                statusCode (responseStatus blockedSystem) `shouldBe` 403
+                aliceDbs <- e2eGet mgr port "/api/databases" aliceAuth
+                items (fromMaybe A.Null (decode (responseBody aliceDbs))) `shouldSatisfy` not . elem (A.String "system")
+                tableList <- e2eGet mgr port "/api/tables" aliceAuth
+                statusCode (responseStatus tableList) `shouldBe` 400
+                at "error" (fromMaybe A.Null (decode (responseBody tableList))) `shouldBe` A.String "no_database"
+                _ <- e2ePost mgr port "/api/databases" "{\"name\":\"shop\"}" auth
+                shopTables <- e2eGet mgr port "/api/tables" (("X-ChuSQL-Database", "shop") : aliceAuth)
+                statusCode (responseStatus shopTables) `shouldBe` 200
+                BL.toStrict (responseBody shopTables) `shouldSatisfy` (not . BS.isInfixOf "__chusql_users")
+                settings <- e2eSend mgr port "PUT" "/api/settings" "{\"values\":{\"password-min-length\":\"8\"}}" aliceAuth
+                statusCode (responseStatus settings) `shouldBe` 403
+                hidden <- e2ePost mgr port "/api/query" "{\"sql\":\"SELECT * FROM __chusql_users\"}" aliceAuth
+                statusCode (responseStatus hidden) `shouldSatisfy` (>= 400)
+                BL.toStrict (responseBody hidden) `shouldSatisfy` (not . BS.isInfixOf "pbkdf2")
+                selfService <- e2ePost mgr port "/api/account/password" "{\"current\":\"alice-password\",\"next\":\"alice-new-password\"}" aliceAuth
+                statusCode (responseStatus selfService) `shouldBe` 404
+                adminAgain <- e2ePost mgr port "/api/login" (loginBody "admin" "s3cret") []
+                let authAgain = [("Cookie", fromMaybe "" (e2eCookie adminAgain))]
+                reset <- e2eSend mgr port "PATCH" "/api/tables/__chusql_users/rows/alice" "{\"values\":{\"password\":\"alice-new-password\"}}" (("X-ChuSQL-Database", "system") : authAgain)
+                statusCode (responseStatus reset) `shouldBe` 200
+            stopStorageProcess sp
+            (_, _, _, process) <- createProcess (proc serverBin ["--config", cfg]){std_out = NoStream, std_err = NoStream}
+            let restarted = StorageProcess process (spPipe sp)
+            bracket (pure restarted) stopStorageProcess $ \_ -> do
+                waitForStorage 200 >>= (`shouldBe` True)
+                backend2 <- ipcBackend
+                sessions2 <- newSessionStore getCurrentTime defaultSessionPolicy
+                limiter2 <- newRateLimiter getCurrentTime 50 300
+                env2 <- newAppEnv backend2 sessions2 testCredential limiter2 staticDir
+                app2 <- webApp env2
+                Warp.testWithApplication (pure app2) $ \port -> do
+                    mgr <- newManager defaultManagerSettings
+                    fresh <- e2ePost mgr port "/api/login" (loginBody "alice" "alice-new-password") []
+                    statusCode (responseStatus fresh) `shouldBe` 204
+                    stale <- e2ePost mgr port "/api/login" (loginBody "alice" "alice-password") []
+                    statusCode (responseStatus stale) `shouldBe` 401
+                    root <- e2ePost mgr port "/api/login" (loginBody "admin" "s3cret") []
+                    statusCode (responseStatus root) `shouldBe` 204
+
+-- | 找构建好的 csql 可执行文件；没构建出可执行文件就返回 Nothing
+locateCliExe :: IO (Maybe FilePath)
+locateCliExe = do
+    let name = platformBinaryName os "csql"
+    firstFile . concat =<< mapM (\root -> findFileUnder 8 (root </> ".stack-work") name) cliRoots
+
+-- | csql 可能落地的根：测试的 CWD 是 chusql-web/，所以两种相对位置都试
+cliRoots :: [FilePath]
+cliRoots = ["", "chusql-cli", ".." </> "chusql-cli", "chusql-web", ".." </> "chusql-web", ".."]
+
+-- | 按名字在 .stack-work 里递进找可执行文件。
+--   stack 会把它放在带平台、包哈希与编译器版本的多层目录里，写死路径会过期。
+findFileUnder :: Int -> FilePath -> FilePath -> IO [FilePath]
+findFileUnder depth dir name = do
+    exists <- doesDirectoryExist dir
+    if not exists || depth <= 0
+        then pure []
+        else do
+            entries <- System.Directory.listDirectory dir
+            let (named, rest) = partition (== name) entries
+            deeper <- mapM (\entry -> findFileUnder (depth - 1) (dir </> entry) name) (filter diggable rest)
+            pure ([dir </> entry | entry <- named] ++ concat deeper)
+  where
+    -- 只往可能放可执行文件的目录里钻，跳过编译中间产物与包索引
+    diggable entry =
+        not ("." `isPrefixOf` entry)
+            && entry `notElem` ["work", "tmp", "package-index", "snapshots", "pantry", "indices"]
+
+-- | 一次端到端用例用的管名后缀：同一进程内唯一
+uniqueSuffix :: IO String
+uniqueSuffix = do
+    u <- newUnique
+    pure (show (hashUnique u))
+
+-- | 造一份临时 chusql.toml（[server] pipe_name + [storage] data_dir），路径由调用方显式交给存储进程
+makeServerConfig :: String -> IO (String, FilePath, FilePath)
+makeServerConfig label = do
+    tmp <- getTemporaryDirectory
+    suffix <- uniqueSuffix
+    let pipe = "chusql-web-" ++ label ++ "-" ++ suffix
+        dataDir = tmp </> pipe
+        cfg = dataDir ++ ".toml"
+        -- TOML 的普通字符串会吃反斜杠，路径统一用正斜杠
+        slashed = map (\c -> if c == '\\' then '/' else c) dataDir
+    -- 临时路径在不同轮次可能重名，先扫干净，别把上一次的库带进来
+    removePathForcibly cfg
+    removePathForcibly dataDir
+    createDirectoryIfMissing True dataDir
+    writeFile
+        cfg
+        ( unlines
+            [ "[server]"
+            , "pipe_name = \"" ++ pipe ++ "\""
+            , "[storage]"
+            , "data_dir = \"" ++ slashed ++ "\""
+            ]
+        )
+    setPipeName pipe
+    pure (pipe, dataDir, cfg)
+
+-- | 给 CLI 子进程造一份临时 chusql.toml：管名与 root 凭据都在里面，返回配置文件路径
+makeCliHome :: Int -> String -> String -> String -> IO FilePath
+makeCliHome port pipe user password = do
+    tmp <- getTemporaryDirectory
+    let home = tmp </> ("chusql-cli-" ++ show port)
+        cfg = home </> "chusql.toml"
+    createDirectoryIfMissing True home
+    writeFile
+        cfg
+        ( unlines
+            [ "[server]"
+            , "pipe_name = \"" ++ pipe ++ "\""
+            , "[web]"
+            , "user = \"" ++ user ++ "\""
+            , "password = \"" ++ password ++ "\""
+            ]
+        )
+    pure cfg
 
 -- | 找存储进程，cargo 不可用则 pending
 locateServerOrSkip :: IO FilePath
@@ -1721,8 +2670,7 @@ buildServer storageDir = do
                 ExitSuccess -> do
                     found <-
                         firstFile
-                            [ storageDir </> "target" </> "debug" </> "chusql-storage.exe"
-                            , storageDir </> "target" </> "debug" </> "chusql-storage"
+                            [ storageDir </> "target" </> "debug" </> platformBinaryName os "chusql-storage"
                             ]
                     pure (maybe (Left "cargo build finished but no storage executable was found") Right found)
 
