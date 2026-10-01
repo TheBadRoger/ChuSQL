@@ -1,54 +1,45 @@
 # ChuSQL
 
-本项目是一个简单的数据库项目，服务端采用Haskell和Rust联合编写，采取B/S模式，管理客户端运行在浏览器网页上。
+本项目是一个简单的数据库项目，服务端采用 Haskell 和 Rust 联合编写，采取 B/S 模式，管理客户端运行在浏览器网页上。
 
-## 仓库布局
+优点：
 
-| 目录              | 语言                       | 组件                                                              |
-| ----------------- | -------------------------- | ----------------------------------------------------------------- |
-| `chusql-engine/`  | Haskell                    | 执行引擎：词法分析与AST、表达式求值、关系代数、内存表、服务端接口 |
-| `chusql-storage/` | Rust                       | 存储引擎：磁盘IO、B+树、缓冲池、WAL、崩溃恢复、并发控制           |
-| `chusql-web/`     | Haskell + React/TypeScript | Web 管理端：Scotty REST API + VS Code Dark+ 风格数据库 Web IDE    |
-| `script/`         | PowerShell                 | `chusql.ps1` / `chusql.cmd`：一键启动 / 子命令 / 设置管理         |
+- 轻量：两个可执行文件加一份静态资源，解包即用，没有 Node / Python 之类的运行时依赖
+- 部署容易：Linux 与 macOS 一条命令装完并启动，Windows 解压后跑一次安装脚本
+- 配置统一：一个 `chusql.toml` 同时管住存储、Web 与命令行
+- 账号统一：Web 管理端与命令行共用同一个管理员和同一张账号表
 
-# 架构分层
+## 安装
 
-## Haskell部分
+Linux / macOS（自动识别当前平台，取对应发行包）：
 
-作为函数式编程语言，从语言层面契合SQL语句解析和代数数学运算，同时有强大的类型安全系统。
+```sh
+curl -fsSL https://github.com/TheBadRoger/ChuSQL/releases/latest/download/install.sh | sh -s -- --component web
+```
 
-- SQL词法分析、AST
-- 语义分析：表/列存在性与类型检查（执行前的关卡）
-- 事务处理
-- 查询优化、内存表管理
-- 关系代数运算
-- 服务端接口与请求相应
-- Web 管理端：Scotty REST API、登录会话、静态页面交付
+Windows：下载 `chusql-web-windows-x86_64.zip`，解压后在 PowerShell 里执行
 
-## Rust部分
+```powershell
+.\install.ps1 -Component web
+```
 
-高性能、内存安全且具有强大并行异步编程能力的现代编程语言。
+只装命令行客户端就把 `web` 换成 `cli`，入口变成 `csql`。安装位置、目录结构与卸载方式见
+[doc/install.md](doc/install.md)。
 
-- 磁盘IO
-- B+树、页面管理
-- 缓冲池
-- WAL
-- 事务日志和崩溃恢复
-- 并发控制
+## 启动
 
-# 性能基准
+```sh
+csql-web
+```
 
-| 指标                                             | 200 × 200 | 500 × 500 |         1000 × 1000 |
-| ------------------------------------------------ | --------: | --------: | ------------------: |
-| 单条 `INSERT`（整条语句）                        |   2.66 ms |   2.86 ms |             2.88 ms |
-| 同一条 `INSERT`（原始 IPC，不经引擎）            |   2.50 ms |   2.85 ms |             2.77 ms |
-| **多行 `INSERT`（100 行/条）**                   |         — |         — |     **0.059 ms/行** |
-| `SELECT * FROM users`                            |    0.4 ms |    1.0 ms |              1.9 ms |
-| `SELECT name FROM users WHERE age > 90`          |    0.3 ms |    0.8 ms |              2.7 ms |
-| `SELECT ... JOIN ... WHERE`                      |    0.9 ms |    2.4 ms |              5.3 ms |
-| `SELECT name FROM users WHERE id = k`            |    0.2 ms |    0.2 ms |              0.2 ms |
-| `DELETE FROM users WHERE id = k`（删 1 行）      |         — |         — |              4.8 ms |
-| `DELETE FROM users`（删全部 1000 行）            |         — |         — |             20.2 ms |
-| `SELECT ... WHERE code = k`（无索引 → 建索引后） |         — |         — | 1.8 ms → **0.2 ms** |
+浏览器打开 http://127.0.0.1:7777 ，默认账号 `root`，口令是安装时给的那个。服务启动后只有系统库 `system`（里面是账号表），**没有默认工作库**：自己建一个库再用 `USE <库名>` 选中它。
+换口令、换端口、改数据目录都在安装时写好的 `chusql.toml` 里。
 
-> 最近更新：2026-09-26
+## 文档
+
+| 文档                              | 内容                                                                     |
+| --------------------------------- | ------------------------------------------------------------------------ |
+| [安装与卸载](doc/install.md)      | 三种安装方式、全部安装选项、装完的目录结构、从源码安装、卸载             |
+| [配置选项](doc/config.md)         | 配置位置与优先级、全部配置键与默认值、端点规则、口令与安全               |
+| [命令与选项](doc/commands.md)     | `csql` 与 `chusql-web` 的选项、元命令、账号与角色权限、REST 接口         |
+| [架构与组件](doc/architecture.md) | 三个组件怎么分工、一次请求经过什么、数据落在哪                           |

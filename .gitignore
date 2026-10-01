@@ -2,7 +2,7 @@
 # ChuSQL 单仓库 .gitignore
 #   chusql-engine/   Haskell (Stack + Cabal)
 #   chusql-storage/  Rust (Cargo)
-#   chusql-web/      前端 (Node / TypeScript)
+#   chusql-web/      前端 (手写 HTML / CSS / JS，无 Node 工具链)
 # ============================================================
 
 # ------------------------------------------------------------
@@ -38,33 +38,19 @@ target/
 # 运行时数据（Rust 服务默认数据目录 CHUSQL_DATA_DIR=data/），不入库
 chusql-storage/data/
 
-# 一键启动脚本（script/chusql.ps1）的唯一默认数据目录与日志，不入库
+# 一键启动脚本的默认数据目录与日志，不入库
 localdata/
 
-# 启动器保存的设置（script/chusql.ps1 config set ... 写这里），本机专用，不入库
-script/chusql.settings.json
-
-# 前端 IDE 设置（字体等，由 /api/ui-settings 读写），同样本机专用
-script/chusql.ui.settings.json
+# 前端 IDE 设置（字体等，由 /api/ui-settings 读写），本机专用，不入库
+scripts/chusql.ui.settings.json
 
 # Cargo.lock 要入库（本项目是要产出可执行程序的 crate，不是纯库）
 
 # ------------------------------------------------------------
-# 前端 / Node —— chusql-web
+# 前端 —— chusql-web/static 是手写的源文件，必须入库
 # ------------------------------------------------------------
-node_modules/
-.pnpm-store/
-build/
-.next/
-.nuxt/
-.vite/
-.npm-cache/
-.angular/
-coverage/
-*.tsbuildinfo
-
-# 前端构建产物：vite outDir 指向 ../static，由 npm run build 生成，不入库
-chusql-web/static/
+# 这里曾经放着 node_modules / .vite / *.tsbuildinfo 等 Node 工具链规则；
+# 前端已改为纯 HTML + CSS + JS 静态资源，不再需要它们。
 
 # 环境变量：只提交 .env.example，本地实际配置不入库
 .env
@@ -87,9 +73,15 @@ chusql-web/static/
 *~
 \#*\#
 .\#*
+agent_credientials
 
 # 注意：.zed/tasks.json 是本仓库共享的构建任务（stack build / run / test / repl），
 # 需要入库，所以这里不忽略 .zed/
+
+# ------------------------------------------------------------
+# 项目计划 / 提示词 / 设计决策 / 已知问题（本机文档，不入库）
+# ------------------------------------------------------------
+plandocs/
 
 # ------------------------------------------------------------
 # 操作系统

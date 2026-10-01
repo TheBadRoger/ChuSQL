@@ -1,0 +1,100 @@
+# Linux 流水线：Rust 存储 + Haskell 引擎/Web/CLI 的构建与测试。
+#
+# 这里每条命令都在 WSL Debian（cargo 1.98 / GHC 9.10.3 / stack 3.11.1）上跑通过，
+# 见仓库根 README 的「构建与测试」段。IPC 用例需要 chusql-storage 可执行文件，
+# 所以 Rust 先构建，Haskell 的 engine/web 用例才能真跑而不是 pending。
+# 打包和发版资源走 .github/workflows/release.yml（tag 触发，也可手动 dispatch）。
+name: linux
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: build + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------- Rust 存储 ----------
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            chusql-storage/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('chusql-storage/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: cargo build (release)
+        working-directory: chusql-storage
+        run: cargo build --release
+
+      - name: cargo build (debug, IPC 用例要它)
+        working-directory: chusql-storage
+        run: cargo build --bin chusql-storage
+
+      - name: cargo test
+        working-directory: chusql-storage
+        run: cargo test --release
+
+      - name: cargo clippy (-D warnings)
+        working-directory: chusql-storage
+        run: cargo clippy --all-targets -- -D warnings
+
+      # 故意不做 rustfmt 检查：仓库里没有 rustfmt.toml，历史代码也不是按当前 rustfmt 的
+      # 默认风格排的，直接跑会报上百处折行与 use 排序差异；格式化不是本仓的门禁，别拿它
+      # 当交付标准。
+
+      # ---------- Haskell ----------
+      - name: Haskell toolchain
+        uses: haskell-actions/setup@v2
+        with:
+          ghc-version: '9.10.3'
+          enable-stack: true
+          stack-version: '3.11.1'
+
+      - name: Cache stack
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.stack
+            chusql-engine/.stack-work
+            chusql-web/.stack-work
+            chusql-cli/.stack-work
+          key: ${{ runner.os }}-stack-${{ hashFiles('**/stack.yaml', '**/stack.yaml.lock') }}
+          restore-keys: ${{ runner.os }}-stack-
+
+      - name: stack build (cabal 里带 -Wall)
+        working-directory: chusql-cli
+        run: stack build --fast
+
+      - name: engine tests
+        working-directory: chusql-engine
+        run: stack test --fast
+
+      - name: web tests
+        working-directory: chusql-web
+        run: stack test --fast
+
+      - name: cli tests
+        working-directory: chusql-cli
+        run: stack test chusql-cli --fast
+
