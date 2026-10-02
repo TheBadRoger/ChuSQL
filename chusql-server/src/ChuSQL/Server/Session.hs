@@ -27,10 +27,11 @@ module ChuSQL.Server.Session
 import ChuSQL.Core.Model (Value (..))
 import ChuSQL.Core.Protocol (Account, QueryResult (..), queryResultJson)
 import ChuSQL.Core.Engine.Storage.IPC (TableInfo (..))
+import qualified ChuSQL.Core.Engine.Error as E
 import ChuSQL.Core.Engine.Syntax.AST (Statement (..))
 import ChuSQL.Core.Engine.Syntax.Parser (parseStatement)
 import ChuSQL.Interface.AccountTable (systemTableInfo)
-import ChuSQL.Interface.Auth (Credential, defaultSessionPolicy, newSessionStore)
+import ChuSQL.Interface.Auth (defaultSessionPolicy, newSessionStore)
 import ChuSQL.Server.Accounts
 import ChuSQL.Server.Backend (Backend (..), StatementResult (..))
 import ChuSQL.Server.Policy (configurePasswordPolicy)
@@ -54,12 +55,7 @@ data SessionError = SessionError
 
 -- | 引擎报错翻成错误码
 engineErrorCode :: String -> SessionError
-engineErrorCode err
-    | "no database selected" `T.isInfixOf` message = SessionError "no_database" message
-    | "unknown table" `T.isInfixOf` message = SessionError "not_found" message
-    | otherwise = SessionError "query_error" message
-  where
-    message = T.pack err
+engineErrorCode err = SessionError (T.pack (E.errorCode err)) (T.pack err)
 
 data Session = Session
     { ssBackend :: Backend
@@ -71,10 +67,10 @@ data Session = Session
     }
 
 -- | 开一个会话：账号与角色服务、配置策略都和 Web 端一致
-newSession :: Backend -> Credential -> FilePath -> IO Session
-newSession backend credential settingsFile = do
+newSession :: Backend -> Text -> FilePath -> IO Session
+newSession backend name settingsFile = do
     sessions <- newSessionStore getCurrentTime defaultSessionPolicy
-    accountsService <- newAccounts backend sessions credential
+    accountsService <- newAccounts backend sessions name
     privileges <- newPrivileges backend
     configurePasswordPolicy accountsService settingsFile
     -- 服务启动后只有系统库：没 USE 之前不预设任何工作库
@@ -106,7 +102,7 @@ reloadPolicy session = do
 sessionUser :: Session -> IO (Maybe Text)
 sessionUser session = fmap principalName <$> readIORef (ssPrincipal session)
 
--- | 是不是配置里的 root
+-- | 是不是管理员
 sessionIsAdmin :: Session -> IO Bool
 sessionIsAdmin session = maybe False principalIsRoot <$> readIORef (ssPrincipal session)
 

@@ -3,7 +3,7 @@
 # 整条链路共用这一份文件，按分区各管各的，互不影响：
 #   数据库服务：[server]（TCP 监听地址、端口、单行上限、单次结果行数上限）
 #     —— 只有它装入 chusql_core_storage 动态库并独占数据目录
-#   Web / 命令行：[web]（账号口令、会话、分页上限、静态目录），都经 [server] 走
+#   Web / 命令行：[web]（账号名、会话、分页上限、静态目录），都经 [server] 走
 # 数据目录在 [storage] data_dir；这一行是安装时会替换的占位：
 # 不写就按平台惯例（Windows %LOCALAPPDATA%\ChuSQL\data，
 # Unix ${XDG_DATA_HOME:-$HOME/.local/share}/chusql/data）。
@@ -41,9 +41,9 @@ level = "info"
 host = "127.0.0.1"
 port = 7778
 static_dir = "static"
-# 管理员账号与口令。口令留空表示"只允许管理员免密登录"，普通账号一律不能登录。
+# 管理员账号名。口令存在系统表 __system_users 里，不写进这份文件；
+# 首启为空口令，登录后用 ALTER USER 或在 Web 账号页设置。
 user = "root"
-password = ""
 # 会话与登录限流
 session_idle = 28800
 session_max = 86400

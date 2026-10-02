@@ -243,16 +243,11 @@ comparison db place env a b = do
         then Right (InferType CBool)
         else Left (place ++ ": both sides of = must have the same type, got " ++ renderType ta ++ " and " ++ renderType tb)
 
--- | 两类能不能比
+-- | 两类能不能比，类型族规则来自 Model
 compatible :: InferredType -> InferredType -> Bool
 compatible InferNull _ = True
 compatible _ InferNull = True
-compatible (InferType a) (InferType b)
-    | numericType a && numericType b = True
-    | typeClassOf a == typeClassOf b = True
-    | typeClassOf a == TemporalClass && typeClassOf b == TextClass = True
-    | typeClassOf b == TemporalClass && typeClassOf a == TextClass = True
-    | otherwise = False
+compatible (InferType a) (InferType b) = comparableTypes a b
 
 -- | 逻辑运算两边的类型检查
 boolean :: Database -> String -> Scope -> Expr -> Expr -> Either String InferredType

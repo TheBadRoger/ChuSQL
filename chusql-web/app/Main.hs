@@ -3,20 +3,17 @@
 module Main (main) where
 
 import ChuSQL.Web.API (AppEnv (..), Live (..), newAppEnvAt, setLive, webApp)
-import ChuSQL.Interface.Auth (Credential (..), SessionPolicy (..), setPayloadPolicy)
+import ChuSQL.Interface.Auth (SessionPolicy (..), setPayloadPolicy)
 import ChuSQL.Interface.Config (
     ServerConfig (..),
     WebConfig (..),
-    defaultPassword,
     defaultUser,
     loadServerConfigAt,
     loadWebConfigAt,
-    resolveCredential,
-    resolvePlainPassword,
+    legacyPasswordKey,
     resolveStaticDir,
     rootUserName,
     staticDirCandidates,
-    usingDefaultCredentials,
  )
 import ChuSQL.Interface.Link (clientPing, closeClient, connectClient)
 import ChuSQL.Interface.RateLimit (newRateLimiter)
@@ -126,7 +123,7 @@ usage = do
     putStrLn "config: chusql.toml sits at a fixed place and its sections hold every knob below;"
     putStrLn "        Windows: %APPDATA%\\ChuSQL\\chusql.toml"
     putStrLn "        other:   $XDG_CONFIG_HOME/ChuSQL/chusql.toml (or ~/.config/ChuSQL/chusql.toml)"
-    putStrLn "        [web] host/port/static_dir/user/password and the limits;"
+    putStrLn "        [web] host/port/static_dir/user (administrator name) and the limits;"
     putStrLn "        [storage] data_dir; [page] size; [btree] order; [buffer] pool_size; [log] level"
     putStrLn ""
     putStrLn "  --config FILE          read that config file instead ([web] host ...)"
@@ -146,9 +143,9 @@ usage = do
     putStrLn "  --max-sql-length N     max SQL characters          ([web] max_sql_length, default 20000)"
     putStrLn "  --seed BOOL            load demo data when the db is empty ([web] seed, default false)"
     putStrLn ""
-    putStrLn "administrator password: user / password in the [web] section of chusql.toml, else the built-in demo"
-    putStrLn "  an empty password means the administrator signs in with no password; ordinary accounts are then refused"
-    putStrLn ("without either the demo administrator is " ++ T.unpack defaultUser ++ " / " ++ T.unpack defaultPassword)
+    putStrLn "administrator password: lives in the __system_users system table, never in chusql.toml"
+    putStrLn "  the installer always sets one; an account whose hash is still empty signs in with an empty password"
+    putStrLn ("  the [web] user key only picks the administrator name (default " ++ T.unpack defaultUser ++ ")")
     putStrLn "ordinary accounts: CREATE USER / ALTER USER / DROP USER from the SQL console (administrator only)"
     putStrLn "storage: the server owns the data directory and loads the chusql_core_storage library;"
     putStrLn "  this process is a plain TCP client: every statement, lookup and account request goes to it"
@@ -210,6 +207,7 @@ run opts = do
             let settingsFile = configPath
                 policy = SessionPolicy (fromIntegral (wcSessionIdle cfg)) (fromIntegral (wcSessionMax cfg))
             saved <- readSettingsFile settingsFile
+            legacy <- legacyPasswordKey settingsFile
             config <- loadServerConfigAt settingsFile
             limiter <-
                 newRateLimiter
@@ -227,7 +225,7 @@ run opts = do
             setLive env (liveFromConfig cfg)
             app <- webApp env
             printBanner cfg configPath staticDir
-            reportCredential cfg saved
+            reportCredential cfg saved legacy
             checkServer (aeServerHost env) (aeServerPort env)
             seedIfWanted cfg saved (aeServerHost env) (aeServerPort env)
             let settings =
@@ -261,23 +259,17 @@ serve settings app = do
             putStrLn "  on Windows: netsh interface ipv4 show excludedportrange protocol=tcp"
             exitFailure
 
--- | 口令是从哪来的（用了内置默认口令就明确警告）
-reportCredential :: WebConfig -> Map.Map Text Text -> IO ()
-reportCredential cfg saved = do
-    credential <- resolveCredential cfg saved
-    if usingDefaultCredentials saved
+-- | 报告管理员账号状态：配置里还留着明文口令键就提醒
+reportCredential :: WebConfig -> Map.Map Text Text -> Bool -> IO ()
+reportCredential cfg saved legacy = do
+    putStrLn ("administrator: " ++ T.unpack (rootUserName cfg saved))
+    if legacy
         then do
-            putStrLn ""
-            putStrLn "  !! Administrator credentials are not configured; the built-in demo password is in use:"
-            putStrLn ("  !!   user " ++ T.unpack (credUser credential) ++ " / password " ++ T.unpack defaultPassword)
-            putStrLn "  !!   set user / password in the [web] section of chusql.toml and restart"
-            putStrLn ""
-        else
-            if T.null (credEncoded credential)
-                then putStrLn ("administrator: " ++ T.unpack (rootUserName cfg saved) ++ " (passwordless: only the administrator may sign in)")
-                else putStrLn ("administrator: " ++ T.unpack (rootUserName cfg saved) ++ " (credentials come from the settings file only)")
+            putStrLn "  !! the [web] section still carries a plaintext password key; it is ignored now"
+            putStrLn "  !! remove it: the administrator password lives in the __system_users system table"
+        else pure ()
 
--- | 配了 seed 就以管理员身份补演示数据
+-- | 配了 seed 就补演示数据（管理员已设口令时跳过）
 seedIfWanted :: WebConfig -> Map.Map Text Text -> Text -> Int -> IO ()
 seedIfWanted cfg saved host port
     | not (wcSeedDemo cfg) = pure ()
@@ -287,9 +279,9 @@ seedIfWanted cfg saved host port
             Left message -> TIO.putStrLn ("demo data skipped: " <> message)
             Right client -> do
                 session <- newSession client
-                signed <- authenticateSession session (rootUserName cfg saved) (resolvePlainPassword saved)
+                signed <- authenticateSession session (rootUserName cfg saved) ""
                 case signed of
-                    Left message -> TIO.putStrLn ("demo data skipped: " <> message)
+                    Left message -> TIO.putStrLn ("demo data skipped: " <> message <> " (set the administrator password after seeding)")
                     Right () -> do
                         result <- seedDemo session
                         case result of

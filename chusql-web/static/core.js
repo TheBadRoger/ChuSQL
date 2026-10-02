@@ -18,7 +18,7 @@ export function escapeHtml(value) {
 const identifierPattern = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 // 账号表：在 system 库里像普通表一样浏览，写入会翻译成账号命令。
-export const accountsTable = '__chusql_users';
+export const accountsTable = '__system_users';
 
 // 值转 SQL 字面量（字符串加引号转义）。
 export function sqlLiteral(value) {

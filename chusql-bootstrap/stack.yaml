@@ -6,7 +6,5 @@ extra-lib-dirs:
 packages:
     - .
     - ../chusql-core/engine
-    - ../chusql-server
-    - ../chusql-bootstrap
     - ../chusql-core/model
     - ../chusql-interface

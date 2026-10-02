@@ -3,11 +3,12 @@
 module ChuSQL.Server.Accounts (
     Accounts, AccountError (..), Principal (..), PasswordPolicy (..), defaultPasswordPolicy,
     newAccounts, accountsPolicy, setAccountsPolicy, passwordAllowed,
-    rootUserName, principalName, principalIsRoot,
+    ensureRootAccount, administratorPasswordless, rootUserName, principalName, principalIsRoot,
     authenticate, currentPrincipal,
     listAccounts, findAccount, AccountCommand (..), accountCommand, runAccountCommand,
 ) where
 
+import ChuSQL.Core.Engine.Error (accountErrorCode)
 import ChuSQL.Core.Engine.Storage.IPC (Account (..), Request (..))
 import ChuSQL.Core.Engine.Syntax.AST (Statement (..))
 import ChuSQL.Interface.Auth
@@ -19,11 +20,11 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import qualified Data.Text as T
 
--- 账号服务：root 来自配置，普通账号由 root 用 CREATE/ALTER/DROP USER 管理，口令在此校验并派生哈希。
+-- 账号服务：管理员是系统表里名字固定的那一行，口令哈希存在表里，普通账号由管理员用 CREATE/ALTER/DROP USER 管理。
 
 data AccountError = AccountError Text Text deriving (Show, Eq)
 
--- | 当前身份：配置里的管理员，或系统表里的一个普通账号
+-- | 当前身份：名字固定的管理员，或系统表里的一个普通账号
 data Principal
     = Root Text
     | Ordinary Account
@@ -39,7 +40,7 @@ principalName :: Principal -> Text
 principalName (Root name) = name
 principalName (Ordinary a) = accountUser a
 
--- | 是不是配置里的管理员
+-- | 是不是名字固定的管理员
 principalIsRoot :: Principal -> Bool
 principalIsRoot (Root _) = True
 principalIsRoot (Ordinary _) = False
@@ -49,23 +50,23 @@ data Accounts = Accounts
     , acSessions :: SessionStore
     , acLock :: MVar ()
     , acPolicy :: IORef PasswordPolicy
-    , acRoot :: Credential
+    , acRootName :: Text
     }
 
--- | 建账号服务，记录配置根账号
-newAccounts :: Backend -> SessionStore -> Credential -> IO Accounts
-newAccounts backend sessions credential = do
+-- | 建账号服务，记下管理员名字
+newAccounts :: Backend -> SessionStore -> Text -> IO Accounts
+newAccounts backend sessions name = do
     lock <- newMVar ()
     policy <- newIORef defaultPasswordPolicy
-    pure (Accounts backend sessions lock policy credential)
+    pure (Accounts backend sessions lock policy (normalize name))
 
 -- | 账号名统一小写去空白
 normalize :: Text -> Text
 normalize = T.toLower . T.strip
 
--- | 配置里的管理员叫什么
+-- | 管理员叫什么
 rootName :: Accounts -> Text
-rootName = normalize . credUser . acRoot
+rootName = acRootName
 
 -- | 管理员名字（界面显示用）
 rootUserName :: Accounts -> Text
@@ -123,16 +124,42 @@ storageFailure = AccountError "storage_error" "account storage unavailable"
 unauthorized :: AccountError
 unauthorized = AccountError "unauthorized" "invalid account or session"
 
--- | 存储侧报错翻成账号错误
+-- | 存储侧报错翻成账号错误，码统一由引擎错误表给出
 storageResult :: Either String [Account] -> Either AccountError ()
 storageResult (Right _) = Right ()
-storageResult (Left "account already exists") = Left (AccountError "conflict" "account already exists")
-storageResult (Left "unknown account") = Left (AccountError "not_found" "unknown account")
-storageResult (Left _) = Left storageFailure
+storageResult (Left message) = Left (AccountError code text)
+  where
+    -- | 认得的码原样用，其余存储细节不外泄
+    code = T.pack (accountErrorCode message)
+    text = if code == failureCode then failureText else T.pack message
+    AccountError failureCode failureText = storageFailure
 
--- | 读系统表里的普通账号
-readAccounts :: Accounts -> IO (Either AccountError [Account])
-readAccounts service = fmap (either (const (Left storageFailure)) Right) (beAccounts (acBackend service) ReqAccountsList)
+-- | 读系统表里的账号
+readAccounts :: Backend -> IO (Either AccountError [Account])
+readAccounts backend = fmap (either (const (Left storageFailure)) Right) (beAccounts backend ReqAccountsList)
+
+-- | 表里没有管理员那一行就补一行空哈希，表示还没设口令
+ensureRootAccount :: Backend -> Text -> IO (Either AccountError ())
+ensureRootAccount backend name = do
+    stored <- readAccounts backend
+    case stored of
+        Left err -> pure (Left err)
+        Right accounts
+            | any ((== normalize name) . accountUser) accounts -> pure (Right ())
+            | otherwise -> do
+                created <- beAccounts backend (ReqAccountCreate (normalize name) "")
+                pure $ case created of
+                    Right _ -> Right ()
+                    Left "account already exists" -> Right ()
+                    Left _ -> Left storageFailure
+
+-- | 管理员是不是还没设口令
+administratorPasswordless :: Backend -> Text -> IO Bool
+administratorPasswordless backend name = do
+    stored <- readAccounts backend
+    pure $ case stored of
+        Right accounts -> any (\a -> accountUser a == normalize name && T.null (accountHash a)) accounts
+        Left _ -> False
 
 -- | 按令牌解析当前身份，版本对不上即失效
 currentUnlocked :: Accounts -> Text -> IO (Either AccountError Principal)
@@ -140,66 +167,63 @@ currentUnlocked service token = do
     session <- lookupVersionedSession (acSessions service) token
     case session of
         Nothing -> pure (Left unauthorized)
-        Just (user, revision)
-            | user == rootName service && revision == Nothing -> pure (Right (Root (rootName service)))
-            | otherwise -> do
-                stored <- readAccounts service
-                pure $ do
-                    accounts <- stored
-                    account <- case filter ((== user) . accountUser) accounts of
-                        [a] -> Right a
-                        _ -> Left unauthorized
-                    if revision == Just (accountRevision account)
-                        then Right (Ordinary account)
-                        else Left unauthorized
+        Just (user, revision) -> do
+            stored <- readAccounts (acBackend service)
+            pure $ do
+                accounts <- stored
+                account <- case filter ((== user) . accountUser) accounts of
+                    [a] -> Right a
+                    _ -> Left unauthorized
+                if revision == Just (accountRevision account)
+                    then Right (if user == rootName service then Root user else Ordinary account)
+                    else Left unauthorized
 
 -- | 加锁解析当前身份
 currentPrincipal :: Accounts -> Text -> IO (Either AccountError Principal)
 currentPrincipal service token = withMVar (acLock service) $ \_ -> currentUnlocked service token
 
--- | 登录：先比 root，再查普通账号；空口令即免密
+-- | 登录：比哈希，管理员未设口令时只收空口令
 authenticate :: Accounts -> Text -> Text -> IO (Either AccountError Text)
-authenticate service user password = withMVar (acLock service) $ \_ ->
-    if normalize user == rootName service
-        then signInRoot
-        else
-            if passwordless
-                then pure (Left (AccountError "forbidden" "this server only accepts the administrator"))
-                else signInOrdinary
+authenticate service user password = withMVar (acLock service) $ \_ -> do
+    stored <- readAccounts (acBackend service)
+    case stored of
+        Left err -> pure (Left err)
+        Right accounts
+            | name == rootName service -> signInRoot accounts
+            | unset accounts -> pure (Left ordinaryRefused)
+            | otherwise -> signInOrdinary accounts
   where
-    -- | 配置里没有口令
-    passwordless = T.null (credEncoded (acRoot service))
+    name = normalize user
+    ordinaryRefused = AccountError "forbidden" "this server only accepts the administrator"
+    -- | 管理员那一行还没设口令（或压根不在表里）
+    unset accounts = case filter ((== rootName service) . accountUser) accounts of
+        [a] -> T.null (accountHash a)
+        _ -> True
     -- | 管理员登录
-    signInRoot
-        | passwordless =
-            if T.null password
-                then Right <$> createVersionedSession (acSessions service) (rootName service) Nothing
-                else pure (Left unauthorized)
-        | verifyPassword (credEncoded (acRoot service)) password =
-            Right <$> createVersionedSession (acSessions service) (rootName service) Nothing
-        | otherwise = pure (Left unauthorized)
+    signInRoot accounts = case filter ((== rootName service) . accountUser) accounts of
+        [a] | T.null (accountHash a) && T.null password -> issue a
+        [a] | not (T.null (accountHash a)) && verifyPassword (accountHash a) password -> issue a
+        _ -> pure (Left unauthorized)
     -- | 普通账号登录
-    signInOrdinary = do
-        stored <- readAccounts service
-        case stored of
-            Left err -> pure (Left err)
-            Right accounts -> case filter ((== normalize user) . accountUser) accounts of
-                [a] | verifyPassword (accountHash a) password -> do
-                    stamp <- currentStamp
-                    written <- beAccounts (acBackend service) (ReqAccountLogin (accountUser a) (Just stamp))
-                    case written of
-                        Left _ -> pure (Left storageFailure)
-                        Right _ -> Right <$> createVersionedSession (acSessions service) (accountUser a) (Just (accountRevision a))
-                _ -> pure (Left unauthorized)
+    signInOrdinary accounts = case filter ((== name) . accountUser) accounts of
+        [a] | not (T.null (accountHash a)) && verifyPassword (accountHash a) password -> issue a
+        _ -> pure (Left unauthorized)
+    -- | 记一次登录再发会话
+    issue a = do
+        stamp <- currentStamp
+        written <- beAccounts (acBackend service) (ReqAccountLogin (accountUser a) (Just stamp))
+        case written of
+            Left _ -> pure (Left storageFailure)
+            Right _ -> Right <$> createVersionedSession (acSessions service) (accountUser a) (Just (accountRevision a))
 
--- | 系统表里的普通账号清单（root 专用）
+-- | 系统表里的账号清单（含管理员）
 listAccounts :: Accounts -> IO (Either AccountError [Account])
-listAccounts service = withMVar (acLock service) $ \_ -> readAccounts service
+listAccounts service = withMVar (acLock service) $ \_ -> readAccounts (acBackend service)
 
--- | 按用户名找一个普通账号
+-- | 按用户名找一个账号
 findAccount :: Accounts -> Text -> IO (Either AccountError Account)
 findAccount service name = withMVar (acLock service) $ \_ -> do
-    stored <- readAccounts service
+    stored <- readAccounts (acBackend service)
     pure $ do
         accounts <- stored
         case filter ((== normalize name) . accountUser) accounts of
@@ -217,22 +241,26 @@ createUser service name password = withMVar (acLock service) $ \_ -> do
             encoded <- hashPassword password
             storageResult <$> beAccounts (acBackend service) (ReqAccountCreate (normalize name) encoded)
 
--- | 管理员重置普通账号口令
+-- | 设账号口令；管理员不受口令策略约束，空口令即免密
 resetPassword :: Accounts -> Text -> Text -> IO (Either AccountError ())
 resetPassword service name password = withMVar (acLock service) $ \_ -> do
     policy <- accountsPolicy service
-    case validateNewName service name >> passwordAllowed policy password of
+    let admin = normalize name == rootName service
+        checked = if admin then validateUserName name else validateNewName service name >> passwordAllowed policy password
+    case checked of
         Left err -> pure (Left err)
         Right () -> do
-            encoded <- hashPassword password
+            encoded <- if admin && T.null password then pure "" else hashPassword password
             storageResult <$> beAccounts (acBackend service) (ReqAccountReset (normalize name) encoded)
 
 -- | 删一个普通账号
 dropUser :: Accounts -> Text -> IO (Either AccountError ())
 dropUser service name = withMVar (acLock service) $ \_ ->
-    case validateUserName name of
-        Left err -> pure (Left err)
-        Right () -> storageResult <$> beAccounts (acBackend service) (ReqAccountDrop (normalize name))
+    if normalize name == rootName service
+        then pure (Left (AccountError "bad_request" "the administrator cannot be dropped"))
+        else case validateUserName name of
+            Left err -> pure (Left err)
+            Right () -> storageResult <$> beAccounts (acBackend service) (ReqAccountDrop (normalize name))
 
 -- | 账号管理命令：SQL 语句与一键接口在这上面汇合
 data AccountCommand

@@ -4,21 +4,17 @@ module ChuSQL.Interface.Config (
     WebConfig (..),
     defaultWebConfig,
     defaultUser,
-    defaultPassword,
-    usingDefaultCredentials,
     loadWebConfigAt,
-    resolveCredential,
+    legacyPasswordKey,
     resolveStaticDir,
     staticDirCandidates,
     rootUserName,
     canonicalSettingKeys,
-    resolvePlainPassword,
     ServerConfig (..),
     defaultServerConfig,
     loadServerConfigAt,
 ) where
 
-import ChuSQL.Interface.Auth (Credential (..), hashPassword)
 import ChuSQL.Interface.TOML (readSection)
 import Data.Char (toLower)
 import qualified Data.Map.Strict as Map
@@ -33,10 +29,6 @@ import Text.Read (readMaybe)
 -- | 默认账号名
 defaultUser :: Text
 defaultUser = "root"
-
--- | 默认口令（只为方便本地测试；生产/对外必须覆盖）
-defaultPassword :: Text
-defaultPassword = "chusql"
 
 -- | Web 管理端配置
 data WebConfig = WebConfig
@@ -106,25 +98,15 @@ keyAliases =
     , ("password_classes", "password-classes")
     ]
 
--- | 这份配置用的还是内置默认口令吗
-usingDefaultCredentials :: Map.Map Text Text -> Bool
-usingDefaultCredentials saved = Map.notMember "password" saved
+-- | 配置文件的 [web] 分节里是否还留着明文口令键
+legacyPasswordKey :: FilePath -> IO Bool
+legacyPasswordKey path = Map.member "password" <$> readSection path "web"
 
 -- | 设置文件里某个键的非空值
 nonEmptyValue :: Text -> Map.Map Text Text -> Maybe Text
--- | 查一个键
 nonEmptyValue key saved = case T.strip <$> Map.lookup key saved of
     Just value | not (T.null value) -> Just value
     _ -> Nothing
-
--- | root 凭据：明文就哈希，留空免密，缺省用演示口令
-resolveCredential :: WebConfig -> Map.Map Text Text -> IO Credential
-resolveCredential cfg saved = do
-    encoded <- case Map.lookup "password" saved of
-        Just plain | not (T.null (T.strip plain)) -> hashPassword (T.strip plain)
-        Just _ -> pure ""
-        Nothing -> hashPassword defaultPassword
-    pure (Credential (rootUserName cfg saved) encoded)
 
 -- | 管理员名字：命令行 > 设置文件 > 内置默认
 rootUserName :: WebConfig -> Map.Map Text Text -> Text
@@ -143,12 +125,6 @@ loadWebConfigAt path = do
 withStorage :: Map.Map Text Text -> WebConfig -> WebConfig
 withStorage storage cfg =
     cfg{wcDataDir = T.unpack <$> nonEmptyValue "data_dir" storage}
-
--- | 管理员明文口令，没配回落到演示口令，显式留空回空串
-resolvePlainPassword :: Map.Map Text Text -> Text
-resolvePlainPassword saved = case Map.lookup "password" saved of
-    Just plain -> T.strip plain
-    Nothing -> defaultPassword
 
 -- | [web] 分区里的启动参数，缺失或坏值一律回到内置默认
 webConfigFromSection :: Map.Map Text Text -> WebConfig

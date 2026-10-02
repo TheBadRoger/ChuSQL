@@ -59,6 +59,7 @@ test-suite chusql-web-test
     hs-source-dirs:   test
     other-modules:    Gates
     build-tool-depends: chusql-server:chusql-server
+                      , chusql-bootstrap:csql-bootstrap
     build-depends:    base
                     , aeson
                     , bytestring

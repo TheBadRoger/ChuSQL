@@ -1,6 +1,6 @@
 cabal-version: 2.4
 
-name:           chusql-fullchain
+name:           chusql-benchmark
 version:        1.0.0
 synopsis:       ChuSQL 全链路基准：起真 server，全部请求走 TCP
 description:    以基准客户端身份起一个 chusql-server 进程（存储与引擎都在那个进程里），
@@ -8,10 +8,11 @@ description:    以基准客户端身份起一个 chusql-server 进程（存储�
                 本程序不链引擎、不链 server 库，只用 TCP 客户端与协议模型。
 build-type:     Simple
 
-executable chusql-fullchain
+executable chusql-benchmark
     main-is:          Main.hs
     hs-source-dirs:   src
     build-tool-depends: chusql-server:chusql-server
+                      , chusql-bootstrap:csql-bootstrap
     build-depends:    base >= 4.14 && < 5
                     , chusql-core-model
                     , chusql-interface

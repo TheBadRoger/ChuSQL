@@ -80,6 +80,7 @@ data Request
     | ReqAccountDrop T.Text
     | ReqScan String
     | ReqScanColumns String [String]
+    | ReqScanShard String (Maybe [String]) Int Int
     | ReqInsert String Row
     | ReqInsertBatch String [Row]
     | ReqDeleteKeys String [Int]
@@ -111,6 +112,14 @@ instance ToJSON Request where
     toJSON ReqPing = object ["method" .= ("ping" :: T.Text)]
     toJSON (ReqScan t) = object ["method" .= ("scan" :: T.Text), "table" .= t]
     toJSON (ReqScanColumns t cols) = object ["method" .= ("scan" :: T.Text), "table" .= t, "columns" .= cols]
+    toJSON (ReqScanShard t cols shard shards) =
+        object
+            [ "method" .= ("scan_shard" :: T.Text)
+            , "table" .= t
+            , "columns" .= cols
+            , "shard" .= shard
+            , "shards" .= shards
+            ]
     toJSON (ReqInsert t r) =
         object
             [ "method" .= ("insert" :: T.Text)

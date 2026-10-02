@@ -9,3 +9,4 @@ packages:
     - ../chusql-core/model
     - ../chusql-interface
     - ../chusql-server
+    - ../chusql-bootstrap

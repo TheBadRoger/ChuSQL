@@ -5,7 +5,6 @@ pub mod catalog;
 pub mod config;
 pub mod ffi;
 pub mod heap;
-pub mod initsql;
 pub mod log;
 pub mod page;
 pub mod protocol;

@@ -1,9 +1,9 @@
-module ChuSQL.Core.Engine.Algebra.Op (RelOp (..), renderPlan) where
+module ChuSQL.Core.Engine.Algebra.Op (RelOp (..), relOpCols, renderPlan) where
 
-import ChuSQL.Core.Model (Value)
+import ChuSQL.Core.Model
 import ChuSQL.Core.Engine.Syntax.AST (Expr, JoinKind (..), SortDir)
 
--- 关系代数算子定义与算子树文本渲染。
+-- 关系代数算子定义、输出列推导与算子树文本渲染。
 
 data RelOp
     = Scan (Maybe String) String (Maybe [String])
@@ -18,6 +18,27 @@ data RelOp
     | Limit Int RelOp
     | Join JoinKind RelOp RelOp Expr
     deriving (Show, Eq)
+
+-- | 算子会产出哪些列
+relOpCols :: Database -> RelOp -> [String]
+relOpCols _ Unit = []
+relOpCols _ (Compute items _) = map fst items
+relOpCols _ (Aggregate keys aggs _) = keys ++ map fst aggs
+relOpCols _ (Scan mAlias _ (Just cols)) = map (qualify mAlias) cols
+relOpCols db (Scan mAlias tbl Nothing) =
+    case lookup tbl db of
+        Nothing -> []
+        Just t -> map (prefix ++) (colNames t)
+  where
+    prefix = maybe "" (++ ".") mAlias
+relOpCols db (Lookup mAlias tbl _ _) = relOpCols db (Scan mAlias tbl Nothing)
+relOpCols db (Range mAlias tbl _ _ _) = relOpCols db (Scan mAlias tbl Nothing)
+relOpCols db (Filter _ x) = relOpCols db x
+relOpCols _ (Project ["*"] _) = ["*"]
+relOpCols _ (Project cols _) = cols
+relOpCols db (Sort _ x) = relOpCols db x
+relOpCols db (Limit _ x) = relOpCols db x
+relOpCols db (Join _ l r _) = relOpCols db l ++ relOpCols db r
 
 -- | 连接的显示名
 kindLabel :: JoinKind -> String

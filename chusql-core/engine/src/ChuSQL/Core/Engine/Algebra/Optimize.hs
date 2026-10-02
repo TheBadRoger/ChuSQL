@@ -1,33 +1,14 @@
-module ChuSQL.Core.Engine.Algebra.Optimize (optimize, pushProject, relOpCols) where
+module ChuSQL.Core.Engine.Algebra.Optimize (optimize, pushProject) where
 
-import ChuSQL.Core.Engine.Algebra.Expr (colsInExpr, evalExpr)
-import ChuSQL.Core.Engine.Algebra.Op (RelOp (..))
+import ChuSQL.Core.Engine.Algebra.Cost (indexCheaper, pointRows, rangeRows, tableMetaOf)
+import ChuSQL.Core.Engine.Algebra.Expr (colsInExpr, evalExpr, hasDivision)
+import ChuSQL.Core.Engine.Algebra.JoinOrder (reorderJoins)
+import ChuSQL.Core.Engine.Algebra.Op (RelOp (..), relOpCols)
 import ChuSQL.Core.Model
 import ChuSQL.Core.Engine.Syntax.AST (Expr (..), JoinKind (..))
 import Data.List (nub)
 
--- 查询优化：谓词下推、投影下推与常量折叠。
-
--- | 算子会产出哪些列
-relOpCols :: Database -> RelOp -> [String]
-relOpCols _ Unit = []
-relOpCols _ (Compute items _) = map fst items
-relOpCols _ (Aggregate keys aggs _) = keys ++ map fst aggs
-relOpCols _ (Scan mAlias _ (Just cols)) = map (qualify mAlias) cols
-relOpCols db (Scan mAlias tbl Nothing) =
-    case lookup tbl db of
-        Nothing -> []
-        Just t -> map (prefix ++) (colNames t)
-  where
-    prefix = maybe "" (++ ".") mAlias
-relOpCols db (Lookup mAlias tbl _ _) = relOpCols db (Scan mAlias tbl Nothing)
-relOpCols db (Range mAlias tbl _ _ _) = relOpCols db (Scan mAlias tbl Nothing)
-relOpCols db (Filter _ x) = relOpCols db x
-relOpCols _ (Project ["*"] _) = ["*"]
-relOpCols _ (Project cols _) = cols
-relOpCols db (Sort _ x) = relOpCols db x
-relOpCols db (Limit _ x) = relOpCols db x
-relOpCols db (Join _ l r _) = relOpCols db l ++ relOpCols db r
+-- 查询优化：谓词下推、投影下推、常量折叠、扫描方式与连接顺序选择。
 
 -- | need 是否都在 have 里
 isSubsetOf :: [String] -> [String] -> Bool
@@ -89,24 +70,6 @@ pushOne _ (Filter p (Filter q x))
 pushOne _ (Filter p (Sort spec x))
     | not (hasDivision p) = Sort spec (Filter p x)
 pushOne _ op = op
-
--- | 除法可能报错，不能提前或延后求值
-hasDivision :: Expr -> Bool
-hasDivision e = case e of
-    Div _ _ -> True
-    Neg a -> hasDivision a
-    Add a b -> both a b
-    Sub a b -> both a b
-    Mul a b -> both a b
-    Gt a b -> both a b
-    Lt a b -> both a b
-    Eq a b -> both a b
-    And a b -> both a b
-    Or a b -> both a b
-    _ -> False
-  where
-    -- | 两个子表达式里任意一个有除法
-    both a b = hasDivision a || hasDivision b
 
 -- | 检查子计划中可能报错的除法
 planHasDivision :: RelOp -> Bool
@@ -183,24 +146,38 @@ foldConstants (And a b) = foldNode (And (foldConstants a) (foldConstants b))
 foldConstants (Or a b) = foldNode (Or (foldConstants a) (foldConstants b))
 foldConstants e = e
 
+-- | 点查值不值得改写；没有统计就按老规矩改
+worthLookup :: Database -> String -> String -> Bool
+worthLookup db t col = case tableMetaOf db t of
+    Nothing -> True
+    Just m -> indexCheaper m col (pointRows m col)
+
+-- | 范围扫描值不值得改写；没有统计就按老规矩改
+worthRange :: Database -> String -> String -> Bool
+worthRange db t col = case tableMetaOf db t of
+    Nothing -> True
+    Just m -> indexCheaper m col (rangeRows m)
+
 -- | 单节点重写
 rewriteNode :: Database -> RelOp -> RelOp
-rewriteNode _ (Filter (Eq (Col k) (LitInt v)) (Scan mAlias t Nothing)) =
-    Lookup mAlias t (unqualify mAlias k) (VInt v)
-rewriteNode _ (Filter (Eq (Col k) (LitStr v)) (Scan mAlias t Nothing)) =
-    Lookup mAlias t (unqualify mAlias k) (VStr v)
-rewriteNode _ (Filter (And (Gt (Col k1) (LitInt lo)) (Lt (Col k2) (LitInt hi))) (Scan mAlias t Nothing))
-    | k1 == k2 = Range mAlias t (unqualify mAlias k1) (Just (VInt lo, False)) (Just (VInt hi, False))
-rewriteNode _ (Filter (And (Gt (Col k1) (LitStr lo)) (Lt (Col k2) (LitStr hi))) (Scan mAlias t Nothing))
-    | k1 == k2 = Range mAlias t (unqualify mAlias k1) (Just (VStr lo, False)) (Just (VStr hi, False))
-rewriteNode _ (Filter (Gt (Col k) (LitInt v)) (Scan mAlias t Nothing)) =
-    Range mAlias t (unqualify mAlias k) (Just (VInt v, False)) Nothing
-rewriteNode _ (Filter (Gt (Col k) (LitStr v)) (Scan mAlias t Nothing)) =
-    Range mAlias t (unqualify mAlias k) (Just (VStr v, False)) Nothing
-rewriteNode _ (Filter (Lt (Col k) (LitInt v)) (Scan mAlias t Nothing)) =
-    Range mAlias t (unqualify mAlias k) Nothing (Just (VInt v, False))
-rewriteNode _ (Filter (Lt (Col k) (LitStr v)) (Scan mAlias t Nothing)) =
-    Range mAlias t (unqualify mAlias k) Nothing (Just (VStr v, False))
+rewriteNode db (Filter (Eq (Col k) (LitInt v)) (Scan mAlias t Nothing))
+    | worthLookup db t (unqualify mAlias k) = Lookup mAlias t (unqualify mAlias k) (VInt v)
+rewriteNode db (Filter (Eq (Col k) (LitStr v)) (Scan mAlias t Nothing))
+    | worthLookup db t (unqualify mAlias k) = Lookup mAlias t (unqualify mAlias k) (VStr v)
+rewriteNode db (Filter (And (Gt (Col k1) (LitInt lo)) (Lt (Col k2) (LitInt hi))) (Scan mAlias t Nothing))
+    | k1 == k2 && worthRange db t (unqualify mAlias k1) =
+        Range mAlias t (unqualify mAlias k1) (Just (VInt lo, False)) (Just (VInt hi, False))
+rewriteNode db (Filter (And (Gt (Col k1) (LitStr lo)) (Lt (Col k2) (LitStr hi))) (Scan mAlias t Nothing))
+    | k1 == k2 && worthRange db t (unqualify mAlias k1) =
+        Range mAlias t (unqualify mAlias k1) (Just (VStr lo, False)) (Just (VStr hi, False))
+rewriteNode db (Filter (Gt (Col k) (LitInt v)) (Scan mAlias t Nothing))
+    | worthRange db t (unqualify mAlias k) = Range mAlias t (unqualify mAlias k) (Just (VInt v, False)) Nothing
+rewriteNode db (Filter (Gt (Col k) (LitStr v)) (Scan mAlias t Nothing))
+    | worthRange db t (unqualify mAlias k) = Range mAlias t (unqualify mAlias k) (Just (VStr v, False)) Nothing
+rewriteNode db (Filter (Lt (Col k) (LitInt v)) (Scan mAlias t Nothing))
+    | worthRange db t (unqualify mAlias k) = Range mAlias t (unqualify mAlias k) Nothing (Just (VInt v, False))
+rewriteNode db (Filter (Lt (Col k) (LitStr v)) (Scan mAlias t Nothing))
+    | worthRange db t (unqualify mAlias k) = Range mAlias t (unqualify mAlias k) Nothing (Just (VStr v, False))
 rewriteNode db (Filter p (Join kind l r c))
     | not (hasDivision p || planHasDivision (Join kind l r c)) =
         case kind of
@@ -235,4 +212,4 @@ optimizePredicates db op =
 
 -- | 优化总入口
 optimize :: Database -> RelOp -> RelOp
-optimize db op = pushProject db ["*"] (optimizePredicates db op)
+optimize db op = pushProject db ["*"] (reorderJoins db (optimizePredicates db op))

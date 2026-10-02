@@ -2,7 +2,9 @@
 
 module Main (main) where
 
+import ChuSQL.Interface.Link (closeClient, connectClient)
 import ChuSQL.Interface.RateLimit (newRateLimiter)
+import ChuSQL.Interface.Session (authenticateSession, newSession, runStatement)
 import ChuSQL.Interface.Settings (
     applySettings,
     defaultOf,
@@ -66,6 +68,7 @@ import System.Directory (
     removeFile,
     removePathForcibly,
  )
+import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.Info (os)
@@ -76,6 +79,7 @@ import System.Process (
     StdStream (CreatePipe, NoStream),
     createProcess,
     proc,
+    readProcessWithExitCode,
     terminateProcess,
     waitForProcess,
  )
@@ -222,7 +226,7 @@ ensureAccount hs user password = do
     created <-
         postAs
             (withDb "system" hs)
-            "/api/tables/__chusql_users/rows"
+            "/api/tables/__system_users/rows"
             (encode (object ["values" .= object ["user" .= user, "password" .= password]]))
     check (statusCode (WT.simpleStatus created) `shouldSatisfy` (`elem` [200, 409]))
 
@@ -376,11 +380,31 @@ startLiveWorld label = do
         config = root </> "chusql.toml"
     createDirectoryIfMissing True dataDir
     writeFile config (serverConfigText dataDir)
+    seedSystemCatalog config
     (_, Just out, _, process) <-
         createProcess (proc bin ["--config", config]){std_out = CreatePipe, std_err = NoStream}
     port <- readListeningPort out
     _ <- forkIO (drainHandle out)
+    setAdminPassword port
     pure (LiveWorld process port config dataDir)
+
+-- | 首启的管理员还没有口令：先用空口令登录，再按业务流程设一个
+setAdminPassword :: Int -> IO ()
+setAdminPassword port = do
+    opened <- connectClient "127.0.0.1" port
+    case opened of
+        Left err -> fail ("fixture server refused the connection: " ++ T.unpack err)
+        Right client -> do
+            session <- newSession client
+            signed <- authenticateSession session adminUser ""
+            case signed of
+                Left err -> fail ("fixture administrator cannot sign in: " ++ T.unpack err)
+                Right () -> do
+                    changed <- runStatement session ("ALTER USER " <> adminUser <> " IDENTIFIED BY '" <> adminPassword <> "'")
+                    case changed of
+                        Left err -> fail ("fixture administrator keeps no password: " ++ T.unpack err)
+                        Right _ -> pure ()
+            closeClient client
 
 -- | 生成夹具 server 的配置文本
 serverConfigText :: FilePath -> String
@@ -388,7 +412,6 @@ serverConfigText dataDir =
     unlines
         [ "[web]"
         , "user = \"" ++ T.unpack adminUser ++ "\""
-        , "password = \"" ++ T.unpack adminPassword ++ "\""
         , "password-min-length = 8"
         , "password-classes = 2"
         , ""
@@ -438,6 +461,28 @@ locateServerExe = do
     case found of
         Just path -> pure path
         Nothing -> fail "chusql-server was not found on PATH: run `stack build` first"
+
+-- | 全新的数据目录还没有系统目录：先跑引导程序建表并补一个免密管理员，
+-- server 才肯启动（未引导的目录会被它拒绝）。
+seedSystemCatalog :: FilePath -> IO ()
+seedSystemCatalog config = do
+    bootstrap <- locateBootstrapExe
+    (code, out, errOut) <- readProcessWithExitCode bootstrap ["--config", config, "--passwordless"] ""
+    case code of
+        ExitSuccess -> pure ()
+        _ -> fail ("the fixture bootstrap program failed (exit " ++ show code ++ "): " ++ out ++ errOut)
+
+-- | 找引导程序：先环境变量，再 PATH
+locateBootstrapExe :: IO FilePath
+locateBootstrapExe = do
+    fromEnv <- lookupEnv "CHUSQL_BOOTSTRAP_EXE"
+    case fromEnv of
+        Just path -> pure path
+        Nothing -> do
+            found <- findExecutable (binaryName "csql-bootstrap")
+            case found of
+                Just path -> pure path
+                Nothing -> fail "csql-bootstrap was not found on PATH: run `stack build` first"
 
 -- | 构造指向真 server 的 Web 环境
 liveEnv :: LiveWorld -> FilePath -> Int -> IO AppEnv
@@ -491,7 +536,7 @@ unitSpec = describe "pure helpers" $ do
     it "round-trips settings through a real TOML file" $ do
         path <- tempFilePath "settings"
         removeIfExists path
-        writeSettingsFile path (Map.fromList [("rows-per-page", "50"), ("user", "admin"), ("password", "s3cret")])
+        writeSettingsFile path (Map.fromList [("rows-per-page", "50"), ("user", "admin")])
             >>= (`shouldSatisfy` isRightE)
         values <- readSettingsFile path
         Map.lookup "rows-per-page" values `shouldBe` Just "50"
@@ -500,8 +545,8 @@ unitSpec = describe "pure helpers" $ do
         applySettings Map.empty (Map.fromList [("nope", "1")]) `shouldSatisfy` isLeftE
         applySettings Map.empty (Map.fromList [("password-min-length", "3")]) `shouldSatisfy` isLeftE
         applySettings Map.empty (Map.fromList [("password-min-length", "12")]) `shouldSatisfy` isRightE
-    it "marks root credentials as locked and lists the live keys" $ do
-        isLockedSetting "password" `shouldBe` True
+    it "marks the administrator name as locked and lists the live keys" $ do
+        isLockedSetting "user" `shouldBe` True
         isLockedSetting "rows-per-page" `shouldBe` False
         ("rows-per-page" `elem` liveKeys) `shouldBe` True
         length settingCatalogue `shouldSatisfy` (> 20)
@@ -589,7 +634,7 @@ gatingSpec env = describe "gate keeping" $ do
         it "rejects the account table outside the system database" $ do
             hs <- adminHeaders
             ensureDatabase hs testDatabaseName
-            res <- getAs (withDb testDatabaseName hs) "/api/tables/__chusql_users/rows"
+            res <- getAs (withDb testDatabaseName hs) "/api/tables/__system_users/rows"
             expectStatusWith "account table outside system" res 400
         it "rejects role management without a cookie" $ do
             res <- getAs [] "/api/roles"
@@ -703,7 +748,7 @@ settingsSpec env = describe "settings and password policy" $ do
             let entries = items (at "items" (jsonBody res))
             check (length entries `shouldSatisfy` (> 20))
             check (asText (at "value" (headEntry "rows-per-page" entries)) `shouldBe` "25")
-            check (at "locked" (headEntry "password" entries) `shouldBe` A.Bool True)
+            check (at "locked" (headEntry "user" entries) `shouldBe` A.Bool True)
         it "writes a setting, makes the server reload the policy, and reports it applied" $ do
             hs <- adminHeaders
             res <-
@@ -728,12 +773,12 @@ settingsSpec env = describe "settings and password policy" $ do
             values <- liftIO (readSettingsFile (aeSettingsFile env))
             check (Map.lookup "password-min-length" values `shouldBe` Just "16")
             check (Map.lookup "user" values `shouldBe` Just adminUser)
-        it "refuses unknown settings and the locked root credentials" $ do
+        it "refuses unknown settings and the locked administrator name" $ do
             hs <- adminHeaders
             unknown <- putAs hs "/api/settings" (encode (object ["values" .= object ["nope" .= ("1" :: Text)]]))
             expectStatusWith "unknown setting" unknown 400
-            locked <- putAs hs "/api/settings" (encode (object ["values" .= object ["password" .= ("hacked" :: Text)]]))
-            expectStatusWith "locked credential" locked 403
+            locked <- putAs hs "/api/settings" (encode (object ["values" .= object ["user" .= ("hacked" :: Text)]]))
+            expectStatusWith "locked administrator name" locked 403
 
 -- 账号表 ---------------------------------------------------------------------
 
@@ -745,14 +790,14 @@ accountSpec env = describe "the account table (system database, admin only)" $ d
             hs <- adminHeaders
             res <- getAs (withDb "system" hs) "/api/tables"
             expectStatusWith "system tables" res 200
-            check (("__chusql_users" `elem` map (asText . at "table") (items (jsonBody res))) `shouldBe` True)
+            check (("__system_users" `elem` map (asText . at "table") (items (jsonBody res))) `shouldBe` True)
         it "creates an account, changes its password, signs in as it and drops it" $ do
             hs <- adminHeaders
             ensureAccount hs "alice" "alice-Secret-1234"
             duplicate <-
                 postAs
                     (withDb "system" hs)
-                    "/api/tables/__chusql_users/rows"
+                    "/api/tables/__system_users/rows"
                     (encode (object ["values" .= object ["user" .= ("alice" :: Text), "password" .= ("alice-Secret-9999" :: Text)]]))
             expectStatusWith "duplicate account" duplicate 409
             alice <- ordinaryHeaders "alice" "alice-Secret-1234"
@@ -764,14 +809,14 @@ accountSpec env = describe "the account table (system database, admin only)" $ d
             changed <-
                 patchAs
                     (withDb "system" hs)
-                    "/api/tables/__chusql_users/rows/alice"
+                    "/api/tables/__system_users/rows/alice"
                     (encode (object ["values" .= object ["password" .= ("alice-Secret-5678" :: Text)]]))
             expectStatusWith "change password" changed 200
             _ <- ordinaryHeaders "alice" "alice-Secret-5678"
-            dropped <- deleteAs (withDb "system" hs) "/api/tables/__chusql_users/rows/alice"
+            dropped <- deleteAs (withDb "system" hs) "/api/tables/__system_users/rows/alice"
             expectStatusWith "drop account" dropped 200
         it "refuses account writes without a cookie" $ do
-            res <- getAs (withDb "system" []) "/api/tables/__chusql_users/rows"
+            res <- getAs (withDb "system" []) "/api/tables/__system_users/rows"
             expectStatusWith "account rows without a cookie" res 401
 
 -- 角色 -----------------------------------------------------------------------

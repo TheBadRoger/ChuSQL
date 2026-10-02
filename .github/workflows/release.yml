@@ -97,6 +97,10 @@ jobs:
         working-directory: chusql-cli
         run: stack build --fast chusql-server:exe:chusql-server
 
+      - name: build bootstrap program
+        working-directory: chusql-bootstrap
+        run: stack build --fast chusql-bootstrap:exe:csql-bootstrap
+
       # ---------- 装配 + 打归档（CI 里直接写在这里；本机打同一个包用 scripts/package.sh）----------
       # 归档里是包内容本身（bin/、scripts/、static/、install.sh 就在根上），安装脚本按这个布局找文件。
       - name: package (Unix)
@@ -121,6 +125,15 @@ jobs:
             cp "$front" "$stage/bin/"
           done
 
+          # 引导程序住在自己的工程里，安装根也单独问它要
+          bootstrap_root="$(cd chusql-bootstrap && stack path --local-install-root | tail -n 1 | tr -d '\r')"
+          bootstrap_bin="$bootstrap_root/bin/csql-bootstrap"
+          if [ ! -f "$bootstrap_bin" ]; then
+            bootstrap_bin="$(find chusql-bootstrap/.stack-work -name csql-bootstrap -type f 2>/dev/null | head -n 1 || true)"
+          fi
+          [ -n "$bootstrap_bin" ] && [ -f "$bootstrap_bin" ] || { echo "csql-bootstrap not found" >&2; exit 1; }
+          cp "$bootstrap_bin" "$stage/bin/"
+
           # Haskell 一般静态链接，靶目录里真有共享库就一起带上；改名前的旧库（libchusql_storage.*）不能进包
           for lib in chusql-core/storage/target/release/*.so chusql-core/storage/target/release/*.dylib; do
             [ -f "$lib" ] || continue
@@ -130,14 +143,15 @@ jobs:
             cp "$lib" "$stage/bin/"
           done
 
-          cp scripts/chusql.toml scripts/init.sql "$stage/scripts/"
+          cp scripts/chusql.toml "$stage/scripts/"
           cp scripts/install.ps1 scripts/install.sh "$stage/"
+          cp scripts/uninstall.ps1 scripts/uninstall.sh "$stage/"
           mkdir -p "$stage/static"
           cp -R chusql-web/static/. "$stage/static/"
           cp scripts/csql-web.sh "$stage/"
           if [ -f scripts/csql-web.ps1 ]; then cp scripts/csql-web.ps1 "$stage/"; fi
 
-          chmod +x "$stage/install.sh" "$stage/csql-web.sh"
+          chmod +x "$stage/install.sh" "$stage/uninstall.sh" "$stage/csql-web.sh"
 
           mkdir -p dist
           tar -czf "dist/$name.tar.gz" -C "$stage" .
@@ -167,13 +181,23 @@ jobs:
             Copy-Item $front "$stage/bin/"
           }
 
+          $bootstrapRoot = (& stack path --local-install-root | Select-Object -Last 1).Trim()
+          $bootstrapExe = Join-Path $bootstrapRoot 'bin/csql-bootstrap.exe'
+          if (-not (Test-Path $bootstrapExe)) {
+            $bootstrapExe = Get-ChildItem -Path 'chusql-bootstrap/.stack-work' -Recurse -Filter 'csql-bootstrap.exe' -File -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $bootstrapExe -or -not (Test-Path $bootstrapExe)) { throw 'csql-bootstrap.exe not found' }
+          Copy-Item $bootstrapExe "$stage/bin/"
+
           # 第三方 dll 才要连带上：名字带 chusql 的是本 crate 产物或改名前的残留，上面已按名拷过
           Get-ChildItem 'chusql-core/storage/target/release' -Filter '*.dll' -File -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -notlike 'chusql*' } |
             ForEach-Object { Copy-Item $_.FullName "$stage/bin/" }
 
-          Copy-Item 'scripts/chusql.toml', 'scripts/init.sql' "$stage/scripts/"
+          Copy-Item 'scripts/chusql.toml' "$stage/scripts/"
           Copy-Item 'scripts/install.ps1', 'scripts/install.sh' $stage
+          Copy-Item 'scripts/uninstall.ps1', 'scripts/uninstall.sh' $stage
           New-Item -ItemType Directory -Force -Path "$stage/static" | Out-Null
           Copy-Item 'chusql-web/static/*' "$stage/static" -Recurse
           Copy-Item 'scripts/csql-web.sh' $stage

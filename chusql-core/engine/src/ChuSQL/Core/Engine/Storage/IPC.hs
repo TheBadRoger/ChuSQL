@@ -28,8 +28,10 @@ module ChuSQL.Core.Engine.Storage.IPC (
 
 import ChuSQL.Core.Model
 import ChuSQL.Core.Protocol (Account (..), Request (..), Response (..), SchemaColumn (..), TableInfo (..))
+import ChuSQL.Core.Engine.Parallel (parallelShardLimit, poolRun, workerPool)
 import ChuSQL.Core.Engine.Storage
 import ChuSQL.Core.Engine.Storage.FFI (closeStorage, openStorage, storageRequest)
+import Control.Concurrent (getNumCapabilities)
 import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar)
 import Data.Aeson (eitherDecodeStrict, encode)
 import Data.ByteString qualified as BS
@@ -166,6 +168,18 @@ doScan t = ask "scan" (ReqScan t) $ \resp -> case resp of
     RespRows rows -> Just rows
     _ -> Nothing
 
+-- | 发带投影的 Scan
+doScanColumns :: String -> [String] -> IO (Either String [Row])
+doScanColumns t cols = ask "scan" (ReqScanColumns t cols) $ \resp -> case resp of
+    RespRows rows -> Just [[(c, v) | c <- cols, Just v <- [lookup c row]] | row <- rows]
+    _ -> Nothing
+
+-- | 发分片 Scan：只取第 shard 片
+doScanShard :: String -> Maybe [String] -> Int -> Int -> IO (Either String [Row])
+doScanShard t cols shard shards = ask "scan_shard" (ReqScanShard t cols shard shards) $ \resp -> case resp of
+    RespRows rows -> Just rows
+    _ -> Nothing
+
 -- | 发 Insert（索引由存储层维护）
 doInsert :: String -> Row -> IO (Either String ())
 doInsert t r = ask "insert" (ReqInsert t r) okOnly
@@ -290,9 +304,20 @@ instance MonadStorage IPCStorage where
     -- \| 发 Scan
     scan t = IPCStorage (doScan t)
     -- \| 只取指定列
-    scanColumns t cols = IPCStorage $ ask "scan" (ReqScanColumns t cols) $ \resp -> case resp of
-        RespRows rows -> Just [[(c, v) | c <- cols, Just v <- [lookup c row]] | row <- rows]
-        _ -> Nothing
+    scanColumns t cols = IPCStorage (doScanColumns t cols)
+
+    -- \| 并行分片数：按 RTS 能力数，封顶在 parallelShardLimit
+    parallelShards = IPCStorage $ do
+        caps <- getNumCapabilities
+        pure (max 1 (min parallelShardLimit caps))
+
+    -- \| 分片并行扫，再按分片序拼接
+    scanShards width t cols
+        | width <= 1 = IPCStorage (maybe (doScan t) (doScanColumns t) cols)
+        | otherwise = IPCStorage $ do
+            pool <- workerPool width
+            parts <- poolRun pool [doScanShard t cols shard width | shard <- [0 .. width - 1]]
+            pure (fmap concat (sequence parts))
 
     -- \| 发 Insert（索引由存储层自己维护）
     insert t r = IPCStorage (doInsert t r)
@@ -341,7 +366,7 @@ instance MonadStorage IPCStorage where
             rows <- doScan (tiTable info)
             pure
                 ( tiTable info
-                , Table (tiTable info) (schemaToColumns (tiColumns info)) (either (const []) id rows)
+                , Table (tiTable info) (schemaToColumns (tiColumns info)) (either (const []) id rows) (Just (metaOf info))
                 )
 
     -- \| 只问数据字典要结构，设了当前库只留它的表
@@ -354,6 +379,10 @@ instance MonadStorage IPCStorage where
             Left _ -> []
             Right xs -> concatMap (visibleTables current) xs
 
+-- | 线上表信息转引擎侧统计
+metaOf :: TableInfo -> TableMeta
+metaOf info = TableMeta (tiRows info) (tiStats info) (tiIndexes info)
+
 -- | 没设库名就照单全收；设了库名只收这个库的表，键名去掉库名前缀
 visibleTables :: Maybe String -> TableInfo -> [(String, Table)]
 visibleTables current info
@@ -365,4 +394,4 @@ visibleTables current info
   where
     named = info {tiTable = unqualify current (tiTable info)}
     -- | 组装成不带行的表
-    bare i = (tiTable i, Table (tiTable i) (schemaToColumns (tiColumns i)) [])
+    bare i = (tiTable i, Table (tiTable i) (schemaToColumns (tiColumns i)) [] (Just (metaOf i)))

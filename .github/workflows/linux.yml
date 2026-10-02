@@ -74,6 +74,7 @@ jobs:
           path: |
             ~/.stack
             chusql-core/engine/.stack-work
+            chusql-bootstrap/.stack-work
             chusql-server/.stack-work
             chusql-web/.stack-work
             chusql-cli/.stack-work
@@ -82,6 +83,10 @@ jobs:
 
       - name: stack build (cabal 里带 -Wall)
         working-directory: chusql-cli
+        run: stack build --fast
+
+      - name: bootstrap build
+        working-directory: chusql-bootstrap
         run: stack build --fast
 
       - name: engine tests

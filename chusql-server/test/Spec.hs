@@ -3,11 +3,23 @@
 
 module Main (main) where
 
+import ChuSQL.Core.Engine.Storage.IPC (Account (..), Request (ReqAccountReset))
+import ChuSQL.Core.Engine.Syntax.Parser (parseStatement)
 import ChuSQL.Core.Model (Database, Table (..), Value (..), pattern TInt, pattern TStr)
-import ChuSQL.Interface.Auth (Credential (..), hashPasswordWith)
-import ChuSQL.Interface.Protocol (ClientRequest (..), ServerResponse (..), decodeRequest, encodeResponse)
+import ChuSQL.Interface.Auth (hashPasswordWith)
+import ChuSQL.Interface.Protocol (ClientRequest (..), Grant (..), RoleView (..), ServerResponse (..), decodeRequest, encodeResponse)
 import ChuSQL.Interface.RateLimit (newRateLimiter)
-import ChuSQL.Server.Backend (memoryBackend)
+import ChuSQL.Server.Accounts (Principal (..), ensureRootAccount)
+import ChuSQL.Server.Backend (Backend (..), memoryBackend)
+import ChuSQL.Server.Privileges (
+    PrivilegeCommand (..),
+    PrivilegeError (..),
+    Privileges,
+    authorize,
+    listRoleViews,
+    newPrivileges,
+    runPrivilegeCommand,
+ )
 import ChuSQL.Server.Session (QueryResult (..))
 import ChuSQL.Server.TCP (
     ServerConfig (..),
@@ -74,6 +86,7 @@ spec :: Spec
 spec = do
     tcpSpec
     tcpServerSpec
+    privilegeSpec
 
 -- 夹具：内存后端装在 MVar 里，跟 Web 测试同一套表
 
@@ -91,18 +104,28 @@ testDb =
             [ [("id", VInt i), ("name", VStr ("user" ++ show i)), ("age", VInt (20 + i))]
             | i <- [1 .. 5]
             ]
+            Nothing
       )
     , ( "orders"
       , Table
             "orders"
             [("id", TInt), ("user_id", TInt)]
             [[("id", VInt 1), ("user_id", VInt 1)]]
+            Nothing
       )
     ]
 
--- | 测试账号：迭代次数压低（跑得快），口令 `s3cret`
-testCredential :: Credential
-testCredential = Credential "admin" (hashPasswordWith 1000 (BS.replicate 16 7) "s3cret")
+-- | 测试管理员名字
+testRootName :: Text
+testRootName = "admin"
+
+-- | 测试管理员口令
+testRootPassword :: Text
+testRootPassword = "s3cret"
+
+-- | 口令哈希：迭代次数压低，跑得快
+testPasswordHash :: Text -> Text
+testPasswordHash raw = hashPasswordWith 1000 (BS.replicate 16 7) raw
 
 -- 小工具
 
@@ -159,14 +182,23 @@ removeIfExists path = do
     there <- doesFileExist path
     if there then void (try (removeFile path) :: IO (Either IOException ())) else pure ()
 
--- | 起一台内存后端的测试服务器
+-- | 起一台内存后端的测试服务器：管理员已设口令 `s3cret`
 withTcpServer :: ServerConfig -> (ServerEnv -> ServerHandle -> IO a) -> IO a
-withTcpServer config body = do
+withTcpServer = withTcpServerAs (Just testRootPassword)
+
+-- | 起内存后端测试服务器；Nothing 表示首启未设口令
+withTcpServerAs :: Maybe Text -> ServerConfig -> (ServerEnv -> ServerHandle -> IO a) -> IO a
+withTcpServerAs password config body = do
     db <- newMVar testDb
     limiter <- newRateLimiter getCurrentTime 50 300
     path <- tempSettingsPath "tcp-server"
     removeIfExists path
-    env <- newServerEnv (memoryBackend testDatabaseName db) testCredential path config{scPort = 0} limiter
+    let backend = memoryBackend testDatabaseName db
+    _ <- ensureRootAccount backend testRootName
+    case password of
+        Nothing -> pure ()
+        Just raw -> void (beAccounts backend (ReqAccountReset testRootName (testPasswordHash raw)))
+    env <- newServerEnv backend testRootName path config{scPort = 0} limiter
     handle <- startServer env
     body env handle `finally` shStop handle
 
@@ -321,6 +353,14 @@ tcpServerSpec = do
                     asText (at "status" reply) `shouldBe` "error"
                     asText (at "code" reply) `shouldBe` "unauthorized"
                     asText (at "message" reply) `shouldBe` "sign in first"
+        it "signs the administrator in with an empty password until one is set" $
+            withTcpServerAs Nothing defaultServerConfig $ \_ handle ->
+                withConnection handle $ \h -> do
+                    wrong <- tcpLogin h "admin" "nope"
+                    asText (at "code" wrong) `shouldBe` "unauthorized"
+                    good <- tcpLogin h "admin" ""
+                    asText (at "status" good) `shouldBe` "ok"
+                    asBool (at "admin" good) `shouldBe` True
         it "refuses a wrong password and then accepts the right one" $
             withTcpServer defaultServerConfig $ \_ handle ->
                 withConnection handle $ \h -> do
@@ -414,3 +454,94 @@ tcpServerSpec = do
                     withConnection handle $ \other -> do
                         blocked <- tcpQuery other "select * from users"
                         asText (at "code" blocked) `shouldBe` "unauthorized"
+
+-- 权限服务夹具：内存后端上的系统库视角
+
+-- | 一个普通账号
+testAccount :: Account
+testAccount = Account 0 "alice" "" 0 "" Nothing
+
+-- | 权限用例传的当前库名
+testDatabase :: Text
+testDatabase = T.pack testDatabaseName
+
+-- | 一个空的权限服务加管理员身份
+withPrivileges :: (Privileges -> Principal -> IO a) -> IO a
+withPrivileges body = do
+    db <- newMVar testDb
+    service <- newPrivileges (memoryBackend testDatabaseName db)
+    body service (Root testRootName)
+
+-- | 权限与目录 API 用例
+privilegeSpec :: Spec
+privilegeSpec = describe "server privileges" $ do
+    it "creates a role and lists it" $ withPrivileges $ \service root -> do
+        created <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
+        created `shouldBe` Right ()
+        views <- listRoleViews service
+        fmap (map roleName) views `shouldBe` Right ["reader"]
+
+    it "refuses a role that already exists" $ withPrivileges $ \service root -> do
+        _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
+        again <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
+        again `shouldBe` Left (PrivilegeError "conflict" "role already exists: reader")
+
+    it "grants a privilege on a table and shows it in the role view" $ withPrivileges $ \service root -> do
+        _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
+        granted <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "reader")
+        granted `shouldBe` Right ()
+        views <- listRoleViews service
+        fmap (map roleGrants) views `shouldBe` Right [[Grant "reader" "select" "test.users"]]
+
+    it "expands ALL and keeps a star object as is" $ withPrivileges $ \service root -> do
+        _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
+        _ <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["all"] "*" "reader")
+        views <- listRoleViews service
+        fmap (concatMap (map grantPrivilege) . map roleGrants) views
+            `shouldBe` Right ["select", "insert", "update", "delete"]
+        fmap (concatMap (map grantObject) . map roleGrants) views `shouldBe` Right (replicate 4 "*")
+
+    it "revokes a privilege again" $ withPrivileges $ \service root -> do
+        _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
+        _ <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "reader")
+        _ <- runPrivilegeCommand service root testDatabase (RevokePrivilegesCommand ["select"] "users" "reader")
+        views <- listRoleViews service
+        fmap (map roleGrants) views `shouldBe` Right [[]]
+
+    it "adds and removes members" $ withPrivileges $ \service root -> do
+        _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
+        _ <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "reader" ["alice"])
+        _ <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "reader" ["alice", "bob"])
+        views <- listRoleViews service
+        fmap (map roleMembers) views `shouldBe` Right [["alice", "bob"]]
+        _ <- runPrivilegeCommand service root testDatabase (RevokeRoleCommand "reader" ["alice"])
+        remaining <- listRoleViews service
+        fmap (map roleMembers) remaining `shouldBe` Right [["bob"]]
+
+    it "drops a role together with its grants and members" $ withPrivileges $ \service root -> do
+        _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
+        _ <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "reader")
+        _ <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "reader" ["alice"])
+        dropped <- runPrivilegeCommand service root testDatabase (DropRoleCommand "reader")
+        dropped `shouldBe` Right ()
+        views <- listRoleViews service
+        views `shouldBe` Right []
+
+    it "refuses a command on a role that does not exist" $ withPrivileges $ \service root -> do
+        missing <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "ghost")
+        missing `shouldBe` Left (PrivilegeError "not_found" "unknown role: ghost")
+
+    it "refuses a table grant without a selected database" $ withPrivileges $ \service root -> do
+        _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
+        refused <- runPrivilegeCommand service root "" (GrantPrivilegesCommand ["select"] "users" "reader")
+        refused `shouldBe` Left (PrivilegeError "no_database" "no database selected")
+
+    it "refuses a non-administrator" $ withPrivileges $ \service _ -> do
+        refused <- runPrivilegeCommand service (Ordinary testAccount) testDatabase (CreateRoleCommand "reader")
+        refused `shouldBe` Left (PrivilegeError "forbidden" "administrator required")
+
+    it "authorizes the administrator on any statement" $ withPrivileges $ \service root ->
+        case parseStatement "SELECT * FROM users" of
+            Left err -> expectationFailure err
+            Right stmt -> authorize service root testDatabase stmt `shouldReturn` Right ()
+

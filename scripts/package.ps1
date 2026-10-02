@@ -49,11 +49,14 @@ function Assert-Stage([string]$stage) {
         'bin\csql.exe',
         'bin\chusql-web.exe',
         'bin\chusql-server.exe',
+        'bin\csql-bootstrap.exe',
         'static\index.html',
         'csql-web.ps1',
         'scripts\chusql.toml',
         'install.ps1',
-        'install.sh'
+        'install.sh',
+        'uninstall.ps1',
+        'uninstall.sh'
     )
     foreach ($rel in $must) {
         if (-not (Test-Path (Join-Path $stage $rel))) {
@@ -61,7 +64,7 @@ function Assert-Stage([string]$stage) {
         }
     }
     # bin 里带 chusql 名字的文件只能是已知产物；改名前的残留或别的垃圾都算装配错误
-    $known = @('chusql_core_storage.dll', 'chusql-server.exe', 'chusql-web.exe')
+    $known = @('chusql_core_storage.dll', 'chusql-server.exe', 'chusql-web.exe', 'csql-bootstrap.exe')
     $unknown = @(Get-ChildItem (Join-Path $stage 'bin') -Filter 'chusql*' -File -ErrorAction SilentlyContinue |
         Where-Object { $known -notcontains $_.Name })
     if ($unknown.Count -gt 0) {
@@ -91,7 +94,7 @@ function Test-Installed([string]$name, [string]$comp) {
         $pwsh = Join-Path $PSHOME 'pwsh.exe'
         if (-not (Test-Path $pwsh)) { $pwsh = 'powershell' }
         & $pwsh -NoProfile -File (Join-Path $pkg 'install.ps1') -Component $comp -InstallDir $opt `
-            -DataDir $data -RootUser root -RootPassword package-check *>&1 | Out-File -FilePath $log -Encoding UTF8
+            -DataDir $data -RootUser root -Password 'verify-package' -NoStart *>&1 | Out-File -FilePath $log -Encoding UTF8
         if ($LASTEXITCODE -ne 0) {
             Get-Content $log | Select-Object -First 120 | Write-Host
             Fail "$name`: installing the $comp part from the package failed (log above)"
@@ -100,7 +103,8 @@ function Test-Installed([string]$name, [string]$comp) {
         $checks = @(
             (Join-Path $opt 'bin\chusql_core_storage.dll'),
             (Join-Path $opt 'bin\chusql-server.exe'),
-            (Join-Path $opt 'init.sql'),
+            (Join-Path $opt 'bin\csql-bootstrap.exe'),
+            (Join-Path $data 'system\catalog.json'),
             (Join-Path $appdata 'ChuSQL\chusql.toml')
         )
         $forbidden = @()
@@ -162,6 +166,13 @@ if (-not $NoBuild) {
             if ($LASTEXITCODE -ne 0) { Fail "stack build --fast $target failed" }
         } finally { Pop-Location }
     }
+
+    Step 'Building chusql-bootstrap:exe:csql-bootstrap (Haskell)'
+    Push-Location (Join-Path $repoRoot 'chusql-bootstrap')
+    try {
+        & stack build --fast chusql-bootstrap:exe:csql-bootstrap
+        if ($LASTEXITCODE -ne 0) { Fail 'stack build --fast csql-bootstrap failed' }
+    } finally { Pop-Location }
 }
 
 # ---------- 装配 + 打归档 ----------
@@ -194,13 +205,26 @@ try {
         Copy-Item $front (Join-Path $stage 'bin')
     }
 
+    # 引导程序住在自己的工程里，安装根也单独问它要
+    Push-Location (Join-Path $repoRoot 'chusql-bootstrap')
+    try { $bootstrapRoot = (& stack path --local-install-root | Select-Object -Last 1).Trim() } finally { Pop-Location }
+    $bootstrapExe = Join-Path $bootstrapRoot 'bin/csql-bootstrap.exe'
+    if (-not (Test-Path $bootstrapExe)) {
+        $bootstrapExe = Get-ChildItem -Path (Join-Path $repoRoot 'chusql-bootstrap\.stack-work') `
+            -Recurse -Filter 'csql-bootstrap.exe' -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+    }
+    if (-not $bootstrapExe -or -not (Test-Path $bootstrapExe)) { Fail 'csql-bootstrap.exe is not built (run without -NoBuild)' }
+    Copy-Item $bootstrapExe (Join-Path $stage 'bin')
+
     # 第三方 dll 才要连带上：名字带 chusql 的是本 crate 产物或改名前的残留，上面已按名拷过
     Get-ChildItem (Join-Path $repoRoot 'chusql-core\storage\target\release') -Filter '*.dll' -File -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -notlike 'chusql*' } |
         ForEach-Object { Copy-Item $_.FullName (Join-Path $stage 'bin') }
 
-    Copy-Item (Join-Path $repoRoot 'scripts\chusql.toml'), (Join-Path $repoRoot 'scripts\init.sql') (Join-Path $stage 'scripts')
+    Copy-Item (Join-Path $repoRoot 'scripts\chusql.toml') (Join-Path $stage 'scripts')
     Copy-Item (Join-Path $repoRoot 'scripts\install.ps1'), (Join-Path $repoRoot 'scripts\install.sh') $stage
+    Copy-Item (Join-Path $repoRoot 'scripts\uninstall.ps1'), (Join-Path $repoRoot 'scripts\uninstall.sh') $stage
     New-Item -ItemType Directory -Force -Path (Join-Path $stage 'static') | Out-Null
     Copy-Item (Join-Path $repoRoot 'chusql-web\static\*') (Join-Path $stage 'static') -Recurse
     Copy-Item (Join-Path $repoRoot 'scripts\csql-web.sh') $stage

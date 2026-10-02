@@ -44,7 +44,7 @@ instance MonadStorage MemoryStorage where
     createTable name cols = MemoryStorage $ \db ->
         if any ((== name) . fst) db
             then Right (Left ("table already exists: " ++ name), db)
-            else Right (Right (), db ++ [(name, Table name cols [])])
+            else Right (Right (), db ++ [(name, Table name cols [] Nothing)])
 
     -- \| 删表；不存在报错
     dropTable name = MemoryStorage $ \db ->

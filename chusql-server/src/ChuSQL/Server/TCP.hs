@@ -11,11 +11,11 @@ module ChuSQL.Server.TCP (
     runServer,
 ) where
 
-import ChuSQL.Interface.Auth (Credential)
 import ChuSQL.Interface.Config (ServerConfig (..), defaultServerConfig, loadServerConfigAt)
 import ChuSQL.Interface.Policy (PasswordPolicy (..))
 import ChuSQL.Interface.Protocol (ClientRequest (..), ServerResponse (..), decodeRequest, encodeResponse, protocolVersion)
 import ChuSQL.Interface.RateLimit (RateLimiter, rateLimitBlock, rateLimitClear, rateLimitRecord)
+import qualified ChuSQL.Core.Engine.Error as E
 import ChuSQL.Server.Backend (Backend (..))
 import ChuSQL.Server.Session (QueryResult (..), Session, SessionError (..), accounts, authenticateSessionCoded, catalog, databases, newSession, policyOf, reloadPolicy, roleViews, runStatementCoded, sessionIsAdmin, sessionUser)
 import Control.Concurrent (forkIO)
@@ -57,16 +57,16 @@ import System.IO.Error (isEOFError)
 
 data ServerEnv = ServerEnv
     { srvBackend :: Backend
-    , srvCredential :: Credential
+    , srvRootName :: Text
     , srvSettingsFile :: FilePath
     , srvConfig :: ServerConfig
     , srvLimiter :: RateLimiter
     }
 
 -- | 组装服务器环境：每个连接再各开一个会话
-newServerEnv :: Backend -> Credential -> FilePath -> ServerConfig -> RateLimiter -> IO ServerEnv
-newServerEnv backend credential settingsFile config limiter =
-    pure (ServerEnv backend credential settingsFile config limiter)
+newServerEnv :: Backend -> Text -> FilePath -> ServerConfig -> RateLimiter -> IO ServerEnv
+newServerEnv backend rootName settingsFile config limiter =
+    pure (ServerEnv backend rootName settingsFile config limiter)
 
 data ServerHandle = ServerHandle
     { shPort :: Int
@@ -154,7 +154,7 @@ serveConnection env conn = do
     h <- socketToHandle conn ReadWriteMode
     hSetBuffering h LineBuffering
     hSetNewlineMode h noNewlineTranslation
-    session <- newSession (srvBackend env) (srvCredential env) (srvSettingsFile env)
+    session <- newSession (srvBackend env) (srvRootName env) (srvSettingsFile env)
     outcome <- try (loop h session) :: IO (Either IOException ())
     case outcome of
         Left err | not (isEOFError err) -> hPutStrLn stderr ("connection error: " ++ show err)
@@ -253,10 +253,7 @@ overSession session action wrap = do
 
 -- | 会话层的失败文案归一到协议错误码
 sessionCode :: Text -> Text
-sessionCode message
-    | message == "no database selected" = "no_database"
-    | message == "administrator required" = "forbidden"
-    | otherwise = "query_error"
+sessionCode = T.pack . E.errorCode . T.unpack
 
 -- | 登录：按账号名限流，成功清账
 login :: ServerEnv -> Session -> Text -> Text -> IO ServerResponse

@@ -4,18 +4,19 @@ param(
     [string]$InstallDir = '',
     [string]$DataDir = '',
     [string]$RootUser = 'root',
-    [string]$RootPassword = '',
+    [string]$Password = '',
     [string]$Version = 'latest',
     [string]$Repo = 'TheBadRoger/ChuSQL',
     [switch]$ListVersions,
     [switch]$Interactive,
-    [switch]$KeepPackage
+    [switch]$KeepPackage,
+    [switch]$NoStart
 )
 
 $ErrorActionPreference = 'Stop'
 
-# Windows 安装脚本：从包内或 GitHub 发行版装 cli/web，
-# 写全局配置、改用户 PATH，装完删除安装包。
+# Windows 安装脚本：装 cli/web、写全局配置、改用户 PATH、
+# 跑 csql-bootstrap 建系统目录、最后拉起服务。
 
 $script:tempDir = ''
 
@@ -131,13 +132,18 @@ function Ask-YesNo([string]$prompt, [bool]$defaultYes) {
     }
 }
 
-# 读取隐藏输入的密码。
+# 读口令：终端里不回显；-Interactive 时从 stdin 逐行读。
 function Ask-Secret([string]$prompt) {
-    if ($askFromStdin) { return (Ask-Line $prompt) }
+    if ($askFromStdin) {
+        Write-Host $prompt -NoNewline
+        $line = [Console]::In.ReadLine()
+        if ($null -eq $line) { return '' }
+        return $line
+    }
     $secure = Read-Host $prompt -AsSecureString
-    $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
-    try { return [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
-    finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+    $ptr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    try { return [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) }
+    finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
 }
 
 $wantWeb = $false
@@ -159,18 +165,30 @@ if (-not $Component) {
     }
 }
 
-if (-not $PSBoundParameters.ContainsKey('RootPassword') -and $canPrompt) {
+# 管理员口令是装机必答项：交互时当场设，非交互时给 -Password 或
+# CHUSQL_ADMIN_PASSWORD。口令只经 stdin 传给 csql-bootstrap，不落 chusql.toml。
+$adminPassword = "$env:CHUSQL_ADMIN_PASSWORD"
+if ($Password) { $adminPassword = $Password }
+if ($canPrompt) {
     Write-Host ''
     Write-Host ('The administrator account is "{0}".' -f $RootUser)
-    $firstPassword = Ask-Secret ('Root password for {0} (empty means no password) []:' -f $RootUser)
-    if ($firstPassword) {
-        $againPassword = Ask-Secret 'Repeat the root password:'
-        if ($firstPassword -ne $againPassword) { Fail 'the two passwords do not match' }
-        Write-Host 'root password set'
-    } else {
-        Write-Host 'no root password: administrator-only sign-in'
+    while ($true) {
+        $first = Ask-Secret '  Password: '
+        if ($first.Length -eq 0) {
+            Write-Host '  the password cannot be empty'
+            continue
+        }
+        $second = Ask-Secret '  Repeat it: '
+        if ($first -ne $second) {
+            Write-Host '  the two entries differ, try again'
+            continue
+        }
+        $adminPassword = $first
+        break
     }
-    $RootPassword = $firstPassword
+}
+if ($adminPassword.Length -eq 0) {
+    Fail 'no administrator password: pass -Password or set CHUSQL_ADMIN_PASSWORD'
 }
 
 $wanted = @()
@@ -263,6 +281,7 @@ if (-not (Test-Path (Join-Path $pack 'bin\chusql_core_storage.dll'))) {
 $storageLib = Join-Path $pack 'bin\chusql_core_storage.dll'
 if (-not (Test-Path $storageLib)) { Fail "package is incomplete: bin\chusql_core_storage.dll not found in $pack" }
 if (-not (Test-Path (Join-Path $pack 'bin\chusql-server.exe'))) { Fail 'package is incomplete: bin\chusql-server.exe not found' }
+if (-not (Test-Path (Join-Path $pack 'bin\csql-bootstrap.exe'))) { Fail 'package is incomplete: bin\csql-bootstrap.exe not found' }
 if ($wantWeb) {
     if (-not (Test-Path (Join-Path $pack 'bin\chusql-web.exe'))) { Fail 'package is incomplete: bin\chusql-web.exe not found' }
     if (-not (Test-Path (Join-Path $pack 'static'))) { Fail 'package is incomplete: static\ not found' }
@@ -279,7 +298,7 @@ Say ("  components {0}" -f $componentLabel)
 if ($downloaded) { Say ("  release    {0}" -f $Version) }
 Say ("  install to {0}" -f $InstallDir)
 Say ("  data dir   {0}" -f $DataDir)
-Say ("  root user  {0}{1}" -f $RootUser, $(if ($RootPassword) { '' } else { ' (no password: administrator-only sign-in)' }))
+Say ("  root user  {0} (password asked above, kept out of chusql.toml)" -f $RootUser)
 
 # ---- 释放文件 ----
 # 包是合在一起的（web 和 cli 都在），这里按这次的选择逐个释放：没选的组件不落地
@@ -287,6 +306,7 @@ Step 'Installing files'
 New-Item -ItemType Directory -Force -Path (Join-Path $InstallDir 'bin'), (Join-Path $InstallDir 'logs'), $DataDir | Out-Null
 Copy-Item $storageLib (Join-Path $InstallDir 'bin') -Force
 Copy-Item (Join-Path $pack 'bin\chusql-server.exe') (Join-Path $InstallDir 'bin') -Force
+Copy-Item (Join-Path $pack 'bin\csql-bootstrap.exe') (Join-Path $InstallDir 'bin') -Force
 Get-ChildItem (Join-Path $pack 'bin') -Filter '*.dll' -File -ErrorAction SilentlyContinue |
     ForEach-Object { Copy-Item $_.FullName (Join-Path $InstallDir 'bin') -Force }
 if ($wantCli) {
@@ -310,12 +330,22 @@ $configDir = if ($env:APPDATA) { Join-Path $env:APPDATA 'ChuSQL' } else { Join-P
 $configFile = Join-Path $configDir 'chusql.toml'
 $toml = Get-Content -Path $template -Raw -Encoding UTF8
 $toml = $toml -replace '(?m)^(\s*user\s*=\s*).*$', "`$1`"$RootUser`""
-$toml = $toml -replace '(?m)^(\s*password\s*=\s*).*$', "`$1`"$RootPassword`""
 $toml = $toml -replace '(?m)^(\s*data_dir\s*=\s*).*$', "`$1`"$($DataDir -replace '\\', '/')`""
 New-Item -ItemType Directory -Force -Path $configDir | Out-Null
 Set-Content -Path $configFile -Value $toml -Encoding UTF8
 Say ("  config file  {0}" -f $configFile)
-Copy-Item (Join-Path $pack 'scripts\init.sql') $InstallDir -Force -ErrorAction SilentlyContinue
+
+# ---- 引导系统目录 ----
+# csql-bootstrap 建 system 数据库和 __system_users 表，口令只走 stdin，不进 chusql.toml
+Step 'Creating the system catalog'
+$bootstrap = Join-Path $InstallDir 'bin\csql-bootstrap.exe'
+$bootstrapArgs = @('--config', $configFile, '--user', $RootUser)
+$bootstrapArgs += '--password-stdin'
+$bootstrapOutput = $adminPassword | & $bootstrap @bootstrapArgs 2>&1
+$bootstrapOutput | ForEach-Object { Say ("  {0}" -f $_) }
+if ($LASTEXITCODE -ne 0) {
+    Fail ("the bootstrap program failed (exit {0}); the system catalog is not ready" -f $LASTEXITCODE)
+}
 
 # ---- 命令入口 ----
 Step 'Creating commands'
@@ -365,6 +395,27 @@ if (-not $KeepPackage) {
     Say ("kept the downloaded package: {0}" -f $tempDir)
 }
 
+Step 'Starting the server'
+$serverPath = Join-Path $InstallDir 'bin\chusql-server.exe'
+$serverPid = 0
+if ($NoStart) {
+    Say '  -NoStart: the server was not started'
+} else {
+    $serverLog = Join-Path $InstallDir 'logs\server.err.log'
+    $serverProc = Start-Process -FilePath $serverPath `
+        -ArgumentList @('--config', $configFile) `
+        -WorkingDirectory $InstallDir -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput (Join-Path $InstallDir 'logs\server.log') `
+        -RedirectStandardError $serverLog
+    Start-Sleep -Milliseconds 1200
+    if ($serverProc.HasExited) {
+        Fail ("the server stopped right away (exit {0}); look at {1}" -f $serverProc.ExitCode, $serverLog)
+    }
+    $serverPid = $serverProc.Id
+    Say ("  server running, pid {0}" -f $serverPid)
+    Say ("  log            {0}" -f $serverLog)
+}
+
 Step 'Done'
 Say ("  chusql.toml  {0}" -f $configFile)
 Say ("  data         {0}" -f $DataDir)
@@ -372,4 +423,9 @@ $startWith = @()
 if ($wantWeb) { $startWith += 'csql-web' }
 if ($wantCli) { $startWith += 'csql' }
 Say ("  start with   {0}" -f ($startWith -join ', '))
-Say ("  tcp server   {0} (listens on [server] host/port, defaults 127.0.0.1:7777)" -f (Join-Path $InstallDir 'bin\chusql-server.exe'))
+Say ("  tcp server   {0} (listens on [server] host/port, defaults 127.0.0.1:7777)" -f $serverPath)
+if ($serverPid -gt 0) {
+    Say ("  running      pid {0} (stop it with: Stop-Process -Id {0})" -f $serverPid)
+} else {
+    Say ("  start it     {0} --config `"{1}`"" -f $serverPath, $configFile)
+}

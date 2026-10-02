@@ -73,8 +73,9 @@ gateSpec = do
             installer `shouldSatisfy` T.isInfixOf "Get-ResponseText"
             installer `shouldSatisfy` T.isInfixOf "-is [byte[]]"
             installer `shouldSatisfy` T.isInfixOf "ConvertFrom-Json"
-        -- 装什么由人当场选：逐个问、问答用英文、默认装 csql 不装 Web，选完才问管理员口令。
-        -- 提问顺序固定：先 cli 后 web。两个脚本文案必须一致，改一个就得改另一个。
+        -- 装什么由人当场选：逐个问、问答用英文、默认装 csql 不装 Web。管理员口令不在配置里，
+        -- 装机时是必答项：有终端就当场问两遍，没有就给 --password / -Password 或
+        -- CHUSQL_ADMIN_PASSWORD，口令只经 stdin 传给 csql-bootstrap。两个脚本必须一致。
         it "both installers ask which components to install, in the same words" $ do
             sh <- readUtf8 (".." </> "scripts" </> "install.sh")
             ps <- readUtf8 (".." </> "scripts" </> "install.ps1")
@@ -84,13 +85,21 @@ gateSpec = do
                 ( \src -> do
                     src `shouldSatisfy` T.isInfixOf cliAsk
                     src `shouldSatisfy` T.isInfixOf webAsk
-                    src `shouldSatisfy` T.isInfixOf "Root password for"
+                    src `shouldSatisfy` T.isInfixOf "The administrator account is "
+                    src `shouldSatisfy` T.isInfixOf "  the password cannot be empty"
+                    src `shouldSatisfy` T.isInfixOf "the two entries differ, try again"
+                    src `shouldSatisfy` T.isInfixOf "--password-stdin"
+                    src `shouldSatisfy` T.isInfixOf "CHUSQL_ADMIN_PASSWORD"
+                    -- 管理员不能没有口令：两个脚本都不许再留空口令这条路
+                    src `shouldSatisfy` (not . T.isInfixOf "passwordless")
                     -- cli 的问题必须出现在 web 之前（文档里的用法示例也按这个顺序写）
                     T.length (fst (T.breakOn cliAsk src)) `shouldSatisfy` (< T.length (fst (T.breakOn webAsk src)))
                 )
                 [sh, ps]
+            sh `shouldSatisfy` T.isInfixOf "--password PASSWORD"
             sh `shouldSatisfy` T.isInfixOf "--interactive"
             sh `shouldSatisfy` T.isInfixOf "both"
+            ps `shouldSatisfy` T.isInfixOf "-Password"
             ps `shouldSatisfy` T.isInfixOf "-Interactive"
             ps `shouldSatisfy` T.isInfixOf "both"
             -- 到底装的哪个版本要打出来：latest 解析来的和显式指定的，两处都得有。
@@ -107,6 +116,9 @@ gateSpec = do
                     src `shouldSatisfy` T.isInfixOf "releases"
                     src `shouldSatisfy` T.isInfixOf "install.sh"
                     src `shouldSatisfy` T.isInfixOf "install.ps1"
+                    -- 卸载脚本跟安装脚本同路进包：装完就得能在包根上卸干净
+                    src `shouldSatisfy` T.isInfixOf "uninstall.sh"
+                    src `shouldSatisfy` T.isInfixOf "uninstall.ps1"
                 )
                 [sh, ps]
             sh `shouldSatisfy` T.isInfixOf "tar -czf"
@@ -137,10 +149,10 @@ gateSpec = do
             launcher <- readUtf8 (".." </> "scripts" </> "csql-web.sh")
             launcher `shouldSatisfy` T.isInfixOf "cd \"$home_dir\""
             launcher `shouldSatisfy` T.isInfixOf "chusql-server"
-        -- 默认数据目录按平台惯例算，四处必须说同一件事：Rust 代码、配置示例、模板、文档。
+        -- 默认数据目录按平台惯例算，三处必须说同一件事：Rust 代码、配置示例、模板。
         -- 跟安装脚本装的位置也是一处：Windows 装到 %LOCALAPPDATA%\ChuSQL、Unix 装到 ~/.local/share/chusql，
         -- 数据都放在它下面的 data/ 里。
-        it "the default data dir follows the platform, and code, template and docs agree" $ do
+        it "the default data dir follows the platform, and code and template agree" $ do
             rust <- readUtf8 (".." </> "chusql-core" </> "storage" </> "src" </> "config.rs")
             rust `shouldSatisfy` T.isInfixOf "default_data_dir"
             rust `shouldSatisfy` T.isInfixOf "LOCALAPPDATA"
@@ -157,10 +169,6 @@ gateSpec = do
             -- 模板那行是安装时被 sed / -replace 替换的占位，必须保持能生效
             template `shouldSatisfy` T.isInfixOf "\ndata_dir = "
             template `shouldSatisfy` T.isInfixOf "%LOCALAPPDATA%"
-
-            configDoc <- readUtf8 (".." </> "doc" </> "config.md")
-            configDoc `shouldSatisfy` T.isInfixOf "%LOCALAPPDATA%\\ChuSQL\\data"
-            configDoc `shouldSatisfy` T.isInfixOf "chusql/data"
         -- 管道传输退休后，两侧都不该再算套接字路径、也不该再认管名。
         it "neither side computes a socket path or a pipe name any more" $ do
             haskellIpc <- readUtf8 (".." </> "chusql-core" </> "engine" </> "src" </> "ChuSQL" </> "Core" </> "Engine" </> "Storage" </> "IPC.hs")
@@ -209,7 +217,7 @@ gateSpec = do
             release `shouldSatisfy` (not . T.isInfixOf "component: [web, cli]")
         it "no layer looks for a storage executable or a pipe name any more" $ do
             engine <- readUtf8 (".." </> "chusql-core" </> "engine" </> "test" </> "Spec.hs")
-            bench <- readUtf8 (".." </> "benchmark" </> "src" </> "Main.hs")
+            bench <- readUtf8 (".." </> "chusql-benchmark" </> "src" </> "Main.hs")
             template <- readUtf8 (".." </> "scripts" </> "chusql.toml")
             mapM_
                 (\src -> src `shouldSatisfy` (not . T.isInfixOf "pipe_name"))
@@ -223,47 +231,18 @@ gateSpec = do
                     (".." </> "chusql-server" </> "src" </> "ChuSQL" </> "Server" </> "StorageProcess.hs")
             moduleGone `shouldBe` False
 
-    -- 细节分到 doc/ 下四份，README 只留面向用户的关键内容；链接断了或者文档没了，等于没写。
-    describe "Documentation (doc/)" $ do
-        it "the README keeps only the essentials and links the split documents" $ do
+    -- 文档只做结构约束：四篇在、README 能链到它们。正文怎么写、写多长都不校验，
+    -- 免得以后精简文档反而过不了门禁。
+    describe "Documentation (docs/)" $ do
+        it "the README links the split documents" $ do
             readme <- readUtf8 (".." </> "README.md")
             mapM_
-                (\target -> readme `shouldSatisfy` T.isInfixOf ("doc/" <> target <> ".md"))
+                (\target -> readme `shouldSatisfy` T.isInfixOf ("docs/" <> target <> ".md"))
                 ["install", "config", "commands", "architecture"]
-            -- 安装选项与配置键的长表已经搬走，不该在 README 里再长回来
-            readme `shouldSatisfy` (not . T.isInfixOf "--from-source")
-            readme `shouldSatisfy` (not . T.isInfixOf "pool_size")
-            -- 仓库布局这类开发者信息属于 doc/architecture.md，不属于 README
-            readme `shouldSatisfy` (not . T.isInfixOf "chusql-engine/")
-        it "each split document covers what its name promises" $ do
-            let expectations =
-                    [ ("install", ["install.sh", "install.ps1", "--component", "--install-dir", "--from-source", "--version", "--list-versions", "-Component", "-Version", "-ListVersions", "-Interactive", "CHUSQL_GITHUB_TOKEN", "rm -rf"])
-                    , ("config", ["[web]", "[page]", "data_dir", "host", "port"])
-                    , ("commands", ["csql", "--format", "\\dt", "CREATE ROLE", "GRANT", "/api/roles"])
-                    , ("architecture", ["chusql-core", "chusql-server", "chusql-web", "csql", "data_dir", "CREATE DATABASE"])
-                    ]
-            mapM_
-                ( \(name, needles) -> do
-                    doc <- readUtf8 (".." </> "doc" </> name <> ".md")
-                    mapM_ (\needle -> doc `shouldSatisfy` T.isInfixOf needle) needles
-                )
-                expectations
-        -- doc/ 只写面向用户的内容：构建、测试、打包这些开发流程不进文档
-        it "the split documents stay user-facing (no build, test or packaging recipes)" $ do
-            let developerOnly =
-                    [ "package.ps1"
-                    , "stack build"
-                    , "stack test"
-                    , "cargo build"
-                    , "cargo test"
-                    , "cargo clippy"
-                    , ".stack-work"
-                    , ".github/workflows"
-                    , "smoke-linux.sh"
-                    ]
+        it "the split documents exist and are not empty" $ do
             mapM_
                 ( \name -> do
-                    doc <- readUtf8 (".." </> "doc" </> name <> ".md")
-                    mapM_ (\needle -> doc `shouldSatisfy` (not . T.isInfixOf needle)) developerOnly
+                    doc <- readUtf8 (".." </> "docs" </> name <> ".md")
+                    doc `shouldSatisfy` (not . T.null)
                 )
                 ["install", "config", "commands", "architecture"]

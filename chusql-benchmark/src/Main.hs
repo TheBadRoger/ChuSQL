@@ -36,6 +36,7 @@ import System.Process (
     StdStream (CreatePipe, NoStream),
     createProcess,
     proc,
+    readProcessWithExitCode,
     terminateProcess,
     waitForProcess,
  )
@@ -350,6 +351,16 @@ locateServerExe = do
             putStrLn "chusql-server was not found on PATH: run `stack build` first"
             exitFailure
 
+-- | 在 PATH 里找引导程序（server 需要先引导）
+locateBootstrapExe :: IO FilePath
+locateBootstrapExe = do
+    found <- findExecutable (binaryName "csql-bootstrap")
+    case found of
+        Just path -> pure path
+        Nothing -> do
+            putStrLn "csql-bootstrap was not found on PATH: run `stack build` first"
+            exitFailure
+
 -- | 从 server 输出里读出监听端口
 readListeningPort :: Handle -> IO Int
 readListeningPort handle = do
@@ -396,7 +407,7 @@ startBench = do
     bin <- locateServerExe
     tmp <- getTemporaryDirectory
     stamp <- getMonotonicTime
-    let name = "chusql-fullchain-" ++ show (round (stamp * 1e6) :: Int)
+    let name = "chusql-benchmark-" ++ show (round (stamp * 1e6) :: Int)
         dataDir = tmp </> name
         configPath = tmp </> (name ++ ".toml")
         -- TOML 的普通字符串会吃反斜杠，路径统一用正斜杠
@@ -405,6 +416,13 @@ startBench = do
     writeFile configPath (benchConfigText slashed)
     printf "config   : %s\n" configPath
     printf "data dir : %s\n" dataDir
+    bootstrap <- locateBootstrapExe
+    (bootCode, bootOut, bootErr) <- readProcessWithExitCode bootstrap ["--config", configPath, "--passwordless"] ""
+    case bootCode of
+        ExitSuccess -> printf "bootstrap: system catalog ready\n"
+        _ -> do
+            putStrLn ("the bootstrap program failed (exit " ++ show bootCode ++ "): " ++ bootOut ++ bootErr)
+            exitFailure
     (_, Just out, _, process) <-
         createProcess (proc bin ["--config", configPath]){std_out = CreatePipe, std_err = NoStream}
     port <- readListeningPort out
@@ -418,7 +436,7 @@ startBench = do
             exitFailure
         Right client -> do
             session <- newSession client
-            auth <- authenticateSession session (T.pack "admin") (T.pack "s3cret")
+            auth <- authenticateSession session (T.pack "admin") (T.pack "")
             case auth of
                 Left err -> do
                     putStrLn ("cannot sign in: " ++ T.unpack err)
@@ -429,13 +447,12 @@ startBench = do
                     prepareDatabase session
                     pure (Bench process dataDir client session)
 
--- | 基准用的配置：管理员凭据、随机端口、临时数据目录
+-- | 基准用的配置：管理员名字、随机端口、临时数据目录
 benchConfigText :: String -> String
 benchConfigText dataDir =
     unlines
         [ "[web]"
         , "user = \"admin\""
-        , "password = \"s3cret\""
         , ""
         , "[server]"
         , "host = \"127.0.0.1\""

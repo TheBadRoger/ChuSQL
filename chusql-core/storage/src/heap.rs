@@ -73,12 +73,23 @@ fn unpack_position(v: u64) -> (PageId, u16) {
     (v >> 16, (v & 0xFFFF) as u16)
 }
 
-/// 取行里某一列的整数值（不是整数就没有）
-fn row_int(row: &Row, column: &str) -> Option<i64> {
-    match row.get(column) {
-        Some(serde_json::Value::Number(n)) => n.as_i64(),
+/// 数值里取整数，整值浮点折成整数
+pub(crate) fn scalar_int(v: &serde_json::Value) -> Option<i64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_i64().or_else(|| {
+            let f = n.as_f64()?;
+            if f.fract() != 0.0 || f.abs() > 9_007_199_254_740_992.0 {
+                return None;
+            }
+            Some(f as i64)
+        }),
         _ => None,
     }
+}
+
+/// 取行里某一列的整数值（不是整数就没有）
+fn row_int(row: &Row, column: &str) -> Option<i64> {
+    row.get(column).and_then(scalar_int)
 }
 
 /// i64 键 → 8 字节大端（保序，负数也在前）
@@ -89,7 +100,7 @@ fn key_of(value: i64) -> [u8; 8] {
 /// JSON 值 → 索引键字节（与写索引时同一套编码）
 fn value_key(v: &serde_json::Value) -> Option<Vec<u8>> {
     match v {
-        serde_json::Value::Number(n) => n.as_i64().map(|k| key_of(k).to_vec()),
+        serde_json::Value::Number(_) => scalar_int(v).map(|k| key_of(k).to_vec()),
         serde_json::Value::String(s) => Some(s.as_bytes().to_vec()),
         serde_json::Value::Bool(b) => Some(vec![u8::from(*b)]),
         _ => None,
@@ -613,11 +624,41 @@ impl HeapTable {
         self.scan_projected_with_positions(None)
     }
 
+    /// 分片扫描，只取 [from, to) 页区间内的行
+    pub fn scan_columns_pages(
+        &mut self,
+        columns: Option<&[String]>,
+        from: PageId,
+        to: PageId,
+    ) -> io::Result<Vec<Row>> {
+        Ok(self
+            .scan_pages_with_positions(columns, from, to)?
+            .into_iter()
+            .map(|(_, _, r)| r)
+            .collect())
+    }
+
+    /// 当前页数
+    pub fn num_pages(&mut self) -> io::Result<u64> {
+        self.file.num_pages()
+    }
+
     /// 全表扫描，带位置与列投影
     fn scan_projected_with_positions(&mut self, columns: Option<&[String]>) -> io::Result<Vec<(PageId, u16, Row)>> {
         let n = self.file.num_pages()?;
+        self.scan_pages_with_positions(columns, 0, n)
+    }
+
+    /// 扫描 [from, to) 页区间，带位置与列投影
+    fn scan_pages_with_positions(
+        &mut self,
+        columns: Option<&[String]>,
+        from: PageId,
+        to: PageId,
+    ) -> io::Result<Vec<(PageId, u16, Row)>> {
+        let n = self.file.num_pages()?;
         let mut out = Vec::new();
-        for i in 0..n {
+        for i in from..to.min(n) {
             let tuples = self.file.with_page(i, |p| {
                 let mut v = Vec::new();
                 for slot in HeapPage::iter_slots(p) {

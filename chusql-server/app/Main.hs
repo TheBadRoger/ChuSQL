@@ -4,18 +4,17 @@ module Main (main) where
 
 import ChuSQL.Core.Engine.Storage.FFI (storageVersion)
 import ChuSQL.Core.Engine.Storage.IPC (closeConnection, localStorageLink, setStorageLink)
-import ChuSQL.Interface.Auth (Credential (..))
 import ChuSQL.Interface.Config (
     WebConfig (..),
-    defaultPassword,
     defaultUser,
+    legacyPasswordKey,
     loadWebConfigAt,
-    resolveCredential,
-    usingDefaultCredentials,
+    rootUserName,
  )
 import ChuSQL.Interface.RateLimit (newRateLimiter)
 import ChuSQL.Interface.Settings (readSettingsFile)
 import ChuSQL.Interface.TOML (resolveConfigPath)
+import ChuSQL.Server.Accounts (administratorPasswordless)
 import ChuSQL.Server.Backend (Backend (..), ipcBackend)
 import ChuSQL.Server.TCP (
     ServerConfig (..),
@@ -25,10 +24,12 @@ import ChuSQL.Server.TCP (
     runServer,
  )
 import Control.Exception (IOException, bracket, try)
-import qualified Data.Map.Strict as Map
+import qualified Data.Aeson as A
+import qualified Data.Aeson.KeyMap as KM
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Time.Clock (getCurrentTime)
+import GHC.Conc (getNumProcessors, setNumCapabilities)
 import System.Environment (getArgs)
 import System.Exit (exitFailure)
 import System.IO (BufferMode (LineBuffering), hSetBuffering, stdout)
@@ -88,7 +89,7 @@ usage = do
     putStrLn "        Windows: %APPDATA%\\ChuSQL\\chusql.toml"
     putStrLn "        other:   $XDG_CONFIG_HOME/ChuSQL/chusql.toml (or ~/.config/ChuSQL/chusql.toml)"
     putStrLn "        [storage] data_dir; [server] host/port/max_message/max_rows;"
-    putStrLn "        [web] user/password (administrator credentials)"
+    putStrLn "        [web] user (administrator name; the password lives in the system table)"
     putStrLn ""
     putStrLn "  --config FILE          read that config file instead"
     putStrLn "  --host H               listen address              ([server] host, default 127.0.0.1)"
@@ -103,9 +104,11 @@ usage = do
     putStrLn ""
     putStrLn "storage: this process loads the chusql_core_storage library in-process and owns the data directory"
     putStrLn ""
-    putStrLn "administrator password: user / password in the [web] section of chusql.toml, else the built-in demo"
-    putStrLn "  an empty password means the administrator signs in with no password; ordinary accounts are then refused"
-    putStrLn ("without either the demo administrator is " ++ T.unpack defaultUser ++ " / " ++ T.unpack defaultPassword)
+    putStrLn "administrator password: lives in the __system_users system table, never in chusql.toml"
+    putStrLn ("  the [web] user key only picks the administrator name (default " ++ T.unpack defaultUser ++ ")")
+    putStrLn ""
+    putStrLn "first run: the installer calls csql-bootstrap, which creates the system catalog"
+    putStrLn "  {\"method\":\"system_status\"} tells whether that happened; without it the server stops"
 
 -- | 命令行覆盖管理员
 applyWebOptions :: WebConfig -> Options -> WebConfig
@@ -129,9 +132,11 @@ orElse :: Maybe a -> a -> a
 orElse (Just x) _ = x
 orElse Nothing y = y
 
--- | 入口
+-- | 入口：开够能力数，分片扫描才真并行
 main :: IO ()
 main = do
+    caps <- getNumProcessors
+    setNumCapabilities (max 1 (min 8 caps))
     hSetBuffering stdout LineBuffering
     args <- getArgs
     case parseArgs args of
@@ -150,7 +155,8 @@ run opts = do
     base <- loadWebConfigAt configPath
     let cfg = applyWebOptions base opts
     saved <- readSettingsFile configPath
-    cred <- resolveCredential cfg saved
+    legacy <- legacyPasswordKey configPath
+    let rootName = rootUserName cfg saved
     config <- applyServerOptions <$> loadServerConfigAt configPath <*> pure opts
     opened <- localStorageLink (Just configPath)
     case opened of
@@ -162,13 +168,14 @@ run opts = do
             backend <- ipcBackend
             printBanner cfg config configPath
             checkStorage backend
-            reportCredential cred saved
+            checkInitialized backend
+            reportCredential backend rootName legacy
             limiter <-
                 newRateLimiter
                     getCurrentTime
                     (wcLoginMaxAttempts cfg)
                     (fromIntegral (wcLoginWindow cfg))
-            env <- newServerEnv backend cred configPath config limiter
+            env <- newServerEnv backend rootName configPath config limiter
             let announce port = putStrLn ("listening:    tcp://" ++ scHost config ++ ":" ++ show port)
             bracket (pure link) (const closeConnection) (const (serve env announce))
 
@@ -183,18 +190,37 @@ serve env announce = do
             putStrLn "  the port is probably taken or reserved by the system; try another one: --port 7777"
             exitFailure
 
--- | 报告口令来源，用内置默认口令时告警
-reportCredential :: Credential -> Map.Map Text Text -> IO ()
-reportCredential cred saved
-    | usingDefaultCredentials saved = do
-        putStrLn ""
-        putStrLn "  !! Administrator credentials are not configured; the built-in demo password is in use:"
-        putStrLn ("  !!   user " ++ T.unpack (credUser cred) ++ " / password " ++ T.unpack defaultPassword)
-        putStrLn "  !!   set user / password in the [web] section of chusql.toml and restart"
-        putStrLn ""
-    | T.null (credEncoded cred) =
-        putStrLn ("administrator: " ++ T.unpack (credUser cred) ++ " (passwordless: only the administrator may sign in)")
-    | otherwise = putStrLn ("administrator: " ++ T.unpack (credUser cred) ++ " (credentials come from the settings file only)")
+-- | 系统目录没引导过就不许起服务
+checkInitialized :: Backend -> IO ()
+checkInitialized backend = do
+    status <- beStorage backend (A.object ["method" A..= ("system_status" :: Text)])
+    case status of
+        Right value
+            | statusInitialized value -> putStrLn "system:       ready (the catalog is initialized)"
+        _ -> do
+            putStrLn "!! the system catalog is not initialized; run the bootstrap program first:"
+            putStrLn "!!   csql-bootstrap --config <chusql.toml> --password-stdin"
+            exitFailure
+  where
+    -- | 应答里的 initialized 是不是 true
+    statusInitialized (A.Object fields) = KM.lookup "initialized" fields == Just (A.Bool True)
+    statusInitialized _ = False
+
+-- | 报告管理员账号状态：配置里还留着明文口令、或还没设口令都提醒
+reportCredential :: Backend -> Text -> Bool -> IO ()
+reportCredential backend rootName legacy = do
+    putStrLn ("administrator: " ++ T.unpack rootName)
+    if legacy
+        then do
+            putStrLn "  !! the [web] section still carries a plaintext password key; it is ignored now"
+            putStrLn "  !! remove it: the administrator password lives in the __system_users system table"
+        else pure ()
+    passwordless <- administratorPasswordless backend rootName
+    if passwordless
+        then do
+            putStrLn "  !! the administrator has no password yet: sign in with an empty password, then set one"
+            putStrLn "  !!   ALTER USER root IDENTIFIED BY '...'   (or use the account page in the Web UI)"
+        else pure ()
 
 -- | 探测存储是否可用，答不上 ping 就退出
 checkStorage :: Backend -> IO ()
