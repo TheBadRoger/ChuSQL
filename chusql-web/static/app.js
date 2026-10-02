@@ -1,6 +1,3 @@
-// ChuSQL Web IDE：纯 HTML + CSS + JS，无 React、无打包器、无 Node 依赖。
-// 结构：全局状态 → 页面骨架 → 各区域渲染 → 事件代理 → 会话/数据/变更动作。
-
 import * as api from './api.js';
 import { AUTH_EVENT } from './api.js';
 import {
@@ -35,6 +32,8 @@ import {
   typeLabel,
 } from './core.js';
 
+// ChuSQL Web IDE 主逻辑：状态、渲染、事件代理与会话/数据/变更动作。
+
 // ---------------------------------------------------------------- 状态
 
 const state = {
@@ -63,30 +62,36 @@ const root = document.getElementById('root');
 
 // ---------------------------------------------------------------- 小工具
 
+// 按 id 取 DOM 元素。
 function region(id) {
   return document.getElementById(id);
 }
 
+// 当前时间（时分秒）。
 function now() {
   return new Date().toLocaleTimeString('zh-CN', { hour12: false });
 }
 
+// 记一条消息并刷新下方面板。
 function log(level, text) {
   state.messages.push({ level, text, time: now() });
   if (state.messages.length > 200) state.messages.shift();
   renderBottom();
 }
 
+// 设置状态栏文案。
 function setStatus(text) {
   state.status = text;
   const el = region('status-message');
   if (el) el.textContent = text;
 }
 
+// 取错误的文字描述。
 function describe(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
+// 记录错误并写到状态栏。
 function fail(error) {
   const message = describe(error);
   log('error', message);
@@ -94,17 +99,20 @@ function fail(error) {
   return message;
 }
 
+// 生成下一个标签 id。
 function nextTabId(prefix) {
   state.tabSeq += 1;
   return `${prefix}-${state.tabSeq}`;
 }
 
+// 当前激活的标签。
 function activeTab() {
   return state.tabs.find((tab) => tab.id === state.activeId);
 }
 
 // ---------------------------------------------------------------- 登录页
 
+// 渲染登录页。
 function renderLogin(message, level) {
   state.view = 'login';
   root.innerHTML = `
@@ -122,6 +130,7 @@ function renderLogin(message, level) {
 
 // ---------------------------------------------------------------- 页面骨架
 
+// 渲染工作台骨架与对话框。
 function renderShell() {
   state.view = 'workbench';
   root.innerHTML = `
@@ -200,7 +209,7 @@ function renderShell() {
   applyLayout();
 }
 
-// 侧栏宽度与下方面板高度用 CSSOM 写，避免 CSP 拦掉内联 style 属性。
+// 应用侧栏宽度与下方面板高度。
 function applyLayout() {
   const workbench = region('workbench');
   if (!workbench) return;
@@ -210,6 +219,7 @@ function applyLayout() {
 
 // ---------------------------------------------------------------- 账号区
 
+// 渲染右上角账号区。
 function renderAccount() {
   const el = region('account');
   if (!el) return;
@@ -225,6 +235,7 @@ function renderAccount() {
 
 // ---------------------------------------------------------------- 侧栏
 
+// 渲染资源管理器侧栏。
 function renderSidebar() {
   const el = region('sidebar');
   if (!el) return;
@@ -298,6 +309,7 @@ function renderSidebar() {
 
 // ---------------------------------------------------------------- 标签栏
 
+// 渲染标签栏并刷新内容区。
 function renderTabs() {
   const el = region('editor');
   if (!el) return;
@@ -314,6 +326,7 @@ function renderTabs() {
 
 // ---------------------------------------------------------------- 编辑器区
 
+// 渲染当前标签的内容。
 function renderEditor() {
   const el = region('tab-content');
   if (!el) return;
@@ -332,11 +345,13 @@ function renderEditor() {
 
 // ---- 表格标签
 
+// 单元格显示内容的 HTML。
 function cellContent(value, nullText) {
   if (value === null || value === undefined) return `<span class="null-value">${escapeHtml(nullText)}</span>`;
   return escapeHtml(cellText(value, nullText));
 }
 
+// 渲染表格标签（工具栏、表头、数据行）。
 function renderTableTab(el, tab) {
   const data = tab.data;
   if (!data) {
@@ -429,13 +444,16 @@ function renderTableTab(el, tab) {
 
 // ---- SQL 标签
 
+// 生成行号文本。
 function lineNumbers(sql) {
   const count = String(sql ?? '').split('\n').length;
   return Array.from({ length: count }, (_, index) => index + 1).join('\n');
 }
 
+// 渲染 SQL 控制台标签。
 function renderSqlTab(el, tab) {
   const result = tab.result;
+  // 结果区 HTML。
   const resultHtml = (() => {
     if (!result) return '<p class="muted">按 Ctrl+Enter 运行，或点上面的"运行"。</p>';
     if (result.type === 'error') return `<p class="alert alert-error">${escapeHtml(result.message ?? '执行失败')}</p>`;
@@ -473,11 +491,13 @@ function renderSqlTab(el, tab) {
   const minimap = region('sql-minimap');
   if (!textarea) return;
 
+  // 刷新高亮层与行号。
   const refreshLayers = () => {
     if (highlight) highlight.innerHTML = highlightHtml(tab.sql);
     if (gutter) gutter.textContent = lineNumbers(tab.sql);
     sync();
   };
+  // 同步滚动位置与缩略图。
   const sync = () => {
     if (highlight) {
       highlight.scrollTop = textarea.scrollTop;
@@ -496,11 +516,14 @@ function renderSqlTab(el, tab) {
     }
   };
 
+  // 输入时更新 SQL 并刷新高亮。
   textarea.addEventListener('input', () => {
     tab.sql = textarea.value;
     refreshLayers();
   });
+  // 滚动时同步各层。
   textarea.addEventListener('scroll', sync);
+  // Tab 缩进，Ctrl+Enter 运行。
   textarea.addEventListener('keydown', (event) => {
     if (event.key === 'Tab') {
       event.preventDefault();
@@ -523,17 +546,22 @@ function renderSqlTab(el, tab) {
 
 // ---- 设置标签
 
+// 渲染设置标签页。
 function renderSettingsTab(el) {
   const settings = state.settings;
+  // 字体链输入框。
   const fontField = (key) => `
     <label class="field"><span>${escapeHtml(settingLabels[key])}</span>
       <input data-setting="fonts" data-key="${key}" value="${escapeHtml(fontsToText(settings[key]))}" placeholder="字体名用逗号分隔" /></label>`;
+  // 数值输入框。
   const numberField = (key) => `
     <label class="field"><span>${escapeHtml(settingLabels[key])}</span>
       <input type="number" data-setting="number" data-key="${key}" value="${settings[key]}" /></label>`;
+  // 布尔开关。
   const boolField = (key) => `
     <label class="toggle"><input type="checkbox" data-setting="boolean" data-key="${key}"${settings[key] ? ' checked' : ''} /><span>${escapeHtml(settingLabels[key])}</span></label>`;
 
+  // 服务器设置分组表单。
   const serverHtml = (() => {
     const server = state.serverSettings;
     if (!server) return '<p class="muted">正在读取服务器设置…</p>';
@@ -595,6 +623,7 @@ function renderSettingsTab(el) {
 
 // ---------------------------------------------------------------- 下方面板
 
+// 渲染下方面板（变更/消息）。
 function renderBottom() {
   const el = region('bottom');
   if (!el) return;
@@ -635,6 +664,7 @@ function renderBottom() {
 
 // ---------------------------------------------------------------- 数据加载
 
+// 读取并缓存当前会话。
 async function refreshSession() {
   try {
     state.session = await api.currentSession();
@@ -645,6 +675,7 @@ async function refreshSession() {
   }
 }
 
+// 加载数据库列表与当前库的表。
 async function loadWorkspace() {
   try {
     state.databases = await api.listDatabases();
@@ -661,6 +692,7 @@ async function loadWorkspace() {
   }
 }
 
+// 切换当前数据库。
 async function switchDatabase(name) {
   if (name === state.database) return;
   if (changeCount(state.changes) > 0) {
@@ -680,6 +712,7 @@ async function switchDatabase(name) {
   renderEditor();
 }
 
+// 打开表标签并加载数据。
 async function openTable(database, name) {
   const opened = openTableTab(state.tabs, database, name, nextTabId('table'));
   state.tabs = opened.tabs;
@@ -697,6 +730,7 @@ async function openTable(database, name) {
   await loadTableData(tab);
 }
 
+// 加载表标签的一页数据。
 async function loadTableData(tab) {
   const data = tab.data;
   data.loading = true;
@@ -736,6 +770,7 @@ async function loadTableData(tab) {
   }
 }
 
+// 重新加载所有表标签。
 async function reloadOpenTables() {
   for (const tab of state.tabs) {
     if (tab.kind === 'table') await loadTableData(tab);
@@ -744,6 +779,7 @@ async function reloadOpenTables() {
 
 // ---------------------------------------------------------------- 变更动作
 
+// 撤下某行的全部变更。
 function unstageRow(table, pk) {
   const prefix = `${table}:${JSON.stringify(pk)}:`;
   for (const key of [...state.changes.updates.keys()]) {
@@ -752,12 +788,14 @@ function unstageRow(table, pk) {
   state.changes.deletes.delete(deleteKey(table, pk));
 }
 
+// 暂存单元格修改。
 function stageUpdate(table, database, pk, column, oldValue, newValue) {
   if (oldValue === newValue) state.changes.updates.delete(changeKey(table, pk, column));
   else state.changes.updates.set(changeKey(table, pk, column), { table, database, pk, column, oldValue, newValue });
   afterChange();
 }
 
+// 暂存新增行。
 function stageInsert(table, database, values) {
   state.insertSeq += 1;
   const tempId = `new-${state.insertSeq}`;
@@ -765,18 +803,21 @@ function stageInsert(table, database, values) {
   afterChange();
 }
 
+// 暂存删除行。
 function stageDelete(table, database, pk, row) {
   unstageRow(table, pk);
   state.changes.deletes.set(deleteKey(table, pk), { table, database, pk, row });
   afterChange();
 }
 
+// 变更后重绘相关区域。
 function afterChange() {
   renderSidebar();
   renderEditor();
   renderBottom();
 }
 
+// 撤下一条暂存变更。
 function removeStaged(key) {
   if (state.changes.updates.has(key)) state.changes.updates.delete(key);
   else if (state.changes.inserts.has(key)) state.changes.inserts.delete(key);
@@ -784,6 +825,7 @@ function removeStaged(key) {
   afterChange();
 }
 
+// 撤销全部暂存变更。
 function rollbackAll() {
   state.changes = createEmptyChangeSet();
   for (const tab of state.tabs) if (tab.selected) tab.selected.clear();
@@ -791,6 +833,7 @@ function rollbackAll() {
   afterChange();
 }
 
+// 提交全部暂存变更。
 async function commitAll() {
   const payload = toCommitPayload(state.changes);
   if (!payload.length) {
@@ -832,6 +875,7 @@ async function commitAll() {
 
 // ---------------------------------------------------------------- SQL 运行
 
+// 运行 SQL 并展示结果。
 async function runSql(tab) {
   const sql = String(tab.sql ?? '').trim();
   if (!sql) return;
@@ -862,6 +906,7 @@ async function runSql(tab) {
 
 // ---------------------------------------------------------------- 标签动作
 
+// 激活指定标签。
 function activateTab(id) {
   state.activeId = id;
   const tab = activeTab();
@@ -870,6 +915,7 @@ function activateTab(id) {
   renderTabs();
 }
 
+// 关闭指定标签。
 function closeTabById(id) {
   const closed = closeTab(state.tabs, id, state.activeId);
   state.tabs = closed.tabs;
@@ -877,6 +923,7 @@ function closeTabById(id) {
   renderTabs();
 }
 
+// 新开一个查询标签。
 function openQuery(sql) {
   const title = `查询 ${state.tabs.filter((tab) => tab.kind === 'sql').length + 1}`;
   const opened = openQueryTab(state.tabs, title, nextTabId('sql'), state.database, sql ?? '');
@@ -885,6 +932,7 @@ function openQuery(sql) {
   renderTabs();
 }
 
+// 打开设置标签。
 function openSettings() {
   const opened = openSettingsTab(state.tabs, '设置', nextTabId('settings'));
   state.tabs = opened.tabs;
@@ -895,6 +943,7 @@ function openSettings() {
 
 // ---------------------------------------------------------------- 设置动作
 
+// 把 IDE 设置写到 CSS 变量。
 function applySettingsToDom() {
   const style = document.documentElement.style;
   style.setProperty('--ui-font', fontFamilyValue(state.settings.uiFonts));
@@ -909,6 +958,7 @@ function applySettingsToDom() {
 }
 
 let saveTimer;
+// 保存 IDE 设置（本地+服务器）。
 function persistSettings() {
   try {
     localStorage.setItem(IDE_SETTINGS_KEY, JSON.stringify(state.settings));
@@ -921,6 +971,7 @@ function persistSettings() {
   }, 400);
 }
 
+// 更新一项 IDE 设置。
 function updateSetting(key, value) {
   state.settings = { ...state.settings, [key]: value };
   applySettingsToDom();
@@ -928,6 +979,7 @@ function updateSetting(key, value) {
   renderEditor();
 }
 
+// 从本地存储读 IDE 设置。
 function loadLocalSettings() {
   try {
     const raw = localStorage.getItem(IDE_SETTINGS_KEY);
@@ -938,6 +990,7 @@ function loadLocalSettings() {
   }
 }
 
+// 从服务器读 IDE 设置。
 async function loadRemoteSettings() {
   try {
     state.settings = { ...state.settings, ...parseUiSettings(await api.loadUiSettings()) };
@@ -947,6 +1000,7 @@ async function loadRemoteSettings() {
   }
 }
 
+// 读取服务器设置。
 async function loadServerSettings() {
   try {
     state.serverSettings = await api.loadServerSettings();
@@ -956,6 +1010,7 @@ async function loadServerSettings() {
   renderEditor();
 }
 
+// 保存改过的服务器设置。
 async function saveServerSettings() {
   const inputs = [...document.querySelectorAll('[data-server-setting]')];
   const values = {};
@@ -986,6 +1041,7 @@ async function saveServerSettings() {
 
 // ---------------------------------------------------------------- 表格动作
 
+// 切换该列的排序。
 function sortColumn(tab, column) {
   const data = tab.data;
   if (data.sort === column) data.dir = data.dir === 'asc' ? 'desc' : 'asc';
@@ -997,6 +1053,7 @@ function sortColumn(tab, column) {
   void loadTableData(tab);
 }
 
+// 暂存删除选中的行。
 function deleteSelected(tab) {
   const keyColumn = tab.data.columns.find((column) => column.name === 'id');
   if (!keyColumn || !tab.selected) return;
@@ -1007,7 +1064,7 @@ function deleteSelected(tab) {
   afterChange();
 }
 
-// 点一下就地把单元格变成输入框；Enter/失焦提交，Esc 放弃。
+// 就地编辑单元格：提交或放弃。
 function beginCellEdit(cell, options) {
   if (cell.querySelector('input')) return;
   const input = document.createElement('input');
@@ -1018,6 +1075,7 @@ function beginCellEdit(cell, options) {
   input.focus();
   input.select();
   let done = false;
+  // 结束编辑并按需提交。
   const finish = (save) => {
     if (done) return;
     done = true;
@@ -1025,6 +1083,7 @@ function beginCellEdit(cell, options) {
     input.remove();
     options.commit(save ? parseEdited(raw, options.type) : undefined);
   };
+  // Enter 提交，Esc 放弃。
   input.addEventListener('keydown', (event) => {
     if (event.key === 'Enter') {
       event.preventDefault();
@@ -1034,9 +1093,11 @@ function beginCellEdit(cell, options) {
       finish(false);
     }
   });
+  // 失焦时提交。
   input.addEventListener('blur', () => finish(true));
 }
 
+// 在新建表对话框加一列。
 function addColumnRow(name, type) {
   const container = region('dlg-table-columns');
   if (!container) return;
@@ -1049,6 +1110,7 @@ function addColumnRow(name, type) {
   container.appendChild(row);
 }
 
+// 打开新建表对话框。
 function openCreateTableDialog() {
   region('dlg-table-name').value = '';
   region('dlg-table-error').textContent = '';
@@ -1058,6 +1120,7 @@ function openCreateTableDialog() {
   region('dlg-table').showModal();
 }
 
+// 打开建索引对话框。
 function openIndexDialog(table) {
   const meta = state.tables.find((entry) => entry.name === table);
   const select = region('dlg-index-column');
@@ -1070,6 +1133,7 @@ function openIndexDialog(table) {
   region('dlg-index').showModal();
 }
 
+// 提交新建数据库。
 async function createDatabase() {
   const name = region('dlg-db-name').value.trim();
   try {
@@ -1082,6 +1146,7 @@ async function createDatabase() {
   }
 }
 
+// 提交新建表。
 async function createTable() {
   const name = region('dlg-table-name').value.trim();
   const rows = [...region('dlg-table-columns').querySelectorAll('.column-row')];
@@ -1107,6 +1172,7 @@ async function createTable() {
   }
 }
 
+// 提交建索引。
 async function createIndexFor(table) {
   const dialog = region('dlg-index');
   const column = region('dlg-index-column').value;
@@ -1121,6 +1187,7 @@ async function createIndexFor(table) {
   }
 }
 
+// 删除当前数据库。
 async function dropCurrentDatabase() {
   const name = state.database;
   if (!window.confirm(`删除数据库 ${name}？此操作不可撤销。`)) return;
@@ -1136,6 +1203,7 @@ async function dropCurrentDatabase() {
   }
 }
 
+// 删除指定表。
 async function dropTableByName(table) {
   if (!window.confirm(`删除表 ${table}？`)) return;
   try {
@@ -1150,6 +1218,7 @@ async function dropTableByName(table) {
   }
 }
 
+// 删除指定列。
 async function dropColumnByName(table, column) {
   if (!window.confirm(`删除 ${table}.${column}？`)) return;
   try {
@@ -1162,6 +1231,7 @@ async function dropColumnByName(table, column) {
   }
 }
 
+// 删除指定索引。
 async function dropIndexByName(table, column) {
   if (!window.confirm(`删除 ${table}.${column} 上的索引？`)) return;
   try {
@@ -1175,9 +1245,11 @@ async function dropIndexByName(table, column) {
 
 // ---------------------------------------------------------------- 事件代理
 
+// 拖动分隔条调整尺寸。
 function startSplitterDrag(kind, event) {
   event.preventDefault();
   const workbench = region('workbench');
+  // 按鼠标位置调整宽度或高度。
   const move = (moveEvent) => {
     if (kind === 'v') {
       const width = Math.min(560, Math.max(180, moveEvent.clientX - 48));
@@ -1189,6 +1261,7 @@ function startSplitterDrag(kind, event) {
       workbench.style.setProperty('--dock-height', `${height}px`);
     }
   };
+  // 移除拖动监听。
   const stop = () => {
     window.removeEventListener('mousemove', move);
     window.removeEventListener('mouseup', stop);
@@ -1204,10 +1277,12 @@ const DATABASE_ACTIONS = new Set([
   'drop-database', 'commit', 'rollback', 'copy-sql',
 ]);
 
+// 该动作是否需要当前库。
 function needsDatabase(action) {
   return DATABASE_ACTIONS.has(action);
 }
 
+// 点击事件代理。
 function onClick(event) {
   const splitter = event.target.closest('[data-split]');
   if (splitter) {
@@ -1451,6 +1526,7 @@ function onClick(event) {
   }
 }
 
+// 输入与选择事件代理。
 function onChange(event) {
   const target = event.target;
   if (target.dataset.action === 'switch-database') {
@@ -1495,6 +1571,7 @@ function onChange(event) {
   else updateSetting(key, target.value);
 }
 
+// 提交事件代理（登录表单）。
 function onSubmit(event) {
   if (event.target.id !== 'login-form') return;
   event.preventDefault();
@@ -1524,6 +1601,7 @@ function onSubmit(event) {
   })();
 }
 
+// 键盘事件代理。
 function onKeydown(event) {
   if (event.key === 'Enter' && event.target.id === 'dlg-db-name') {
     event.preventDefault();
@@ -1533,6 +1611,7 @@ function onKeydown(event) {
 
 // ---------------------------------------------------------------- 启动
 
+// 会话过期时回到登录页。
 window.addEventListener(AUTH_EVENT, () => {
   if (state.view === 'login') return;
   state.session = null;
@@ -1546,6 +1625,7 @@ root.addEventListener('change', onChange);
 root.addEventListener('submit', onSubmit);
 root.addEventListener('keydown', onKeydown);
 
+// 启动：读设置、恢复会话、渲染。
 async function boot() {
   loadLocalSettings();
   applySettingsToDom();

@@ -1,12 +1,12 @@
 # ============================================================
 # ChuSQL 单仓库 .gitignore
-#   chusql-engine/   Haskell (Stack + Cabal)
-#   chusql-storage/  Rust (Cargo)
+#   chusql-core/engine/   Haskell (Stack + Cabal)
+#   chusql-core/storage/  Rust (Cargo)
 #   chusql-web/      前端 (手写 HTML / CSS / JS，无 Node 工具链)
 # ============================================================
 
 # ------------------------------------------------------------
-# Haskell / Stack / Cabal —— chusql-engine
+# Haskell / Stack / Cabal —— chusql-core/engine
 # ------------------------------------------------------------
 .stack-work/
 dist-newstyle/
@@ -26,20 +26,23 @@ cabal.project.local
 cabal.project.local~
 
 # 锁文件要入库，不要忽略：
-#   chusql-engine/stack.yaml.lock
+#   chusql-core/engine/stack.yaml.lock
 #   cabal.project.freeze
 
 # ------------------------------------------------------------
-# Rust / Cargo —— chusql-storage
+# Rust / Cargo —— chusql-core/storage
 # ------------------------------------------------------------
 target/
 **/*.rs.bk
 
 # 运行时数据（Rust 服务默认数据目录 CHUSQL_DATA_DIR=data/），不入库
-chusql-storage/data/
+chusql-core/storage/data/
 
 # 一键启动脚本的默认数据目录与日志，不入库
 localdata/
+
+# 本机打出来的发行包（scripts/package.sh / package.ps1 的产物），不入库
+releases/
 
 # 前端 IDE 设置（字体等，由 /api/ui-settings 读写），本机专用，不入库
 scripts/chusql.ui.settings.json
@@ -74,7 +77,7 @@ scripts/chusql.ui.settings.json
 \#*\#
 .\#*
 agent_credientials
-
+.dsh
 # 注意：.zed/tasks.json 是本仓库共享的构建任务（stack build / run / test / repl），
 # 需要入库，所以这里不忽略 .zed/
 

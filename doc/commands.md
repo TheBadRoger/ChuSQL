@@ -4,10 +4,10 @@
 
 | 命令 | 作用 | 选项 |
 | ---- | ---- | ---- |
-| `chusql-storage` | 存储进程：页面与索引、WAL | 只有 `--config <path>` |
+| `chusql-server` | 数据库服务：装入引擎与存储动态库、独占数据目录，对外是 TCP | 见「`chusql-server` 选项」 |
 | `chusql-web` | Web 管理端：REST 接口 + 浏览器里的数据库 IDE | 见「`chusql-web` 选项」 |
-| `csql` | 命令行客户端，直连存储进程，不经过 HTTP | 见「`csql` 选项」 |
-| `csql-web` | 一键启动器：按配置拉起存储进程 + Web，日志写 `<install-dir>/logs` | 无选项（`host`/`port` 从配置读） |
+| `csql` | 命令行客户端，连数据库服务的 TCP 端点 | 见「`csql` 选项」 |
+| `csql-web` | 一键启动器：按配置拉起 Web 服务，日志写 `<install-dir>/logs` | 无选项（`host`/`port` 从配置读） |
 
 四个命令共用同一份 [`chusql.toml`](config.md)；`--config` 都是用来临时读另一份配置的。
 
@@ -23,8 +23,6 @@
 | `-f, --format FORMAT` | `table` | 输出格式：`table` / `json` / `csv` |
 | `-e, --execute SQL` | — | 跑一条语句就退出（脚本化用） |
 | `--history FILE` | `~/.chusql_history` | 历史文件位置 |
-| `--pipe NAME` | 配置 `[server] pipe_name` | 端点名（Windows 具名管道 / Unix 套接字文件） |
-| `--storage SERVER` | — | 端点没人应答时，拉起这个存储进程可执行文件 |
 | `--config FILE` | 固定位置的 `chusql.toml` | 读另一份配置 |
 | `-h, --help` | — | 帮助 |
 
@@ -105,10 +103,9 @@ Web 端对应的接口是 `/api/roles` 系列（`GET` 列表、`POST` 建角色�
 | ---- | ---------- | ---- |
 | `--config FILE` | — | 固定位置的 `chusql.toml` |
 | `--host H` | `[web] host` | `127.0.0.1` |
-| `--port N` | `[web] port` | `7777` |
+| `--port N` | `[web] port` | `7778` |
 | `--static DIR` | `[web] static_dir` | `static` |
 | `--user NAME` | `[web] user` | `root` |
-| `--storage SERVER` | `[web] storage_server` | — |
 | `--cookie-secure BOOL` | `[web] cookie_secure` | `false` |
 | `--body-limit N` | `[web] body_limit` | `65536` |
 | `--session-idle N` | `[web] session_idle` | `28800` |
@@ -140,3 +137,29 @@ REST 接口（界面的一键操作全走结构化接口）：
 除探活、登录和首页（`GET /`、`GET /static/:file`）外都要带会话 Cookie。选库用 `X-ChuSQL-Database` 头：
 **不带这个头就是"没选库"**，此时只有限定名语句（`db.table`）能跑，裸表名会得到 400 `no_database`；
 `GET /api/databases` 和 `POST`/`DELETE /api/databases/:name` 不需要选库。普通身份碰 `system` 库一律 403。
+
+## `chusql-server` 选项
+
+    chusql-server [options]
+
+| 选项 | 对应配置键 | 默认 |
+| ---- | ---------- | ---- |
+| `--config FILE` | — | 固定位置的 `chusql.toml` |
+| `--host H` | `[server] host` | `127.0.0.1` |
+| `--port N` | `[server] port` | `7777` |
+| `--user NAME` | `[web] user` | `root` |
+| `--max-message N` | `[server] max_message` | `1048576` |
+| `--max-rows N` | `[server] max_rows` | `1000` |
+| `-h, --help` | — | 帮助 |
+
+启动后打印实际监听地址，它同时是数据目录的唯一持有者：Web 与 `csql` 不开存储，把存储请求交给它转发。
+客户端按**一行一个 JSON** 说话，方法与错误码见
+[architecture.md](architecture.md) 的「TCP 数据库服务」；用 `nc` 手敲一个会话是这样：
+
+    {"method":"hello","protocol":1}
+    {"method":"login","user":"root","password":"..."}
+    {"method":"query","sql":"USE test"}
+    {"method":"query","sql":"SELECT * FROM users"}
+    {"method":"quit"}
+
+对话里每条 SQL 走的是和 Web、`csql` 同一套解析与权限检查，账号与库选择互不共享。

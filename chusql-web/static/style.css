@@ -1,5 +1,4 @@
-/* ChuSQL Web IDE 样式：VS Code Dark+ 风格，纯手写，无框架。
-   字体与字号由 app.js 通过 CSS 变量（--ui-font 等）按 IDE 设置覆盖。 */
+/* ChuSQL Web IDE 样式：VS Code Dark+ 风格，变量由 app.js 覆盖。 */
 
 :root {
   --bg-base: #1e1e1e;

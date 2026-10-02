@@ -1,10 +1,11 @@
-# 发版流水线：打 tag（v*）时为四个平台各出 web / cli 两个发行包，附 sha256，挂到 Release。
+# 发版流水线：打 tag（v*）时为四个平台各出一个发行包，附 sha256，挂到 Release。
 #
-# 资源命名（install.sh 按 <os>-<arch> 挑资源，见 scripts/install.sh）：
-#   chusql-web-linux-x86_64.tar.gz     chusql-cli-linux-x86_64.tar.gz
-#   chusql-web-windows-x86_64.zip      chusql-cli-windows-x86_64.zip
-#   chusql-web-macos-x86_64.tar.gz     chusql-cli-macos-x86_64.tar.gz
-#   chusql-web-macos-arm64.tar.gz      chusql-cli-macos-arm64.tar.gz
+# 资源命名（install.sh / install.ps1 按 <os>-<arch> 挑资源，见 scripts/install.sh）：
+#   chusql-linux-x86_64.tar.gz     chusql-windows-x86_64.zip
+#   chusql-macos-x86_64.tar.gz     chusql-macos-arm64.tar.gz
+#
+# 一个平台一个包，里面 Web 前端与命令行客户端两部分都在；装哪几个由包内的安装脚本
+# 当场问（非交互时用 --component / -Component 指定）。
 #
 # 装的人拿到的就是编好的二进制，不需要 GHC / Rust：
 #   curl -fsSL https://raw.githubusercontent.com/TheBadRoger/ChuSQL/main/scripts/install.sh \
@@ -33,9 +34,9 @@ env:
 
 jobs:
   build:
-    name: ${{ matrix.platform }} / ${{ matrix.component }}
+    name: ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
@@ -44,7 +45,6 @@ jobs:
           - { os: windows-latest, platform: windows-x86_64 }
           - { os: macos-13, platform: macos-x86_64 }
           - { os: macos-14, platform: macos-arm64 }
-        component: [web, cli]
     steps:
       - uses: actions/checkout@v4
 
@@ -58,8 +58,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            chusql-storage/target
-          key: ${{ runner.os }}-${{ matrix.platform }}-cargo-${{ hashFiles('chusql-storage/Cargo.lock') }}
+            chusql-core/storage/target
+          key: ${{ runner.os }}-${{ matrix.platform }}-cargo-${{ hashFiles('chusql-core/storage/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Haskell toolchain
@@ -74,7 +74,7 @@ jobs:
         with:
           path: |
             ~/.stack
-            chusql-engine/.stack-work
+            chusql-core/engine/.stack-work
             chusql-web/.stack-work
             chusql-cli/.stack-work
           key: ${{ runner.os }}-${{ matrix.platform }}-stack-${{ hashFiles('**/stack.yaml', '**/stack.yaml.lock') }}
@@ -82,59 +82,62 @@ jobs:
 
       # ---------- 构建 ----------
       - name: build storage (Rust)
-        working-directory: chusql-storage
+        working-directory: chusql-core/storage
         run: cargo build --release
 
       - name: build web front end
-        if: matrix.component == 'web'
         working-directory: chusql-cli
         run: stack build --fast chusql-web:exe:chusql-web
 
       - name: build cli
-        if: matrix.component == 'cli'
         working-directory: chusql-cli
         run: stack build --fast chusql-cli:exe:csql
 
-      # ---------- 装配 + 打归档（原来放在一个独立的打包脚本里，那个脚本已经删掉）----------
+      - name: build tcp server
+        working-directory: chusql-cli
+        run: stack build --fast chusql-server:exe:chusql-server
+
+      # ---------- 装配 + 打归档（CI 里直接写在这里；本机打同一个包用 scripts/package.sh）----------
       # 归档里是包内容本身（bin/、scripts/、static/、install.sh 就在根上），安装脚本按这个布局找文件。
       - name: package (Unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           set -eu
-          component='${{ matrix.component }}'
-          name="chusql-$component-${{ matrix.platform }}"
+          name="chusql-${{ matrix.platform }}"
           stage="dist/$name"
           rm -rf "$stage"
           mkdir -p "$stage/bin" "$stage/scripts"
 
-          cp chusql-storage/target/release/chusql-storage "$stage/bin/"
+          cp chusql-core/storage/target/release/libchusql_core_storage.* "$stage/bin/"
 
           stack_root="$(cd chusql-cli && stack path --local-install-root | tail -n 1 | tr -d '\r')"
-          if [ "$component" = web ]; then front_name=chusql-web; else front_name=csql; fi
-          front="$stack_root/bin/$front_name"
-          if [ ! -f "$front" ]; then
-            front="$(find chusql-web/.stack-work chusql-cli/.stack-work -name "$front_name" -type f 2>/dev/null | head -n 1 || true)"
-          fi
-          [ -n "$front" ] && [ -f "$front" ] || { echo "front end binary not found: $front_name" >&2; exit 1; }
-          cp "$front" "$stage/bin/"
+          for front_name in chusql-web chusql-server csql; do
+            front="$stack_root/bin/$front_name"
+            if [ ! -f "$front" ]; then
+              front="$(find chusql-web/.stack-work chusql-cli/.stack-work -name "$front_name" -type f 2>/dev/null | head -n 1 || true)"
+            fi
+            [ -n "$front" ] && [ -f "$front" ] || { echo "front end binary not found: $front_name" >&2; exit 1; }
+            cp "$front" "$stage/bin/"
+          done
 
-          # Haskell 一般静态链接，靶目录里真有共享库就一起带上
-          for lib in chusql-storage/target/release/*.so chusql-storage/target/release/*.dylib; do
-            [ -f "$lib" ] && cp "$lib" "$stage/bin/"
+          # Haskell 一般静态链接，靶目录里真有共享库就一起带上；改名前的旧库（libchusql_storage.*）不能进包
+          for lib in chusql-core/storage/target/release/*.so chusql-core/storage/target/release/*.dylib; do
+            [ -f "$lib" ] || continue
+            case "$(basename "$lib")" in
+              libchusql_storage.*|libchusql_storage-*) continue ;;
+            esac
+            cp "$lib" "$stage/bin/"
           done
 
           cp scripts/chusql.toml scripts/init.sql "$stage/scripts/"
           cp scripts/install.ps1 scripts/install.sh "$stage/"
-          if [ "$component" = web ]; then
-            mkdir -p "$stage/static"
-            cp -R chusql-web/static/. "$stage/static/"
-            cp scripts/csql-web.sh "$stage/"
-            if [ -f scripts/csql-web.ps1 ]; then cp scripts/csql-web.ps1 "$stage/"; fi
-          fi
+          mkdir -p "$stage/static"
+          cp -R chusql-web/static/. "$stage/static/"
+          cp scripts/csql-web.sh "$stage/"
+          if [ -f scripts/csql-web.ps1 ]; then cp scripts/csql-web.ps1 "$stage/"; fi
 
-          chmod +x "$stage/install.sh"
-          if [ -f "$stage/csql-web.sh" ]; then chmod +x "$stage/csql-web.sh"; fi
+          chmod +x "$stage/install.sh" "$stage/csql-web.sh"
 
           mkdir -p dist
           tar -czf "dist/$name.tar.gz" -C "$stage" .
@@ -146,35 +149,35 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $component = '${{ matrix.component }}'
-          $name = "chusql-$component-${{ matrix.platform }}"
+          $name = "chusql-${{ matrix.platform }}"
           $stage = "dist/$name"
           if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
           New-Item -ItemType Directory -Force -Path "$stage/bin", "$stage/scripts" | Out-Null
 
-          Copy-Item 'chusql-storage/target/release/chusql-storage.exe' "$stage/bin/"
+          Copy-Item 'chusql-core/storage/target/release/chusql_core_storage.dll' "$stage/bin/"
 
           $stackRoot = (& stack path --local-install-root | Select-Object -Last 1).Trim()
-          $frontName = if ($component -eq 'web') { 'chusql-web.exe' } else { 'csql.exe' }
-          $front = Join-Path $stackRoot "bin/$frontName"
-          if (-not (Test-Path $front)) {
-            $front = Get-ChildItem -Path 'chusql-web/.stack-work', 'chusql-cli/.stack-work' -Recurse -Filter $frontName -File -ErrorAction SilentlyContinue |
-              Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+          foreach ($frontName in @('chusql-web.exe', 'chusql-server.exe', 'csql.exe')) {
+            $front = Join-Path $stackRoot "bin/$frontName"
+            if (-not (Test-Path $front)) {
+              $front = Get-ChildItem -Path 'chusql-web/.stack-work', 'chusql-cli/.stack-work' -Recurse -Filter $frontName -File -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+            }
+            if (-not $front -or -not (Test-Path $front)) { throw "front end binary not found: $frontName" }
+            Copy-Item $front "$stage/bin/"
           }
-          if (-not $front -or -not (Test-Path $front)) { throw "front end binary not found: $frontName" }
-          Copy-Item $front "$stage/bin/"
 
-          Get-ChildItem 'chusql-storage/target/release' -Filter '*.dll' -File -ErrorAction SilentlyContinue |
+          # 第三方 dll 才要连带上：名字带 chusql 的是本 crate 产物或改名前的残留，上面已按名拷过
+          Get-ChildItem 'chusql-core/storage/target/release' -Filter '*.dll' -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notlike 'chusql*' } |
             ForEach-Object { Copy-Item $_.FullName "$stage/bin/" }
 
           Copy-Item 'scripts/chusql.toml', 'scripts/init.sql' "$stage/scripts/"
           Copy-Item 'scripts/install.ps1', 'scripts/install.sh' $stage
-          if ($component -eq 'web') {
-            New-Item -ItemType Directory -Force -Path "$stage/static" | Out-Null
-            Copy-Item 'chusql-web/static/*' "$stage/static" -Recurse
-            Copy-Item 'scripts/csql-web.sh' $stage
-            if (Test-Path 'scripts/csql-web.ps1') { Copy-Item 'scripts/csql-web.ps1' $stage }
-          }
+          New-Item -ItemType Directory -Force -Path "$stage/static" | Out-Null
+          Copy-Item 'chusql-web/static/*' "$stage/static" -Recurse
+          Copy-Item 'scripts/csql-web.sh' $stage
+          if (Test-Path 'scripts/csql-web.ps1') { Copy-Item 'scripts/csql-web.ps1' $stage }
 
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Compress-Archive -Path "$stage/*" -DestinationPath "dist/$name.zip" -Force
@@ -193,7 +196,7 @@ jobs:
       - name: upload
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.platform }}-${{ matrix.component }}
+          name: ${{ matrix.platform }}
           path: |
             dist/*.zip
             dist/*.tar.gz

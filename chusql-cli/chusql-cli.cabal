@@ -2,9 +2,9 @@ cabal-version: 2.4
 
 name:           chusql-cli
 version:        1.0.0
-synopsis:       ChuSQL 命令行客户端：直连引擎与存储，与 Web 管理端共用账号
-description:    ChuSQL 的命令行前端。直接走命名管道接 Rust 存储进程与 Haskell 引擎，
-                不经过 Web REST；root 凭据与 __chusql_users 表与 Web 管理端完全共用。
+synopsis:       ChuSQL 命令行客户端：直连数据库服务，与 Web 管理端共用账号
+description:    ChuSQL 的命令行前端。自己不开存储、不链引擎，所有 SQL 与会话
+                 都走 chusql-server 的 TCP 端点；账号表与权限服务与 Web 管理端完全共用。
 build-type:     Simple
 
 library
@@ -15,11 +15,9 @@ library
     build-depends:    base >= 4.14 && < 5
                     , aeson
                     , bytestring
-                    , chusql-engine
-                    , chusql-web
-                    , scientific
+                    , chusql-core-model
+                    , chusql-interface
                     , text
-                    , time
     default-language: Haskell2010
     ghc-options:      -Wall
 
@@ -28,10 +26,9 @@ executable csql
     other-modules:    Repl
     hs-source-dirs:   app
     build-depends:    base
-                    , aeson
                     , chusql-cli
-                    , chusql-engine
-                    , chusql-web
+                    , chusql-core-model
+                    , chusql-interface
                     , containers
                     , directory
                     , filepath
@@ -40,6 +37,11 @@ executable csql
                     , text
     default-language: Haskell2010
     ghc-options:      -Wall
+    -- 运行期找 libchusql_core_storage.so：$ORIGIN 让二进制与动态库同目录即可
+    if os(linux)
+        ld-options: -Wl,-rpath,$ORIGIN
+    if os(osx)
+        ld-options: -Wl,-rpath,@loader_path
 
 test-suite chusql-cli-test
     type:             exitcode-stdio-1.0
@@ -49,8 +51,7 @@ test-suite chusql-cli-test
                     , aeson
                     , bytestring
                     , chusql-cli
-                    , chusql-engine
-                    , chusql-web
+                    , chusql-core-model
                     , hspec
                     , text
     default-language: Haskell2010

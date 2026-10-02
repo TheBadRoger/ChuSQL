@@ -1,7 +1,7 @@
 #!/bin/sh
-# csql-web：只负责启动 Web 前端（先拉起存储进程，再起 Web 服务）。
-# 配置走 chusql.toml，两层各读各的分区；这里只取 [web] 的 host/port 拼地址。
 set -eu
+
+# csql-web：先起独占数据目录的 server，再起 Web 服务，配置读 chusql.toml。
 
 home_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 bin="$home_dir/bin"
@@ -14,6 +14,7 @@ config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ChuSQL"
 config="$config_dir/chusql.toml"
 [ -f "$config" ] || { echo "!! config not found: $config" >&2; exit 1; }
 
+# 从配置里取一个 [web] 段的值。
 web_setting() {
     awk -v key="$1" -v def="$2" '
         /^[[:space:]]*\[/ { section = $0; gsub(/[][[:space:]]/, "", section); next }
@@ -34,24 +35,26 @@ web_setting() {
     ' "$config"
 }
 
-storage_exe="$bin/chusql-storage"
+server_exe="$bin/chusql-server"
 web_exe="$bin/chusql-web"
-[ -x "$storage_exe" ] || { echo "!! storage binary not found in $bin" >&2; exit 1; }
+[ -x "$server_exe" ] || { echo "!! server binary not found in $bin" >&2; exit 1; }
 [ -x "$web_exe" ] || { echo "!! web binary not found in $bin" >&2; exit 1; }
 
 host=$(web_setting host 127.0.0.1)
-port=$(web_setting port 7777)
+port=$(web_setting port 7778)
 log_dir="$home_dir/logs"
 mkdir -p "$log_dir"
 
-"$storage_exe" >>"$log_dir/storage.log" 2>>"$log_dir/storage.err.log" &
-storage_pid=$!
-"$web_exe" >>"$log_dir/web.log" 2>>"$log_dir/web.err.log" &
+# server 先起来：它进程内装入存储库、独占数据目录，Web 的存储请求都经它转发
+"$server_exe" --config "$config" >>"$log_dir/server.log" 2>>"$log_dir/server.err.log" &
+server_pid=$!
+"$web_exe" --config "$config" >>"$log_dir/web.log" 2>>"$log_dir/web.err.log" &
 web_pid=$!
 
+# 退出时杀掉 web 与 server 进程。
 cleanup() {
-    kill "$web_pid" "$storage_pid" 2>/dev/null || true
-    wait "$web_pid" "$storage_pid" 2>/dev/null || true
+    kill "$web_pid" "$server_pid" 2>/dev/null || true
+    wait "$web_pid" "$server_pid" 2>/dev/null || true
     echo stopped.
 }
 trap cleanup INT TERM EXIT

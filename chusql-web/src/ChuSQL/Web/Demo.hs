@@ -10,16 +10,17 @@ module ChuSQL.Web.Demo (
     seedDemo,
 ) where
 
-import ChuSQL.Model (Value (..))
-import ChuSQL.Storage.IPC (TableInfo (..))
-import ChuSQL.Web.Actions (
+import ChuSQL.Core.Model (Value (..))
+import ChuSQL.Core.Protocol (TableInfo (..))
+import ChuSQL.Interface.Actions (
     ColumnSpec (..),
     CreateTableSpec (..),
     createIndexSql,
     createTableSql,
     insertRowsSql,
  )
-import ChuSQL.Web.Backend (Backend (..))
+import ChuSQL.Interface.Session (Session, catalog, runStatement)
+import Data.Text (Text)
 import qualified Data.Text as T
 
 -- 演示数据：三张表加一个二级索引，语句与界面走同一套拼 SQL 的代码。
@@ -75,12 +76,12 @@ data SeedReport = SeedReport
     }
     deriving (Show, Eq)
 
--- | 缺什么补什么，可反复点不重复灌
-seedDemo :: Backend -> IO (Either String SeedReport)
-seedDemo backend = do
-    catalog <- beCatalog backend
-    case catalog of
-        Left e -> pure (Left e)
+-- | 按需灌演示数据：缺表补表、缺索引补索引
+seedDemo :: Session -> IO (Either Text SeedReport)
+seedDemo session = do
+    catalogResult <- catalog session
+    case catalogResult of
+        Left message -> pure (Left message)
         Right infos -> do
             let existingTables = map tiTable infos
                 missing = [spec | spec <- demoTableSpecs, T.unpack (ctsTable spec) `notElem` existingTables]
@@ -93,34 +94,33 @@ seedDemo backend = do
                     ]
             created <- runAll (map createTableSql missing)
             case created of
-                Left e -> pure (Left e)
+                Left message -> pure (Left message)
                 Right () -> do
                     rowsDone <- runAll [insertRowsSql t rs | (t, rs) <- demoRows, t `elem` missingNames]
                     case rowsDone of
-                        Left e -> pure (Left e)
+                        Left message -> pure (Left message)
                         Right () -> do
-                            indexes <-
-                                runAll [createIndexSql t c | (t, c) <- wantedIndexes]
-                            pure $
-                                fmap
-                                    (const (SeedReport (map T.unpack missingNames) skipped (map (T.unpack . snd) wantedIndexes)))
-                                    indexes
+                            indexes <- runAll [createIndexSql t c | (t, c) <- wantedIndexes]
+                            pure $ fmap (const (SeedReport (map T.unpack missingNames) skipped (map (T.unpack . snd) wantedIndexes))) indexes
   where
-    runAll :: [Either String String] -> IO (Either String ())
+    -- | 顺序跑完一串语句，首错即停
+    runAll :: [Either String String] -> IO (Either Text ())
     runAll [] = pure (Right ())
     runAll (sql : rest) = case sql of
-        Left e -> pure (Left e)
+        Left e -> pure (Left (T.pack e))
         Right statement -> do
-            result <- beStatement backend statement
+            result <- runStatement session (T.pack statement)
             case result of
-                Left e -> pure (Left e)
+                Left message -> pure (Left message)
                 Right _ -> runAll rest
 
-    indexMissing :: [TableInfo] -> T.Text -> T.Text -> Bool
+    -- | 目录里这张表缺不缺这个索引
+    indexMissing :: [TableInfo] -> Text -> Text -> Bool
     indexMissing infos t c = case lookup (T.unpack t) [(tiTable i, tiIndexes i) | i <- infos] of
         Nothing -> True
         Just cols -> T.unpack c `notElem` cols
 
+-- | 演示用户数据
 userRecords :: [(String, Int)]
 userRecords =
     [ ("Alice", 24)
@@ -135,6 +135,7 @@ userRecords =
     , ("Judy", 29)
     ]
 
+-- | 演示订单数据
 orderRecords :: [(Int, String, Int)]
 orderRecords =
     [ (1, "Laptop", 1299)
@@ -151,6 +152,7 @@ orderRecords =
     , (9, "Lamp", 39)
     ]
 
+-- | 演示产品数据
 productRecords :: [(String, Int, Int)]
 productRecords =
     [ ("Laptop", 1001, 1299)

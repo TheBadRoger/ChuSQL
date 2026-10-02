@@ -1,6 +1,12 @@
 resolver: lts-24.59
 
+extra-lib-dirs:
+    - ../chusql-core/storage/target/release
+
 packages:
     - .
-    - ../chusql-engine
+    - ../chusql-core/engine
+    - ../chusql-server
     - ../chusql-web
+    - ../chusql-core/model
+    - ../chusql-interface

@@ -2,7 +2,7 @@
 
 ## 文件在哪
 
-整条链路（存储进程 / Web / 命令行）共用一份 `chusql.toml`，位置固定，**没有环境变量可以覆盖**：
+整条链路（数据库服务 / Web / 命令行）共用一份 `chusql.toml`，位置固定，**没有环境变量可以覆盖**：
 
 | 平台         | 路径 |
 | ------------ | ---- |
@@ -10,7 +10,7 @@
 | Linux / macOS | `$XDG_CONFIG_HOME/ChuSQL/chusql.toml`，没设就是 `~/.config/ChuSQL/chusql.toml`（`HOME` 也没有才退相对路径 `ChuSQL/chusql.toml`） |
 
 安装脚本就是把 [`scripts/chusql.toml`](../scripts/chusql.toml) 这份模板写到上面的位置，并把安装时给的
-`user` / `password` / `data_dir` 填进去。想临时读另一份文件，`chusql-storage`、`chusql-web`、`csql`
+`user` / `password` / `data_dir` 填进去。想临时读另一份文件，`chusql-server`、`chusql-web`、`csql`
 都认 `--config <path>`（启动器 `csql-web` 没有选项，只读固定路径）。
 
 优先级：**命令行选项 > 配置文件 > 内置默认**，也就是配置文件写什么，命令行随时能盖掉
@@ -20,12 +20,13 @@
 
 | 分区 | 谁读 |
 | ---- | ---- |
-| `[page]` `[btree]` `[buffer]` `[storage]` `[server]` `[log]` | 存储进程 `chusql-storage` |
-| `[web]` | Web 服务 `chusql-web` 与命令行 `csql`（账号、会话、限流、分页上限、静态目录、存储进程路径） |
+| `[page]` `[btree]` `[buffer]` `[storage]` `[log]` | 存储层 `chusql-core/storage`（由 `chusql-server` 装入的动态库） |
+| `[server]` | TCP 数据库服务 `chusql-server`（监听地址、端口、单行上限、结果行数上限） |
+| `[web]` | Web 服务 `chusql-web` 与命令行 `csql`（账号、会话、限流、分页上限、静态目录） |
 
-端点与数据目录只有一份配置：前端读它来决定怎么连，存储进程读它来监听与落盘。
+数据目录只有一份配置：`chusql-server` 读它来落盘，别的进程不碰。
 
-## 存储进程的分区
+## 存储的分区
 
 | 键 | 默认 | 说明 |
 | -- | ---- | ---- |
@@ -33,25 +34,23 @@
 | `[btree] order` | `4` | B+ 树阶 |
 | `[buffer] pool_size` | `1024` | 缓冲池页数 |
 | `[storage] data_dir` | Windows `%LOCALAPPDATA%\ChuSQL\data`，Linux / macOS `${XDG_DATA_HOME:-~/.local/share}/chusql/data` | 数据落哪（模板里那行是安装时替换的占位） |
-| `[server] pipe_name` | `chusql-joint` | 端点名（见下） |
 | `[log] level` | `info` | 日志级别 |
 
 数据目录跟着平台惯例走，跟安装脚本装的位置是同一处（Windows 装到 `%LOCALAPPDATA%\ChuSQL`、Unix 装到
 `~/.local/share/chusql`，数据放在它下面的 `data/`）；`LOCALAPPDATA`/`XDG_DATA_HOME`/`HOME` 都没有时才退相对路径。
 要固定就写绝对路径。
 
-存储进程只认一个命令行开关：`--config <path>`（`--help` 看帮助）。
+存储层没有自己的命令行选项：它是 `chusql-server` 进程内装入的动态库。
 
 ## `[web]` 分区
 
 | 键 | 命令行（`chusql-web`） | 默认 | 说明 |
 | -- | ---------------------- | ---- | ---- |
 | `host` | `--host` | `127.0.0.1` | 监听地址 |
-| `port` | `--port` | `7777` | 监听端口 |
+| `port` | `--port` | `7778` | 监听端口 |
 | `static_dir` | `--static` | `static` | 静态资源目录（候选：给定值、`static`、`chusql-web/static`、`../chusql-web/static`、`../static`，取第一个存在的） |
 | `user` | `--user` | 配置文件缺失时 `root` | 管理员账号名 |
 | `password` | — | 文件里**没有**这一项时用内置演示口令 `root` / `chusql` | 管理员口令（明文，启动时哈希；见「口令与安全」） |
-| `storage_server` | `--storage` | 空 | 存储进程可执行文件；留空＝存储已在别处运行，只按 `[server] pipe_name` 去连 |
 | `cookie_secure` | `--cookie-secure` | `false` | 给会话 Cookie 加 `Secure`（HTTPS 部署时开） |
 | `body_limit` | `--body-limit` | `65536` | 请求体上限（字节） |
 | `session_idle` | `--session-idle` | `28800` | 会话空闲超时（秒） |
@@ -77,23 +76,22 @@
 对应关系：`static_dir`→`static-dir`、`session_idle`→`session-idle`、`session_max`→`session-max`、
 `login_max_attempts`→`login-max-attempts`、`login_window`→`login-window`、`body_limit`→`body-limit`、
 `rows_per_page`→`rows-per-page`、`max_page_size`→`max-page-size`、`max_rows`→`max-rows`、
-`max_sql_length`→`max-sql-length`、`storage_server`→`storage-server`、
+`max_sql_length`→`max-sql-length`、
 `password_min_length`→`password-min-length`、`password_classes`→`password-classes`。
 `host`、`port`、`user`、`password`、`seed` 只有一种写法。
 
-## 端点（`pipe_name`）
+## `[server]` 分区
 
-端点只有 `pipe_name` 一个配置，两个平台各一条规则：
+TCP 数据库服务 `chusql-server` 的监听参数。单独一段：别层的进程不认这一段，也不需要认。
 
-| 平台 | 实际地址 |
-| ---- | -------- |
-| Windows | `\\.\pipe\<pipe_name>`（具名管道） |
-| Linux / macOS | `<socket_dir>/<pipe_name>.sock`（文件系统套接字） |
+| 键 | 命令行（`chusql-server`） | 默认 | 说明 |
+| -- | ------------------------- | ---- | ---- |
+| `host` | `--host` | `127.0.0.1` | 监听地址 |
+| `port` | `--port` | `7777` | 监听端口；写 `0` 让系统分配，实际端口打在启动横幅里 |
+| `max_message` | `--max-message` | `1048576` | 单行请求上限（字节），超了回 `too_large` |
+| `max_rows` | `--max-rows` | `1000` | 单次查询返回行数上限，超了截断并置 `truncated` |
 
-`socket_dir` 按 `$XDG_RUNTIME_DIR` → `$TMPDIR` → `/tmp` 依次取。**前端和存储进程必须在同一套环境变量
-下启动**，否则两边算出来的路径不一样。Unix 套接字路径上限约 100 字节，`$XDG_RUNTIME_DIR` 太长时会退到
-`/tmp`；上一次崩溃残留的 `.sock` 会被下次启动清掉，若还有进程在听同一个端点，启动会报
-`another storage server already listens on ...`。
+这四项改完要重启 `chusql-server` 才生效（Web 设置页也把它们标成需要重启）。
 
 ## 口令与安全
 

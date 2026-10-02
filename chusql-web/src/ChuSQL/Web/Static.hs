@@ -23,7 +23,7 @@ maxNameLength = 128
 allowedExtensions :: [String]
 allowedExtensions = [".html", ".css", ".js", ".svg", ".png", ".ico", ".ttf", ".woff2"]
 
--- | 把请求里的文件名变成安全的相对路径；不合法给 Nothing
+-- | 把请求文件名校验成安全相对路径，不合法给 Nothing
 safeRelative :: Text -> Maybe FilePath
 safeRelative t
     | T.null t = Nothing
@@ -33,6 +33,7 @@ safeRelative t
     | map toLower (takeExtension (T.unpack t)) `notElem` allowedExtensions = Nothing
     | otherwise = Just (T.unpack t)
   where
+    -- | 文件名里是否出现不允许的字符
     badChar c = not (isAsciiLower c || isAsciiUpper c || isDigit c || c `elem` ("._-" :: String))
 
 -- | 读一个静态文件；不存在（或是目录）给 Nothing

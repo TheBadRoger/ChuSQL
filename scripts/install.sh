@@ -1,55 +1,60 @@
 #!/bin/sh
-# ChuSQL 安装脚本（Linux / macOS / POSIX sh）。
-#
-# 三种来源，脚本自己判断走哪条：
-#
-#   1) 包内安装：解压一个发行包，脚本旁边就是 bin/，直接装本地文件
-#        ./install.sh --component web
-#
-#   2) 在线安装：脚本从 GitHub 取发行包（也可用 --url 指任意 URL 或本地归档）
-#        curl -fsSL https://raw.githubusercontent.com/TheBadRoger/ChuSQL/main/scripts/install.sh \
-#            | sh -s -- --component web
-#        sh install.sh --component web --url dist/chusql-web-linux-x86_64.tar.gz
-#
-#   3) 源码安装：拉仓库、本地编译（要有 git + cargo + stack + ghc）
-#        ./install.sh --component web --from-source
-#        ./install.sh --component web --from-source --source-dir ../ChuSQL
-#
-# 安装 = 释放到目标目录 + 配好环境变量 + 写全局配置，装完把包目录删掉。
-# storage/engine 一定装；web 与 cli 二选一。
-#
-# 包目录结构（解压后就是这个样子）：
-#   bin/         chusql-storage（必装）、chusql-web 或 csql（二选一）
-#   static/      Web 前端静态资源（装 web 组件时带）
-#   scripts/     chusql.toml、init.sql
-#   csql-web.sh
-#   install.sh
-
 set -eu
+
+# ChuSQL 安装脚本（Linux/macOS）：从包内、发行版或源码装 cli/web，
+# 写全局配置、改 PATH，装完删除安装包。
 
 default_repo='TheBadRoger/ChuSQL'
 
+# GitHub 站点：github.com 用 api.github.com；其它（GitHub Enterprise、镜像、本地夹具）
+# 按 GHE 的约定走 <base>/api/v3，下载也走 <base>/<owner>/<repo>/releases/download/。
+github_base="${CHUSQL_GITHUB_BASE:-https://github.com}"
+github_base="${github_base%/}"
+case "$github_base" in
+    https://github.com|http://github.com) api_base='https://api.github.com' ;;
+    *) api_base="$github_base/api/v3" ;;
+esac
+
+# 查版本走 API，未认证只有 60 次/小时；给了 token 就带上（CI 里 GITHUB_TOKEN 一般就有）
+github_token="${CHUSQL_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
+
+# 打印用法、选项与环境变量说明。
 usage() {
     cat <<'EOF'
-usage: ./install.sh --component web|cli [options]
+usage: ./install.sh [--component web|cli|both] [options]
 
-  --component web|cli     which front end to install (required)
+  --component web|cli|both
+                          which parts to install. Leave it out and the installer
+                          asks (English, y/n), command line client first:
+                            command line client (csql)?   default yes [Y/n]
+                            web front end (browser UI)?   default no  [y/N]
 
+  --interactive           ask even when there is no terminal; the answers are
+                          read from stdin (one per line)
   --install-dir DIR       where to install   (default: $HOME/.local/share/chusql)
   --data-dir DIR          where to keep data (default: <install-dir>/data)
   --user NAME             administrator name (default: root)
   --password PW           administrator password, empty means no password
-                          (administrator-only sign-in)
+                          (administrator-only sign-in). Leave it out and the
+                          installer asks for it, twice, with the echo off.
   --keep-package          do not delete the downloaded/extracted package
 
 where the files come from:
   (default)               a package next to this script, else the newest GitHub release
   --url URL|PATH          install from this archive (URL, file:// URL or local path)
   --repo OWNER/NAME       GitHub repository (default: TheBadRoger/ChuSQL)
-  --version TAG           release tag to download / git ref to build (default: latest)
+  --version TAG           release tag to download / git ref to build
+                          (default: latest = the newest release that has your package)
+  --list-versions         list the release tags in the repository, then exit
   --from-source           clone and build locally (needs git, cargo, stack, ghc)
   --source-dir DIR        build from this checkout instead of cloning
   -h, --help              this text
+
+environment:
+  CHUSQL_GITHUB_BASE      GitHub base URL: GitHub Enterprise, a mirror, or a
+                          local test fixture (default: https://github.com)
+  CHUSQL_GITHUB_TOKEN     token for the version API (or GITHUB_TOKEN); without
+                          one the API allows 60 requests per hour
 EOF
 }
 
@@ -64,6 +69,11 @@ version='latest'
 url_arg=''
 from_source='no'
 source_dir=''
+list_versions='no'
+interactive_flag='no'
+password_given='no'
+want_web='no'
+want_cli='no'
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -71,11 +81,13 @@ while [ $# -gt 0 ]; do
         --install-dir) install_dir="${2:-}"; shift 2 ;;
         --data-dir) data_dir="${2:-}"; shift 2 ;;
         --user) root_user="${2:-}"; shift 2 ;;
-        --password) root_password="${2:-}"; shift 2 ;;
+        --password) root_password="${2:-}"; password_given='yes'; shift 2 ;;
         --keep-package) keep_package='yes'; shift ;;
         --url) url_arg="${2:-}"; shift 2 ;;
         --repo) repo="${2:-}"; shift 2 ;;
         --version) version="${2:-}"; shift 2 ;;
+        --list-versions) list_versions='yes'; shift ;;
+        --interactive) interactive_flag='yes'; shift ;;
         --from-source) from_source='yes'; shift ;;
         --source-dir) source_dir="${2:-}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
@@ -83,15 +95,23 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# 打印错误并退出 1。
 fail() { echo "!! $1" >&2; exit 1; }
+# 打印步骤标题。
 step() { echo; echo "==> $1"; }
+# 打印缩进提示行。
 note() { echo "  $1"; }
 
-case "$component" in
-    web|cli) ;;
-    '') fail '--component is required (web or cli)' ;;
-    *) fail "--component must be web or cli, got: $component" ;;
-esac
+# --list-versions 只问仓库有什么版本，不需要 --component
+if [ "$list_versions" = 'no' ]; then
+    case "$component" in
+        web)  want_web='yes' ;;
+        cli)  want_cli='yes' ;;
+        both) want_web='yes'; want_cli='yes' ;;
+        '')   : ;;   # 没给就交互询问（下面），问不了才报错
+        *) fail "--component must be web, cli or both, got: $component" ;;
+    esac
+fi
 
 # ---- 本脚本在哪（管道进来时 $0 是 sh，这时没有本地包）----
 self=$0
@@ -104,27 +124,137 @@ esac
 [ -n "$install_dir" ] || install_dir="$HOME/.local/share/chusql"
 [ -n "$data_dir" ] || data_dir="$install_dir/data"
 
+# ---- 交互：先确定答案从哪来 ----
+# 管道安装（curl ... | sh -s --）时 stdin 是脚本本身，所以优先开 /dev/tty；
+# 没有控制终端时只认 --interactive（答案按行从 stdin 读），否则保持原来的非交互行为。
+answers=''
+can_prompt='no'
+if [ "$interactive_flag" = 'yes' ]; then
+    answers='stdin'
+    can_prompt='yes'
+elif (exec 3</dev/tty) 2>/dev/null; then
+    answers='/dev/tty'
+    can_prompt='yes'
+elif [ -t 0 ]; then
+    answers='stdin'
+    can_prompt='yes'
+fi
+
+read_line() {   # -> $line（读到空行也算成功）
+    if [ "$answers" = 'stdin' ]; then
+        IFS= read -r line || line=''
+    else
+        IFS= read -r line < "$answers" || line=''
+    fi
+}
+
+read_secret() { # read_secret PROMPT -> 值写到 stdout（提示和换行都走 stderr，回显关掉）
+    printf '%s' "$1" >&2
+    if [ "$answers" = 'stdin' ]; then
+        IFS= read -r secret_line || secret_line=''
+    else
+        saved=''
+        if command -v stty >/dev/null 2>&1; then
+            saved=$(stty -g < "$answers" 2>/dev/null) || saved=''
+            stty -echo < "$answers" 2>/dev/null || true
+        fi
+        IFS= read -r secret_line < "$answers" || secret_line=''
+        if [ -n "$saved" ]; then
+            stty "$saved" < "$answers" 2>/dev/null || true
+        elif command -v stty >/dev/null 2>&1; then
+            stty echo < "$answers" 2>/dev/null || true
+        fi
+    fi
+    printf '\n' >&2
+    printf '%s' "$secret_line"
+}
+
+ask_yes_no() {  # ask_yes_no PROMPT DEFAULT(y|n) -> $reply = yes|no
+    while :; do
+        printf '%s ' "$1" >&2
+        read_line
+        case "$line" in
+            '') reply="$2" ;;
+            [Yy]|[Yy][Ee][Ss]) reply='yes' ;;
+            [Nn]|[Nn][Oo]) reply='no' ;;
+            *) echo '  please answer y or n' >&2; continue ;;
+        esac
+        return 0
+    done
+}
+
+if [ "$component" = '' ] && [ "$list_versions" = 'no' ]; then
+    if [ "$can_prompt" = 'no' ]; then
+        fail '--component is required (web, cli or both) when there is no terminal to ask on'
+    fi
+    echo
+    echo 'ChuSQL installer: which parts do you want?'
+    ask_yes_no 'Install the command line client (csql)? [Y/n]' yes
+    want_cli="$reply"
+    ask_yes_no 'Install the web front end (browser UI)? [y/N]' no
+    want_web="$reply"
+    if [ "$want_web" = 'no' ] && [ "$want_cli" = 'no' ]; then
+        echo '  neither selected: only the storage library and the server get installed' >&2
+    fi
+fi
+
+if [ "$list_versions" = 'no' ] && [ "$password_given" = 'no' ] && [ "$can_prompt" = 'yes' ]; then
+    echo
+    echo "The administrator account is $root_user."
+    first=$(read_secret "Root password for $root_user (empty means no password) []: ")
+    if [ -n "$first" ]; then
+        again=$(read_secret 'Repeat the root password: ')
+        [ "$first" = "$again" ] || fail 'the two passwords do not match'
+        echo 'root password set' >&2
+    else
+        echo 'no root password: administrator-only sign-in' >&2
+    fi
+    root_password="$first"
+fi
+
+# 选中的组件：空格分隔的清单，外加一个显示名（cli 或 web，两个就是 cli+web）
+wanted=''
+if [ "$want_cli" = 'yes' ]; then wanted='cli'; fi
+if [ "$want_web" = 'yes' ]; then
+    if [ -n "$wanted" ]; then wanted="$wanted web"; else wanted='web'; fi
+fi
+component_label=''
+for comp in $wanted; do
+    if [ -n "$component_label" ]; then component_label="$component_label+$comp"; else component_label="$comp"; fi
+done
+if [ -z "$component_label" ]; then component_label='none (storage only)'; fi
+
 tmp=''
+# 退出时删掉临时目录。
 cleanup() { if [ -n "$tmp" ]; then rm -rf "$tmp"; fi; }
+# 建临时目录并登记退出清理。
 new_tmp() {
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/chusql-install.XXXXXX") || fail 'cannot create a temporary directory'
     # --keep-package 时不注册清理，临时目录就留着
     if [ "$keep_package" = 'no' ]; then trap cleanup EXIT INT TERM HUP; fi
 }
 
+# 用 curl 或 wget 把 URL 下载到文件。
 download() {
-    # download URL FILE
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL -o "$2" "$1" || return 1
+        if [ -n "${3:-}" ]; then
+            curl -fsSL -H "$3" -H 'Accept: application/vnd.github+json' -o "$2" "$1" || return 1
+        else
+            curl -fsSL -o "$2" "$1" || return 1
+        fi
     elif command -v wget >/dev/null 2>&1; then
-        wget -q -O "$2" "$1" || return 1
+        if [ -n "${3:-}" ]; then
+            wget -q --header="$3" --header='Accept: application/vnd.github+json' -O "$2" "$1" || return 1
+        else
+            wget -q -O "$2" "$1" || return 1
+        fi
     else
         fail 'need curl or wget to download the package'
     fi
 }
 
+# 校验包的 sha256，没有就跳过。
 verify_checksum() {
-    # verify_checksum ASSET_URL FILE —— 发布带 .sha256 就校验，没带就说明一下
     sums="$tmp/asset.sha256"
     if ! download "$1.sha256" "$sums" 2>/dev/null; then
         note 'checksum   no .sha256 published for this asset (skipped)'
@@ -142,13 +272,13 @@ verify_checksum() {
     note "checksum   $expected (ok)"
 }
 
+# 按扩展名解包 zip 或 tar.gz。
 unpack() {
-    # unpack ARCHIVE DEST
     mkdir -p "$2"
     case "$1" in
         *.zip)
             command -v unzip >/dev/null 2>&1 || fail 'unzip is required to open a .zip package'
-            unzip -q "$1" -d "$2"
+            unzip -q -o "$1" -d "$2"
             ;;
         *)
             tar -xzf "$1" -C "$2"
@@ -156,7 +286,7 @@ unpack() {
     esac
 }
 
-# 平台标签（全局：os、arch、ext、labels）
+# 探测平台标签（os、arch、ext、labels）。
 detect_platform() {
     os=$(uname -s 2>/dev/null || echo unknown)
     case "$os" in
@@ -173,13 +303,127 @@ detect_platform() {
     labels="$os-$arch $os"
 }
 
-# 发行资源（全局：url、archive），成功返回 0
+# ---- 发行 tag：问 GitHub API（不依赖 jq，用 awk 读 JSON）----
+# 请求 GitHub API 并落盘。
+api_get() {
+    if [ -n "$github_token" ]; then
+        download "$api_base$1" "$2" "Authorization: Bearer $github_token"
+    else
+        download "$api_base$1" "$2"
+    fi
+}
+
+# 把 release JSON 解析成 tag 与资源行。
+parse_releases() {
+    awk '
+        in_assets {
+            if ($0 ~ /^[[:space:]]*\]/) { in_assets = 0; next }
+            if ($0 ~ /"name":/) {
+                s = $0; sub(/.*"name": *"/, "", s); sub(/".*/, "", s)
+                if (s != "") { assets = assets " " s }
+            }
+            next
+        }
+        /"assets": *\[\]/ { next }
+        /"assets": *\[/ { in_assets = 1; next }
+        /"tag_name":/ {
+            if (tag != "") { print tag "\t" pre "\t" assets }
+            s = $0; sub(/.*"tag_name": *"/, "", s); sub(/".*/, "", s)
+            tag = s; pre = 0; assets = ""
+            next
+        }
+        /"prerelease":/ { pre = ($0 ~ /true/) ? 1 : 0; next }
+        END { if (tag != "") { print tag "\t" pre "\t" assets } }
+    ' "$1"
+}
+
+# 这份 release 里有没有本平台的包。
+tag_has_asset() {
+    for label in $labels; do
+        case " $1 " in
+            *" chusql-$label.$ext "*) return 0 ;;
+        esac
+    done
+    case " $1 " in
+        *" chusql.$ext "*) return 0 ;;
+    esac
+    return 1
+}
+
+# 从 tags.txt 里挑第一个符合条件的 tag。
+pick_tag() {
+    [ -s "$tmp/tags.txt" ] || return 1
+    while IFS="$(printf '\t')" read -r tag pre assets; do
+        [ -n "$tag" ] || continue
+        if [ "$1" = 'yes' ] && [ "$pre" = '1' ]; then continue; fi
+        if [ "$2" = 'yes' ] && ! tag_has_asset "$assets"; then continue; fi
+        printf '%s\n' "$tag"
+        return 0
+    done < "$tmp/tags.txt"
+    return 1
+}
+
+# 列出仓库的 release tag 与预发布标记。
+list_release_versions() {
+    new_tmp
+    json="$tmp/releases.json"
+    if ! api_get "/repos/$repo/releases?per_page=100" "$json" 2>/dev/null ||
+        ! parse_releases "$json" > "$tmp/tags.txt" 2>/dev/null ||
+        [ ! -s "$tmp/tags.txt" ]; then
+        echo "!! cannot list the releases of $repo from $api_base" >&2
+        echo '   (offline, rate limited, or the repository has no release yet)' >&2
+        echo "   open $github_base/$repo/releases and pass a tag: --version <tag>" >&2
+        exit 1
+    fi
+    echo "ChuSQL releases in $repo"
+    while IFS="$(printf '\t')" read -r tag pre assets; do
+        [ -n "$tag" ] || continue
+        marker=''
+        if [ "$pre" = '1' ]; then marker=' (prerelease)'; fi
+        if ! tag_has_asset "$assets"; then
+            marker="$marker (no package for $os-$arch)"
+        fi
+        echo "  $tag$marker"
+    done < "$tmp/tags.txt"
+    echo
+    echo "install one with: ./install.sh --version <tag>"
+}
+
+# 把 version=latest 解析成具体 tag。
+resolve_version() {
+    [ "$version" = 'latest' ] || return 0
+    json="$tmp/releases.json"
+    if ! api_get "/repos/$repo/releases?per_page=100" "$json" 2>/dev/null; then
+        note "version    latest (cannot reach $api_base; using the latest release redirect)"
+        return 0
+    fi
+    parse_releases "$json" > "$tmp/tags.txt" 2>/dev/null || true
+    picked=''
+    for want_stable in yes no; do
+        picked=$(pick_tag "$want_stable" 'yes') && break
+        picked=''
+    done
+    if [ -z "$picked" ]; then
+        for want_stable in yes no; do
+            picked=$(pick_tag "$want_stable" 'no') && break
+            picked=''
+        done
+    fi
+    if [ -n "$picked" ]; then
+        version="$picked"
+        note "version    $version"
+    else
+        note 'version    latest (no release lists a matching package; trying the latest release)'
+    fi
+}
+
+# 下载本平台的发行包归档。
 fetch_asset() {
     asset="$1"
     if [ "$version" = 'latest' ]; then
-        url="https://github.com/$repo/releases/latest/download/$asset"
+        url="$github_base/$repo/releases/latest/download/$asset"
     else
-        url="https://github.com/$repo/releases/download/$version/$asset"
+        url="$github_base/$repo/releases/download/$version/$asset"
     fi
     archive="$tmp/$asset"
     if download "$url" "$archive" 2>/dev/null; then
@@ -192,6 +436,12 @@ fetch_asset() {
 pack=''
 url=''
 archive=''
+
+if [ "$list_versions" = 'yes' ]; then
+    detect_platform
+    list_release_versions
+    exit 0
+fi
 
 if [ "$from_source" = 'yes' ]; then
     # ---------- 源码安装 ----------
@@ -208,17 +458,17 @@ if [ "$from_source" = 'yes' ]; then
     else
         src="$tmp/src"
         if [ "$version" = 'latest' ]; then
-            step "Cloning https://github.com/$repo.git"
-            git clone --depth 1 "https://github.com/$repo.git" "$src" >/dev/null 2>&1 ||
-                fail "cannot clone https://github.com/$repo.git"
+            step "Cloning $github_base/$repo.git"
+            git clone --depth 1 "$github_base/$repo.git" "$src" >/dev/null 2>&1 ||
+                fail "cannot clone $github_base/$repo.git"
         else
-            step "Cloning https://github.com/$repo.git at $version"
-            git clone --depth 1 --branch "$version" "https://github.com/$repo.git" "$src" >/dev/null 2>&1 ||
+            step "Cloning $github_base/$repo.git at $version"
+            git clone --depth 1 --branch "$version" "$github_base/$repo.git" "$src" >/dev/null 2>&1 ||
                 fail "cannot clone $repo at $version"
         fi
         note "source     $src"
     fi
-    [ -f "$src/chusql-storage/Cargo.toml" ] || fail "not a ChuSQL checkout (chusql-storage/Cargo.toml missing): $src"
+    [ -f "$src/chusql-core/storage/Cargo.toml" ] || fail "not a ChuSQL checkout (chusql-core/storage/Cargo.toml missing): $src"
     [ -f "$src/scripts/chusql.toml" ] || fail "not a ChuSQL checkout (scripts/chusql.toml missing): $src"
 
     if command -v pkg-config >/dev/null 2>&1 && ! pkg-config --exists zlib 2>/dev/null; then
@@ -226,39 +476,48 @@ if [ "$from_source" = 'yes' ]; then
     fi
 
     step 'Building the Rust storage (cargo build --release)'
-    ( cd "$src/chusql-storage" && cargo build --release ) || fail 'cargo build --release failed'
-    storage_bin="$src/chusql-storage/target/release/chusql-storage"
-    [ -f "$storage_bin" ] || fail "storage binary not found after the build: $storage_bin"
-
-    if [ "$component" = 'web' ]; then
-        comp_dir='chusql-web'; front_name='chusql-web'
-    else
-        comp_dir='chusql-cli'; front_name='csql'
-    fi
-    step "Building the Haskell binaries (stack build --fast in $comp_dir)"
-    note 'the first build downloads the Hackage index (about 139 MB)'
-    ( cd "$src/$comp_dir" && stack build --fast ) || fail "stack build failed in $comp_dir"
-    stack_root=$( cd "$src/$comp_dir" && stack path --local-install-root 2>/dev/null | tr -d '\r' )
-    [ -n "$stack_root" ] || fail 'cannot ask stack for --local-install-root'
-    front_bin="$stack_root/bin/$front_name"
-    [ -f "$front_bin" ] || fail "front end binary not found after the build: $front_bin"
+    ( cd "$src/chusql-core/storage" && cargo build --release ) || fail 'cargo build --release failed'
+    storage_lib="$src/chusql-core/storage/target/release/libchusql_core_storage.so"
+    [ -f "$storage_lib" ] || fail "storage library not found after the build: $storage_lib"
 
     step 'Staging the package'
     pack="$tmp/stage"
     mkdir -p "$pack/bin" "$pack/scripts"
-    cp "$storage_bin" "$pack/bin/"
-    cp "$front_bin" "$pack/bin/"
-    for extra in "$stack_root/bin/"*.so "$stack_root/bin/"*.dll; do
-        if [ -f "$extra" ]; then cp "$extra" "$pack/bin/"; fi
-    done
+    cp "$storage_lib" "$pack/bin/"
     cp "$src/scripts/chusql.toml" "$src/scripts/init.sql" "$pack/scripts/"
     cp "$src/scripts/install.sh" "$pack/"
-    if [ "$component" = 'web' ]; then
-        [ -d "$src/chusql-web/static" ] || fail "static assets not found: $src/chusql-web/static"
-        mkdir -p "$pack/static"
-        cp -R "$src/chusql-web/static/." "$pack/static/"
-        cp "$src/scripts/csql-web.sh" "$pack/"
-    fi
+    for comp in $wanted; do
+        if [ "$comp" = 'web' ]; then
+            comp_dir='chusql-web'; front_name='chusql-web'
+        else
+            comp_dir='chusql-cli'; front_name='csql'
+        fi
+        step "Building the Haskell binaries (stack build --fast in $comp_dir)"
+        note 'the first build downloads the Hackage index (about 139 MB)'
+        ( cd "$src/$comp_dir" && stack build --fast ) || fail "stack build failed in $comp_dir"
+        stack_root=$( cd "$src/$comp_dir" && stack path --local-install-root 2>/dev/null | tr -d '\r' )
+        [ -n "$stack_root" ] || fail 'cannot ask stack for --local-install-root'
+        front_bin="$stack_root/bin/$front_name"
+        [ -f "$front_bin" ] || fail "front end binary not found after the build: $front_bin"
+        cp "$front_bin" "$pack/bin/"
+        for extra in "$stack_root/bin/"*.so "$stack_root/bin/"*.dll; do
+            if [ -f "$extra" ]; then cp "$extra" "$pack/bin/"; fi
+        done
+        if [ "$comp" = 'web' ]; then
+            [ -d "$src/chusql-web/static" ] || fail "static assets not found: $src/chusql-web/static"
+            mkdir -p "$pack/static"
+            cp -R "$src/chusql-web/static/." "$pack/static/"
+            cp "$src/scripts/csql-web.sh" "$pack/"
+        fi
+    done
+
+    # TCP 数据库服务必装，跟组件选择无关：它住在 chusql-server 这个 stack 工程里
+    step 'Building the TCP database server (stack build --fast chusql-server:exe:chusql-server)'
+    ( cd "$src/chusql-server" && stack build --fast chusql-server:exe:chusql-server ) || fail 'stack build failed in chusql-server'
+    server_root=$( cd "$src/chusql-server" && stack path --local-install-root 2>/dev/null | tr -d '\r' )
+    [ -n "$server_root" ] || fail 'cannot ask stack for --local-install-root'
+    [ -f "$server_root/bin/chusql-server" ] || fail "chusql-server not found after the build: $server_root/bin/chusql-server"
+    cp "$server_root/bin/chusql-server" "$pack/bin/"
 elif [ -n "$url_arg" ]; then
     # ---------- 指定 URL / 本地归档 ----------
     new_tmp
@@ -278,43 +537,48 @@ elif [ -n "$url_arg" ]; then
     step 'Unpacking'
     unpack "$archive" "$tmp/pkg"
     pack="$tmp/pkg"
-elif [ -n "$script_dir" ] && [ -f "$script_dir/bin/chusql-storage" ]; then
+elif [ -n "$script_dir" ] && ls "$script_dir/bin/"libchusql_core_storage.* >/dev/null 2>&1; then
     # ---------- 包内安装 ----------
     pack="$script_dir"
 else
     # ---------- 从 GitHub 发行版下载 ----------
     new_tmp
     detect_platform
-    step "Looking for a ChuSQL package for $os-$arch (component $component) in $repo"
+    resolve_version
+    mkdir -p "$tmp/pkg"
+    step "Looking for a ChuSQL package for $os-$arch in $repo"
     found=''
     for label in $labels; do
-        if fetch_asset "chusql-$component-$label.$ext"; then
+        if fetch_asset "chusql-$label.$ext"; then
             found="$asset"
             break
         fi
     done
     if [ -z "$found" ]; then
-        if fetch_asset "chusql-$component.$ext"; then found="$asset"; fi
+        if fetch_asset "chusql.$ext"; then found="$asset"; fi
     fi
-    [ -n "$found" ] || fail "no package for $os-$arch in $repo ($version); try --url or --from-source"
+    [ -n "$found" ] || fail "no package for $os-$arch in $repo ($version); try --list-versions, --url or --from-source"
     verify_checksum "$url" "$archive"
-    step 'Unpacking'
+    step "Unpacking $found"
     unpack "$archive" "$tmp/pkg"
     pack="$tmp/pkg"
 fi
 
 # ---- 校验包内容 ----
-[ -f "$pack/bin/chusql-storage" ] || fail "package is incomplete: bin/chusql-storage not found in $pack"
-if [ "$component" = 'web' ]; then
+ls "$pack/bin/"libchusql_core_storage.* >/dev/null 2>&1 || fail "package is incomplete: bin/libchusql_core_storage.* not found in $pack"
+[ -f "$pack/bin/chusql-server" ] || fail "package is incomplete: bin/chusql-server not found in $pack"
+if [ "$want_web" = 'yes' ]; then
     [ -f "$pack/bin/chusql-web" ] || fail 'package is incomplete: bin/chusql-web not found'
     [ -d "$pack/static" ] || fail 'package is incomplete: static/ not found'
-else
+fi
+if [ "$want_cli" = 'yes' ]; then
     [ -f "$pack/bin/csql" ] || fail 'package is incomplete: bin/csql not found'
 fi
 [ -f "$pack/scripts/chusql.toml" ] || fail 'package is incomplete: scripts/chusql.toml not found'
 
 echo 'ChuSQL installer'
-echo "  component  $component"
+echo "  version    $version"
+echo "  components $component_label"
 echo "  install to $install_dir"
 echo "  data dir   $data_dir"
 if [ -n "$root_password" ]; then
@@ -324,11 +588,21 @@ else
 fi
 
 # ---- 释放文件 ----
+# 包是合在一起的（web 和 cli 都在），这里按这次的选择逐个释放：没选的组件不落地
 step 'Installing files'
 mkdir -p "$install_dir/bin" "$install_dir/logs" "$data_dir"
-cp -R "$pack/bin/." "$install_dir/bin/"
-chmod +x "$install_dir/bin/"* 2>/dev/null || true
-if [ "$component" = 'web' ]; then
+cp "$pack/bin/chusql-server" "$install_dir/bin/"
+for lib in "$pack/bin/"libchusql_core_storage.*; do
+    if [ -f "$lib" ]; then cp "$lib" "$install_dir/bin/"; fi
+done
+for lib in "$pack/bin/"*.so "$pack/bin/"*.dylib "$pack/bin/"*.dll; do
+    if [ -f "$lib" ]; then cp "$lib" "$install_dir/bin/"; fi
+done
+if [ "$want_cli" = 'yes' ]; then
+    cp "$pack/bin/csql" "$install_dir/bin/"
+fi
+if [ "$want_web" = 'yes' ]; then
+    cp "$pack/bin/chusql-web" "$install_dir/bin/"
     mkdir -p "$install_dir/static"
     cp -R "$pack/static/." "$install_dir/static/"
     if [ -f "$pack/csql-web.sh" ]; then
@@ -336,6 +610,7 @@ if [ "$component" = 'web' ]; then
         chmod +x "$install_dir/csql-web.sh"
     fi
 fi
+chmod +x "$install_dir/bin/"* 2>/dev/null || true
 
 # ---- 写全局配置 ----
 step 'Writing chusql.toml'
@@ -351,13 +626,14 @@ if [ -f "$pack/scripts/init.sql" ]; then cp "$pack/scripts/init.sql" "$install_d
 
 # ---- 命令入口 ----
 step 'Creating commands'
-if [ "$component" = 'web' ]; then
+if [ "$want_web" = 'yes' ]; then
     cat > "$install_dir/csql-web" <<'EOF'
 #!/bin/sh
 exec "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/csql-web.sh" "$@"
 EOF
     chmod +x "$install_dir/csql-web"
-else
+fi
+if [ "$want_cli" = 'yes' ]; then
     cat > "$install_dir/csql" <<'EOF'
 #!/bin/sh
 exec "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/bin/csql" "$@"
@@ -387,7 +663,7 @@ if [ "$keep_package" = 'no' ]; then
     case "$install_dir" in
         "$pack"*|"$pack") echo "kept the package (install dir is inside it): $pack" ;;
         *)
-            if [ -f "$pack/bin/chusql-storage" ]; then
+            if ls "$pack/bin/"libchusql_core_storage.* >/dev/null 2>&1; then
                 ( cd / && rm -rf "$pack" )
                 echo 'package removed'
             else
@@ -403,4 +679,10 @@ fi
 step 'Done'
 echo "  chusql.toml  $config_file"
 echo "  data         $data_dir"
-if [ "$component" = 'web' ]; then echo '  start with   csql-web'; else echo '  start with   csql'; fi
+start_with=''
+if [ "$want_web" = 'yes' ]; then start_with='csql-web'; fi
+if [ "$want_cli" = 'yes' ]; then
+    if [ -n "$start_with" ]; then start_with="$start_with, csql"; else start_with='csql'; fi
+fi
+echo "  start with   $start_with"
+echo "  tcp server   $install_dir/bin/chusql-server (listens on [server] host/port, defaults 127.0.0.1:7777)"

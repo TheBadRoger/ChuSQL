@@ -1,0 +1,70 @@
+cabal-version: 2.4
+
+name:           chusql-core-engine
+version:        1.0.0
+synopsis:       ChuSQL 执行引擎：SQL 词法与语法分析、表达式求值
+description:    ChuSQL 服务端执行引擎。负责 SQL 词法分析与 AST 构建、
+                WHERE 条件表达式求值、关系代数运算与内存表管理。
+build-type:     Simple
+
+library
+    hs-source-dirs:   src
+    exposed-modules:  ChuSQL.Core.Engine.Algebra.Eval
+                      ChuSQL.Core.Engine.Algebra.Expr
+                      ChuSQL.Core.Engine.Algebra.Op
+                      ChuSQL.Core.Engine.Algebra.Optimize
+                      ChuSQL.Core.Engine.Algebra.Planner
+                      ChuSQL.Core.Engine.Algebra.Sort
+                      ChuSQL.Core.Engine
+                      ChuSQL.Core.Engine.Semantic
+                      ChuSQL.Core.Engine.Storage
+                      ChuSQL.Core.Engine.Storage.FFI
+                      ChuSQL.Core.Engine.Storage.IPC
+                      ChuSQL.Core.Engine.Storage.Memory
+                      ChuSQL.Core.Engine.Syntax.AST
+                      ChuSQL.Core.Engine.Syntax.Parser
+    build-depends:    base >= 4.14 && < 5
+                    , aeson
+                    , bytestring
+                    , hashable
+                    , chusql-core-model
+                    , megaparsec
+                    , parser-combinators
+                    , scientific
+                    , text
+                    , unordered-containers
+    extra-libraries:  chusql_core_storage
+    -- 运行期找 libchusql_core_storage.so：$ORIGIN 让二进制与动态库同目录即可
+    if os(linux)
+        ld-options: -Wl,-rpath,$ORIGIN
+    if os(osx)
+        ld-options: -Wl,-rpath,@loader_path
+    default-language: Haskell2010
+    ghc-options:      -Wall
+
+executable chusql-core-engine
+    main-is:          Main.hs
+    hs-source-dirs:   app
+    build-depends:    base
+                    , chusql-core-engine
+                    , chusql-core-model
+    default-language: Haskell2010
+    ghc-options:      -Wall
+    -- 运行期找 libchusql_core_storage.so：$ORIGIN 让二进制与动态库同目录即可
+    if os(linux)
+        ld-options: -Wl,-rpath,$ORIGIN
+    if os(osx)
+        ld-options: -Wl,-rpath,@loader_path
+
+test-suite chusql-core-engine-test
+    type:             exitcode-stdio-1.0
+    main-is:          Spec.hs
+    hs-source-dirs:   test
+    build-depends:    base
+                    , chusql-core-engine
+                    , chusql-core-model
+                    , directory
+                    , filepath
+                    , hspec
+    default-language: Haskell2010
+    ghc-options:      -Wall

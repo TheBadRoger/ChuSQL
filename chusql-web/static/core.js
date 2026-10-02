@@ -1,9 +1,9 @@
-// 纯逻辑层：SQL 生成、变更集、筛选、类型、标签页与 IDE 设置默认值。
-// 不碰 DOM、不发请求，方便单独阅读与替换。
+// 纯逻辑层：SQL 生成、变更集、筛选、类型、标签页与 IDE 设置。
+// 不碰 DOM、不发请求。
 
 // ---------------------------------------------------------------- 转义
 
-// 所有拼进 innerHTML 的文本都要先过这里（表名、列名、单元格值都是用户数据）。
+// 转义 HTML 特殊字符。
 export function escapeHtml(value) {
   return String(value ?? '')
     .replaceAll('&', '&amp;')
@@ -20,7 +20,7 @@ const identifierPattern = /^[A-Za-z_][A-Za-z0-9_]*$/;
 // 账号表：在 system 库里像普通表一样浏览，写入会翻译成账号命令。
 export const accountsTable = '__chusql_users';
 
-// 字面量：NULL / 数字 / 布尔原样，其它按字符串加单引号并把单引号翻倍。
+// 值转 SQL 字面量（字符串加引号转义）。
 export function sqlLiteral(value) {
   if (value === null || value === undefined) return 'NULL';
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
@@ -70,11 +70,12 @@ export function changeSql(change) {
 
 // ---------------------------------------------------------------- 变更集
 
-// 空变更集：updates 按"表:主键:列"记，inserts/deletes 按各自的键记。
+// 建一个空变更集。
 export function createEmptyChangeSet() {
   return { updates: new Map(), inserts: new Map(), deletes: new Map() };
 }
 
+// 复制变更集。
 export function cloneChangeSet(changes) {
   return {
     updates: new Map(changes.updates),
@@ -83,6 +84,7 @@ export function cloneChangeSet(changes) {
   };
 }
 
+// 变更总条数。
 export function changeCount(changes) {
   return changes.updates.size + changes.inserts.size + changes.deletes.size;
 }
@@ -92,7 +94,7 @@ export function changeKey(table, pk, column) {
   return `${table}:${JSON.stringify(pk)}:${column}`;
 }
 
-// 插入行的键（临时 id，不落库）。
+// 插入行的键。
 export function insertKey(table, tempId) {
   return `${table}:${tempId}`;
 }
@@ -121,7 +123,7 @@ export function toCommitPayload(changes) {
   ];
 }
 
-// 面板里要显示的一条条变更：[{ key, kind, table, sql, … }]
+// 面板展示用的变更条目列表。
 export function changeEntries(changes) {
   const updates = [...changes.updates.entries()].map(([key, update]) => ({
     key,
@@ -155,16 +157,18 @@ export function changesSql(changes) {
 
 // ---------------------------------------------------------------- 筛选
 
+// 转义正则元字符。
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// like 通配转正则。
 function likePattern(raw) {
   const escaped = escapeRegExp(raw).replaceAll('%', '.*').replaceAll('_', '.');
   return new RegExp(`^${escaped}$`, 'i');
 }
 
-// 表格筛选表达式：null / true / false / like 通配 / 数值比较 / 纯文本包含。
+// 判断单元格值是否命中筛选表达式。
 export function matchesFilter(value, rawExpression) {
   const expression = String(rawExpression ?? '').trim();
   if (!expression) return true;
@@ -209,23 +213,27 @@ export const creatableTypes = [
   'float', 'double', 'decimal(10,2)', 'date', 'timestamp', 'blob',
 ];
 
+// 取类型基名（去掉参数）。
 export function columnKind(type) {
   return String(type).split('(')[0].trim().toLowerCase();
 }
 
+// 是否整数类型。
 export function isIntegerType(type) {
   return ['int', 'bigint', 'smallint'].includes(columnKind(type));
 }
 
+// 是否数值类型。
 export function isNumericType(type) {
   return ['int', 'bigint', 'smallint', 'float', 'double', 'decimal', 'numeric'].includes(columnKind(type));
 }
 
+// 是否布尔类型。
 export function isBooleanType(type) {
   return ['bool', 'boolean'].includes(columnKind(type));
 }
 
-// 显示名：按基名查标签，参数原样跟在后面（varchar(20) → VARCHAR(20)）。
+// 类型的显示名。
 export function typeLabel(type) {
   const kind = columnKind(type);
   const label = typeLabels[kind];
@@ -236,7 +244,7 @@ export function typeLabel(type) {
 
 // ---------------------------------------------------------------- 值渲染
 
-// 单元格显示的文本；null/undefined 用设置里的占位文本。
+// 单元格显示文本（空值用占位文本）。
 export function cellText(value, nullText) {
   if (value === null || value === undefined) return nullText;
   if (typeof value === 'boolean') return value ? 'true' : 'false';
@@ -249,7 +257,7 @@ export function editText(value) {
   return String(value);
 }
 
-// 把编辑框里的文本变回提交给服务的值（空串按 null 处理，与界面上的"清空"一致）。
+// 编辑框文本转提交值（空串当 null）。
 export function parseEdited(raw, type) {
   const text = String(raw ?? '').trim();
   if (text === '') return null;
@@ -296,6 +304,7 @@ export function tokenizeSql(sql) {
   let plain = '';
   let index = 0;
   const text = String(sql ?? '');
+  // 收尾当前普通片段。
   const flush = () => {
     if (plain) {
       tokens.push({ text: plain, kind: 'plain' });
@@ -352,7 +361,7 @@ export function tokenizeSql(sql) {
   return tokens;
 }
 
-// 高亮片段转 HTML（词法切分的结果，文本仍然要转义）。
+// 高亮 SQL 片段转 HTML。
 export function highlightHtml(sql) {
   return tokenizeSql(sql)
     .map((token) => (token.kind === 'plain' ? escapeHtml(token.text) : `<span class="tok-${token.kind}">${escapeHtml(token.text)}</span>`))
@@ -492,6 +501,7 @@ export function fontsFromText(text) {
     .slice(0, 10);
 }
 
+// 字体链转逗号分隔文本。
 export function fontsToText(chain) {
   return chain.join(', ');
 }

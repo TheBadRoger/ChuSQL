@@ -1,9 +1,10 @@
-# csql-web：只负责启动 Web 前端（先拉起存储进程，再起 Web 服务）。
-# 配置走 chusql.toml，两层各读各的分区；这里只取 [web] 的 host/port 拼地址。
-
 $ErrorActionPreference = 'Stop'
 
+# csql-web：先起独占数据目录的 server，再起 Web 服务，配置读 chusql.toml。
+
+# 打印错误并退出 1。
 function Fail([string]$msg) { Write-Host "!! $msg" -ForegroundColor Red; exit 1 }
+# 打印一行输出。
 function Say([string]$msg) { Write-Host $msg }
 
 $home_dir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -13,6 +14,7 @@ $config_dir = if ($env:APPDATA) { Join-Path $env:APPDATA 'ChuSQL' } else { Join-
 $config = Join-Path $config_dir 'chusql.toml'
 if (-not (Test-Path $config)) { Fail "config not found: $config" }
 
+# 从配置里取一个 [web] 段的值。
 function Get-WebSetting([string]$Key, [string]$Default) {
     $section = ''
     $pattern = '^\s*' + [regex]::Escape($Key) + '\s*='
@@ -27,21 +29,22 @@ function Get-WebSetting([string]$Key, [string]$Default) {
     return $Default
 }
 
-$storage_exe = Join-Path $bin 'chusql-storage.exe'
+$server_exe = Join-Path $bin 'chusql-server.exe'
 $web_exe = Join-Path $bin 'chusql-web.exe'
-if (-not (Test-Path $storage_exe)) { Fail "storage binary not found in $bin" }
+if (-not (Test-Path $server_exe)) { Fail "server binary not found in $bin" }
 if (-not (Test-Path $web_exe)) { Fail "web binary not found in $bin" }
 
 $host_addr = Get-WebSetting 'host' '127.0.0.1'
-$port = Get-WebSetting 'port' '7777'
+$port = Get-WebSetting 'port' '7778'
 $log_dir = Join-Path $home_dir 'logs'
 New-Item -ItemType Directory -Force -Path $log_dir | Out-Null
 
-$storage = $null
+$server = $null
 $web = $null
 try {
-    $storage = Start-Process -FilePath $storage_exe -WorkingDirectory $home_dir -PassThru -RedirectStandardOutput (Join-Path $log_dir 'storage.log') -RedirectStandardError (Join-Path $log_dir 'storage.err.log')
-    $web = Start-Process -FilePath $web_exe -WorkingDirectory $home_dir -PassThru -RedirectStandardOutput (Join-Path $log_dir 'web.log') -RedirectStandardError (Join-Path $log_dir 'web.err.log')
+    # server 先起来：它进程内装入存储库、独占数据目录，Web 的存储请求都经它转发
+    $server = Start-Process -FilePath $server_exe -ArgumentList '--config', $config -WorkingDirectory $home_dir -PassThru -RedirectStandardOutput (Join-Path $log_dir 'server.log') -RedirectStandardError (Join-Path $log_dir 'server.err.log')
+    $web = Start-Process -FilePath $web_exe -ArgumentList '--config', $config -WorkingDirectory $home_dir -PassThru -RedirectStandardOutput (Join-Path $log_dir 'web.log') -RedirectStandardError (Join-Path $log_dir 'web.err.log')
 
     Say 'starting web ...'
     Say "ready: http://${host_addr}:${port}/"
@@ -51,7 +54,7 @@ try {
     Say "!! web exited with code $($web.ExitCode)"
 }
 finally {
-    foreach ($proc in @($web, $storage)) {
+    foreach ($proc in @($web, $server)) {
         if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
     }
     Say 'stopped.'

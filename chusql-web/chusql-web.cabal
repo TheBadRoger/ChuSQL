@@ -4,37 +4,27 @@ name:           chusql-web
 version:        1.0.0
 synopsis:       ChuSQL Web 管理端：Scotty + REST API + 静态页面
 description:    ChuSQL 的浏览器管理端。负责 HTTP 交付、鉴权、静态文件，
-                以及把用户 SQL 转交给 chusql-engine（再由 IPC 打到 Rust 存储进程）。
+                并把用户的 SQL 经 TCP 转交给 chusql-server（存储由服务器进程里的
+                chusql_core_storage 动态库承担）。本进程不链引擎，也不碰存储。
+                数据库服务器与 TCP 协议在 chusql-server 包里，这里只做 HTTP 这一面。
 build-type:     Simple
 
 library
     hs-source-dirs:   src
-    exposed-modules:  ChuSQL.Web.Actions
-                      ChuSQL.Web.Accounts
-                      ChuSQL.Web.API
-                      ChuSQL.Web.Auth
-                      ChuSQL.Web.Backend
-                      ChuSQL.Web.Config
+    exposed-modules:  ChuSQL.Web.API
                       ChuSQL.Web.Demo
-                      ChuSQL.Web.Privileges
-                      ChuSQL.Web.RateLimit
                       ChuSQL.Web.Secure
-                      ChuSQL.Web.Settings
                       ChuSQL.Web.Static
-                      ChuSQL.Web.StorageProcess
-                      ChuSQL.Web.TOML
                       ChuSQL.Web.UISettings
     build-depends:    base >= 4.14 && < 5
                     , aeson
                     , bytestring
-                    , chusql-engine
+                    , chusql-core-model
+                    , chusql-interface
                     , containers
-                    , crypton
                     , directory
                     , filepath
                     , http-types
-                    , memory
-                    , process
                     , scientific
                     , scotty
                     , text
@@ -48,30 +38,32 @@ executable chusql-web
     main-is:          Main.hs
     hs-source-dirs:   app
     build-depends:    base
-                    , bytestring
-                    , chusql-engine
+                    , chusql-interface
                     , chusql-web
                     , containers
-                    , crypton
-                    , directory
-                    , filepath
-                    , http-types
-                    , memory
                     , text
                     , time
                     , wai
                     , warp
     default-language: Haskell2010
     ghc-options:      -Wall
+    -- 运行期找 libchusql_core_storage.so：$ORIGIN 让二进制与动态库同目录即可
+    if os(linux)
+        ld-options: -Wl,-rpath,$ORIGIN
+    if os(osx)
+        ld-options: -Wl,-rpath,@loader_path
 
 test-suite chusql-web-test
     type:             exitcode-stdio-1.0
     main-is:          Spec.hs
     hs-source-dirs:   test
+    other-modules:    Gates
+    build-tool-depends: chusql-server:chusql-server
     build-depends:    base
                     , aeson
                     , bytestring
-                    , chusql-engine
+                    , chusql-core-model
+                    , chusql-interface
                     , chusql-web
                     , containers
                     , directory
@@ -88,4 +80,4 @@ test-suite chusql-web-test
                     , wai-extra
                     , warp
     default-language: Haskell2010
-    ghc-options:      -Wall
+    ghc-options:      -Wall -threaded
