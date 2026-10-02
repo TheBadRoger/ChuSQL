@@ -57,15 +57,18 @@ parseMeta raw = do
         "format" -> selectFormat argument
         other -> MetaUnknown other
   where
+    -- | 拼出切库命令
     connectTo argument
         | T.null argument = MetaUnknown "c"
         | otherwise = MetaConnect argument
+    -- | 解析格式参数
     selectFormat argument = maybe (MetaUnknown "format") MetaSetFormat (parseFormat argument)
 
--- | 取出第一条以分号结束的语句与后面的残余；字符串与注释里的分号不算
+-- | 取出第一条语句，忽略引号与注释里的分号
 takeStatement :: Text -> Maybe (Text, Text)
 takeStatement = go ScanNormal [] . T.unpack
   where
+    -- | 逐字符扫描语句边界
     go _ _ [] = Nothing
     go ScanNormal acc (';' : rest) = Just (T.strip (T.pack (reverse acc)), T.pack rest)
     go ScanNormal acc ('-' : '-' : rest) = go ScanLineComment ('-' : '-' : acc) rest

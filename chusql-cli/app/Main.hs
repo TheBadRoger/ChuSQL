@@ -11,19 +11,11 @@ import ChuSQL.CLI.Session (
     newSession,
     switchDatabase,
  )
-import ChuSQL.Web.Auth (Credential (..))
-import ChuSQL.Web.Backend (ipcBackend)
-import ChuSQL.Web.Config (WebConfig (..), defaultPassword, loadWebConfigAt, resolveCredential, resolvePipeName)
-import ChuSQL.Web.Settings (readSettingsFile)
-import ChuSQL.Web.TOML (resolveConfigPath)
-import ChuSQL.Web.StorageProcess (
-    StorageProcess,
-    findStorageServer,
-    startStorageProcessAt,
-    stopStorageProcess,
-    waitForStorage,
- )
-import ChuSQL.Storage.IPC (setPipeName)
+import ChuSQL.Interface.Auth (Credential (..))
+import ChuSQL.Interface.Config (ServerConfig (..), loadServerConfigAt, loadWebConfigAt, resolveCredential, resolvePlainPassword)
+import ChuSQL.Interface.Link (Client, closeClient, connectClient)
+import ChuSQL.Interface.Settings (readSettingsFile)
+import ChuSQL.Interface.TOML (resolveConfigPath)
 import Control.Exception (finally)
 import Control.Monad (unless)
 import Data.IORef (newIORef)
@@ -39,7 +31,7 @@ import System.Exit (exitFailure)
 import System.FilePath ((</>))
 import System.IO (hSetEncoding, stderr, stdout, utf8)
 
--- chusql-cli：与 Web 管理端并列的前端，直连存储与引擎，账号与 Web 共用。
+-- chusql-cli：与 Web 管理端并列的前端，接到拥有存储的 server 上跑 SQL，账号与 Web 共用。
 
 data Options = Options
     { optUser :: Maybe Text
@@ -48,11 +40,10 @@ data Options = Options
     , optFormat :: OutputFormat
     , optExecute :: Maybe Text
     , optHistory :: Maybe FilePath
-    , optPipe :: Maybe String
-    , optStorage :: Maybe FilePath
     , optConfig :: Maybe FilePath
     }
 
+-- | 命令行参数解析器
 optionsParser :: Parser Options
 optionsParser =
     Options
@@ -78,13 +69,13 @@ optionsParser =
             )
         <*> optional (T.pack <$> strOption (long "execute" <> short 'e' <> metavar "SQL" <> help "Run one statement and exit"))
         <*> optional (strOption (long "history" <> metavar "FILE" <> help "SQL history file (default ~/.chusql_history)"))
-        <*> optional (strOption (long "pipe" <> metavar "NAME" <> help "Endpoint name of the storage process (Windows named pipe, Unix socket file; default: [server] pipe_name in chusql.toml)"))
-        <*> optional (strOption (long "storage" <> metavar "SERVER" <> help "Rust storage executable to spawn when nothing answers the endpoint"))
         <*> optional (strOption (long "config" <> metavar "FILE" <> help "Config file to read (default: the fixed chusql.toml under the system config directory)"))
 
+-- | 把 --format 的取值解析成格式
 formatReader :: String -> Either String OutputFormat
 formatReader raw = maybe (Left "format must be table, json or csv") Right (parseFormat (T.pack raw))
 
+-- | 命令行界面与帮助
 parserInfo :: ParserInfo Options
 parserInfo =
     info
@@ -94,6 +85,7 @@ parserInfo =
             <> header "csql - the ChuSQL command line client"
         )
 
+-- | 解析参数、登录 server 后进入会话
 main :: IO ()
 main = do
     hSetEncoding stdout utf8
@@ -101,31 +93,29 @@ main = do
     options <- execParser parserInfo
     configPath <- resolveConfigPath (optConfig options)
     base <- loadWebConfigAt configPath
-    let settingsFile = configPath
-    saved <- readSettingsFile settingsFile
+    saved <- readSettingsFile configPath
     credential <- resolveCredential base saved
+    config <- loadServerConfigAt configPath
     let rootName = credUser credential
         userName = fromMaybe rootName (optUser options)
-        pipeName = resolvePipe options base
-    setPipeName pipeName
     password <- resolvePassword (optPromptPassword options) userName rootName saved
-    storage <- acquireStorage options pipeName settingsFile
-    case storage of
+    connected <- connectClient (T.pack (scHost config)) (scPort config)
+    case connected of
         Left message -> reportError message >> exitFailure
-        Right spawned ->
-            connect options credential settingsFile userName password
-                `finally` maybe (pure ()) stopStorageProcess spawned
+        Right client ->
+            connect options client userName password
+                `finally` closeClient client
 
--- | 接上存储，登录，然后进交互或跑单条语句
-connect :: Options -> Credential -> FilePath -> Text -> Text -> IO ()
-connect options credential settingsFile userName password = do
-    backend <- ipcBackend
-    session <- newSession backend credential settingsFile
+-- | 连 server、登录，之后转入会话
+connect :: Options -> Client -> Text -> Text -> IO ()
+connect options client userName password = do
+    session <- newSession client
     signedIn <- authenticateSession session userName password
     case signedIn of
         Left message -> reportError message >> exitFailure
         Right () -> runSession options session
 
+-- | 执行 -e 的单条语句，否则进交互循环
 runSession :: Options -> Session -> IO ()
 runSession options session = do
     formatRef <- newIORef (optFormat options)
@@ -140,7 +130,7 @@ runSession options session = do
                 historyFile <- resolveHistory (optHistory options)
                 runRepl session formatRef historyFile
 
--- | 只有 -d 明确给了一个库才切；没给就保持"未选库"（服务没有默认库）
+-- | -d 指定了库才切，否则保持未选库
 selectDatabase :: Session -> Text -> IO Bool
 selectDatabase _ wanted | T.null wanted = pure True
 selectDatabase session wanted
@@ -151,54 +141,20 @@ selectDatabase session wanted
             Left message -> reportError message >> pure False
             Right () -> pure True
 
--- | 口令：-p 强制交互输入；否则配置里的 root 明文（同 Web）> 交互输入
+-- | 决定口令是交互输入还是取自配置
 resolvePassword :: Bool -> Text -> Text -> Map.Map Text Text -> IO Text
 resolvePassword forcePrompt userName rootName saved
     | forcePrompt = promptPassword userName
-    | T.toLower userName == T.toLower rootName = pure (configuredPassword saved)
+    | T.toLower userName == T.toLower rootName = pure (resolvePlainPassword saved)
     | otherwise = promptPassword userName
-  where
-    configuredPassword values = case nonEmpty (Map.lookup "password" values) of
-        Just plain -> plain
-        Nothing -> defaultPassword
 
+-- | 交互式读取口令
 promptPassword :: Text -> IO Text
 promptPassword user = do
     entered <- runInputT defaultSettings (getPassword (Just '*') (T.unpack user <> "'s password: "))
     pure (maybe "" T.pack entered)
 
--- | 先找已经在跑的存储；--storage 给了可执行文件才自己拉一个
-acquireStorage :: Options -> String -> FilePath -> IO (Either Text (Maybe StorageProcess))
-acquireStorage options pipeName configPath = do
-    up <- waitForStorage 4
-    case optStorage options of
-        Nothing
-            | up -> pure (Right Nothing)
-            | otherwise ->
-                pure
-                    ( Left
-                        ( "no storage process answered on pipe "
-                            <> T.pack pipeName
-                            <> "; start the server first, or pass --storage <path>"
-                        )
-                    )
-        Just given
-            | up -> pure (Right Nothing)
-            | otherwise -> do
-                found <- findStorageServer (Just given)
-                case found of
-                    Left err -> pure (Left (T.pack err))
-                    Right binary -> fmap (either (Left . T.pack) (Right . Just)) (startStorageProcessAt binary pipeName configPath)
-
--- | 管名：--pipe > chusql.toml 的 [server] pipe_name（缺省 chusql-joint）
-resolvePipe :: Options -> WebConfig -> String
-resolvePipe options base = fromMaybe (resolvePipeName base) (optPipe options)
-
-nonEmpty :: Maybe Text -> Maybe Text
-nonEmpty given = case T.strip <$> given of
-    Just text | not (T.null text) -> Just text
-    _ -> Nothing
-
+-- | 取历史文件路径，没给就用默认
 resolveHistory :: Maybe FilePath -> IO (Maybe FilePath)
 resolveHistory (Just path) = pure (Just path)
 resolveHistory Nothing = do

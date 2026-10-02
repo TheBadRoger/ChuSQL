@@ -1,40 +1,39 @@
+{-# LANGUAGE OverloadedStrings #-}
+
 module Main where
 
-import ChuSQL.Engine (runStatementM)
-import ChuSQL.Model (Row, Value (..))
-import ChuSQL.Storage (IndexResult (..))
-import ChuSQL.Storage.IPC (
-    IPCStorage (..),
-    Request (..),
-    Response (..),
-    TableInfo (..),
-    closeConnection,
-    doInsert,
-    doListCatalog,
-    doLookupByColumn,
-    sendRequest,
-    setPipeName,
+import ChuSQL.Core.Protocol (QueryResult (..), TableInfo (..))
+import ChuSQL.Interface.Link (Client, clientPing, closeClient, connectClient)
+import ChuSQL.Interface.Session (
+    Session,
+    authenticateSession,
+    catalog,
+    newSession,
+    runStatement,
+    switchDatabase,
  )
-import ChuSQL.Syntax.Parser (parseStatement)
-import Control.Concurrent (threadDelay)
-import Control.Exception (SomeException, bracket, evaluate, try)
-import Control.Monad (filterM, unless, when)
-import Data.List (intercalate, isInfixOf)
+import Control.Concurrent (forkIO, threadDelay)
+import Control.Exception (IOException, bracket, evaluate, try)
+import Control.Monad (unless, when)
+import Data.List (intercalate)
+import Data.Text (Text)
+import qualified Data.Text as T
 import GHC.Clock (getMonotonicTime)
 import System.Directory (
     createDirectoryIfMissing,
-    doesFileExist,
+    findExecutable,
     getTemporaryDirectory,
     removeDirectoryRecursive,
  )
 import System.Environment (getArgs)
-import System.Exit (exitFailure)
+import System.Exit (ExitCode (..), exitFailure)
 import System.FilePath ((</>))
 import System.Info (os)
+import System.IO (Handle, hGetLine)
 import System.Process (
-    CreateProcess (..),
+    CreateProcess (std_err, std_out),
     ProcessHandle,
-    StdStream (..),
+    StdStream (CreatePipe, NoStream),
     createProcess,
     proc,
     terminateProcess,
@@ -42,103 +41,51 @@ import System.Process (
  )
 import Text.Printf (printf)
 
--- 全链路基准：Haskell 引擎与 Rust 存储进程一起跑，语句走完整链路并打印墙上耗时。
+-- 全链路基准：客户端经 TCP 连 chusql-server，落盘到进程内 Rust 存储。
+-- 每条语句都走完整链路：解析、语义检查、提交。
+-- 对照项：ping 与 catalog。
 
--- | 找 Rust 存储进程：优先 release
-findServer :: FilePath -> IO FilePath
-findServer "" = do
-    let dirs =
-            [ "chusql-storage/target"
-            , "../chusql-storage/target"
-            ]
-        modes = ["release", "debug"]
-        -- 名字跟平台走：同一个 target 目录里可能躺着一份别处交叉编译出来的 .exe，
-        -- 在 Linux 上误选它只会拿到 config file not found
-        exes = [if os == "mingw32" then "chusql-storage.exe" else "chusql-storage"]
-        candidates = [d </> m </> e | d <- dirs, m <- modes, e <- exes]
-    found <- filterM doesFileExist candidates
-    case found of
-        (p : _) -> do
-            unless ("release" `isInfixOf` p) $
-                putStrLn "!! using the debug storage binary; numbers will be slower, run: cargo build --release"
-            pure p
-        [] -> do
-            putStrLn "Rust storage binary not found. Build it first:"
-            putStrLn "    cd chusql-storage && cargo build --release"
-            exitFailure
-findServer p = do
-    ok <- doesFileExist p
-    if ok
-        then pure p
-        else do
-            putStrLn ("storage binary not found: " ++ p)
-            exitFailure
+-- | 一个基准世界：真 server 进程 + 一条 TCP 会话
+data Bench = Bench
+    { bProcess :: ProcessHandle
+    , bDataDir :: FilePath
+    , bClient :: Client
+    , bSession :: Session
+    }
 
--- | 起存储进程并等管道可连：调参走 --config 指的那份配置文件，环境原样继承
-startServer :: FilePath -> FilePath -> IO ProcessHandle
-startServer serverPath configPath = do
-    (_, _, _, ph) <-
-        createProcess
-            (proc serverPath ["--config", configPath]){std_out = NoStream, std_err = Inherit}
-    ready <- waitReady (200 :: Int)
-    unless ready $ do
-        putStrLn "storage process was not ready within 5 s"
-        exitFailure
-    pure ph
-
--- | 轮询 ping，直到对面应答
-waitReady :: Int -> IO Bool
-waitReady 0 = pure False
-waitReady n = do
-    r <- try (sendRequest ReqPing) :: IO (Either SomeException Response)
-    case r of
-        Right RespPong -> pure True
-        _ -> threadDelay 25000 >> waitReady (n - 1)
-
--- | 停存储进程并清掉缓存连接
-stopServer :: ProcessHandle -> FilePath -> IO ()
-stopServer ph dataDir = do
-    closeConnection
-    terminateProcess ph
-    _ <- waitForProcess ph
-    _ <- try (removeDirectoryRecursive dataDir) :: IO (Either SomeException ())
-    pure ()
+-- | 跑一条 SQL 文本（整条链路）
+runSql :: Bench -> String -> IO (Either Text QueryResult)
+runSql bench sql = runStatement (bSession bench) (T.pack sql)
 
 -- | 量一次墙上耗时并强制求出行数
-timedRows :: IO (Either String [Row]) -> IO (Double, Either String Int)
-timedRows act = do
+timedQuery :: Bench -> String -> IO (Double, Either Text Int)
+timedQuery bench sql = do
     t0 <- getMonotonicTime
-    r <- act
+    r <- runSql bench sql
     n <- case r of
         Left _ -> pure (-1)
-        Right rows -> evaluate (length rows)
+        Right result -> evaluate (qrRowCount result)
     t1 <- getMonotonicTime
     pure (t1 - t0, either Left (const (Right n)) r)
 
--- | 跑一条 SQL 文本（整条链路）
-runSql :: String -> IO (Either String [Row])
-runSql sql = case parseStatement sql of
-    Left e -> pure (Left e)
-    Right stmt -> runIPCStorage (runStatementM stmt)
-
 -- | 打印一行结果
-report :: String -> Either String Int -> Double -> IO ()
+report :: String -> Either Text Int -> Double -> IO ()
 report label result dt = case result of
-    Left e -> printf "%-38s %10s   !! %s\n" label "FAILED" e
+    Left e -> printf "%-38s %10s   !! %s\n" label ("FAILED" :: String) (T.unpack e)
     Right n -> printf "%-38s %8.1f ms %8d rows\n" label (dt * 1000) n
 
 -- | 单独量一条可重复的 SQL（先预热）
-benchSql :: String -> String -> IO (Either String Int)
-benchSql label sql = do
-    _ <- runSql sql
-    (dt, r) <- timedRows (runSql sql)
+benchSql :: Bench -> String -> String -> IO (Either Text Int)
+benchSql bench label sql = do
+    _ <- runSql bench sql
+    (dt, r) <- timedQuery bench sql
     report label r dt
     pure r
 
 -- | 只跑一次的语句（重跑会报错）
-benchSqlOnce :: String -> String -> IO (Either String Int)
-benchSqlOnce label sql = do
-    (dt, r) <- timedRows (runSql sql)
+benchSqlOnce :: Bench -> String -> String -> IO (Either Text Int)
+benchSqlOnce bench label sql = do
+    (dt, r) <- timedQuery bench sql
     report label r dt
     pure r
 
@@ -157,10 +104,10 @@ orderSql u j =
         (j `mod` 50)
 
 -- | 批量插入并报平均耗时
-batchInsert :: String -> Int -> (Int -> String) -> IO (Either String ())
-batchInsert label n mkSql = do
+batchInsert :: Bench -> String -> Int -> (Int -> String) -> IO (Either Text ())
+batchInsert bench label n mkSql = do
     t0 <- getMonotonicTime
-    results <- mapM (runSql . mkSql) [1 .. n]
+    results <- mapM (runSql bench . mkSql) [1 .. n]
     t1 <- getMonotonicTime
     let total = t1 - t0
         errs = [e | Left e <- results]
@@ -173,66 +120,66 @@ batchInsert label n mkSql = do
                 (total * 1000 / fromIntegral n)
             pure (Right ())
         (e : _) -> do
-            printf "%-38s %10s   !! %s\n" label "FAILED" e
+            printf "%-38s %10s   !! %s\n" label ("FAILED" :: String) (T.unpack e)
             pure (Left e)
 
--- | 一次点查（原始 IPC，不经过引擎）
-benchLookup :: String -> String -> Int -> Int -> IO ()
-benchLookup table column key times = do
-    _ <- doLookupByColumn table column (VInt key)
+-- | 纯 TCP 往返：只过协议层，不过引擎与存储
+benchPing :: Bench -> Int -> IO ()
+benchPing bench times = do
+    _ <- clientPing (bClient bench)
     t0 <- getMonotonicTime
-    results <- mapM (const (doLookupByColumn table column (VInt key))) [1 .. times]
+    results <- mapM (const (clientPing (bClient bench))) [1 .. times]
     t1 <- getMonotonicTime
     let total = t1 - t0
-        hit = length [() | Right (IndexRows (_ : _)) <- results]
+        hits = length [() | Right _ <- results]
     printf
-        "%-38s %8.1f ms %7.3f ms/op (hits %d/%d)\n"
-        "lookup_by_index (raw IPC, by id)"
+        "%-38s %8.1f ms %7.3f ms/op (pongs %d/%d)\n"
+        ("tcp round trip (ping, no engine)" :: String)
         (total * 1000)
         (total * 1000 / fromIntegral times)
-        hit
+        hits
+        times
+
+-- | 一次点查（走语句，等于把 id 索引那一支也量进去）
+benchLookup :: Bench -> Int -> Int -> IO ()
+benchLookup bench key times = do
+    let sql = printf "SELECT name FROM users WHERE id = %d" key
+    _ <- runSql bench sql
+    t0 <- getMonotonicTime
+    results <- mapM (const (runSql bench sql)) [1 .. times]
+    t1 <- getMonotonicTime
+    let total = t1 - t0
+        hits = length [() | Right result <- results, qrRowCount result > 0]
+    printf
+        "%-38s %8.1f ms %7.3f ms/op (hits %d/%d)\n"
+        ("point lookup by id (statement, over TCP)" :: String)
+        (total * 1000)
+        (total * 1000 / fromIntegral times)
+        hits
         times
 
 -- | 量 list_catalog（只取结构，不取行）
-benchListCatalog :: Int -> IO ()
-benchListCatalog n = do
+benchCatalog :: Bench -> Int -> IO ()
+benchCatalog bench n = do
+    _ <- catalog (bSession bench)
     t0 <- getMonotonicTime
-    _ <- mapM (const doListCatalog) [1 .. n]
+    results <- mapM (const (catalog (bSession bench))) [1 .. n]
     t1 <- getMonotonicTime
     let total = t1 - t0
+        hits = length [() | Right _ <- results]
     printf
-        "%-38s %8.1f ms %7.3f ms/op\n"
-        "list_catalog (schema only)"
+        "%-38s %8.1f ms %7.3f ms/op (%d/%d ok)\n"
+        ("list_catalog (schema only, over TCP)" :: String)
         (total * 1000)
         (total * 1000 / fromIntegral n)
-
--- | 量原始 IPC 插入（不经过引擎）
-benchRawInsert :: String -> [Row] -> IO ()
-benchRawInsert table rows = do
-    t0 <- getMonotonicTime
-    results <- mapM (\r -> doInsert table r) rows
-    t1 <- getMonotonicTime
-    let total = t1 - t0
-        n = length rows
-        errs = [e | Left e <- results]
-    case errs of
-        [] ->
-            printf
-                "%-38s %8.1f ms %7.3f ms/row\n"
-                ("raw IPC insert x " ++ show n)
-                (total * 1000)
-                (total * 1000 / fromIntegral n)
-        (e : _) -> printf "%-38s %10s   !! %s\n" "raw IPC insert" "FAILED" e
-
--- | 造一行 users 数据（给原始 IPC 用）
-userRow :: Int -> Row
-userRow i = [("id", VInt i), ("name", VStr ("user" ++ show i)), ("age", VInt (i `mod` 100))]
+        hits
+        n
 
 -- | 依次跑一批语句，返回 (耗时秒, 错误清单)
-runBatch :: [String] -> IO (Double, [String])
-runBatch sqls = do
+runBatch :: Bench -> [String] -> IO (Double, [Text])
+runBatch bench sqls = do
     t0 <- getMonotonicTime
-    results <- mapM runSql sqls
+    results <- mapM (runSql bench) sqls
     t1 <- getMonotonicTime
     pure (t1 - t0, [e | Left e <- results])
 
@@ -240,6 +187,7 @@ runBatch sqls = do
 chunked :: Int -> Int -> [[Int]]
 chunked size n = go [1 .. n]
   where
+    -- | 递归切分
     go [] = []
     go xs = let (a, b) = splitAt size xs in a : go b
 
@@ -264,11 +212,11 @@ printStats i =
         )
 
 -- | 主场景
-runScenarios :: Int -> Int -> IO ()
-runScenarios u o = do
+runScenarios :: Bench -> Int -> Int -> IO ()
+runScenarios bench u o = do
     putStrLn "\n[create tables]"
-    r1 <- benchSqlOnce "CREATE TABLE users" "CREATE TABLE users (id int, name str, age int)"
-    r2 <- benchSqlOnce "CREATE TABLE orders" "CREATE TABLE orders (id int, user_id int, product str)"
+    r1 <- benchSqlOnce bench "CREATE TABLE users" "CREATE TABLE users (id int, name str, age int)"
+    r2 <- benchSqlOnce bench "CREATE TABLE orders" "CREATE TABLE orders (id int, user_id int, product str)"
     case (r1, r2) of
         (Right _, Right _) -> pure ()
         _ -> do
@@ -276,90 +224,245 @@ runScenarios u o = do
             exitFailure
 
     putStrLn "\n[write: every INSERT is a full durable commit]"
-    _ <- batchInsert (printf "%d INSERT INTO users" u) u userSql
-    _ <- batchInsert (printf "%d INSERT INTO orders" o) o (orderSql u)
+    _ <- batchInsert bench (printf "%d INSERT INTO users" u) u userSql
+    _ <- batchInsert bench (printf "%d INSERT INTO orders" o) o (orderSql u)
 
-    putStrLn "\n[breakdown: same INSERT split in two, both via raw IPC, no engine]"
-    _ <- benchSqlOnce "CREATE TABLE raw_users" "CREATE TABLE raw_users (id int, name str, age int)"
-    benchListCatalog 200
-    benchRawInsert "raw_users" [userRow i | i <- [1 .. u]]
+    putStrLn "\n[breakdown: protocol round trip vs one catalog call, both over TCP]"
+    benchPing bench 200
+    benchCatalog bench 200
 
     putStrLn "\n[read/query: full statement, including parsing and semantic checks]"
-    _ <- benchSql "SELECT * FROM users" "SELECT * FROM users"
-    ageR <- benchSql "SELECT name FROM users WHERE age > 90" "SELECT name FROM users WHERE age > 90"
+    _ <- benchSql bench "SELECT * FROM users" "SELECT * FROM users"
+    ageR <- benchSql bench "SELECT name FROM users WHERE age > 90" "SELECT name FROM users WHERE age > 90"
 
     putStrLn "\n[read/query: join]"
     joinR <-
         benchSql
+            bench
             "JOIN + WHERE (hash join)"
             "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 90"
 
     putStrLn "\n[point lookup]"
-    benchLookup "users" "id" (u `div` 2) 100
-    _ <- benchSql "SELECT ... WHERE id = k (via Lookup)" (printf "SELECT name FROM users WHERE id = %d" (u `div` 2))
+    benchLookup bench (u `div` 2) 100
 
     putStrLn "\n[batch insert: one statement with N rows, one durable commit]"
-    _ <- benchSqlOnce "CREATE TABLE batch_t" "CREATE TABLE batch_t (id int, name str, age int)"
+    _ <- benchSqlOnce bench "CREATE TABLE batch_t" "CREATE TABLE batch_t (id int, name str, age int)"
     let groups = chunked 100 u
-    (bt, batchErrs) <- runBatch (map multiInsertSql groups)
+        perStmt = maximum (0 : map length groups)
+    (bt, batchErrs) <- runBatch bench (map multiInsertSql groups)
     case batchErrs of
         [] ->
             printf
                 "%-38s %8.1f ms %7.3f ms/row (%d rows/stmt x %d statements)\n"
-                "multi-row INSERT"
+                ("multi-row INSERT" :: String)
                 (bt * 1000)
                 (bt * 1000 / fromIntegral u)
-                (100 :: Int)
+                (perStmt :: Int)
                 (length groups)
-        (e : _) -> printf "%-38s %10s   !! %s\n" "multi-row INSERT" "FAILED" e
+        (e : _) -> printf "%-38s %10s   !! %s\n" ("multi-row INSERT" :: String) ("FAILED" :: String) (T.unpack e)
 
     putStrLn "\n[row delete: cost tracks the scan plus one commit, not the row count]"
-    _ <- benchSqlOnce "DELETE FROM users WHERE id = k (1 row)" (printf "DELETE FROM users WHERE id = %d" (u `div` 2))
-    _ <- benchSqlOnce "DELETE FROM users (all)" "DELETE FROM users"
+    _ <- benchSqlOnce bench "DELETE FROM users WHERE id = k (1 row)" (printf "DELETE FROM users WHERE id = %d" (u `div` 2))
+    _ <- benchSqlOnce bench "DELETE FROM users (all)" "DELETE FROM users"
 
     putStrLn "\n[secondary index: falls back to scan, then uses the index once built]"
-    _ <- benchSqlOnce "CREATE TABLE items" "CREATE TABLE items (id int, code int)"
+    _ <- benchSqlOnce bench "CREATE TABLE items" "CREATE TABLE items (id int, code int)"
     let itemGroups = chunked 100 o
         itemSql ids =
             "INSERT INTO items (id, code) VALUES "
                 ++ intercalate ", " [printf "(%d, %d)" i (i * 7 + 1) | i <- ids]
-    (it, itemErrs) <- runBatch (map itemSql itemGroups)
+    (it, itemErrs) <- runBatch bench (map itemSql itemGroups)
     case itemErrs of
         [] -> pure ()
-        (e : _) -> printf "  !! %s\n" e
+        (e : _) -> printf "  !! %s\n" (T.unpack e)
     printf "  (loaded %d rows into items: %.1f ms)\n" o (it * 1000)
     let targetCode = (o `div` 2) * 7 + 1
     _ <-
         benchSql
+            bench
             "SELECT ... WHERE code = k (no index)"
             (printf "SELECT id FROM items WHERE code = %d" targetCode)
-    _ <- benchSqlOnce "CREATE INDEX ON items (code)" "CREATE INDEX ON items (code)"
+    _ <- benchSqlOnce bench "CREATE INDEX ON items (code)" "CREATE INDEX ON items (code)"
     _ <-
         benchSql
+            bench
             "SELECT ... WHERE code = k (via index)"
             (printf "SELECT id FROM items WHERE code = %d" targetCode)
 
     putStrLn "\n[catalog stats]"
-    cat <- doListCatalog
+    cat <- catalog (bSession bench)
     case cat of
-        Left e -> printf "  failed to read stats: %s\n" e
+        Left e -> printf "  failed to read stats: %s\n" (T.unpack e)
         Right infos -> mapM_ printStats infos
 
     putStrLn "\n[checks]"
     let expectAge = 9 * (u `div` 100) + max 0 (u `mod` 100 - 90)
     printf
         "age > 90 matched %s (expected %d rows from the data distribution)\n"
-        (either show show ageR)
+        (either T.unpack show ageR)
         expectAge
     when (u == o) $
         printf
             "JOIN matched %s (one order per user, should equal the line above = %d)\n"
-            (either show show joinR)
+            (either T.unpack show joinR)
             expectAge
     unless (u == o) $
         putStrLn "(users and orders differ in size; no simple formula, printing only)"
-    printf "multi-row INSERT loaded %d rows (expected %d)\n" u u
+    loadedCheck <- runSql bench "SELECT id FROM batch_t"
+    printf
+        "multi-row INSERT loaded %s rows (expected %d)\n"
+        (either T.unpack (show . qrRowCount) loadedCheck)
+        u
     printf "secondary index: code = %d should find id = %d\n" targetCode (o `div` 2)
+
+-- | 基准用的库名
+benchDatabase :: String
+benchDatabase = "bench"
+
+-- | 服务端没有默认库：先开一个库，再把之后的语句都落进它
+prepareDatabase :: Session -> IO ()
+prepareDatabase session = do
+    created <- runStatement session ("CREATE DATABASE " <> T.pack benchDatabase)
+    case created of
+        Left e -> die ("cannot create the benchmark database: " ++ T.unpack e)
+        Right _ -> do
+            used <- switchDatabase session (T.pack benchDatabase)
+            case used of
+                Left e -> die ("cannot select the benchmark database: " ++ T.unpack e)
+                Right () -> pure ()
+  where
+    -- | 报错退出
+    die message = do
+        putStrLn message
+        exitFailure
+
+-- | 按平台补上 .exe 后缀
+binaryName :: String -> String
+binaryName stem = if os == "mingw32" then stem ++ ".exe" else stem
+
+-- | 在 PATH 里找 server 可执行文件
+locateServerExe :: IO FilePath
+locateServerExe = do
+    found <- findExecutable (binaryName "chusql-server")
+    case found of
+        Just path -> pure path
+        Nothing -> do
+            putStrLn "chusql-server was not found on PATH: run `stack build` first"
+            exitFailure
+
+-- | 从 server 输出里读出监听端口
+readListeningPort :: Handle -> IO Int
+readListeningPort handle = do
+    line <- hGetLine handle
+    case portFromBanner line of
+        Just port -> pure port
+        Nothing -> readListeningPort handle
+
+-- | 取一行里最后一串数字
+portFromBanner :: String -> Maybe Int
+portFromBanner line
+    | not ("listening:" `isInfixOf` line) = Nothing
+    | otherwise = case span isDigit (dropWhile (not . isDigit) (reverse line)) of
+        ([], _) -> Nothing
+        (digits, _) -> Just (read (reverse digits))
+
+-- | 判断子串是否出现
+isInfixOf :: String -> String -> Bool
+isInfixOf needle haystack = any (prefix needle) (tails haystack)
+  where
+    -- | 前缀匹配
+    prefix [] _ = True
+    prefix _ [] = False
+    prefix (x : xs) (y : ys) = x == y && prefix xs ys
+    -- | 所有后缀
+    tails [] = [[]]
+    tails s@(_ : rest) = s : tails rest
+
+-- | 判断是不是数字字符
+isDigit :: Char -> Bool
+isDigit ch = ch >= '0' && ch <= '9'
+
+-- | 把 server 的 stdout 抽干，免得管道塞满
+drainHandle :: Handle -> IO ()
+drainHandle handle = do
+    result <- try (hGetLine handle) :: IO (Either IOException String)
+    case result of
+        Left _ -> pure ()
+        Right _ -> drainHandle handle
+
+-- | 起 server、连上去、登录、开库
+startBench :: IO Bench
+startBench = do
+    bin <- locateServerExe
+    tmp <- getTemporaryDirectory
+    stamp <- getMonotonicTime
+    let name = "chusql-fullchain-" ++ show (round (stamp * 1e6) :: Int)
+        dataDir = tmp </> name
+        configPath = tmp </> (name ++ ".toml")
+        -- TOML 的普通字符串会吃反斜杠，路径统一用正斜杠
+        slashed = map (\c -> if c == '\\' then '/' else c) dataDir
+    createDirectoryIfMissing True dataDir
+    writeFile configPath (benchConfigText slashed)
+    printf "config   : %s\n" configPath
+    printf "data dir : %s\n" dataDir
+    (_, Just out, _, process) <-
+        createProcess (proc bin ["--config", configPath]){std_out = CreatePipe, std_err = NoStream}
+    port <- readListeningPort out
+    _ <- forkIO (drainHandle out)
+    printf "server   : pid launched, tcp port %d\n" port
+    linked <- connectClient "127.0.0.1" port
+    case linked of
+        Left err -> do
+            putStrLn ("cannot connect to the server: " ++ T.unpack err)
+            stopProcess process
+            exitFailure
+        Right client -> do
+            session <- newSession client
+            auth <- authenticateSession session (T.pack "admin") (T.pack "s3cret")
+            case auth of
+                Left err -> do
+                    putStrLn ("cannot sign in: " ++ T.unpack err)
+                    closeClient client
+                    stopProcess process
+                    exitFailure
+                Right () -> do
+                    prepareDatabase session
+                    pure (Bench process dataDir client session)
+
+-- | 基准用的配置：管理员凭据、随机端口、临时数据目录
+benchConfigText :: String -> String
+benchConfigText dataDir =
+    unlines
+        [ "[web]"
+        , "user = \"admin\""
+        , "password = \"s3cret\""
+        , ""
+        , "[server]"
+        , "host = \"127.0.0.1\""
+        , "port = 0"
+        , ""
+        , "[storage]"
+        , "data_dir = \"" ++ dataDir ++ "\""
+        , ""
+        , "[log]"
+        , "level = \"error\""
+        ]
+
+-- | 收摊：关会话、停 server、清数据目录
+stopBench :: Bench -> IO ()
+stopBench bench = do
+    putStrLn "\n[teardown] closing the TCP session, stopping the server, removing the data dir"
+    closeClient (bClient bench)
+    stopProcess (bProcess bench)
+    _ <- try (removeDirectoryRecursive (bDataDir bench)) :: IO (Either IOException ())
+    pure ()
+
+-- | 杀掉 server 进程
+stopProcess :: ProcessHandle -> IO ()
+stopProcess process = do
+    terminateProcess process
+    _ <- try (waitForProcess process) :: IO (Either IOException ExitCode)
+    pure ()
 
 -- | 主入口
 main :: IO ()
@@ -368,48 +471,18 @@ main = do
     let pick i d = if length args > i then args !! i else d
         u = read (pick 0 "200") :: Int
         o = read (pick 1 "200") :: Int
-        serverArg = pick 2 ""
-    serverPath <- findServer serverArg
-
-    tmp <- getTemporaryDirectory
-    stamp <- getMonotonicTime
-    let pipe = "chusql-fullchain-" ++ show (round (stamp * 1e6) :: Int)
-        dataDir = tmp </> pipe
-        configPath = tmp </> (pipe ++ ".toml")
-        -- TOML 的普通字符串会吃反斜杠，路径统一用正斜杠
-        slashed = map (\c -> if c == '\\' then '/' else c) dataDir
-    createDirectoryIfMissing True dataDir
-    writeFile
-        configPath
-        ( unlines
-            [ "[storage]"
-            , "data_dir = \"" ++ slashed ++ "\""
-            , "[server]"
-            , "pipe_name = \"" ++ pipe ++ "\""
-            , "[log]"
-            , "level = \"error\""
-            ]
-        )
-    setPipeName pipe
-
-    printf "full-chain benchmark: Haskell engine <--named pipe--> Rust storage\n"
-    printf "storage  : %s\n" serverPath
-    printf "config   : %s\n" configPath
-    printf "pipe     : %s\n" pipe
-    printf "data dir : %s\n" dataDir
+    printf "full-chain benchmark: TCP client --> chusql-server --> in-process Rust storage\n"
     printf "dataset  : users = %d rows, orders = %d rows\n" u o
-    printf "timing   : wall clock (monotonic); every statement runs the full chain\n"
-
+    printf "timing   : wall clock (monotonic); every statement runs the full chain over TCP\n"
+    printf "note     : the client no longer links the engine or the storage library\n"
     bracket
         (do
             t1 <- getMonotonicTime
-            ph <- startServer serverPath configPath
+            bench <- startBench
             t2 <- getMonotonicTime
-            printf "\n[startup] storage ready in %.2f s\n" (t2 - t1)
-            pure ph
+            printf "\n[startup] server up, storage ready, signed in: %.2f s\n" (t2 - t1)
+            threadDelay 25000
+            pure bench
         )
-        (\ph -> do
-            putStrLn "\n[teardown] stopping storage and removing the data dir"
-            stopServer ph dataDir
-        )
-        (const (runScenarios u o))
+        stopBench
+        (\bench -> runScenarios bench u o)

@@ -1,0 +1,8 @@
+resolver: lts-24.59
+
+extra-lib-dirs:
+    - ../storage/target/release
+
+packages:
+    - .
+    - ../model
