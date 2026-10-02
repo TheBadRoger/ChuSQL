@@ -32,6 +32,190 @@ fn scan_projects_columns_and_preserves_empty_rows() -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+/// 分片扫描按页序拼接后与整表扫描逐行一致
+#[test]
+fn scan_shard_concatenates_to_the_whole_scan() -> Result<(), Box<dyn std::error::Error>> {
+    let (_srv, data) = start_server();
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"create_table","table":"wide","columns":[{"name":"id","ty":"int"},{"name":"name","ty":"str"}]}))?;
+    let rows: Vec<serde_json::Value> = (1..=1200)
+        .map(|i| serde_json::json!({"id": i, "name": format!("row-{i:04}")}))
+        .collect();
+    request_ok(&mut c, serde_json::json!({"method":"insert_batch","table":"wide","rows":rows}))?;
+    let heap_bytes = std::fs::metadata(data.path().join("databases/main/wide.db"))?.len();
+    assert!(heap_bytes > 4 * 4096, "分片要有意义得多页，实际只有 {heap_bytes} 字节");
+    let whole: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"scan","table":"wide"}"#))?;
+    let all = whole["rows"].as_array().expect("rows").clone();
+    assert_eq!(all.len(), 1200);
+    for shards in [1, 3, 4, 7, 16] {
+        let mut merged = Vec::new();
+        for shard in 0..shards {
+            let request = serde_json::json!({"method":"scan_shard","table":"wide","shard":shard,"shards":shards});
+            let part: serde_json::Value = serde_json::from_str(&send(&mut c, &request.to_string()))?;
+            assert_eq!(part["status"], "rows", "shards={shards} shard={shard}: {part}");
+            merged.extend(part["rows"].as_array().expect("rows").iter().cloned());
+        }
+        assert_eq!(
+            serde_json::Value::Array(merged),
+            serde_json::Value::Array(all.clone()),
+            "{shards} 个分片拼接后必须与整表同序"
+        );
+    }
+    Ok(())
+}
+
+/// 分片扫描支持投影与空列，越界分片和未知名都明确报错
+#[test]
+fn scan_shard_projects_columns_and_rejects_bad_ranges() -> Result<(), Box<dyn std::error::Error>> {
+    let (_srv, _data) = start_server();
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"create_table","table":"items","columns":[{"name":"id","ty":"int"},{"name":"name","ty":"str"}]}))?;
+    request_ok(&mut c, serde_json::json!({"method":"insert_batch","table":"items","rows":[{"id":1,"name":"one"},{"id":2,"name":null}]}))?;
+    for (columns, expected) in [
+        (serde_json::json!(["name"]), serde_json::json!([{"name":"one"},{"name":null}])),
+        (serde_json::json!([]), serde_json::json!([{},{}])),
+    ] {
+        let mut merged = Vec::new();
+        for shard in 0..3 {
+            let request = serde_json::json!({"method":"scan_shard","table":"items","columns":columns,"shard":shard,"shards":3});
+            let part: serde_json::Value = serde_json::from_str(&send(&mut c, &request.to_string()))?;
+            assert_eq!(part["status"], "rows", "{part}");
+            merged.extend(part["rows"].as_array().expect("rows").iter().cloned());
+        }
+        assert_eq!(serde_json::Value::Array(merged), expected);
+    }
+    request_ok(&mut c, serde_json::json!({"method":"create_table","table":"blank","columns":[{"name":"id","ty":"int"}]}))?;
+    for (line, why) in [
+        (r#"{"method":"scan_shard","table":"blank","shard":0,"shards":4}"#, "空表"),
+        (r#"{"method":"scan_shard","table":"items","shard":3,"shards":3}"#, "分片号越界"),
+        (r#"{"method":"scan_shard","table":"items","shard":0,"shards":0}"#, "分片数为零"),
+        (r#"{"method":"scan_shard","table":"missing","shard":0,"shards":2}"#, "未知表"),
+        (r#"{"method":"scan_shard","table":"items","columns":["missing"],"shard":0,"shards":2}"#, "未知列"),
+    ] {
+        let result: serde_json::Value = serde_json::from_str(&send(&mut c, line))?;
+        if why == "空表" {
+            assert_eq!(result["rows"], serde_json::json!([]), "{line}");
+        } else {
+            assert_eq!(result["status"], "error", "{why}: {line} -> {result}");
+        }
+    }
+    Ok(())
+}
+
+/// 多线程并发分片读同一实例，各分片结果与整表一致
+#[test]
+fn concurrent_shard_reads_share_one_instance() -> Result<(), Box<dyn std::error::Error>> {
+    let (_srv, _data) = start_server();
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"create_table","table":"wide","columns":[{"name":"id","ty":"int"},{"name":"name","ty":"str"}]}))?;
+    let rows: Vec<serde_json::Value> = (1..=600)
+        .map(|i| serde_json::json!({"id": i, "name": format!("row-{i:04}")}))
+        .collect();
+    request_ok(&mut c, serde_json::json!({"method":"insert_batch","table":"wide","rows":rows}))?;
+
+    let storage = CURRENT.with(|slot| slot.borrow().as_ref().cloned().expect("storage opened"));
+    let shards = 4;
+    let parts = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..shards)
+            .map(|shard| {
+                let storage = Arc::clone(&storage);
+                scope.spawn(move || {
+                    let request = format!(
+                        r#"{{"method":"scan_shard","database":"{FIXTURE_DATABASE}","table":"wide","shard":{shard},"shards":{shards}}}"#
+                    );
+                    let mut rows = Vec::new();
+                    for _ in 0..4 {
+                        let reply = storage.request_line(&request);
+                        let value: serde_json::Value = serde_json::from_str(&reply).expect("json");
+                        assert_eq!(value["status"], "rows", "{reply}");
+                        rows = value["rows"].as_array().expect("rows").clone();
+                    }
+                    rows
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("worker thread"))
+            .collect::<Vec<_>>()
+    });
+
+    let whole: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"scan","table":"wide"}"#))?;
+    let merged: Vec<serde_json::Value> = parts.into_iter().flatten().collect();
+    assert_eq!(merged.len(), 600, "并发分片不能丢行");
+    assert_eq!(serde_json::Value::Array(merged), whole["rows"]);
+    Ok(())
+}
+
+/// 分片读与同表写并发时读者只看到一致快照
+#[test]
+fn concurrent_shard_reads_exclude_writers() -> Result<(), Box<dyn std::error::Error>> {
+    let (_srv, _data) = start_server();
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"create_table","table":"wide","columns":[{"name":"id","ty":"int"},{"name":"name","ty":"str"}]}))?;
+    let rows: Vec<serde_json::Value> = (1..=400)
+        .map(|i| serde_json::json!({"id": i, "name": format!("row-{i:04}")}))
+        .collect();
+    request_ok(&mut c, serde_json::json!({"method":"insert_batch","table":"wide","rows":rows}))?;
+
+    let storage = CURRENT.with(|slot| slot.borrow().as_ref().cloned().expect("storage opened"));
+    let shards = 3;
+    let inserted = 20;
+    std::thread::scope(|scope| {
+        let writer = {
+            let storage = Arc::clone(&storage);
+            scope.spawn(move || {
+                for i in 401..=400 + inserted {
+                    let request = format!(
+                        r#"{{"method":"insert","database":"{FIXTURE_DATABASE}","table":"wide","row":{{"id":{i},"name":"row-{i:04}"}}}}"#
+                    );
+                    let reply = storage.request_line(&request);
+                    let value: serde_json::Value = serde_json::from_str(&reply).expect("json");
+                    assert_eq!(value["status"], "ok", "{reply}");
+                }
+            })
+        };
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let storage = Arc::clone(&storage);
+                scope.spawn(move || {
+                    let mut seen = Vec::new();
+                    for _ in 0..8 {
+                        let mut total = 0usize;
+                        for shard in 0..shards {
+                            let request = format!(
+                                r#"{{"method":"scan_shard","database":"{FIXTURE_DATABASE}","table":"wide","shard":{shard},"shards":{shards}}}"#
+                            );
+                            let reply = storage.request_line(&request);
+                            let value: serde_json::Value = serde_json::from_str(&reply).expect("json");
+                            assert_eq!(value["status"], "rows", "{reply}");
+                            total += value["rows"].as_array().expect("rows").len();
+                        }
+                        seen.push(total);
+                    }
+                    seen
+                })
+            })
+            .collect();
+        for reader in readers {
+            let seen: Vec<usize> = reader.join().expect("reader thread");
+            assert!(
+                seen.iter().all(|n| (400..=400 + inserted).contains(n)),
+                "分片读看到越界行数: {seen:?}"
+            );
+            assert!(
+                seen.windows(2).all(|pair| pair[0] <= pair[1]),
+                "并发写时快照行数倒退: {seen:?}"
+            );
+        }
+        writer.join().expect("writer thread");
+    });
+
+    let whole: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"scan","table":"wide"}"#))?;
+    assert_eq!(whole["rows"].as_array().expect("rows").len(), 400 + inserted);
+    Ok(())
+}
+
 /// 删列不改堆字节，重启后不再暴露该列
 #[test]
 fn drop_column_keeps_heap_bytes_and_hides_values_after_restart() -> Result<(), Box<dyn std::error::Error>> {
@@ -240,7 +424,7 @@ fn startup_compaction_reclaims_dropped_columns() -> Result<(), Box<dyn std::erro
 fn databases_reject_unsafe_names_and_keep_only_system_reserved() -> Result<(), Box<dyn std::error::Error>> {
     let (_srv, data) = start_server();
     let mut c = connect()?;
-    for database in ["", "../escape", "a/b", "a.b", "CON", "__chusql_users"] {
+    for database in ["", "../escape", "a/b", "a.b", "CON", "__system_users"] {
         let response: serde_json::Value = serde_json::from_str(&send(&mut c, &serde_json::json!({"method":"create_database","database":database}).to_string()))?;
         assert_eq!(response["status"], "error", "{database}: {response}");
     }
@@ -270,7 +454,7 @@ fn system_database_owns_accounts_and_nothing_is_default() -> Result<(), Box<dyn 
     assert_eq!(listed["tables"], serde_json::json!(["main", "system"]));
     let created: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"account_create","user":"alice","password_hash":"hash-1"}"#))?;
     assert_eq!(created["status"], "accounts", "{created}");
-    assert!(data.path().join("system/__chusql_users.db").is_file());
+    assert!(data.path().join("system/__system_users.db").is_file());
     // 账号是全局的：请求里带的库名对账号操作不起作用
     let accounts: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"accounts_list","database":"sales"}"#))?;
     assert_eq!(accounts["status"], "accounts");
@@ -323,9 +507,10 @@ fn start_server() -> (ServerProc, tempfile::TempDir) {
     (server, data)
 }
 
-/// 在指定数据目录起存储并建测试库
+/// 在指定数据目录起存储、引导系统目录并建测试库
 fn start_server_in(data: &std::path::Path) -> ServerProc {
     open_storage(&write_config(data));
+    bootstrap_system();
     create_fixture_database();
     ServerProc
 }
@@ -371,7 +556,7 @@ fn named_database_survives_restart_and_accounts_stay_global() -> Result<(), Box<
     assert_eq!(rows["rows"], serde_json::json!([{"id":7}]));
     let accounts: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"accounts_list","database":"sales"}"#))?;
     assert_eq!(accounts["status"], "accounts");
-    let hidden: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"scan","table":"sales.__chusql_users"}"#))?;
+    let hidden: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"scan","table":"sales.__system_users"}"#))?;
     assert_eq!(hidden["status"], "error");
     Ok(())
 }
@@ -402,6 +587,15 @@ fn create_fixture_database() {
     if let Ok(mut c) = connect() {
         let _ = send_raw(&mut c, &format!(r#"{{"method":"create_database","database":"{FIXTURE_DATABASE}"}}"#));
     }
+}
+
+/// 引导系统目录：建账号表，不塞账号
+fn bootstrap_system() {
+    let reply = CURRENT.with(|slot| {
+        let storage = slot.borrow().as_ref().cloned().expect("storage opened");
+        storage.request_line(r#"{"method":"bootstrap_system"}"#)
+    });
+    assert!(reply.contains(r#""status":"system""#), "{reply}");
 }
 
 /// 发一行请求读一行响应（没写库名就补测试库）
@@ -437,7 +631,7 @@ fn reserved_tables_reject_every_generic_operation() -> std::io::Result<()> {
     for method in ["scan", "insert", "insert_batch", "delete_keys", "lookup_by_index",
         "replace_all", "describe_table", "create_table", "drop_table", "create_index",
         "drop_index", "drop_column"] {
-        let request = serde_json::json!({"method": method, "table": "__chusql_users",
+        let request = serde_json::json!({"method": method, "table": "__system_users",
             "column": "id", "key": 1, "keys": [], "row": {"id": 1}, "rows": [], "columns": []});
         let result = send(&mut c, &request.to_string());
         assert!(result.contains("reserved system table"), "{method}: {result}");
@@ -450,11 +644,11 @@ fn reserved_tables_reject_every_generic_operation() -> std::io::Result<()> {
 fn generic_ipc_rejects_path_aliases() -> std::io::Result<()> {
     let (_srv, _data) = start_server();
     let mut c = connect()?;
-    for table in ["../__chusql_users", "__CHUSQL_USERS", "__chusql_users."] {
+    for table in ["../__system_users", "__SYSTEM_USERS", "__system_users."] {
         let result = send(&mut c, &serde_json::json!({"method":"scan", "table":table}).to_string());
         assert!(result.contains("error"), "{result}");
     }
-    let result = send(&mut c, r#"{"method":"create_index","table":"business","column":"../__chusql_users"}"#);
+    let result = send(&mut c, r#"{"method":"create_index","table":"business","column":"../__system_users"}"#);
     assert!(result.contains("invalid column name"), "{result}");
     Ok(())
 }
@@ -484,7 +678,7 @@ fn account_create_reset_drop_and_hidden_from_ordinary_api() -> Result<(), Box<dy
     assert_eq!(empty["accounts"], serde_json::json!([]));
     for method in ["list_tables", "list_catalog"] {
         let result = send(&mut c, &serde_json::json!({"method":method}).to_string());
-        assert!(!result.contains("__chusql_users"), "{result}");
+        assert!(!result.contains("__system_users"), "{result}");
     }
     Ok(())
 }
@@ -492,6 +686,7 @@ fn account_create_reset_drop_and_hidden_from_ordinary_api() -> Result<(), Box<dy
 /// 用同一份数据目录重开一次存储
 fn restart_at(data: &std::path::Path) -> std::io::Result<ServerProc> {
     open_storage(&write_config(data));
+    bootstrap_system();
     create_fixture_database();
     Ok(ServerProc)
 }
@@ -514,8 +709,8 @@ fn account_snapshot_replays_twice_without_duplicating_accounts() -> Result<(), B
         wal.truncate()?;
         wal.append(&WalOp::Accounts { accounts: accounts.clone() })?;
         drop(wal);
-        std::fs::write(data.path().join("system/__chusql_users.idx"), b"torn index")?;
-        std::fs::write(data.path().join("system/__chusql_users.db"), b"torn heap")?;
+        std::fs::write(data.path().join("system/__system_users.idx"), b"torn index")?;
+        std::fs::write(data.path().join("system/__system_users.db"), b"torn heap")?;
         let restarted = restart_at(data.path())?;
         let mut connection = connect()?;
         let actual: serde_json::Value = serde_json::from_str(&send(&mut connection, r#"{"method":"accounts_list"}"#))?;
@@ -555,12 +750,13 @@ fn account_failure_preserves_wal_and_blocks_writes() -> Result<(), Box<dyn std::
 /// 账号文件已存在时拒绝建账号
 #[test]
 fn account_create_rejects_reserved_file_collision() -> std::io::Result<()> {
-    let (_server, data) = start_server();
-    std::fs::write(data.path().join("system/__chusql_users.db"), b"existing")?;
+    let data = tempfile::tempdir()?;
+    open_storage(&write_config(data.path()));
+    std::fs::write(data.path().join("system/__system_users.db"), b"existing")?;
     let mut c = connect()?;
     let result = send(&mut c, r#"{"method":"account_create","user":"alice","password_hash":"hash-one"}"#);
     assert!(result.contains("collision"), "{result}");
-    assert_eq!(std::fs::read(data.path().join("system/__chusql_users.db"))?, b"existing");
+    assert_eq!(std::fs::read(data.path().join("system/__system_users.db"))?, b"existing");
     Ok(())
 }
 
@@ -578,18 +774,95 @@ fn oversized_account_hash_is_rejected_before_wal() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+/// 空哈希表示免密，允许建立
+#[test]
+fn account_create_accepts_empty_hash() -> std::io::Result<()> {
+    let (_server, _data) = start_server();
+    let mut c = connect()?;
+    let created: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"account_create","user":"root","password_hash":""}"#))?;
+    assert_eq!(created["accounts"][0]["password_hash"], serde_json::json!(""));
+    let listed = send(&mut c, r#"{"method":"accounts_list"}"#);
+    assert!(listed.contains("root"), "{listed}");
+    Ok(())
+}
+
 /// 字典里已有同名普通表时拒绝建账号
 #[test]
 fn account_create_rejects_existing_ordinary_catalog_entry() -> std::io::Result<()> {
     let data = tempfile::tempdir()?;
     let mut catalog = chusql_core_storage::catalog::Catalog::default();
-    catalog.create_table("__chusql_users", Vec::new())?;
+    catalog.create_table("__system_users", Vec::new())?;
     std::fs::create_dir(data.path().join("system"))?;
     catalog.save(data.path().join("system/catalog.json"))?;
-    let _server = restart_at(data.path())?;
+    open_storage(&write_config(data.path()));
     let mut c = connect()?;
     let result = send(&mut c, r#"{"method":"account_create","user":"alice","password_hash":"hash-one"}"#);
     assert!(result.contains("collision"), "{result}");
+    Ok(())
+}
+
+/// 没引导过就不能动账号
+#[test]
+fn account_requests_require_bootstrap() -> std::io::Result<()> {
+    let data = tempfile::tempdir()?;
+    open_storage(&write_config(data.path()));
+    let mut c = connect()?;
+    let status = send(&mut c, r#"{"method":"system_status"}"#);
+    assert!(status.contains(r#""initialized":false"#), "{status}");
+    for request in [r#"{"method":"accounts_list"}"#,
+        r#"{"method":"account_create","user":"alice","password_hash":"hash-one"}"#] {
+        let result = send(&mut c, request);
+        assert!(result.contains("csql-bootstrap"), "{request}: {result}");
+    }
+    Ok(())
+}
+
+/// 引导幂等：再跑一次不改已有管理员的口令
+#[test]
+fn bootstrap_is_idempotent_and_keeps_the_password() -> std::io::Result<()> {
+    let data = tempfile::tempdir()?;
+    open_storage(&write_config(data.path()));
+    let mut c = connect()?;
+    let created = send(&mut c, r#"{"method":"bootstrap_system","user":"root","password_hash":"hash-one"}"#);
+    assert!(created.contains(r#""initialized":true"#), "{created}");
+    let again = send(&mut c, r#"{"method":"bootstrap_system","user":"root","password_hash":"hash-two"}"#);
+    assert!(again.contains(r#""initialized":true"#), "{again}");
+    let listed = send(&mut c, r#"{"method":"accounts_list"}"#);
+    assert!(listed.contains("hash-one"), "{listed}");
+    assert!(!listed.contains("hash-two"), "{listed}");
+    assert_eq!(std::fs::metadata(data.path().join("system/wal.log"))?.len(), 0);
+    Ok(())
+}
+
+/// 引导程序不给已经播过种的表塞新账号
+#[test]
+fn bootstrap_does_not_add_an_account_to_a_seeded_table() -> std::io::Result<()> {
+    let data = tempfile::tempdir()?;
+    open_storage(&write_config(data.path()));
+    let mut c = connect()?;
+    send(&mut c, r#"{"method":"bootstrap_system","user":"root","password_hash":"hash-one"}"#);
+    let sneaky = send(&mut c, r#"{"method":"bootstrap_system","user":"eve","password_hash":"raw-hash"}"#);
+    assert!(sneaky.contains(r#""initialized":true"#), "{sneaky}");
+    let listed = send(&mut c, r#"{"method":"accounts_list"}"#);
+    assert!(!listed.contains("eve"), "{listed}");
+    assert!(listed.contains("hash-one"), "{listed}");
+    Ok(())
+}
+
+/// 空表还能被重新播种：先只建表，再补管理员
+#[test]
+fn bootstrap_seeds_an_empty_account_table() -> std::io::Result<()> {
+    let data = tempfile::tempdir()?;
+    open_storage(&write_config(data.path()));
+    let mut c = connect()?;
+    let bare = send(&mut c, r#"{"method":"bootstrap_system"}"#);
+    assert!(bare.contains(r#""initialized":true"#), "{bare}");
+    let empty = send(&mut c, r#"{"method":"accounts_list"}"#);
+    assert!(empty.contains(r#""accounts":[]"#), "{empty}");
+    let seeded = send(&mut c, r#"{"method":"bootstrap_system","user":"root","password_hash":"hash-again"}"#);
+    assert!(seeded.contains(r#""initialized":true"#), "{seeded}");
+    let listed = send(&mut c, r#"{"method":"accounts_list"}"#);
+    assert!(listed.contains("hash-again"), "{listed}");
     Ok(())
 }
 
@@ -661,6 +934,38 @@ fn duplicate_id_is_rejected() {
     let r = send(&mut c, r#"{"method":"insert","table":"dup_id","row":{"id":1,"name":"B"}}"#);
     assert!(r.contains(r#""status":"error""#), "got: {}", r);
     assert!(r.contains("duplicate value on the id index"), "got: {}", r);
+}
+
+/// 整值浮点与整数是同一个索引键
+#[test]
+fn integral_float_uses_the_same_index_key() -> Result<(), Box<dyn std::error::Error>> {
+    let (_srv, _data) = start_server();
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"create_table","table":"float_id","columns":[{"name":"id","ty":"int"},{"name":"name","ty":"str"}]}))?;
+    request_ok(&mut c, serde_json::json!({"method":"insert","table":"float_id","row":{"id":7,"name":"A"}}))?;
+
+    let found: serde_json::Value = serde_json::from_str(&send(
+        &mut c,
+        r#"{"method":"lookup_by_index","table":"float_id","key":7.0}"#,
+    ))?;
+    assert_eq!(
+        found["rows"],
+        serde_json::json!([{"id":7,"name":"A"}]),
+        "lookup by 7.0: {}",
+        found
+    );
+
+    let dup: serde_json::Value = serde_json::from_str(&send(
+        &mut c,
+        r#"{"method":"insert","table":"float_id","row":{"id":7.0,"name":"B"}}"#,
+    ))?;
+    assert_eq!(dup["status"], "error", "7.0 must clash with 7: {}", dup);
+    assert!(
+        dup["message"].as_str().unwrap_or("").contains("duplicate value on the id index"),
+        "got: {}",
+        dup
+    );
+    Ok(())
 }
 
 /// 批量插入一次全进
@@ -878,6 +1183,7 @@ fn config_file_is_used() {
     std::fs::write(&config_path, text).unwrap();
 
     open_storage(&config_path);
+    bootstrap_system();
     create_fixture_database();
 
     let mut c = connect().unwrap();
@@ -1016,7 +1322,7 @@ fn account_table_uses_typed_columns_and_stamps_login() -> Result<(), Box<dyn std
     assert!(account["last_login_at"].is_null(), "还没登录过: {}", account);
 
     let catalog: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(data.path().join("system/catalog.json"))?)?;
-    let entry = &catalog["tables"]["__chusql_users"];
+    let entry = &catalog["tables"]["__system_users"];
     let columns = entry["columns"].as_array().ok_or("missing columns")?;
     let names: Vec<&str> = columns.iter().map(|col| col["name"].as_str().unwrap_or("")).collect();
     assert_eq!(names, vec!["id", "user", "password_hash", "registered_at", "last_login_at", "revision"]);

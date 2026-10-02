@@ -13,6 +13,7 @@ library
     hs-source-dirs:   src
     exposed-modules:  ChuSQL.Server.Accounts
                       ChuSQL.Server.Backend
+                      ChuSQL.Server.Catalog
                       ChuSQL.Server.Policy
                       ChuSQL.Server.Privileges
                       ChuSQL.Server.Session
@@ -40,6 +41,7 @@ executable chusql-server
     main-is:          Main.hs
     hs-source-dirs:   app
     build-depends:    base
+                    , aeson
                     , chusql-core-engine
                     , chusql-core-model
                     , chusql-interface

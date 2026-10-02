@@ -11,15 +11,13 @@ import ChuSQL.CLI.Session (
     newSession,
     switchDatabase,
  )
-import ChuSQL.Interface.Auth (Credential (..))
-import ChuSQL.Interface.Config (ServerConfig (..), loadServerConfigAt, loadWebConfigAt, resolveCredential, resolvePlainPassword)
+import ChuSQL.Interface.Config (ServerConfig (..), loadServerConfigAt, loadWebConfigAt, rootUserName)
 import ChuSQL.Interface.Link (Client, closeClient, connectClient)
 import ChuSQL.Interface.Settings (readSettingsFile)
 import ChuSQL.Interface.TOML (resolveConfigPath)
 import Control.Exception (finally)
 import Control.Monad (unless)
 import Data.IORef (newIORef)
-import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -35,7 +33,6 @@ import System.IO (hSetEncoding, stderr, stdout, utf8)
 
 data Options = Options
     { optUser :: Maybe Text
-    , optPromptPassword :: Bool
     , optDatabase :: Text
     , optFormat :: OutputFormat
     , optExecute :: Maybe Text
@@ -48,7 +45,6 @@ optionsParser :: Parser Options
 optionsParser =
     Options
         <$> optional (T.pack <$> strOption (long "user" <> short 'u' <> metavar "USER" <> help "Sign in as this account (default: the configured administrator)"))
-        <*> switch (long "password" <> short 'p' <> help "Always ask for the password, ignoring the configured one")
         <*> ( T.pack
                 <$> strOption
                     ( long "database"
@@ -94,11 +90,10 @@ main = do
     configPath <- resolveConfigPath (optConfig options)
     base <- loadWebConfigAt configPath
     saved <- readSettingsFile configPath
-    credential <- resolveCredential base saved
     config <- loadServerConfigAt configPath
-    let rootName = credUser credential
+    let rootName = rootUserName base saved
         userName = fromMaybe rootName (optUser options)
-    password <- resolvePassword (optPromptPassword options) userName rootName saved
+    password <- promptPassword userName
     connected <- connectClient (T.pack (scHost config)) (scPort config)
     case connected of
         Left message -> reportError message >> exitFailure
@@ -141,14 +136,7 @@ selectDatabase session wanted
             Left message -> reportError message >> pure False
             Right () -> pure True
 
--- | 决定口令是交互输入还是取自配置
-resolvePassword :: Bool -> Text -> Text -> Map.Map Text Text -> IO Text
-resolvePassword forcePrompt userName rootName saved
-    | forcePrompt = promptPassword userName
-    | T.toLower userName == T.toLower rootName = pure (resolvePlainPassword saved)
-    | otherwise = promptPassword userName
-
--- | 交互式读取口令
+-- | 交互式读取口令；直接回车表示空口令
 promptPassword :: Text -> IO Text
 promptPassword user = do
     entered <- runInputT defaultSettings (getPassword (Just '*') (T.unpack user <> "'s password: "))

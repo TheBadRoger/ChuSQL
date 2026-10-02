@@ -100,7 +100,7 @@ errorHint message
     | "unknown column" `T.isInfixOf` lowered = Just "run \\d <table> to see the columns of a table"
     | "unknown database" `T.isInfixOf` lowered = Just "run \\l to list the databases"
     | "syntax" `T.isInfixOf` lowered = Just "one statement at a time, and every statement ends with a semicolon"
-    | "invalid user name or password" `T.isInfixOf` lowered = Just "check --user and the password"
+    | "invalid user name or password" `T.isInfixOf` lowered = Just "check --user and the password; an empty password works only while the account has none"
     | "sign in first" `T.isInfixOf` lowered = Just "the session expired, restart the CLI"
     | "too many failed sign-in attempts" `T.isInfixOf` lowered = Just "wait a few minutes before trying again"
     | otherwise = Nothing

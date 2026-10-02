@@ -17,23 +17,35 @@ module ChuSQL.Server.Privileges (
     runPrivilegeCommand,
 ) where
 
-import ChuSQL.Core.Model (Row, Value (..))
 import ChuSQL.Core.Engine.Syntax.AST
 import ChuSQL.Server.Accounts (Principal, principalIsRoot, principalName)
-import ChuSQL.Interface.Actions (sqlLiteral)
 import ChuSQL.Interface.Protocol (Grant (..), RoleView (..))
 import ChuSQL.Server.Backend (
     Backend (..),
-    StatementResult (..),
     exprTables,
-    grantsTable,
-    membersTable,
-    rolesTable,
     systemDatabaseName,
     tableRefsOf,
  )
-import Control.Concurrent.MVar (MVar, newMVar, withMVar)
-import Data.List (intercalate, isInfixOf, nub, sort)
+import ChuSQL.Server.Catalog (
+    Catalog,
+    addGrant,
+    addMember,
+    dropRole,
+    eachAction,
+    insertRole,
+    newCatalog,
+    normalizeObject,
+    normalizeRole,
+    normalizeUser,
+    readGrants,
+    readMembers,
+    readRoleNames,
+    removeGrant,
+    removeMember,
+    withCatalogLock,
+    ensureCatalog,
+ )
+import Data.List (nub, sort)
 import Data.Text (Text)
 import qualified Data.Text as T
 
@@ -63,15 +75,12 @@ data PrivilegeCommand
     deriving (Show, Eq)
 
 data Privileges = Privileges
-    { pvBackend :: Backend
-    , pvLock :: MVar ()
+    { pvCatalog :: Catalog
     }
 
 -- | 建权限服务，固定在 system 库上
 newPrivileges :: Backend -> IO Privileges
-newPrivileges base = do
-    lock <- newMVar ()
-    pure (Privileges (beWithDatabase base systemDatabaseName) lock)
+newPrivileges base = Privileges <$> newCatalog (beWithDatabase base systemDatabaseName)
 
 -- | 语句转管理命令，不认的给 Nothing
 privilegeCommand :: Statement -> Maybe PrivilegeCommand
@@ -137,13 +146,6 @@ listRoleViews service = withTables service $ do
         members <- membersOfRole service role
         pure (RoleView role <$> grants <*> members)
 
--- | 授权对象落库口径：`*` 原样，裸表名按当前库补全
-normalizeObject :: Text -> Text -> Text
-normalizeObject database object
-    | T.strip object == "*" = "*"
-    | T.any (== '.') object = T.toLower (T.strip object)
-    | otherwise = normalizeUser database <> "." <> normalizeUser object
-
 -- | 一条语句需要哪些 (表, 权限)
 requiredActions :: Statement -> Maybe [(Text, Text)]
 requiredActions stmt = case stmt of
@@ -177,34 +179,29 @@ checkAll database grants needed = case [pair | pair@(table, privilege) <- needed
 -- | 一个用户实际能用的授权：他所属角色身上的那些
 grantsOfUser :: Privileges -> Text -> IO (Either PrivilegeError [Grant])
 grantsOfUser service user = do
-    members <- readRows service membersTable
-    rows <- readRows service grantsTable
+    members <- catalog (readMembers (pvCatalog service))
+    grants <- catalog (readGrants (pvCatalog service))
     pure $ do
         memberRows <- members
-        grantRows <- rows
-        let mine = [normalizeRole (cell "role" row) | row <- memberRows, normalizeUser (cell "member" row) == normalizeUser user]
-        pure [grantOf row | row <- grantRows, normalizeRole (cell "role" row) `elem` mine]
+        grantRows <- grants
+        let mine = [role | (role, member) <- memberRows, member == normalizeUser user]
+        pure [grant | grant <- grantRows, grantRole grant `elem` mine]
 
 -- | 一个角色挂着的授权
 roleGrantsOf :: Privileges -> Text -> IO (Either PrivilegeError [Grant])
 roleGrantsOf service role = do
-    rows <- readRows service grantsTable
-    pure $ fmap (map grantOf . filter (\row -> normalizeRole (cell "role" row) == normalizeRole role)) rows
+    grants <- catalog (readGrants (pvCatalog service))
+    pure (filter (\grant -> grantRole grant == normalizeRole role) <$> grants)
 
 -- | 角色名清单（统一小写）
 roleNames :: Privileges -> IO (Either PrivilegeError [Text])
-roleNames service = do
-    rows <- readRows service rolesTable
-    pure (map (normalizeRole . cell "name") <$> rows)
+roleNames service = catalog (readRoleNames (pvCatalog service))
 
 -- | 一个角色的成员清单
 membersOfRole :: Privileges -> Text -> IO (Either PrivilegeError [Text])
 membersOfRole service role = do
-    rows <- readRows service membersTable
-    pure $
-        fmap
-            (map (normalizeUser . cell "member") . filter (\row -> normalizeRole (cell "role" row) == normalizeRole role))
-            rows
+    members <- catalog (readMembers (pvCatalog service))
+    pure (map snd . filter (\(name, _) -> name == normalizeRole role) <$> members)
 
 -- | 角色必须存在，否则命令不落地
 requireRole :: Privileges -> Text -> IO (Either PrivilegeError ())
@@ -225,129 +222,55 @@ applyCommand service database command = case command of
             Left err -> pure (Left err)
             Right names
                 | normalizeRole role `elem` names -> pure (Left (PrivilegeError "conflict" ("role already exists: " <> role)))
-                | otherwise -> exec service (insertSql rolesTable ["name"] [normalizeRole role])
+                | otherwise -> catalog (insertRole (pvCatalog service) role)
     DropRoleCommand role -> do
         allowed <- requireRole service role
         case allowed of
             Left err -> pure (Left err)
-            Right () -> do
-                first <- exec service ("DELETE FROM " ++ rolesTable ++ " WHERE name = " ++ roleLiteral role)
-                second <- exec service ("DELETE FROM " ++ grantsTable ++ " WHERE role = " ++ roleLiteral role)
-                third <- exec service ("DELETE FROM " ++ membersTable ++ " WHERE role = " ++ roleLiteral role)
-                pure (sequence_ [first, second, third])
+            Right () -> catalog (dropRole (pvCatalog service) role)
     GrantPrivilegesCommand privileges object role -> do
         allowed <- requireRole service role
         case allowed of
             Left err -> pure (Left err)
-            Right () -> each (expandPrivileges privileges) $ \privilege -> do
-                let target = normalizeObject database object
-                cleared <- exec service (deleteGrantSql role privilege target)
-                case cleared of
-                    Left err -> pure (Left err)
-                    Right () ->
-                        exec service (insertSql grantsTable ["role", "privilege", "object"] [normalizeRole role, privilege, target])
+            Right () ->
+                eachAction (expandPrivileges privileges) $ \privilege ->
+                    catalog (addGrant (pvCatalog service) role privilege (normalizeObject database object))
     RevokePrivilegesCommand privileges object role -> do
         allowed <- requireRole service role
         case allowed of
             Left err -> pure (Left err)
             Right () ->
-                each (expandPrivileges privileges) $ \privilege ->
-                    exec service (deleteGrantSql role privilege (normalizeObject database object))
+                eachAction (expandPrivileges privileges) $ \privilege ->
+                    catalog (removeGrant (pvCatalog service) role privilege (normalizeObject database object))
     GrantRoleCommand role users -> do
         allowed <- requireRole service role
         case allowed of
             Left err -> pure (Left err)
             Right () ->
-                each users $ \user -> do
+                eachAction users $ \user -> do
                     known <- membersOfRole service role
                     case known of
                         Left err -> pure (Left err)
                         Right members
                             | normalizeUser user `elem` members -> pure (Right ())
-                            | otherwise ->
-                                exec service (insertSql membersTable ["role", "member"] [normalizeRole role, normalizeUser user])
+                            | otherwise -> catalog (addMember (pvCatalog service) role user)
     RevokeRoleCommand role users -> do
         allowed <- requireRole service role
         case allowed of
             Left err -> pure (Left err)
-            Right () ->
-                each users $ \user ->
-                    exec
-                        service
-                        ( "DELETE FROM " ++ membersTable ++ " WHERE role = " ++ roleLiteral role
-                            ++ " AND member = " ++ literal (normalizeUser user)
-                        )
+            Right () -> eachAction users $ \user -> catalog (removeMember (pvCatalog service) role user)
 
--- | 建表只在第一次用时做；已经有了就算成功
+-- | 全程持锁，先保证系统表存在再跑动作
 withTables :: Privileges -> IO (Either PrivilegeError a) -> IO (Either PrivilegeError a)
-withTables service action = withMVar (pvLock service) $ \_ -> do
-    ready <- ensureTables service
+withTables service action = withCatalogLock (pvCatalog service) $ do
+    ready <- ensureCatalog (pvCatalog service)
     case ready of
-        Left err -> pure (Left err)
+        Left err -> pure (Left (storageError err))
         Right () -> action
 
--- | 确保三张内部表存在
-ensureTables :: Privileges -> IO (Either PrivilegeError ())
-ensureTables service = each tableDefs (createTable service)
-  where
-    -- | 三张内部表的定义
-    tableDefs =
-        [ (rolesTable, "(name VARCHAR(64))")
-        , (grantsTable, "(role VARCHAR(64), privilege VARCHAR(16), object VARCHAR(128))")
-        , (membersTable, "(role VARCHAR(64), member VARCHAR(64))")
-        ]
-
--- | 建一张内部表，已存在算成功
-createTable :: Privileges -> (String, String) -> IO (Either PrivilegeError ())
-createTable service (table, columns) = do
-    result <- beStatement (pvBackend service) ("CREATE TABLE " ++ table ++ " " ++ columns)
-    pure $ case result of
-        Right _ -> Right ()
-        Left err
-            | "exists" `isInfixOf` err -> Right ()
-            | otherwise -> Left (storageError err)
-
--- | 跑一条内部写语句
-exec :: Privileges -> String -> IO (Either PrivilegeError ())
-exec service sql = do
-    result <- beStatement (pvBackend service) sql
-    pure $ case result of
-        Left err -> Left (storageError err)
-        Right _ -> Right ()
-
--- | 读一张内部表
-readRows :: Privileges -> String -> IO (Either PrivilegeError [Row])
-readRows service table = do
-    result <- beStatement (pvBackend service) ("SELECT * FROM " ++ table)
-    pure $ case result of
-        Left err -> Left (storageError err)
-        Right res -> Right (srRows res)
-
--- | 行里取一列文本
-cell :: String -> Row -> Text
-cell column row = case lookup column row of
-    Just (VStr value) -> T.pack value
-    _ -> ""
-
--- | 一行记录转成授权
-grantOf :: Row -> Grant
-grantOf row =
-    Grant
-        { grantRole = normalizeRole (cell "role" row)
-        , grantPrivilege = T.toLower (T.strip (cell "privilege" row))
-        , grantObject = T.toLower (T.strip (cell "object" row))
-        }
-
--- | 拼一条删授权的 SQL
-deleteGrantSql :: Text -> Text -> Text -> String
-deleteGrantSql role privilege object =
-    "DELETE FROM " ++ grantsTable ++ " WHERE role = " ++ roleLiteral role
-        ++ " AND privilege = " ++ literal privilege ++ " AND object = " ++ literal object
-
--- | 拼一条插入的 SQL
-insertSql :: String -> [String] -> [Text] -> String
-insertSql table columns values =
-    "INSERT INTO " ++ table ++ " (" ++ intercalate ", " columns ++ ") VALUES (" ++ intercalate ", " (map literal values) ++ ")"
+-- | 目录操作转成权限错误
+catalog :: IO (Either String a) -> IO (Either PrivilegeError a)
+catalog action = fmap (either (Left . storageError) Right) action
 
 -- | 把 ALL 展开成四种具体权限
 expandPrivileges :: [Text] -> [Text]
@@ -356,31 +279,6 @@ expandPrivileges privileges = nub (concatMap expand (map (T.toLower . T.strip) p
     -- | 展开一条权限名
     expand "all" = ["select", "insert", "update", "delete"]
     expand other = [other]
-
--- | 一串动作挨着跑，遇到第一个错误就停
-each :: [a] -> (a -> IO (Either PrivilegeError ())) -> IO (Either PrivilegeError ())
-each [] _ = pure (Right ())
-each (item : rest) action = do
-    result <- action item
-    case result of
-        Left err -> pure (Left err)
-        Right () -> each rest action
-
--- | 角色名的 SQL 字面量
-roleLiteral :: Text -> String
-roleLiteral = literal . normalizeRole
-
--- | 文本值的 SQL 字面量
-literal :: Text -> String
-literal = sqlLiteral . VStr . T.unpack
-
--- | 角色名统一小写去空白
-normalizeRole :: Text -> Text
-normalizeRole = T.toLower . T.strip
-
--- | 用户名统一小写去空白
-normalizeUser :: Text -> Text
-normalizeUser = T.toLower . T.strip
 
 forbidden :: PrivilegeError
 forbidden = PrivilegeError "forbidden" "administrator required"

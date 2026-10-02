@@ -90,16 +90,19 @@ check_stage() {
     [ -f "$stage/bin/csql" ] || Fail 'bin/csql is missing from the package'
     [ -f "$stage/bin/chusql-web" ] || Fail 'bin/chusql-web is missing from the package'
     [ -f "$stage/bin/chusql-server" ] || Fail 'bin/chusql-server is missing from the package'
+    [ -f "$stage/bin/csql-bootstrap" ] || Fail 'bin/csql-bootstrap is missing from the package'
     [ -f "$stage/static/index.html" ] || Fail 'static/index.html is missing from the package'
     [ -f "$stage/csql-web.sh" ] || Fail 'csql-web.sh is missing from the package'
     [ -f "$stage/scripts/chusql.toml" ] || Fail 'scripts/chusql.toml is missing from the package'
     [ -f "$stage/install.sh" ] || Fail 'install.sh is missing from the package'
     [ -f "$stage/install.ps1" ] || Fail 'install.ps1 is missing from the package'
+    [ -f "$stage/uninstall.sh" ] || Fail 'uninstall.sh is missing from the package'
+    [ -f "$stage/uninstall.ps1" ] || Fail 'uninstall.ps1 is missing from the package'
     # bin 里带 chusql 名字的文件只能是已知产物；改名前的残留或别的垃圾都算装配错误
     for f in "$stage"/bin/chusql* "$stage"/bin/libchusql*; do
         [ -e "$f" ] || continue
         case "$(basename "$f")" in
-            libchusql_core_storage.so|libchusql_core_storage.dylib|libchusql_core_storage.dll|chusql-server|chusql-web) ;;
+            libchusql_core_storage.so|libchusql_core_storage.dylib|libchusql_core_storage.dll|chusql-server|chusql-web|csql-bootstrap) ;;
             *) Fail "unexpected artifact in bin/: $(basename "$f")" ;;
         esac
     done
@@ -116,8 +119,10 @@ verify_package() {
             rm -rf "$vtmp"
             Fail "$name: the archive does not unpack"
         fi
-        if ! ( cd "$vtmp/pkg" && HOME="$vtmp/home" sh install.sh --component "$comp" \
-                --install-dir "$vtmp/opt" --data-dir "$vtmp/data" --user root --password package-check ) \
+        if ! ( cd "$vtmp/pkg" && HOME="$vtmp/home" CHUSQL_ADMIN_PASSWORD='verify-package' \
+                sh install.sh --component "$comp" \
+                --install-dir "$vtmp/opt" --data-dir "$vtmp/data" --user root \
+                --no-start ) \
                 >"$vtmp/log" 2>&1; then
             sed -n '1,120p' "$vtmp/log" >&2
             rm -rf "$vtmp"
@@ -126,7 +131,8 @@ verify_package() {
         ok=yes
         ls "$vtmp/opt/bin/"libchusql_core_storage.* >/dev/null 2>&1 || ok=no
         [ -f "$vtmp/opt/bin/chusql-server" ] || ok=no
-        [ -f "$vtmp/opt/init.sql" ] || ok=no
+        [ -f "$vtmp/opt/bin/csql-bootstrap" ] || ok=no
+        [ -f "$vtmp/data/system/catalog.json" ] || ok=no
         [ -f "$vtmp/home/.config/ChuSQL/chusql.toml" ] || ok=no
         grep -q "data_dir = \"$vtmp/data\"" "$vtmp/home/.config/ChuSQL/chusql.toml" || ok=no
         if [ "$comp" = web ]; then
@@ -164,6 +170,8 @@ if [ "$build" = yes ]; then
     ( cd "$repo_root/chusql-cli" && stack build --fast chusql-cli:exe:csql )
     Step 'Building the TCP database server (Haskell)'
     ( cd "$repo_root/chusql-cli" && stack build --fast chusql-server:exe:chusql-server )
+    Step 'Building the bootstrap program (Haskell)'
+    ( cd "$repo_root/chusql-bootstrap" && stack build --fast chusql-bootstrap:exe:csql-bootstrap )
 fi
 
 # ---------- 装配 + 打归档 ----------
@@ -191,6 +199,15 @@ for front_name in chusql-web chusql-server csql; do
     cp "$front" "$stage/bin/"
 done
 
+# 引导程序住在自己的工程里，安装根也单独问它要
+bootstrap_root=$(cd "$repo_root/chusql-bootstrap" && stack path --local-install-root | tail -n 1 | tr -d '\r')
+bootstrap_bin="$bootstrap_root/bin/csql-bootstrap"
+if [ ! -f "$bootstrap_bin" ]; then
+    bootstrap_bin=$(find "$repo_root/chusql-bootstrap/.stack-work" -name csql-bootstrap -type f 2>/dev/null | head -n 1 || true)
+fi
+[ -n "$bootstrap_bin" ] && [ -f "$bootstrap_bin" ] || Fail 'csql-bootstrap is not built (run without --no-build)'
+cp "$bootstrap_bin" "$stage/bin/"
+
 # Haskell 一般静态链接，靶目录里真有共享库就一起带上；改名前的旧库（libchusql_storage.*）不能进包
 for lib in "$repo_root"/chusql-core/storage/target/release/*.so "$repo_root"/chusql-core/storage/target/release/*.dylib; do
     [ -f "$lib" ] || continue
@@ -200,13 +217,13 @@ for lib in "$repo_root"/chusql-core/storage/target/release/*.so "$repo_root"/chu
     cp "$lib" "$stage/bin/"
 done
 
-cp "$repo_root/scripts/chusql.toml" "$repo_root/scripts/init.sql" "$stage/scripts/"
-cp "$repo_root/scripts/install.sh" "$repo_root/scripts/install.ps1" "$stage/"
+cp "$repo_root/scripts/chusql.toml" "$stage/scripts/"
+cp "$repo_root/scripts/install.sh" "$repo_root/scripts/install.ps1" "$repo_root/scripts/uninstall.sh" "$repo_root/scripts/uninstall.ps1" "$stage/"
 mkdir -p "$stage/static"
 cp -R "$repo_root"/chusql-web/static/. "$stage/static/"
 cp "$repo_root/scripts/csql-web.sh" "$stage/"
 if [ -f "$repo_root/scripts/csql-web.ps1" ]; then cp "$repo_root/scripts/csql-web.ps1" "$stage/"; fi
-chmod +x "$stage/install.sh" "$stage/csql-web.sh"
+chmod +x "$stage/install.sh" "$stage/uninstall.sh" "$stage/csql-web.sh"
 
 check_stage "$stage"
 

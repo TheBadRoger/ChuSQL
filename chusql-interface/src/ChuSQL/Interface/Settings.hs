@@ -55,7 +55,6 @@ settingCatalogue =
     , item "max-rows" "Rows per query" "limits" "int" "1000" False False
     , item "max-sql-length" "Max SQL characters" "limits" "int" "20000" False False
     , item "user" "管理员账号（设置文件）" "auth" "text" "root" True True
-    , item "password" "管理员口令（设置文件，明文）" "auth" "secret" "" True True
     , item "password-min-length" "口令最短长度" "auth" "int" "12" True False
     , item "password-classes" "口令字符类别数" "auth" "int" "2" True False
     , owned "data-dir" "Data directory" "storage" "text" "" "storage" "data_dir"
@@ -117,7 +116,7 @@ isRootOnly key = maybe False siRootOnly (findItem key)
 
 -- | 网页端不能改的键
 lockedKeys :: [Text]
-lockedKeys = ["user", "password"]
+lockedKeys = ["user"]
 
 -- | 这项在界面上是不是只读
 isLockedSetting :: Text -> Bool

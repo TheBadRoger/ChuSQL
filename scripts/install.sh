@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-# ChuSQL 安装脚本（Linux/macOS）：从包内、发行版或源码装 cli/web，
-# 写全局配置、改 PATH，装完删除安装包。
+# ChuSQL 安装脚本（Linux/macOS）：装 cli/web、写全局配置、
+# 改 PATH、跑 csql-bootstrap 建系统目录、最后拉起服务。
 
 default_repo='TheBadRoger/ChuSQL'
 
@@ -28,16 +28,20 @@ usage: ./install.sh [--component web|cli|both] [options]
                           asks (English, y/n), command line client first:
                             command line client (csql)?   default yes [Y/n]
                             web front end (browser UI)?   default no  [y/N]
+                          it then asks whether to give the administrator account a
+                          password (default no); that password goes straight into the
+                          system catalog and is never written to chusql.toml
 
   --interactive           ask even when there is no terminal; the answers are
                           read from stdin (one per line)
   --install-dir DIR       where to install   (default: $HOME/.local/share/chusql)
   --data-dir DIR          where to keep data (default: <install-dir>/data)
   --user NAME             administrator name (default: root)
-  --password PW           administrator password, empty means no password
-                          (administrator-only sign-in). Leave it out and the
-                          installer asks for it, twice, with the echo off.
   --keep-package          do not delete the downloaded/extracted package
+  --password VALUE        password of the administrator account (required when
+                          there is no terminal to ask on; shows up in the shell
+                          history, so CHUSQL_ADMIN_PASSWORD is safer)
+  --no-start              do not start the server after installing
 
 where the files come from:
   (default)               a package next to this script, else the newest GitHub release
@@ -51,6 +55,8 @@ where the files come from:
   -h, --help              this text
 
 environment:
+  CHUSQL_ADMIN_PASSWORD   password of the administrator account, same as
+                          --password
   CHUSQL_GITHUB_BASE      GitHub base URL: GitHub Enterprise, a mirror, or a
                           local test fixture (default: https://github.com)
   CHUSQL_GITHUB_TOKEN     token for the version API (or GITHUB_TOKEN); without
@@ -62,8 +68,9 @@ component=''
 install_dir=''
 data_dir=''
 root_user='root'
-root_password=''
 keep_package='no'
+password_arg=''
+no_start='no'
 repo="$default_repo"
 version='latest'
 url_arg=''
@@ -71,7 +78,6 @@ from_source='no'
 source_dir=''
 list_versions='no'
 interactive_flag='no'
-password_given='no'
 want_web='no'
 want_cli='no'
 
@@ -81,8 +87,9 @@ while [ $# -gt 0 ]; do
         --install-dir) install_dir="${2:-}"; shift 2 ;;
         --data-dir) data_dir="${2:-}"; shift 2 ;;
         --user) root_user="${2:-}"; shift 2 ;;
-        --password) root_password="${2:-}"; password_given='yes'; shift 2 ;;
         --keep-package) keep_package='yes'; shift ;;
+        --password) password_arg="${2:-}"; shift 2 ;;
+        --no-start) no_start='yes'; shift ;;
         --url) url_arg="${2:-}"; shift 2 ;;
         --repo) repo="${2:-}"; shift 2 ;;
         --version) version="${2:-}"; shift 2 ;;
@@ -148,27 +155,6 @@ read_line() {   # -> $line（读到空行也算成功）
     fi
 }
 
-read_secret() { # read_secret PROMPT -> 值写到 stdout（提示和换行都走 stderr，回显关掉）
-    printf '%s' "$1" >&2
-    if [ "$answers" = 'stdin' ]; then
-        IFS= read -r secret_line || secret_line=''
-    else
-        saved=''
-        if command -v stty >/dev/null 2>&1; then
-            saved=$(stty -g < "$answers" 2>/dev/null) || saved=''
-            stty -echo < "$answers" 2>/dev/null || true
-        fi
-        IFS= read -r secret_line < "$answers" || secret_line=''
-        if [ -n "$saved" ]; then
-            stty "$saved" < "$answers" 2>/dev/null || true
-        elif command -v stty >/dev/null 2>&1; then
-            stty echo < "$answers" 2>/dev/null || true
-        fi
-    fi
-    printf '\n' >&2
-    printf '%s' "$secret_line"
-}
-
 ask_yes_no() {  # ask_yes_no PROMPT DEFAULT(y|n) -> $reply = yes|no
     while :; do
         printf '%s ' "$1" >&2
@@ -181,6 +167,24 @@ ask_yes_no() {  # ask_yes_no PROMPT DEFAULT(y|n) -> $reply = yes|no
         esac
         return 0
     done
+}
+
+# 读一行口令 -> $line；从终端读时关掉回显（-interactive 从 stdin 读，没法关）。
+read_secret() {
+    if [ "$answers" = 'stdin' ]; then
+        read_line
+        return 0
+    fi
+    _saved=$(stty -g < "$answers" 2>/dev/null) || _saved=''
+    stty -echo < "$answers" 2>/dev/null || true
+    read_line
+    if [ -n "$_saved" ]; then
+        stty "$_saved" < "$answers" 2>/dev/null || true
+    else
+        stty echo < "$answers" 2>/dev/null || true
+    fi
+    printf '\n' >&2
+    return 0
 }
 
 if [ "$component" = '' ] && [ "$list_versions" = 'no' ]; then
@@ -198,18 +202,36 @@ if [ "$component" = '' ] && [ "$list_versions" = 'no' ]; then
     fi
 fi
 
-if [ "$list_versions" = 'no' ] && [ "$password_given" = 'no' ] && [ "$can_prompt" = 'yes' ]; then
-    echo
-    echo "The administrator account is $root_user."
-    first=$(read_secret "Root password for $root_user (empty means no password) []: ")
-    if [ -n "$first" ]; then
-        again=$(read_secret 'Repeat the root password: ')
-        [ "$first" = "$again" ] || fail 'the two passwords do not match'
-        echo 'root password set' >&2
-    else
-        echo 'no root password: administrator-only sign-in' >&2
+# 管理员口令是装机必答项：交互时当场设，非交互时给 --password 或
+# CHUSQL_ADMIN_PASSWORD。口令只经 stdin 传给 csql-bootstrap，不落 chusql.toml。
+admin_password="${CHUSQL_ADMIN_PASSWORD:-}"
+if [ "$list_versions" = 'no' ]; then
+    if [ -n "$password_arg" ]; then
+        admin_password="$password_arg"
     fi
-    root_password="$first"
+    if [ "$can_prompt" = 'yes' ]; then
+        echo
+        echo "The administrator account is $root_user."
+        while :; do
+            printf '  Password: ' >&2
+            read_secret
+            admin_password="$line"
+            if [ -z "$admin_password" ]; then
+                echo '  the password cannot be empty' >&2
+                continue
+            fi
+            printf '  Repeat it: ' >&2
+            read_secret
+            if [ "$line" != "$admin_password" ]; then
+                echo '  the two entries differ, try again' >&2
+                continue
+            fi
+            break
+        done
+    fi
+    if [ -z "$admin_password" ]; then
+        fail 'no administrator password: pass --password PASSWORD or set CHUSQL_ADMIN_PASSWORD'
+    fi
 fi
 
 # 选中的组件：空格分隔的清单，外加一个显示名（cli 或 web，两个就是 cli+web）
@@ -484,7 +506,7 @@ if [ "$from_source" = 'yes' ]; then
     pack="$tmp/stage"
     mkdir -p "$pack/bin" "$pack/scripts"
     cp "$storage_lib" "$pack/bin/"
-    cp "$src/scripts/chusql.toml" "$src/scripts/init.sql" "$pack/scripts/"
+    cp "$src/scripts/chusql.toml" "$pack/scripts/"
     cp "$src/scripts/install.sh" "$pack/"
     for comp in $wanted; do
         if [ "$comp" = 'web' ]; then
@@ -518,6 +540,14 @@ if [ "$from_source" = 'yes' ]; then
     [ -n "$server_root" ] || fail 'cannot ask stack for --local-install-root'
     [ -f "$server_root/bin/chusql-server" ] || fail "chusql-server not found after the build: $server_root/bin/chusql-server"
     cp "$server_root/bin/chusql-server" "$pack/bin/"
+
+    # 引导程序独立成工程：建 system 目录不依赖服务本身，坏了还能单独重跑
+    step 'Building the bootstrap program (stack build --fast chusql-bootstrap:exe:csql-bootstrap)'
+    ( cd "$src/chusql-bootstrap" && stack build --fast chusql-bootstrap:exe:csql-bootstrap ) || fail 'stack build failed in chusql-bootstrap'
+    bootstrap_root=$( cd "$src/chusql-bootstrap" && stack path --local-install-root 2>/dev/null | tr -d '\r' )
+    [ -n "$bootstrap_root" ] || fail 'cannot ask stack for --local-install-root'
+    [ -f "$bootstrap_root/bin/csql-bootstrap" ] || fail "csql-bootstrap not found after the build: $bootstrap_root/bin/csql-bootstrap"
+    cp "$bootstrap_root/bin/csql-bootstrap" "$pack/bin/"
 elif [ -n "$url_arg" ]; then
     # ---------- 指定 URL / 本地归档 ----------
     new_tmp
@@ -567,6 +597,7 @@ fi
 # ---- 校验包内容 ----
 ls "$pack/bin/"libchusql_core_storage.* >/dev/null 2>&1 || fail "package is incomplete: bin/libchusql_core_storage.* not found in $pack"
 [ -f "$pack/bin/chusql-server" ] || fail "package is incomplete: bin/chusql-server not found in $pack"
+[ -f "$pack/bin/csql-bootstrap" ] || fail "package is incomplete: bin/csql-bootstrap not found in $pack"
 if [ "$want_web" = 'yes' ]; then
     [ -f "$pack/bin/chusql-web" ] || fail 'package is incomplete: bin/chusql-web not found'
     [ -d "$pack/static" ] || fail 'package is incomplete: static/ not found'
@@ -581,17 +612,14 @@ echo "  version    $version"
 echo "  components $component_label"
 echo "  install to $install_dir"
 echo "  data dir   $data_dir"
-if [ -n "$root_password" ]; then
-    echo "  root user  $root_user"
-else
-    echo "  root user  $root_user (no password: administrator-only sign-in)"
-fi
+echo "  root user  $root_user (password asked above, kept out of chusql.toml)"
 
 # ---- 释放文件 ----
 # 包是合在一起的（web 和 cli 都在），这里按这次的选择逐个释放：没选的组件不落地
 step 'Installing files'
 mkdir -p "$install_dir/bin" "$install_dir/logs" "$data_dir"
 cp "$pack/bin/chusql-server" "$install_dir/bin/"
+cp "$pack/bin/csql-bootstrap" "$install_dir/bin/"
 for lib in "$pack/bin/"libchusql_core_storage.*; do
     if [ -f "$lib" ]; then cp "$lib" "$install_dir/bin/"; fi
 done
@@ -618,11 +646,17 @@ config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ChuSQL"
 config_file="$config_dir/chusql.toml"
 mkdir -p "$config_dir"
 sed -e "s|^\(user[[:space:]]*=[[:space:]]*\).*|\1\"$root_user\"|" \
-    -e "s|^\(password[[:space:]]*=[[:space:]]*\).*|\1\"$root_password\"|" \
     -e "s|^\(data_dir[[:space:]]*=[[:space:]]*\).*|\1\"$data_dir\"|" \
     "$pack/scripts/chusql.toml" > "$config_file"
 echo "  config file  $config_file"
-if [ -f "$pack/scripts/init.sql" ]; then cp "$pack/scripts/init.sql" "$install_dir/"; fi
+
+# ---- 引导系统目录 ----
+# csql-bootstrap 建 system 数据库和 __system_users 表；口令只走 stdin，不进 chusql.toml
+step 'Creating the system catalog'
+bootstrap="$install_dir/bin/csql-bootstrap"
+[ -n "$admin_password" ] || fail 'the administrator password is required'
+printf '%s\n' "$admin_password" | "$bootstrap" --config "$config_file" --user "$root_user" --password-stdin ||
+    fail 'the bootstrap program failed; the system catalog is not ready'
 
 # ---- 命令入口 ----
 step 'Creating commands'
@@ -676,6 +710,24 @@ else
     echo "  package kept at $pack"
 fi
 
+# ---- 拉起服务 ----
+server_bin="$install_dir/bin/chusql-server"
+server_pid=''
+if [ "$no_start" = 'yes' ]; then
+    note '--no-start: the server was not started'
+else
+    step 'Starting the server'
+    mkdir -p "$install_dir/logs"
+    nohup "$server_bin" --config "$config_file" > "$install_dir/logs/server.log" 2> "$install_dir/logs/server.err.log" &
+    server_pid=$!
+    sleep 1
+    if ! kill -0 "$server_pid" 2>/dev/null; then
+        fail "the server stopped right away; look at $install_dir/logs/server.err.log"
+    fi
+    note "server running, pid $server_pid"
+    note "log            $install_dir/logs/server.err.log"
+fi
+
 step 'Done'
 echo "  chusql.toml  $config_file"
 echo "  data         $data_dir"
@@ -685,4 +737,9 @@ if [ "$want_cli" = 'yes' ]; then
     if [ -n "$start_with" ]; then start_with="$start_with, csql"; else start_with='csql'; fi
 fi
 echo "  start with   $start_with"
-echo "  tcp server   $install_dir/bin/chusql-server (listens on [server] host/port, defaults 127.0.0.1:7777)"
+echo "  tcp server   $server_bin (listens on [server] host/port, defaults 127.0.0.1:7777)"
+if [ -n "$server_pid" ]; then
+    echo "  running      pid $server_pid (stop it with: kill $server_pid)"
+else
+    echo "  start it     $server_bin --config \"$config_file\""
+fi

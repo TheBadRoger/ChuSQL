@@ -9,6 +9,7 @@ module ChuSQL.Core.Model
     , TypeClass (..)
     , Value (..)
     , Row
+    , TableMeta (..)
     , Table (..)
     , Database
     , colNames
@@ -24,10 +25,15 @@ module ChuSQL.Core.Model
     , parseColumnType
     , typeClassOf
     , assignable
+    , comparableTypes
     , integerType
     , numericType
     , valueFits
     , coerceValue
+    , canonicalValue
+    , compareValue
+    , valuesEqual
+    , hashValue
     ) where
 
 import Data.Char (isDigit, isSpace, toLower)
@@ -230,6 +236,19 @@ integerType CBigInt = True
 integerType CSmallInt = True
 integerType _ = False
 
+-- | 比较用的类型族：同大类可比，日期时间与文本互比
+comparableTypes :: ColumnType -> ColumnType -> Bool
+comparableTypes a b = sameClass || crossTemporal
+  where
+    -- | 两个类型同属一个大类
+    sameClass = typeClassOf a == typeClassOf b
+    -- | 时间与文本放在一起比
+    crossTemporal = (temporal a && textual b) || (textual a && temporal b)
+    -- | 是不是时间类型
+    temporal t = typeClassOf t == TemporalClass
+    -- | 是不是文本类型
+    textual t = typeClassOf t == TextClass
+
 -- | 是不是数值类型
 numericType :: ColumnType -> Bool
 numericType t = typeClassOf t == NumericClass
@@ -363,22 +382,76 @@ data Value
     | VBool Bool
     deriving (Show, Eq)
 
+-- | 值的比较关键字：整值浮点折成整数
+canonicalValue :: Value -> Value
+canonicalValue (VFloat d)
+    | wholeDouble d = VInt (truncate d)
+canonicalValue v = v
+
+-- | 浮点是不是能精确折成整数的整值
+wholeDouble :: Double -> Bool
+wholeDouble d =
+    not (isNaN d)
+        && not (isInfinite d)
+        && abs d <= 9007199254740992
+        && d == fromIntegral (truncate d :: Int)
+
+-- | 值的全序：NULL 最小，数值跨类型比大小，异族按族的先后
+compareValue :: Value -> Value -> Ordering
+compareValue a b = case (canonicalValue a, canonicalValue b) of
+    (VNull, VNull) -> EQ
+    (VNull, _) -> LT
+    (_, VNull) -> GT
+    (VInt x, VInt y) -> compare x y
+    (VInt x, VFloat y) -> compare (fromIntegral x) y
+    (VFloat x, VInt y) -> compare x (fromIntegral y)
+    (VFloat x, VFloat y) -> compare x y
+    (VStr x, VStr y) -> compare x y
+    (VBool x, VBool y) -> compare x y
+    (x, y) -> compare (valueRank x) (valueRank y)
+
+-- | 族的先后，只用来给异族值定序
+valueRank :: Value -> Int
+valueRank VNull = 0
+valueRank (VInt _) = 1
+valueRank (VFloat _) = 1
+valueRank (VStr _) = 2
+valueRank (VBool _) = 3
+
+-- | 相等语义：比较关键字相同即相等，与 hashValue 配套
+valuesEqual :: Value -> Value -> Bool
+valuesEqual a b = canonicalValue a == canonicalValue b
+
+-- | 值的关键字哈希，与 valuesEqual 用同一套关键字
+hashValue :: Value -> Int
+hashValue v = case canonicalValue v of
+    VNull -> hashWithSalt 0 (0 :: Int)
+    VInt n -> hashWithSalt 1 n
+    VFloat d -> hashWithSalt 1 d
+    VStr t -> hashWithSalt 2 t
+    VBool b -> hashWithSalt 3 b
+
 -- | 值按类型打散搅拌
 instance Hashable Value where
-    hashWithSalt s VNull = hashWithSalt (hashWithSalt s (0 :: Int)) ()
-    hashWithSalt s (VInt n) = hashWithSalt (hashWithSalt s (1 :: Int)) n
-    hashWithSalt s (VFloat d) = hashWithSalt (hashWithSalt s (2 :: Int)) d
-    hashWithSalt s (VStr t) = hashWithSalt (hashWithSalt s (3 :: Int)) t
-    hashWithSalt s (VBool b) = hashWithSalt (hashWithSalt s (4 :: Int)) b
+    hashWithSalt s = hashWithSalt s . hashValue
 
 -- | 一行数据
 type Row = [(String, Value)]
 
--- | 一张表：名字、列定义与全部行
+-- | 一张表的统计：行数、各列不同值数（capped 表示只数到上限）、有索引的列
+data TableMeta = TableMeta
+    { metaRowCount :: Int
+    , metaDistinct :: [(String, Int, Bool)]
+    , metaIndexes :: [String]
+    }
+    deriving (Show)
+
+-- | 一张表：名字、列定义与全部行；meta 为存储层统计，拿不到是 Nothing
 data Table = Table
     { tableName :: String
     , tableCols :: [(String, Column)]
     , tableRows :: [Row]
+    , tableMeta :: Maybe TableMeta
     }
     deriving (Show)
 

@@ -2,24 +2,32 @@
 
 module Main where
 
-import ChuSQL.Core.Engine.Algebra.Eval (evalRelOp)
+import ChuSQL.Core.Engine.Algebra.Eval (evalRelOp, evalRelOpM)
 import ChuSQL.Core.Engine.Algebra.Expr (colsInExpr, evalExpr)
 import ChuSQL.Core.Engine.Algebra.Op (RelOp (..), renderPlan)
 import ChuSQL.Core.Engine.Algebra.Optimize (optimize, pushProject)
 import ChuSQL.Core.Engine.Algebra.Planner (translate)
+import ChuSQL.Core.Engine.Algebra.Sort (sortRows)
+import ChuSQL.Core.Engine.Builtin
+import ChuSQL.Core.Engine.Error
 import ChuSQL.Core.Engine
+import ChuSQL.Core.Engine.Parallel (poolRun, workerPool)
 import ChuSQL.Core.Model
 import ChuSQL.Core.Engine.Semantic (prepare)
 import ChuSQL.Core.Engine.Storage (IndexResult (..), MonadStorage (..))
 import ChuSQL.Core.Engine.Storage.IPC (IPCStorage (runIPCStorage), closeConnection, doListTables, getDatabaseName, localStorageLink, setDatabaseName, setStorageLink)
 import ChuSQL.Core.Engine.Syntax.AST
 import ChuSQL.Core.Engine.Syntax.Parser
-import Control.Exception (IOException, finally, try)
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar)
+import Control.Exception (ErrorCall, IOException, finally, try)
+import Data.Hashable (hash)
 import Data.List (isInfixOf, sortOn)
 import Data.Unique (hashUnique, newUnique)
 import System.CPUTime (getCPUTime)
 import System.Directory (createDirectoryIfMissing, getTemporaryDirectory, removePathForcibly)
 import System.FilePath ((</>))
+import System.Timeout (timeout)
 import Test.Hspec
 
 -- 引擎层的 hspec 测试：语法、执行、优化器与存储链路行为。
@@ -35,6 +43,7 @@ users =
             , [("id", VInt 2), ("name", VStr "Bob"), ("age", VInt 17)]
             , [("id", VInt 3), ("name", VStr "Carol"), ("age", VInt 30)]
             ]
+        , tableMeta = Nothing
         }
 
 -- | 测试表 orders：id/user_id/product
@@ -48,11 +57,50 @@ orders =
             , [("id", VInt 2), ("user_id", VInt 2), ("product", VStr "Pen")]
             , [("id", VInt 3), ("user_id", VInt 1), ("product", VStr "Cup")]
             ]
+        , tableMeta = Nothing
         }
 
 -- | 两个测试表组成的默认库
 testDB :: Database
 testDB = [("users", users), ("orders", orders)]
+
+-- | 连接链测试表 a：6 行，id 各不相同
+chainA :: Table
+chainA =
+    Table
+        { tableName = "a"
+        , tableCols = [("id", TInt), ("name", TStr)]
+        , tableRows = [[("id", VInt n), ("name", VStr ("a" ++ show n))] | n <- [1 .. 6]]
+        , tableMeta = Just (TableMeta 6 [("id", 6, False)] ["id"])
+        }
+
+-- | 连接链测试表 b：4 行，a_id 各不相同
+chainB :: Table
+chainB =
+    Table
+        { tableName = "b"
+        , tableCols = [("id", TInt), ("a_id", TInt)]
+        , tableRows = [[("id", VInt n), ("a_id", VInt n)] | n <- [1 .. 4]]
+        , tableMeta = Just (TableMeta 4 [("id", 4, False), ("a_id", 4, False)] ["id"])
+        }
+
+-- | 连接链测试表 c：2 行，b_id 各不相同
+chainC :: Table
+chainC =
+    Table
+        { tableName = "c"
+        , tableCols = [("id", TInt), ("b_id", TInt)]
+        , tableRows = [[("id", VInt n), ("b_id", VInt n)] | n <- [1, 2]]
+        , tableMeta = Just (TableMeta 2 [("id", 2, False), ("b_id", 2, False)] ["id"])
+        }
+
+-- | 三张表组成的连接链测试库
+chainDB :: Database
+chainDB = [("a", chainA), ("b", chainB), ("c", chainC)]
+
+-- | 同一个连接链测试库，但没有统计
+chainDBWithoutStats :: Database
+chainDBWithoutStats = [(n, t { tableMeta = Nothing }) | (n, t) <- chainDB]
 
 -- | 跑引擎层全部 hspec 用例
 main :: IO ()
@@ -1161,6 +1209,47 @@ main = hspec $ do
             fmap firstFilterCond (optimizedPlan "SELECT name FROM users WHERE 1 > 2")
                 `shouldBe` Right (Just (LitBool False))
 
+        it "picks the index only when the statistics make it cheaper" $ do
+            let stat rows distinct indexes = TableMeta rows [(c, d, False) | (c, d) <- distinct] indexes
+                dbWith m = [("users", Table "users" [("id", TInt), ("name", TStr)] [] (Just m))]
+                unknown = [("users", Table "users" [("id", TInt), ("name", TStr)] [] Nothing)]
+                point = Filter (Eq (Col "id") (LitInt 1)) (Scan Nothing "users" Nothing)
+                range = Filter (Gt (Col "id") (LitInt 5)) (Scan Nothing "users" Nothing)
+            -- 索引在、点查命中一行：改写
+            optimize (dbWith (stat 10000 [("id", 10000)] ["id"])) point
+                `shouldBe` Lookup Nothing "users" "id" (VInt 1)
+            -- 拿不到统计：保持原有改写行为
+            optimize unknown point `shouldBe` Lookup Nothing "users" "id" (VInt 1)
+            -- 没有索引：不改写，省掉一次白跑的存储层查询
+            optimize (dbWith (stat 10000 [("id", 10000)] [])) point `shouldBe` point
+            -- 有索引但整列一个值：点查等于全表，全表扫更便宜
+            optimize (dbWith (stat 10000 [("name", 1)] ["name"])) (Filter (Eq (Col "name") (LitStr "a")) (Scan Nothing "users" Nothing))
+                `shouldBe` Filter (Eq (Col "name") (LitStr "a")) (Scan Nothing "users" Nothing)
+            -- 范围扫描同理
+            optimize (dbWith (stat 10000 [("id", 10000)] ["id"])) range
+                `shouldBe` Range Nothing "users" "id" (Just (VInt 5, False)) Nothing
+            optimize (dbWith (stat 10000 [("id", 10000)] [])) range `shouldBe` range
+
+        it "reorders an inner join chain only when the statistics say it is cheaper" $ do
+            let sql =
+                    "SELECT a.name FROM a JOIN b ON a.id = b.a_id JOIN c ON b.id = c.b_id ORDER BY a.name"
+                unordered = "SELECT a.name FROM a JOIN b ON a.id = b.a_id JOIN c ON b.id = c.b_id"
+            -- 统计说先接最小的 c 更省：文本顺序 a / b / c 换成一个更便宜的顺序
+            fmap planTables (optimizedPlanIn chainDB sql) `shouldBe` Right ["b", "c", "a"]
+            -- 拿不到统计：保持文本顺序
+            fmap planTables (optimizedPlanIn chainDBWithoutStats sql) `shouldBe` Right ["a", "b", "c"]
+            -- 行序可观察（没有 ORDER BY）：不动顺序
+            fmap planTables (optimizedPlanIn chainDB unordered) `shouldBe` Right ["a", "b", "c"]
+
+        it "keeps an inner join chain result identical when it reorders it" $ do
+            let sql =
+                    "SELECT a.name FROM a JOIN b ON a.id = b.a_id JOIN c ON b.id = c.b_id ORDER BY a.name"
+            case parseStatement sql >>= prepare chainDB of
+                Left err -> expectationFailure err
+                Right q -> case translate q of
+                    Left err -> expectationFailure err
+                    Right relOp -> evalRelOp chainDB (optimize chainDB relOp) `shouldBe` evalRelOp chainDB relOp
+
         it "removes a filter whose predicate folds to true" $ do
             fmap anyFilter (optimizedPlan "SELECT name FROM users WHERE 1 = 1")
                 `shouldBe` Right False
@@ -1600,6 +1689,24 @@ main = hspec $ do
                 fmap sortRow (indexRow fresh)
                     `shouldBe` Just (sortRow [("id", VInt 3), ("code", VInt 502)])
 
+        it "schema carries the row count, index list and column statistics" $ do
+            withTestSession $ \srv -> withServerEnv srv $ do
+                _ <- runIPCStorage (runStatementM (CreateTable "meta_t" [("id", TInt), ("code", TInt)]))
+                _ <-
+                    runIPCStorage
+                        ( runStatementM
+                            (Insert "meta_t" ["id", "code"] [[LitInt 1, LitInt 500], [LitInt 2, LitInt 501]])
+                        )
+                _ <- runIPCStorage (runStatementM (CreateIndex "meta_t" "code"))
+                db <- runIPCStorage schema
+                case lookup "meta_t" db of
+                    Nothing -> expectationFailure "meta_t missing from schema"
+                    Just t -> do
+                        fmap metaRowCount (tableMeta t) `shouldBe` Just 2
+                        fmap metaIndexes (tableMeta t) `shouldBe` Just ["id", "code"]
+                        fmap (sortOn fst . map (\(c, d, _) -> (c, d)) . metaDistinct) (tableMeta t)
+                            `shouldBe` Just [("code", 2), ("id", 2)]
+
         it "CREATE INDEX accepts duplicates and returns every matching row" $ do
             withTestSession $ \srv -> withServerEnv srv $ do
                 _ <- runIPCStorage (runStatementM (CreateTable "dup_ix" [("id", TInt), ("age", TInt)]))
@@ -1662,7 +1769,7 @@ main = hspec $ do
                 `shouldBe` Right (makeSelect ["*"] "t" (Just (Eq (Col "flag") (LitBool True))))
 
         it "inserts and reads back a boolean column end-to-end" $ do
-            let db = [("t", Table "t" [("id", TInt), ("flag", TBool)] [])]
+            let db = [("t", Table "t" [("id", TInt), ("flag", TBool)] [] Nothing)]
             case runStatement db (Insert "t" ["id", "flag"] [[LitInt 1, LitBool True]]) of
                 Left e -> expectationFailure e
                 Right (db', _) ->
@@ -1877,6 +1984,206 @@ main = hspec $ do
             run nulls "ALTER TABLE nl ALTER COLUMN tag DROP NOT NULL" `shouldSatisfy` isRight
             run strict "ALTER TABLE nl2 ALTER COLUMN tag DROP NOT NULL" `shouldSatisfy` isRight
 
+    describe "ChuSQL.Core.Model (值语义唯一权威)" $ do
+        it "treats an integral float and an int as the same value" $ do
+            valuesEqual (VInt 1) (VFloat 1.0) `shouldBe` True
+            compareValue (VInt 1) (VFloat 1.0) `shouldBe` EQ
+            hash (VInt 1) `shouldBe` hash (VFloat 1.0)
+            hashValue (VInt 1) `shouldBe` hashValue (VFloat 1.0)
+
+        it "keeps null, text and boolean in their own buckets" $ do
+            hash VNull `shouldNotBe` hash (VInt 0)
+            hash (VInt 1) `shouldNotBe` hash (VStr "1")
+            hash (VStr "a") `shouldNotBe` hash (VBool True)
+
+        it "orders null below every value and compares across families" $ do
+            compareValue VNull (VInt minBound) `shouldBe` LT
+            compareValue (VInt maxBound) VNull `shouldBe` GT
+            compareValue VNull VNull `shouldBe` EQ
+            compareValue (VInt 1) (VStr "a") `shouldBe` LT
+            compareValue (VStr "a") (VBool True) `shouldBe` LT
+            compareValue (VBool True) VNull `shouldBe` GT
+
+        it "propagates null through comparisons" $ do
+            evalExpr (Eq (Col "v") LitNull) [("v", VInt 1)] `shouldBe` Right VNull
+            evalExpr (Gt LitNull (LitInt 1)) [] `shouldBe` Right VNull
+
+        it "uses one comparability rule and one canonical form" $ do
+            comparableTypes CInt CFloat `shouldBe` True
+            assignable CInt CFloat `shouldBe` True
+            assignable CStr CInt `shouldBe` False
+            comparableTypes CInt CStr `shouldBe` False
+            comparableTypes CStr CDate `shouldBe` True
+            canonicalValue (VFloat 3.0) `shouldBe` VInt 3
+            canonicalValue (VFloat 3.5) `shouldBe` VFloat 3.5
+
+    describe "比较语义统一（排序 / 聚合 / 哈希连接）" $ do
+        -- vals：在给定库上跑 SQL 只取值
+        let vals db input = fmap (map (map snd)) (parseStatement input >>= rowsOf . runStatement db)
+            -- seed：建一张两列空表
+            seed name = case parseStatement ("CREATE TABLE " ++ name ++ " (id int, v int)") >>= runStatement emptyDB of
+                Left e -> error e
+                Right (db, _) -> db
+            -- ins：插入一行，失败直接判测试失败
+            ins db input = case parseStatement input >>= runStatement db of
+                Left e -> error e
+                Right (db', _) -> db'
+            rows3 =
+                ins
+                    (ins (ins (seed "m") "INSERT INTO m (id, v) VALUES (1, 2)") "INSERT INTO m (id, v) VALUES (2, 1)")
+                    "INSERT INTO m (id, v) VALUES (3, 2)"
+            withNull =
+                ins
+                    (ins (ins (seed "m2") "INSERT INTO m2 (id, v) VALUES (1, 2)") "INSERT INTO m2 (id) VALUES (2)")
+                    "INSERT INTO m2 (id, v) VALUES (3, 1)"
+
+        it "sorts with the same rule that aggregates use" $ do
+            map (map snd) (sortRows [("v", Asc)] [[("v", VFloat 1.5)], [("v", VNull)], [("v", VInt 1)]])
+                `shouldBe` [[VNull], [VInt 1], [VFloat 1.5]]
+            vals rows3 "SELECT v FROM m ORDER BY v, id" `shouldBe` Right [[VInt 1], [VInt 2], [VInt 2]]
+            vals rows3 "SELECT v FROM m ORDER BY v DESC, id" `shouldBe` Right [[VInt 2], [VInt 2], [VInt 1]]
+            vals rows3 "SELECT MIN(v), MAX(v) FROM m" `shouldBe` Right [[VInt 1, VInt 2]]
+
+        it "sorts the catalog names that are unknown into one code" $ do
+            errorCode "unknown database: d" `shouldBe` "not_found"
+            errorCode "unknown role: r" `shouldBe` "not_found"
+            errorCode "unknown account" `shouldBe` "not_found"
+
+        it "puts null first when sorting and skips it in aggregates" $ do
+            vals withNull "SELECT v FROM m2 ORDER BY v" `shouldBe` Right [[VNull], [VInt 1], [VInt 2]]
+            vals withNull "SELECT MIN(v), MAX(v), SUM(v), COUNT(v), COUNT(*) FROM m2"
+                `shouldBe` Right [[VInt 1, VInt 2, VInt 3, VInt 2, VInt 3]]
+
+        it "uses 1 and 1.0 as one key in predicates and unique columns" $ do
+            let one = ins (seed "f1") "INSERT INTO f1 (id, v) VALUES (1, 1)"
+            vals one "SELECT id FROM f1 WHERE v = 1.0" `shouldBe` Right [[VInt 1]]
+            vals one "SELECT id FROM f1 WHERE v = 1" `shouldBe` Right [[VInt 1]]
+            let uniqueTable = case parseStatement "CREATE TABLE uq (id int, v int UNIQUE)" >>= runStatement emptyDB of
+                    Left e -> error e
+                    Right (db, _) -> db
+                seeded = ins uniqueTable "INSERT INTO uq (id, v) VALUES (1, 1)"
+            case parseStatement "INSERT INTO uq (id, v) VALUES (2, 1.0)" >>= runStatement seeded of
+                Left err -> err `shouldBe` "UNIQUE: duplicate value in column v"
+                Right _ -> expectationFailure "1.0 must clash with 1 on a unique column"
+
+    describe "ChuSQL.Core.Engine.Builtin (解析与调用唯一入口)" $ do
+        it "resolves aggregate names case-insensitively" $ do
+            resolveBuiltin "COUNT" `shouldBe` Just BCount
+            resolveBuiltin "Sum" `shouldBe` Just BSum
+            resolveBuiltin "median" `shouldBe` Nothing
+            map fst builtinNames `shouldBe` ["count", "sum", "avg", "min", "max"]
+
+        it "invokes every aggregate from one place" $ do
+            invokeBuiltin BCountAll 3 [] `shouldBe` Right (VInt 3)
+            invokeBuiltin BCount 3 [VInt 1, VNull, VInt 2] `shouldBe` Right (VInt 2)
+            invokeBuiltin BSum 0 [] `shouldBe` Right VNull
+            invokeBuiltin BSum 3 [VInt 1, VNull, VInt 2] `shouldBe` Right (VInt 3)
+            invokeBuiltin BAvg 2 [VInt 1, VInt 3] `shouldBe` Right (VFloat 2)
+            invokeBuiltin BMin 2 [VNull, VInt 4] `shouldBe` Right (VInt 4)
+            invokeBuiltin BMax 2 [VNull, VInt 4] `shouldBe` Right (VInt 4)
+
+        it "maps names to syntax nodes in one table" $ do
+            builtinOfExpr CountAll `shouldBe` Just BCountAll
+            builtinNode BCount (Col "age") `shouldBe` CountOf (Col "age")
+            builtinNode BAvg (Col "age") `shouldBe` AvgOf (Col "age")
+            aggregateArg (SumOf (Col "age")) `shouldBe` Just (Col "age")
+            aggregateArg CountAll `shouldBe` Nothing
+            unsupportedAggregate `shouldBe` "only COUNT, SUM, AVG, MIN and MAX can be aggregated"
+
+        it "exposes one operator table and one executor" $ do
+            operatorSymbol <$> operatorOfExpr (Add (LitInt 1) (LitInt 2)) `shouldBe` Just "+"
+            operatorSymbol <$> operatorOfExpr (And (LitBool True) (LitBool False)) `shouldBe` Just "AND"
+            executeOperator OpAdd [VInt 1, VInt 2] `shouldBe` Right (VInt 3)
+            executeOperator OpDiv [VInt 1, VInt 0] `shouldBe` Left "division by zero"
+            executeOperator OpNeg [VFloat 2] `shouldBe` Right (VFloat (-2))
+            executeOperator OpEq [VInt 1, VFloat 1.0] `shouldBe` Right (VBool True)
+            executeOperator OpGt [VNull, VInt 1] `shouldBe` Right VNull
+            executeOperator OpAnd [VBool True, VNull] `shouldBe` Right VNull
+            executeOperator OpOr [VBool True, VNull] `shouldBe` Right (VBool True)
+            executeOperator OpAdd [VInt 1] `shouldSatisfy` isLeft
+            executeOperator OpNeg [VInt 1, VInt 2] `shouldSatisfy` isLeft
+
+        it "keeps null comparisons three-valued" $ do
+            inValues VNull [VInt 1] `shouldBe` Right VNull
+            inValues (VInt 1) [VInt 1, VNull] `shouldBe` Right (VBool True)
+            inValues (VInt 2) [VInt 1, VNull] `shouldBe` Right VNull
+            threeValuedNot VNull `shouldBe` VNull
+            threeValuedNot (VBool True) `shouldBe` VBool False
+
+    describe "ChuSQL.Core.Engine.Parallel (分片调度与分片选择)" $ do
+        it "keeps the submission order of finished jobs" $ do
+            pool <- workerPool 4
+            results <- poolRun pool [delayed 30000 (1 :: Int), delayed 1000 2, delayed 20000 3]
+            results `shouldBe` [1, 2, 3]
+
+        it "dispatches every job without waiting for the slow one" $ do
+            pool <- workerPool 4
+            finished <- timeout 800000 (poolRun pool (replicate 4 (delayed 300000 ())))
+            finished `shouldBe` Just (replicate 4 ())
+
+        it "rethrows job failures in the submission order" $ do
+            pool <- workerPool 4
+            let failed = error "first bad job" :: IO ()
+                later = error "second bad job" :: IO ()
+            outcome <- try (poolRun pool (pure () : failed : [later])) :: IO (Either ErrorCall [()])
+            case outcome of
+                Left err -> show err `shouldContain` "first bad job"
+                Right _ -> expectationFailure "poolRun returned instead of rethrowing the job failure"
+
+        it "scans a small table in one sequential request" $ do
+            probe <- newProbe users 4
+            let op = Scan Nothing "users" Nothing
+            runProbeStorage (evalRelOpM testDB op) probe `shouldReturn` evalRelOp testDB op
+            recordedCalls probe `shouldReturn` ["scan:users"]
+
+        it "splits a large table into the available shards" $ do
+            probe <- newProbe bigTable 4
+            let op = Scan Nothing "big" Nothing
+            runProbeStorage (evalRelOpM bigDB op) probe `shouldReturn` evalRelOp bigDB op
+            recordedCalls probe `shouldReturn` ["scan_shards:4:big"]
+
+        it "projects columns through the shard path" $ do
+            probe <- newProbe bigTable 3
+            let op = Scan Nothing "big" (Just ["name"])
+            runProbeStorage (evalRelOpM bigDB op) probe `shouldReturn` evalRelOp bigDB op
+            recordedCalls probe `shouldReturn` ["scan_shards:3:big"]
+
+        it "reads shards of one table through the wire" $ do
+            withTestSession $ \srv -> withServerEnv srv $ do
+                let rows = [[("id", VInt i), ("name", VStr ("n" ++ show i))] | i <- [1 .. 400 :: Int]]
+                runIPCStorage (insertMany "wide" rows) `shouldReturn` Right ()
+                whole <- runIPCStorage (scan "wide")
+                fmap length whole `shouldBe` Right 400
+                shardRows <- runIPCStorage (scanShards 4 "wide" Nothing)
+                shardRows `shouldBe` whole
+                projected <- runIPCStorage (scanShards 4 "wide" (Just ["name"]))
+                fmap (map (map fst)) projected `shouldBe` Right (map (const ["name"]) rows)
+                fmap (concatMap (map snd)) projected
+                    `shouldBe` Right (map (VStr . ("n" ++) . show) [1 .. 400 :: Int])
+
+    describe "ChuSQL.Core.Engine.Error (错误分类唯一入口)" $ do
+        it "maps messages to wire codes without changing them" $ do
+            errorCode "no database selected" `shouldBe` "no_database"
+            errorCode "administrator required" `shouldBe` "forbidden"
+            errorCode "unknown table: t" `shouldBe` "not_found"
+            errorCode "unknown column: c" `shouldBe` "query_error"
+            errorCode "type error: expected two numbers" `shouldBe` "query_error"
+            errorCode "something else" `shouldBe` "query_error"
+
+        it "keeps the account service codes in the same module" $ do
+            accountErrorCode "account already exists" `shouldBe` "conflict"
+            accountErrorCode "unknown account" `shouldBe` "not_found"
+            accountErrorCode "disk gone" `shouldBe` "storage_error"
+
+        it "classifies the same messages into categories" $ do
+            errorCategory "no database selected" `shouldBe` NoDatabaseError
+            errorCategory "administrator required" `shouldBe` PermissionError
+            errorCategory "unknown table: t" `shouldBe` CatalogError
+            errorCategory "type error: expected two numbers" `shouldBe` TypeError
+            errorCategory "storage library call failed: x" `shouldBe` StorageError
+            errorCategory "unsupported protocol version" `shouldBe` ProtocolError
+            errorCategory "something else" `shouldBe` UnknownError
+
 -- | 每个测试表都清空行后的库
 emptyDB :: Database
 emptyDB = [(n, t{tableRows = []}) | (n, t) <- testDB]
@@ -1984,6 +2291,94 @@ isLeft :: Either a b -> Bool
 isLeft (Left _) = True
 isLeft (Right _) = False
 
+-- | 延时后返回一个值
+delayed :: Int -> a -> IO a
+delayed micros value = threadDelay micros >> pure value
+
+-- | 造一个记录调用序列的探针
+newProbe :: Table -> Int -> IO Probe
+newProbe table width = do
+    calls <- newMVar []
+    pure Probe {probeTable = table, probeCalls = calls, probeWidth = width}
+
+-- | 记一条存储调用
+recordCall :: Probe -> String -> IO ()
+recordCall probe name = modifyMVar_ (probeCalls probe) (\calls -> pure (calls ++ [name]))
+
+-- | 取回调用序列
+recordedCalls :: Probe -> IO [String]
+recordedCalls = readMVar . probeCalls
+
+-- | 按列投影（空清单保留行）
+projectColumns :: [String] -> [Row] -> [Row]
+projectColumns cols = map (\row -> [(c, v) | c <- cols, Just v <- [lookup c row]])
+
+-- | 按行数切成连续分片
+rowShards :: Int -> [a] -> [[a]]
+rowShards width rows
+    | width <= 1 = [rows]
+    | otherwise = go rows
+  where
+    -- | 每片行数
+    chunk = (length rows + width - 1) `div` width
+    -- | 反复切出前一片
+    go rest
+        | null rest = []
+        | otherwise = let (part, more) = splitAt chunk rest in part : go more
+
+-- | 声明 1000 行的大表
+bigTable :: Table
+bigTable = users {tableName = "big", tableMeta = Just (TableMeta 1000 [("id", 1000, False)] ["id"])}
+
+-- | 只装大表的库
+bigDB :: Database
+bigDB = [("big", bigTable)]
+
+-- | 记录存储调用、按行分片的假存储
+data Probe = Probe
+    { probeTable :: Table
+    , probeCalls :: MVar [String]
+    , probeWidth :: Int
+    }
+
+-- | 探针单子
+newtype ProbeStorage a = ProbeStorage {runProbeStorage :: Probe -> IO a}
+
+instance Functor ProbeStorage where
+    fmap f (ProbeStorage act) = ProbeStorage (fmap f . act)
+
+instance Applicative ProbeStorage where
+    pure value = ProbeStorage (\_ -> pure value)
+    ProbeStorage fn <*> ProbeStorage act = ProbeStorage (\probe -> fn probe <*> act probe)
+
+instance Monad ProbeStorage where
+    ProbeStorage act >>= next =
+        ProbeStorage (\probe -> act probe >>= \value -> runProbeStorage (next value) probe)
+
+instance MonadStorage ProbeStorage where
+    scan table = ProbeStorage $ \probe -> do
+        recordCall probe ("scan:" ++ table)
+        pure (Right (tableRows (probeTable probe)))
+
+    scanColumns table columns = ProbeStorage $ \probe -> do
+        recordCall probe ("scan_columns:" ++ table)
+        pure (Right (projectColumns columns (tableRows (probeTable probe))))
+
+    parallelShards = ProbeStorage (pure . probeWidth)
+
+    scanShards width table columns = ProbeStorage $ \probe -> do
+        recordCall probe ("scan_shards:" ++ show width ++ ":" ++ table)
+        let rows = maybe id projectColumns columns (tableRows (probeTable probe))
+        pure (Right (concat (rowShards width rows)))
+
+    insert _ _ = ProbeStorage (\_ -> pure (Left "probe: insert is not supported"))
+    replaceAll _ _ = ProbeStorage (\_ -> pure (Left "probe: replaceAll is not supported"))
+    createTable _ _ = ProbeStorage (\_ -> pure (Left "probe: createTable is not supported"))
+    dropTable _ = ProbeStorage (\_ -> pure (Left "probe: dropTable is not supported"))
+    dropColumn _ _ = ProbeStorage (\_ -> pure (Left "probe: dropColumn is not supported"))
+    replaceSchema _ _ _ = ProbeStorage (\_ -> pure (Left "probe: replaceSchema is not supported"))
+    snapshot = ProbeStorage (\_ -> pure [])
+
 -- | 判断 Either 是 Right
 isRight :: Either a b -> Bool
 isRight (Right _) = True
@@ -2017,6 +2412,27 @@ optimizedPlan :: String -> Either String RelOp
 optimizedPlan sql = do
     q <- parseStatement sql
     optimize testDB <$> translate q
+
+-- | 在给定库上解析并优化 SQL，返回计划
+optimizedPlanIn :: Database -> String -> Either String RelOp
+optimizedPlanIn db sql = do
+    q <- parseStatement sql
+    optimize db <$> translate q
+
+-- | 计划里出现的表名（先序）
+planTables :: RelOp -> [String]
+planTables op = case op of
+    Scan _ t _ -> [t]
+    Lookup _ t _ _ -> [t]
+    Range _ t _ _ _ -> [t]
+    Filter _ x -> planTables x
+    Project _ x -> planTables x
+    Compute _ x -> planTables x
+    Aggregate _ _ x -> planTables x
+    Sort _ x -> planTables x
+    Limit _ x -> planTables x
+    Join _ l r _ -> planTables l ++ planTables r
+    Unit -> []
 
 -- | 计划里每个 Join 节点是不是 LEFT JOIN（先序）
 leftJoinKinds :: RelOp -> [Bool]

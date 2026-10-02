@@ -158,7 +158,7 @@ memoryBackendWith trusted name ref =
             modifyMVar ref $ \db -> case memoryAccounts db stamp req of
                 Left err -> pure (db, Left err)
                 Right accounts -> pure ((usersTable, Table usersTable [("account", TStr)]
-                    [[("account", VStr (BL.unpack (A.encode a))) ] | a <- accounts]) : filter ((/= usersTable) . fst) db, Right accounts)
+                    [[("account", VStr (BL.unpack (A.encode a))) ] | a <- accounts] Nothing) : filter ((/= usersTable) . fst) db, Right accounts)
         , beWithDatabase = withDatabase
         , beDatabases = pure (Right (nub [name, systemDatabaseName]))
         , beStorage = \_ -> pure (Left "storage is not available in this backend")
@@ -367,7 +367,7 @@ systemDatabaseName :: String
 systemDatabaseName = "system"
 
 usersTable :: String
-usersTable = "__chusql_users"
+usersTable = "__system_users"
 
 -- | 角色与授权表的名字，不带内部前缀
 rolesTable :: String
@@ -384,7 +384,7 @@ internalNames = [rolesTable, grantsTable, membersTable]
 
 -- | 名字是否带内部表前缀
 reserved :: String -> Bool
-reserved = T.isPrefixOf "__chusql_" . T.toLower . T.pack
+reserved = T.isPrefixOf "__system_" . T.toLower . T.pack
 
 -- | 是不是服务自己的内部表
 internalTable :: String -> Bool

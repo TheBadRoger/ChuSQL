@@ -35,6 +35,14 @@ class (Monad m) => MonadStorage m where
         result <- scan t
         pure (fmap (map (\row -> [(c, v) | c <- cols, Just v <- [lookup c row]])) result)
 
+    -- \| 本存储能用的并行分片数；不支持并行的存储返回 1
+    parallelShards :: m Int
+    parallelShards = pure 1
+
+    -- \| 按分片并行扫描并按分片序拼接；默认退回顺序扫描
+    scanShards :: Int -> String -> Maybe [String] -> m (Either String [Row])
+    scanShards _ t cols = maybe (scan t) (scanColumns t) cols
+
     -- \| 追加一行
     insert :: String -> Row -> m (Either String ())
 

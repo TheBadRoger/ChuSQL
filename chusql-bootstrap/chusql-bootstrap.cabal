@@ -1,0 +1,20 @@
+cabal-version: 2.4
+
+name:           chusql-bootstrap
+version:        1.0.0
+synopsis:       ChuSQL 引导程序：建系统库与管理员账号
+description:    ChuSQL 初始化引导。首次启动前建系统库、账号表与管理员行，
+                装完即退，保留在 bin 里备用。后续的 catalog 修复也走这里。
+build-type:     Simple
+
+executable csql-bootstrap
+    hs-source-dirs:   app
+    main-is:          Main.hs
+    build-depends:    base >= 4.14 && < 5
+                    , aeson
+                    , bytestring
+                    , chusql-core-engine
+                    , chusql-interface
+                    , text
+    default-language: Haskell2010
+    ghc-options:      -Wall

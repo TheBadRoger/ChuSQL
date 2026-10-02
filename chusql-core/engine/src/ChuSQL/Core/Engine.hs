@@ -11,6 +11,7 @@ import ChuSQL.Core.Engine.Storage.Memory (MemoryStorage (runMemoryStorage))
 import ChuSQL.Core.Engine.Syntax.AST
 import ChuSQL.Core.Engine.Syntax.Parser (parseExpression)
 import Data.Maybe (mapMaybe)
+import qualified Data.HashSet as HS
 
 -- 引擎入口：检查语义、按语句分发执行，另有内存实现与泛型版本。
 
@@ -86,13 +87,15 @@ runStatementUncheckedM db (Update tbl assigns mWhere) =
             rowsResult <- scan tbl
             case rowsResult of
                 Left err -> pure (Left err)
-                Right rows -> do
-                    newRows <- mapM (updateRowM db table mWhere assigns) rows
-                    case sequence newRows of
-                        Left err -> pure (Left err)
-                        Right rs -> do
-                            result <- replaceAll tbl rs
-                            pure (result >> Right [])
+                Right rows -> case checkPlan table of
+                    Left err -> pure (Left err)
+                    Right plan -> do
+                        newRows <- mapM (updateRowM db table plan mWhere assigns) rows
+                        case sequence newRows of
+                            Left err -> pure (Left err)
+                            Right rs -> do
+                                result <- replaceAll tbl rs
+                                pure (result >> Right [])
 runStatementUncheckedM _ (CreateTable name cols) = do
     result <- createTable name cols
     pure (result >> Right [])
@@ -156,7 +159,8 @@ buildRows table current cols rows = do
     -- | 逐行构造，最后统一查一遍约束
     go _ _ [] acc = do
         let built = reverse acc
-        mapM_ (runChecks table) built
+        plan <- checkPlan table
+        mapM_ (runChecks plan) built
         enforceNotNull (tableCols table) built
         enforceUnique (tableCols table) (current ++ built)
         Right built
@@ -208,19 +212,29 @@ autoStart (Just (name, _)) rows = case [n | r <- rows, Just (VInt n) <- [lookup 
     [] -> 1
     ns -> maximum ns + 1
 
--- | 执行 CHECK 约束
-runChecks :: Table -> Row -> Either String ()
-runChecks table row = mapM_ check (tableCols table)
+-- | 一次解析出来的 CHECK 条件
+type CheckPlan = [(String, Expr)]
+
+-- | 把表上的 CHECK 文本解析成条件，每语句只解析一次
+checkPlan :: Table -> Either String CheckPlan
+checkPlan table = mapM parse (mapMaybe checked (tableCols table))
   where
-    -- | 查这一列的 CHECK
-    check (name, col) = case columnCheck col of
-        Nothing -> Right ()
-        Just text -> case parseExpression text of
-            Left err -> Left ("CHECK on " ++ name ++ ": " ++ firstLine err)
-            Right e -> case evalCondForRow e row of
-                Left err -> Left ("CHECK on " ++ name ++ ": " ++ err)
-                Right True -> Right ()
-                Right False -> Left ("CHECK on " ++ name ++ " failed")
+    -- | 只挑出带 CHECK 文本的列
+    checked (name, col) = (,) name <$> columnCheck col
+    -- | 解析一列的 CHECK 文本
+    parse (name, text) = case parseExpression text of
+        Left err -> Left ("CHECK on " ++ name ++ ": " ++ firstLine err)
+        Right e -> Right (name, e)
+
+-- | 执行解析好的 CHECK 条件
+runChecks :: CheckPlan -> Row -> Either String ()
+runChecks plan row = mapM_ check plan
+  where
+    -- | 跑一条 CHECK
+    check (name, e) = case evalCondForRow e row of
+        Left err -> Left ("CHECK on " ++ name ++ ": " ++ err)
+        Right True -> Right ()
+        Right False -> Left ("CHECK on " ++ name ++ " failed")
 
 -- | 只取第一行（报错提示用）
 firstLine :: String -> String
@@ -242,18 +256,18 @@ enforceUnique cols rows = mapM_ check targets
   where
     targets = [(n, c) | (n, c) <- cols, columnUnique c || columnPrimaryKey c]
     -- | 查这一列有没有重复值
-    check (name, _) = go name [] (mapMaybe (lookup name) rows)
+    check (name, _) = go name HS.empty (mapMaybe (lookup name) rows)
     -- | 逐个值比过去
     go _ _ [] = Right ()
     -- | NULL 不算冲突，跳过
     go name seen (VNull : rest) = go name seen rest
     go name seen (v : rest)
-        | v `elem` seen = Left ("UNIQUE: duplicate value in column " ++ name)
-        | otherwise = go name (v : seen) rest
+        | HS.member (canonicalValue v) seen = Left ("UNIQUE: duplicate value in column " ++ name)
+        | otherwise = go name (HS.insert (canonicalValue v) seen) rest
 
 -- | UPDATE 的一行（条件与赋值都可能带子查询）
-updateRowM :: (MonadStorage m) => Database -> Table -> Maybe Expr -> [(String, Expr)] -> Row -> m (Either String Row)
-updateRowM db table cond asgns row = do
+updateRowM :: (MonadStorage m) => Database -> Table -> CheckPlan -> Maybe Expr -> [(String, Expr)] -> Row -> m (Either String Row)
+updateRowM db table plan cond asgns row = do
     keep <- case cond of
         Nothing -> pure (Right True)
         Just e -> evalCondForRowM db e row
@@ -262,7 +276,7 @@ updateRowM db table cond asgns row = do
         Right False -> pure (Right row)
         Right True -> do
             row' <- applyUpdatesM db table asgns row
-            pure (row' >>= \r -> runChecks table r >> Right r)
+            pure (row' >>= \r -> runChecks plan r >> Right r)
 
 -- | 依次求值、收类型并覆盖列（表达式可以带子查询）
 applyUpdatesM :: (MonadStorage m) => Database -> Table -> [(String, Expr)] -> Row -> m (Either String Row)
@@ -316,8 +330,9 @@ alterTable db tbl change = case lookupTable db tbl of
   where
     -- | 改完再统一查一遍约束
     checkAltered (cols, rows) = do
-        let table = Table tbl cols rows
-        mapM_ (runChecks table) rows
+        let table = Table tbl cols rows Nothing
+        plan <- checkPlan table
+        mapM_ (runChecks plan) rows
         enforceNotNull cols rows
         enforceUnique cols rows
         Right (cols, rows)

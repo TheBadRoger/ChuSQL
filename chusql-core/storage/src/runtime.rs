@@ -1,12 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::catalog::Catalog;
 use crate::config::{self, Config, Loaded};
-use crate::heap::HeapTable;
-use crate::initsql::{self, InitColumn, InitTable};
+use crate::heap::{scalar_int, HeapTable};
 use crate::log;
 use crate::protocol::{
     reserved_table, Account, ColumnStatWire, IndexWire, Request, Response, Row, SchemaColumn, TableSchemaWire, USERS_TABLE,
@@ -21,6 +20,7 @@ struct Server {
     cfg: Config,
     tables: Mutex<HashMap<String, Arc<Mutex<HeapTable>>>>,
     write_lock: Mutex<()>,
+    gate: RwLock<()>,
     catalog: Mutex<Catalog>,
     wal: Wal,
     recovery_required: AtomicBool,
@@ -38,6 +38,7 @@ impl Server {
             cfg,
             tables: Mutex::new(HashMap::new()),
             write_lock: Mutex::new(()),
+            gate: RwLock::new(()),
             catalog: Mutex::new(catalog),
             wal,
             recovery_required: AtomicBool::new(false),
@@ -125,6 +126,56 @@ impl Server {
         let h = self.table_handle(table)?;
         let mut guard = h.lock().unwrap();
         f(&mut guard)
+    }
+
+    /// 请求带列名时逐个查字典
+    fn check_columns(&self, table: &str, columns: Option<&[String]>) -> std::io::Result<()> {
+        let Some(cols) = columns else {
+            return Ok(());
+        };
+        let c = self.catalog.lock().map_err(|_| std::io::Error::other("catalog lock poisoned"))?;
+        let schema = c
+            .describe(table)
+            .ok_or_else(|| std::io::Error::other(format!("unknown table: {table}")))?;
+        for col in cols {
+            if !schema.columns.iter().any(|c| &c.name == col) {
+                return Err(std::io::Error::other(format!("unknown column: {col}")));
+            }
+        }
+        Ok(())
+    }
+
+    /// 分片只读扫描：独立句柄读一段连续页，不经表锁
+    fn scan_shard(
+        &self,
+        table: &str,
+        columns: Option<&[String]>,
+        shard: u32,
+        shards: u32,
+    ) -> std::io::Result<Vec<Row>> {
+        if shards == 0 || shard >= shards {
+            return Err(std::io::Error::other("invalid shard range"));
+        }
+        if !self.table_exists(table)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("unknown table: {}", table),
+            ));
+        }
+        let hidden: HashSet<String> = self
+            .catalog
+            .lock()
+            .map_err(|_| std::io::Error::other("catalog lock poisoned"))?
+            .describe(table)
+            .map(|s| s.dropped_columns.iter().cloned().collect())
+            .unwrap_or_default();
+        let mut t = HeapTable::open(self.table_path(table), self.cfg.page_size, self.cfg.pool_size)?;
+        t.set_hidden_columns(hidden);
+        let n = t.num_pages()?;
+        let chunk = n.div_ceil(u64::from(shards));
+        let from = u64::from(shard).saturating_mul(chunk).min(n);
+        let to = u64::from(shard + 1).saturating_mul(chunk).min(n);
+        t.scan_columns_pages(columns, from, to)
     }
 
     /// 表不存在就报错
@@ -528,6 +579,88 @@ impl Server {
         Ok(())
     }
 
+    /// 账号表是否已登记为系统表
+    fn account_table_ready(&self) -> std::io::Result<bool> {
+        use std::io::{Error, ErrorKind};
+        let registered = {
+            let c = self.catalog.lock().map_err(|_| Error::other("catalog lock poisoned"))?;
+            c.describe(USERS_TABLE).map(|schema| schema.system)
+        };
+        match registered {
+            Some(true) => Ok(true),
+            Some(false) => Err(Error::new(ErrorKind::AlreadyExists, "reserved account table collision")),
+            None => {
+                if self.table_path(USERS_TABLE).exists() || self.index_path(USERS_TABLE, "id").exists() {
+                    Err(Error::new(ErrorKind::AlreadyExists, "reserved account file collision"))
+                } else {
+                    Ok(false)
+                }
+            }
+        }
+    }
+
+    /// 系统目录里账号表已登记
+    fn system_initialized(&self) -> bool {
+        self.catalog
+            .lock()
+            .map(|c| c.describe(USERS_TABLE).is_some_and(|schema| schema.system))
+            .unwrap_or(false)
+    }
+
+    /// 读账号表；表没登记或数据文件缺失都算错
+    fn load_accounts(&self) -> std::io::Result<Vec<Account>> {
+        use std::io::Error;
+        if !self.table_path(USERS_TABLE).exists() {
+            return Err(Error::other("missing account data"));
+        }
+        let mut accounts: Vec<Account> = self
+            .with_existing_table(USERS_TABLE, |t| t.scan())?
+            .iter()
+            .map(decode_account_row)
+            .collect::<std::io::Result<_>>()?;
+        for account in accounts.iter_mut() {
+            normalize_account(account);
+        }
+        Ok(accounts)
+    }
+
+    /// 引导系统目录：建账号表，空表才补管理员
+    fn bootstrap_system(&self, user: Option<&str>, password_hash: Option<&str>) -> std::io::Result<Vec<Account>> {
+        use std::io::Error;
+        let _guard = self.write_lock.lock().map_err(|_| Error::other("write lock poisoned"))?;
+        if self.recovery_required.load(Ordering::Acquire) {
+            return Err(Error::other("storage recovery required"));
+        }
+        let initialized = self.account_table_ready()?;
+        let mut accounts = if initialized { self.load_accounts()? } else { Vec::new() };
+        let mut changed = !initialized;
+        if let Some(user) = user {
+            let name = account_name(user)?;
+            // 表里已经有行就不再补人：引导程序只在空表上播种，
+            // 免得有人拿 storage 透传绕过账号接口往里塞一个已知口令的账号
+            if accounts.is_empty() && !accounts.iter().any(|a| a.user == name) {
+                let id = accounts.iter().map(|a| a.id).max().unwrap_or(0)
+                    .checked_add(1).ok_or_else(|| Error::other("account id exhausted"))?;
+                accounts.push(new_account(id, &name, password_hash.unwrap_or_default().to_string())?);
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(accounts);
+        }
+        for row in account_rows(&accounts)? {
+            HeapTable::encode_row(&row, self.cfg.page_size)?;
+        }
+        let op = WalOp::Accounts { accounts: accounts.clone() };
+        self.recovery_required.store(true, Ordering::Release);
+        self.wal.truncate()?;
+        self.wal.append(&op)?;
+        self.apply_op(&op)?;
+        self.wal.clear()?;
+        self.recovery_required.store(false, Ordering::Release);
+        Ok(accounts)
+    }
+
     /// 账号读写共享串行持久化边界
     fn accounts_request(&self, request: Request) -> std::io::Result<Vec<Account>> {
         use std::io::{Error, ErrorKind};
@@ -535,31 +668,10 @@ impl Server {
         if self.recovery_required.load(Ordering::Acquire) {
             return Err(Error::other("storage recovery required"));
         }
-        let initialized = {
-            let c = self.catalog.lock().map_err(|_| Error::other("catalog lock poisoned"))?;
-            match c.describe(USERS_TABLE) {
-                Some(schema) if schema.system => true,
-                Some(_) => return Err(Error::new(ErrorKind::AlreadyExists, "reserved account table collision")),
-                None => false,
-            }
-        };
-        if !initialized && (self.table_path(USERS_TABLE).exists() || self.index_path(USERS_TABLE, "id").exists()) {
-            return Err(Error::new(ErrorKind::AlreadyExists, "reserved account file collision"));
+        if !self.account_table_ready()? {
+            return Err(Error::other("system catalog is not initialized; run csql-bootstrap"));
         }
-        let mut accounts: Vec<Account> = if initialized {
-            if !self.table_path(USERS_TABLE).exists() {
-                return Err(Error::other("missing account data"));
-            }
-            let mut loaded: Vec<Account> = self
-                .with_existing_table(USERS_TABLE, |t| t.scan())?
-                .iter()
-                .map(decode_account_row)
-                .collect::<std::io::Result<_>>()?;
-            for account in loaded.iter_mut() {
-                normalize_account(account);
-            }
-            loaded
-        } else { Vec::new() };
+        let mut accounts = self.load_accounts()?;
         match request {
             Request::AccountsList => return Ok(accounts),
             Request::AccountCreate { user, password_hash } => {
@@ -609,8 +721,27 @@ impl Server {
         Ok(accounts)
     }
 
-    /// 一条请求翻成一条响应
+    /// 一条请求翻成一条响应：先过读/写门再分发
     fn handle_request(&self, req: Request) -> Response {
+        if concurrent_read(&req) {
+            match self.gate.read() {
+                Ok(_read) => self.dispatch(req),
+                Err(_) => Response::Error {
+                    message: "storage read gate poisoned".into(),
+                },
+            }
+        } else {
+            match self.gate.write() {
+                Ok(_write) => self.dispatch(req),
+                Err(_) => Response::Error {
+                    message: "storage write gate poisoned".into(),
+                },
+            }
+        }
+    }
+
+    /// 持门后分发一条请求
+    fn dispatch(&self, req: Request) -> Response {
         let _ddl_guard = if matches!(req, Request::CreateTable { .. } | Request::DropTable { .. }
             | Request::CreateIndex { .. } | Request::DropIndex { .. }) {
             match self.write_lock.lock() {
@@ -641,6 +772,13 @@ impl Server {
                     Err(e) => Response::Error { message: e.to_string() },
                 }
             }
+            Request::BootstrapSystem { user, password_hash } => {
+                match self.bootstrap_system(user.as_deref(), password_hash.as_deref()) {
+                    Ok(_) => Response::System { initialized: true },
+                    Err(e) => Response::Error { message: e.to_string() },
+                }
+            }
+            Request::SystemStatus => Response::System { initialized: self.system_initialized() },
             Request::Ping => {
                 log_debug!(request, "ping");
                 Response::Pong
@@ -650,15 +788,7 @@ impl Server {
                 log_debug!(request, "scan table={}", table);
 
                 let result = (|| {
-                    if let Some(cols) = &columns {
-                        let c = self.catalog.lock().map_err(|_| std::io::Error::other("catalog lock poisoned"))?;
-                        let schema = c.describe(&table).ok_or_else(|| std::io::Error::other(format!("unknown table: {table}")))?;
-                        for col in cols {
-                            if !schema.columns.iter().any(|c| &c.name == col) {
-                                return Err(std::io::Error::other(format!("unknown column: {col}")));
-                            }
-                        }
-                    }
+                    self.check_columns(&table, columns.as_deref())?;
                     self.with_existing_table(&table, |t| t.scan_columns(columns.as_deref()))
                 })();
 
@@ -666,6 +796,30 @@ impl Server {
                     Ok(rows) => Response::Rows { rows },
                     Err(e) => {
                         log_warn!(request, "scan {}: {}", table, e);
+                        Response::Error {
+                            message: format!("scan {}: {}", table, e),
+                        }
+                    }
+                }
+            }
+
+            Request::ScanShard {
+                table,
+                columns,
+                shard,
+                shards,
+            } => {
+                log_debug!(request, "scan_shard table={} shard={}/{}", table, shard, shards);
+
+                let result = (|| {
+                    self.check_columns(&table, columns.as_deref())?;
+                    self.scan_shard(&table, columns.as_deref(), shard, shards)
+                })();
+
+                match result {
+                    Ok(rows) => Response::Rows { rows },
+                    Err(e) => {
+                        log_warn!(request, "scan {} shard {}/{}: {}", table, shard, shards, e);
                         Response::Error {
                             message: format!("scan {}: {}", table, e),
                         }
@@ -733,7 +887,7 @@ impl Server {
                 if !indexed {
                     return Response::NoIndex;
                 }
-                let found = match key.as_i64() {
+                let found = match scalar_int(&key) {
                     Some(k) => self.with_table(&table, |t| t.get_all_by_column_key(&column, k)),
                     None => match key.as_str() {
                         Some(s) => self.with_table(&table, |t| t.get_all_by_string_key(&column, s)),
@@ -1025,18 +1179,31 @@ fn account_rows(accounts: &[Account]) -> std::io::Result<Vec<Row>> {
     ]))).collect()
 }
 
-/// 按 init.sql 把系统表写进字典
+/// 系统库的账号表结构：引导模块按这份定义建表
+fn users_columns() -> Vec<SchemaColumn> {
+    vec![
+        SchemaColumn { name: "id".into(), ty: "int".into(), nullable: false,
+            auto_increment: true, primary_key: true, ..Default::default() },
+        SchemaColumn { name: "user".into(), ty: "varchar(64)".into(), nullable: false,
+            unique: true, ..Default::default() },
+        SchemaColumn { name: "password_hash".into(), ty: "varchar(256)".into(),
+            nullable: false, ..Default::default() },
+        SchemaColumn { name: "registered_at".into(), ty: "timestamp".into(),
+            nullable: false, ..Default::default() },
+        SchemaColumn { name: "last_login_at".into(), ty: "timestamp".into(),
+            ..Default::default() },
+        SchemaColumn { name: "revision".into(), ty: "int".into(), nullable: false,
+            ..Default::default() },
+    ]
+}
+
+/// 把系统表写进字典
 fn declare_system_schema(catalog: &mut Catalog, rows: &[Row]) -> std::io::Result<()> {
-    for table in system_schema() {
-        let stats: &[Row] = if table.name == USERS_TABLE { rows } else { &[] };
-        catalog.rebuild_stats(&table.name, stats);
-        catalog.set_columns(&table.name, table.columns.iter().map(InitColumn::to_schema).collect())?;
-        catalog.rebuild_stats(&table.name, stats);
-        catalog.mark_system(&table.name)?;
-        for index in &table.indexes {
-            catalog.add_index(&table.name, index)?;
-        }
-    }
+    catalog.rebuild_stats(USERS_TABLE, rows);
+    catalog.set_columns(USERS_TABLE, users_columns())?;
+    catalog.rebuild_stats(USERS_TABLE, rows);
+    catalog.mark_system(USERS_TABLE)?;
+    catalog.add_index(USERS_TABLE, "user")?;
     Ok(())
 }
 
@@ -1110,9 +1277,9 @@ fn account_name(user: &str) -> std::io::Result<String> {
     Ok(user.to_ascii_lowercase())
 }
 
-/// 校验口令哈希长度
+/// 校验口令哈希长度，空串表示免密
 fn validate_account_hash(hash: &str) -> std::io::Result<()> {
-    if hash.is_empty() || hash.len() > 256 {
+    if hash.len() > 256 {
         return Err(std::io::Error::other("invalid account credential"));
     }
     Ok(())
@@ -1171,15 +1338,6 @@ impl Drop for Server {
 /// 系统库名：账号表住在这里，其中的表都是系统表。服务启动时只建它一个，
 /// 别的库一律要显式建（没有默认工作库）。
 const SYSTEM_DATABASE: &str = "system";
-
-/// 系统库的表结构来自这份脚本（编译期嵌进来）
-const SYSTEM_SCHEMA_SQL: &str = include_str!("../../../scripts/init.sql");
-
-/// 系统库 schema：脚本缺表或多表都按它来
-fn system_schema() -> &'static [InitTable] {
-    static TABLES: std::sync::OnceLock<Vec<InitTable>> = std::sync::OnceLock::new();
-    TABLES.get_or_init(|| initsql::parse(SYSTEM_SCHEMA_SQL).unwrap_or_else(|e| panic!("scripts/init.sql: {e}")))
-}
 
 /// 保留库：不能建、不能删。
 fn reserved_database(name: &str) -> bool {
@@ -1322,13 +1480,25 @@ impl Databases {
         let request: Request = serde_json::from_value(value).map_err(Error::other)?;
         let global = matches!(request, Request::AccountsList | Request::AccountCreate { .. }
             | Request::AccountReset { .. } | Request::AccountLogin { .. }
-            | Request::AccountDrop { .. } | Request::Ping);
+            | Request::AccountDrop { .. } | Request::BootstrapSystem { .. }
+            | Request::SystemStatus | Request::Ping);
         let server = if global { &self.system }
             else if selected.is_empty() { return Err(Error::other("no database selected")); }
             else if selected == SYSTEM_DATABASE { &self.system }
             else { named.get(&selected).ok_or_else(|| Error::other("unknown database"))? };
         Ok(server.handle_request(request))
     }
+}
+
+/// 只读表页的请求可与其它读并发，其余独占
+fn concurrent_read(req: &Request) -> bool {
+    matches!(
+        req,
+        Request::Scan { .. }
+            | Request::ScanShard { .. }
+            | Request::LookupByIndex { .. }
+            | Request::RangeByIndex { .. }
+    )
 }
 
 /// 校验库名是否合法

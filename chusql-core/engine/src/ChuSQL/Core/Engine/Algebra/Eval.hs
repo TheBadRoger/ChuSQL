@@ -1,15 +1,17 @@
 module ChuSQL.Core.Engine.Algebra.Eval (evalRelOp, evalRelOpM, evalExprM, evalCondForRowM) where
 
+import ChuSQL.Core.Engine.Algebra.Cost (tableMetaOf)
 import ChuSQL.Core.Engine.Algebra.Expr (evalCondForRow, evalExpr)
-import ChuSQL.Core.Engine.Algebra.Optimize (optimize, relOpCols)
+import ChuSQL.Core.Engine.Algebra.Optimize (optimize)
 import ChuSQL.Core.Engine.Algebra.Op
 import ChuSQL.Core.Engine.Algebra.Planner (translate)
-import ChuSQL.Core.Engine.Algebra.Sort (compareValue, sortRows)
+import ChuSQL.Core.Engine.Algebra.Sort (sortRows)
+import ChuSQL.Core.Engine.Builtin (aggregateArg, builtinOfExpr, invokeBuiltin, unsupportedAggregate)
 import ChuSQL.Core.Model
 import ChuSQL.Core.Engine.Storage (IndexResult (..), MonadStorage (..))
 import ChuSQL.Core.Engine.Storage.Memory (runMemoryStorage)
 import ChuSQL.Core.Engine.Syntax.AST (Expr (..), JoinKind (..), Subquery (..))
-import Control.Monad (filterM, foldM)
+import Control.Monad (filterM)
 import qualified Data.HashMap.Strict as HM
 
 -- 执行：按算子树算出结果行，外层行供相关子查询引用。
@@ -58,17 +60,10 @@ rowsCols :: [Row] -> [String]
 rowsCols (r : _) = map fst r
 rowsCols [] = []
 
--- | 参与等值匹配的键：NULL 不参与，整数值的浮点归一
+-- | 参与等值匹配的键：NULL 不参与，整值浮点归一
 joinKey :: Value -> Maybe Value
 joinKey VNull = Nothing
-joinKey (VFloat d)
-    | not (isNaN d)
-    , not (isInfinite d)
-    , fromIntegral (rounded :: Integer) == d =
-        Just (VInt (fromIntegral rounded))
-  where
-    rounded = round d :: Integer
-joinKey v = Just v
+joinKey v = Just (canonicalValue v)
 
 -- | 取一行的连接键
 joinKeyOf :: String -> Row -> Maybe Value
@@ -230,57 +225,13 @@ groupRows keys rows = go rows (HM.empty, [])
 valuesOf :: Row -> Expr -> [Row] -> Either String [Value]
 valuesOf outer e rows = mapM (evalExpr e . (++ outer)) rows
 
--- | 去掉 NULL
-nonNull :: [Value] -> [Value]
-nonNull = filter (/= VNull)
-
--- | 数值相加：整数配整数还是整数
-addValue :: Value -> Value -> Either String Value
-addValue (VInt a) (VInt b) = Right (VInt (a + b))
-addValue (VInt a) (VFloat b) = Right (VFloat (fromIntegral a + b))
-addValue (VFloat a) (VInt b) = Right (VFloat (a + fromIntegral b))
-addValue (VFloat a) (VFloat b) = Right (VFloat (a + b))
-addValue _ _ = Left "type error: expected two numbers"
-
--- | 能当数用的值
-numberOf :: Value -> Either String Double
-numberOf (VInt n) = Right (fromIntegral n)
-numberOf (VFloat d) = Right d
-numberOf _ = Left "type error: expected a number"
-
--- | 一组值里的极值（NULL 已经先剔掉）
-extremeOf :: (Value -> Value -> Value) -> [Value] -> Either String Value
-extremeOf _ [] = Right VNull
-extremeOf pick (x : xs) = Right (foldl pick x xs)
-
--- | 一个聚合算子在一组行上的结果
+-- | 一个聚合算子在一组行上的结果，统一走内置函数权威
 evalAgg :: Row -> Expr -> [Row] -> Either String Value
-evalAgg outer agg rows = case agg of
-    CountAll -> Right (VInt (length rows))
-    CountOf e -> do
-        vs <- valuesOf outer e rows
-        Right (VInt (length (nonNull vs)))
-    SumOf e -> do
-        vs <- valuesOf outer e rows
-        case nonNull vs of
-            [] -> Right VNull
-            xs -> foldM addValue (VInt 0) xs
-    AvgOf e -> do
-        vs <- valuesOf outer e rows
-        case nonNull vs of
-            [] -> Right VNull
-            xs -> do
-                total <- foldM addValue (VInt 0) xs
-                sumOf <- numberOf total
-                Right (VFloat (sumOf / fromIntegral (length xs)))
-    MinOf e -> valuesOf outer e rows >>= extremeOf lower . nonNull
-    MaxOf e -> valuesOf outer e rows >>= extremeOf higher . nonNull
-    _ -> Left "only COUNT, SUM, AVG, MIN and MAX can be aggregated"
-  where
-    -- | 取更小的那个
-    lower a b = if compareValue b a == LT then b else a
-    -- | 取更大的那个
-    higher a b = if compareValue b a == GT then b else a
+evalAgg outer agg rows = case builtinOfExpr agg of
+    Nothing -> Left unsupportedAggregate
+    Just builtin -> do
+        vs <- maybe (Right []) (\e -> valuesOf outer e rows) (aggregateArg agg)
+        invokeBuiltin builtin (length rows) vs
 
 -- | 一组的输出行：分组列 + 各聚合值
 oneGroup :: Row -> [String] -> [(String, Expr)] -> ([Value], [Row]) -> Either String Row
@@ -429,8 +380,8 @@ evalRelOpIn db outer (Compute items op) = do
 evalRelOpIn db outer (Aggregate keys aggs op) = do
     rows <- evalRelOpIn db outer op
     pure (rows >>= evalAggregate outer keys aggs)
-evalRelOpIn _ _ (Scan mAlias tbl cols) = do
-    res <- maybe (scan tbl) (scanColumns tbl) cols
+evalRelOpIn db _ (Scan mAlias tbl cols) = do
+    res <- scanTable db tbl cols
     pure (fmap (prefixRows mAlias) res)
 evalRelOpIn db outer (Lookup mAlias tbl col k) = do
     res <- lookupByColumn tbl col k
@@ -487,8 +438,23 @@ scanFiltered ::
     String ->
     Expr ->
     m (Either String [Row])
-scanFiltered _ outer mAlias tbl cond = do
-    res <- scan tbl
+scanFiltered db outer mAlias tbl cond = do
+    res <- scanTable db tbl Nothing
     pure $ do
         rows <- res
         filterM (evalCondForRow cond . (++ outer)) (prefixRows mAlias rows)
+
+-- | 行数到阈值才值得并行分片
+parallelRowThreshold :: Int
+parallelRowThreshold = 1000
+
+-- | 表够大且存储支持并行时按分片扫，否则顺序扫
+scanTable :: (MonadStorage m) => Database -> String -> Maybe [String] -> m (Either String [Row])
+scanTable db tbl cols = do
+    width <- parallelShards
+    if width > 1 && rows >= parallelRowThreshold
+        then scanShards width tbl cols
+        else maybe (scan tbl) (scanColumns tbl) cols
+  where
+    -- | 统计里的行数，没有统计算 0
+    rows = maybe 0 metaRowCount (tableMetaOf db tbl)

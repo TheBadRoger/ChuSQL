@@ -3,6 +3,7 @@
 module ChuSQL.Core.Engine.Syntax.Parser (parseStatement, parseExpression) where
 
 import ChuSQL.Core.Model (Column (..), ColumnType (..), Value (..), plainColumn)
+import ChuSQL.Core.Engine.Builtin (Builtin (..), builtinName, builtinNames, builtinNode)
 import ChuSQL.Core.Engine.Syntax.AST
 import Control.Monad (void)
 import Control.Monad.Combinators.Expr (Operator (..), makeExprParser)
@@ -172,18 +173,14 @@ inPredicate = do
 subquerySelect :: Parser Subquery
 subquerySelect = Subquery <$> selectStatement <*> pure []
 
--- | 聚合调用：COUNT/SUM/AVG/MIN/MAX
+-- | 聚合调用：名称与节点都由内置函数表给出
 aggregateCall :: Parser Expr
-aggregateCall =
-    choice
-        [ CountAll <$ try (keyword "count" *> between (symbol "(") (symbol ")") (symbol "*"))
-        , CountOf <$> aggArg "count"
-        , SumOf <$> aggArg "sum"
-        , AvgOf <$> aggArg "avg"
-        , MinOf <$> aggArg "min"
-        , MaxOf <$> aggArg "max"
-        ]
+aggregateCall = choice (countAll : map named builtinNames)
   where
+    -- | COUNT(*)，没有参数
+    countAll = CountAll <$ try (keyword (builtinName BCountAll) *> between (symbol "(") (symbol ")") (symbol "*"))
+    -- | 表里每一个带参数的内置函数
+    named (name, builtin) = builtinNode builtin <$> aggArg name
     -- | 读聚合函数的参数
     aggArg name = try (keyword name *> between (symbol "(") (symbol ")") expr)
 

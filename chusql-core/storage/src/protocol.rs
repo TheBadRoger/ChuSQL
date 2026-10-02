@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 pub type Row = HashMap<String, serde_json::Value>;
 
-pub const USERS_TABLE: &str = "__chusql_users";
+pub const USERS_TABLE: &str = "__system_users";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Account {
@@ -83,11 +83,27 @@ pub enum Request {
         at: Option<String>,
     },
     AccountDrop { user: String },
+    /// 引导系统目录：建系统表，给了 user 就同时补首个管理员
+    BootstrapSystem {
+        #[serde(default)]
+        user: Option<String>,
+        #[serde(default)]
+        password_hash: Option<String>,
+    },
+    SystemStatus,
     Ping,
     Scan {
         table: String,
         #[serde(default)]
         columns: Option<Vec<String>>,
+    },
+    /// 分片扫描：第 shard 片只读总页数按 shards 均分后的那一段
+    ScanShard {
+        table: String,
+        #[serde(default)]
+        columns: Option<Vec<String>>,
+        shard: u32,
+        shards: u32,
     },
     Insert {
         table: String,
@@ -174,7 +190,8 @@ impl Request {
     /// 普通表操作的统一访问边界
     pub fn table(&self) -> Option<&str> {
         match self {
-            Self::Scan { table, .. } | Self::Insert { table, .. }
+            Self::Scan { table, .. } | Self::ScanShard { table, .. }
+            | Self::Insert { table, .. }
             | Self::InsertBatch { table, .. } | Self::DeleteKeys { table, .. }
             | Self::LookupByIndex { table, .. } | Self::ReplaceAll { table, .. }
             | Self::RangeByIndex { table, .. }
@@ -185,14 +202,14 @@ impl Request {
             | Self::ReplaceSchema { table, .. } => Some(table),
             Self::Ping | Self::ListTables | Self::ListCatalog | Self::AccountsList
             | Self::AccountCreate { .. } | Self::AccountReset { .. } | Self::AccountLogin { .. }
-            | Self::AccountDrop { .. } => None,
+            | Self::AccountDrop { .. } | Self::BootstrapSystem { .. } | Self::SystemStatus => None,
         }
     }
 }
 
 /// 是不是保留系统表名
 pub fn reserved_table(table: &str) -> bool {
-    table.to_ascii_lowercase().starts_with("__chusql_")
+    table.to_ascii_lowercase().starts_with("__system_")
 }
 
 /// 没写 column 时按 `id` 算
@@ -219,6 +236,8 @@ pub enum Response {
     },
     NoIndex,
     Ok,
+    /// 系统目录状态
+    System { initialized: bool },
     Error { message: String },
     Catalog { schemas: Vec<TableSchemaWire> },
 }
