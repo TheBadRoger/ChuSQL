@@ -229,6 +229,19 @@ pub fn reserved_table(table: &str) -> bool {
     table.to_ascii_lowercase().starts_with("__system_")
 }
 
+/// 服务自己的角色与授权表名
+pub const PRIVILEGE_TABLES: [&str; 3] = ["__system_roles", "__system_grants", "__system_members"];
+
+/// 是不是服务自己经请求通道读写的系统表
+pub fn internal_table(table: &str) -> bool {
+    PRIVILEGE_TABLES.contains(&table.to_ascii_lowercase().as_str())
+}
+
+/// 是不是请求通道要拒绝的系统表
+pub fn blocked_table(table: &str) -> bool {
+    reserved_table(table) && !internal_table(table)
+}
+
 /// 没写 column 时按 `id` 算
 fn default_id_column() -> String {
     "id".to_string()

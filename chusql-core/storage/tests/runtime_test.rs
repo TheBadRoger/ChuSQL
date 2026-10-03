@@ -1686,6 +1686,59 @@ fn legacy_catalog_and_partial_rows_are_migrated() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+/// 老系统库的角色表启动时改到内部前缀
+#[test]
+fn legacy_privilege_tables_are_renamed_on_start() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, data) = start_server();
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"create_table","database":"system","table":"sys_roles","columns":[{"name":"id","ty":"int"},{"name":"name","ty":"str"}]}))?;
+    request_ok(&mut c, serde_json::json!({"method":"insert","database":"system","table":"sys_roles","row":{"id":1,"name":"admin"}}))?;
+    drop(c);
+    drop(server);
+
+    let system_dir = data.path().join("system");
+    assert!(system_dir.join("sys_roles.db").exists(), "老数据文件要先生成");
+
+    let _restarted = start_server_in(data.path());
+    let mut c = connect()?;
+
+    let described: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"describe_table","database":"system","table":"__system_roles"}"#))?;
+    assert_eq!(described["status"], "schema", "{described}");
+    let rows: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"scan","database":"system","table":"__system_roles"}"#))?;
+    assert_eq!(rows["rows"], serde_json::json!([{"id":1,"name":"admin"}]), "行要跟着改名走");
+    let old: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"describe_table","database":"system","table":"sys_roles"}"#))?;
+    assert_eq!(old["status"], "error", "旧名不该还在：{old}");
+    assert!(system_dir.join("__system_roles.db").exists(), "数据文件要改名");
+    assert!(!system_dir.join("sys_roles.db").exists(), "老数据文件要改掉");
+    Ok(())
+}
+
+/// 角色与授权表能被请求通道读到，账号表不能
+#[test]
+fn privilege_tables_are_reachable_but_account_table_is_not() -> Result<(), Box<dyn std::error::Error>> {
+    let (_server, _data) = start_server();
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"create_table","database":"system","table":"__system_roles","columns":[{"name":"id","ty":"int"},{"name":"name","ty":"str"}]}))?;
+    let scanned: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"scan","database":"system","table":"__system_roles"}"#))?;
+    assert_eq!(scanned["status"], "rows", "{scanned}");
+    let denied: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"scan","database":"system","table":"__system_users"}"#))?;
+    assert_eq!(denied["status"], "error", "{denied}");
+    assert!(
+        denied["message"].as_str().unwrap_or("").contains("reserved system table"),
+        "{denied}"
+    );
+    let listed: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"list_tables","database":"system"}"#))?;
+    let tables: Vec<&str> = listed["tables"]
+        .as_array()
+        .ok_or("missing tables")?
+        .iter()
+        .map(|one| one.as_str().unwrap_or(""))
+        .collect();
+    assert!(tables.contains(&"__system_roles"), "授权表要在字典里: {listed}");
+    assert!(!tables.contains(&"__system_users"), "账号表不能露面: {listed}");
+    Ok(())
+}
+
 /// 账号表落盘类型与索引，登录盖时间戳
 #[test]
 fn account_table_uses_typed_columns_and_stamps_login() -> Result<(), Box<dyn std::error::Error>> {

@@ -53,6 +53,6 @@ chusql-server
 
 WAL 负责崩溃恢复：每条记录带自增 LSN，一组写操作与一条提交标记一次落盘；进程重启时按标记分组重放已提交的记录、丢弃没有标记的整组，重放前逐条做幂等检查，恢复结束把最大 LSN 写进 `wal.checkpoint` 并清空 WAL。`SystemStatus` 应答里的 `last_lsn` 报告该检查点 LSN。建表、删表、建索引、删索引与数据改动走同一条 WAL，恢复时一并重放。
 
-系统数据库及部分管理操作仅允许管理员访问。
+系统数据库及部分管理操作仅允许管理员访问。系统表统一用 `__system_` 前缀：账号表 `__system_users` 对语句通道隐藏，角色、授权、成员三张表（`__system_roles` / `__system_grants` / `__system_members`）只在 `system` 库里可见，权限服务自身也通过 SQL 读写它们；存储启动时把旧名 `sys_roles` / `sys_grants` / `sys_members` 连同数据与索引文件一起迁移过来。
 
 服务监听地址、端口和请求限制可在 `chusql.toml` 的 `[server]` 分区中配置。
