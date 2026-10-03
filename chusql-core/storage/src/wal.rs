@@ -19,6 +19,10 @@ const OP_REPLACE_SCHEMA: u8 = 7;
 const OP_HIDE_COLUMN: u8 = 8;
 const OP_COMPACT: u8 = 9;
 const OP_COMMIT: u8 = 10;
+const OP_CREATE_TABLE: u8 = 11;
+const OP_DROP_TABLE: u8 = 12;
+const OP_CREATE_INDEX: u8 = 13;
+const OP_DROP_INDEX: u8 = 14;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum WalOp {
@@ -51,6 +55,21 @@ pub enum WalOp {
         columns: Vec<SchemaColumn>,
         rows: Vec<Row>,
     },
+    CreateTable {
+        table: String,
+        columns: Vec<SchemaColumn>,
+    },
+    DropTable {
+        table: String,
+    },
+    CreateIndex {
+        table: String,
+        column: String,
+    },
+    DropIndex {
+        table: String,
+        column: String,
+    },
     /// 一组写操作的提交标记；没有标记的组算未提交
     Commit,
 }
@@ -65,6 +84,11 @@ struct DropColumnPayload {
 struct ReplaceSchemaPayload {
     columns: Vec<SchemaColumn>,
     rows: Vec<Row>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CreateTablePayload {
+    columns: Vec<SchemaColumn>,
 }
 
 pub struct Wal {
@@ -319,6 +343,23 @@ fn encode(op: &WalOp, lsn: u64) -> io::Result<Vec<u8>> {
             .map_err(io::Error::other)?;
             (OP_REPLACE_SCHEMA, table.clone(), p)
         }
+        WalOp::CreateTable { table, columns } => (
+            OP_CREATE_TABLE,
+            table.clone(),
+            serde_json::to_vec(&CreateTablePayload { columns: columns.clone() })
+                .map_err(io::Error::other)?,
+        ),
+        WalOp::DropTable { table } => (OP_DROP_TABLE, table.clone(), Vec::new()),
+        WalOp::CreateIndex { table, column } => (
+            OP_CREATE_INDEX,
+            table.clone(),
+            serde_json::to_vec(column).map_err(io::Error::other)?,
+        ),
+        WalOp::DropIndex { table, column } => (
+            OP_DROP_INDEX,
+            table.clone(),
+            serde_json::to_vec(column).map_err(io::Error::other)?,
+        ),
         WalOp::Commit => (OP_COMMIT, String::new(), Vec::new()),
     };
 
@@ -409,6 +450,25 @@ fn decode_body(body: &[u8]) -> Result<(u64, WalOp), String> {
                 columns: p.columns,
                 rows: p.rows,
             }
+        }
+        OP_CREATE_TABLE => {
+            let p: CreateTablePayload = serde_json::from_slice(payload)
+                .map_err(|e| format!("bad create_table payload: {e}"))?;
+            WalOp::CreateTable {
+                table,
+                columns: p.columns,
+            }
+        }
+        OP_DROP_TABLE => WalOp::DropTable { table },
+        OP_CREATE_INDEX => {
+            let column: String = serde_json::from_slice(payload)
+                .map_err(|e| format!("bad create_index payload: {e}"))?;
+            WalOp::CreateIndex { table, column }
+        }
+        OP_DROP_INDEX => {
+            let column: String = serde_json::from_slice(payload)
+                .map_err(|e| format!("bad drop_index payload: {e}"))?;
+            WalOp::DropIndex { table, column }
         }
         other => return Err(format!("unknown op type: {}", other)),
     };
