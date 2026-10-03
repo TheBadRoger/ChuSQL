@@ -52,6 +52,14 @@ csql -f json -e "SELECT count(*) FROM orders"
 - 投影列可以起别名：`SELECT count(*) AS total FROM orders`，别名就是结果集的列名。`ORDER BY` 仍按来源列解析，要引用派生表的列得写限定名（如 `ORDER BY d.total`）。
 - 鉴权覆盖整棵来源树：查派生表时内层表也要有权限，只有外层引用的表有权限不够。
 
+公共表表达式：
+
+- `WITH 名字 AS (SELECT …), 另一个 AS (SELECT …) SELECT … FROM 名字` 先定义再引用，名字可以带列清单（`WITH t(who) AS (SELECT name FROM users) …`）。
+- `WITH` 在解析期就展开成派生表，所以引用处只能当普通表用：没有别名时用 CTE 名当限定名（`WITH t AS (…) SELECT t.name FROM t`）。
+- 名字不分大小写；只能引用前面已经定义的 CTE，向前引用会当成普通表名去查（有同名表就用表，没有就报 `unknown table`）。
+- 不支持递归 CTE，主语句与每个 CTE 都只能是 `SELECT`；同一个 CTE 被引用两次会各执行一次（不做物化）。
+- 鉴权同样覆盖 CTE 里的表：`WITH d AS (SELECT name FROM orders) …` 要求对 `orders` 有权限。
+
 事务：
 
 - `BEGIN`（或 `START TRANSACTION`）开始显式事务，`COMMIT` 提交，`ROLLBACK` 回滚。

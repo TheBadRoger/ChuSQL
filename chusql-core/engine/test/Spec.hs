@@ -459,6 +459,65 @@ main = hspec $ do
             sql "SELECT d.name FROM users u JOIN (SELECT name FROM users WHERE id = u.id) d ON u.name = d.name"
                 `shouldSatisfy` isLeft
 
+    describe "ChuSQL.Core.Engine (WITH)" $ do
+        -- sql：在默认库上跑 SQL 取结果行
+        let sql input = parseStatement input >>= rowsOf . runStatement testDB
+            -- values：只取结果里的值
+            values input = fmap (map (map snd)) (sql input)
+        it "parses a CTE into a derived table" $ do
+            parseStatement "WITH t AS (SELECT name FROM users) SELECT t.name FROM t"
+                `shouldBe` Right
+                    ( Select
+                        { selectCols = ["t.name"]
+                        , selectFrom =
+                            FromSubquery
+                                (Just "t")
+                                (Select ["name"] (FromTable Nothing "users") Nothing [] [] Nothing)
+                        , selectWhere = Nothing
+                        , selectGroupBy = []
+                        , selectOrderBy = []
+                        , selectLimit = Nothing
+                        }
+                    )
+
+        it "runs a CTE as a source" $ do
+            values "WITH t AS (SELECT name FROM users) SELECT t.name FROM t"
+                `shouldBe` Right [[VStr "Alice"], [VStr "Bob"], [VStr "Carol"]]
+
+        it "refers to an earlier CTE inside the next one" $ do
+            values "WITH young AS (SELECT name FROM users WHERE age < 20), picked AS (SELECT y.name FROM young y) SELECT p.name FROM picked p"
+                `shouldBe` Right [[VStr "Bob"]]
+
+        it "renames the output columns of a CTE" $ do
+            values "WITH t(who) AS (SELECT name FROM users) SELECT t.who FROM t ORDER BY t.who"
+                `shouldBe` Right [[VStr "Alice"], [VStr "Bob"], [VStr "Carol"]]
+
+        it "takes a bare column from a CTE" $ do
+            values "WITH t(who) AS (SELECT name FROM users) SELECT who FROM t ORDER BY who"
+                `shouldBe` Right [[VStr "Alice"], [VStr "Bob"], [VStr "Carol"]]
+
+        it "runs a CTE inside an IN subquery" $ do
+            values "WITH grown AS (SELECT id FROM users WHERE age > 20) SELECT name FROM users WHERE id IN (SELECT id FROM grown) ORDER BY name"
+                `shouldBe` Right [[VStr "Alice"], [VStr "Carol"]]
+
+        it "joins a CTE with itself" $ do
+            values "WITH t AS (SELECT id, name FROM users) SELECT a.name FROM t a JOIN t b ON a.id = b.id ORDER BY a.name"
+                `shouldBe` Right [[VStr "Alice"], [VStr "Bob"], [VStr "Carol"]]
+
+        it "keeps a CTE inside a derived table" $ do
+            values "SELECT d.name FROM (WITH t AS (SELECT name FROM users) SELECT t.name FROM t) d"
+                `shouldBe` Right [[VStr "Alice"], [VStr "Bob"], [VStr "Carol"]]
+
+        it "rejects a column list that does not match" $ do
+            sql "WITH t(a, b) AS (SELECT name FROM users) SELECT t.a FROM t" `shouldSatisfy` isLeft
+
+        it "reports an unknown table for a forward reference" $ do
+            sql "WITH a AS (SELECT b.name FROM b), b AS (SELECT name FROM users) SELECT a.name FROM a"
+                `shouldSatisfy` isLeft
+
+        it "reports an unknown table for a name that is not a CTE" $ do
+            sql "WITH t AS (SELECT name FROM users) SELECT x.name FROM x" `shouldSatisfy` isLeft
+
     describe "ChuSQL.Core.Engine (SELECT)" $ do
         -- sql：在默认库上跑 SQL 取结果行
         let sql input = parseStatement input >>= rowsOf . runStatement testDB
