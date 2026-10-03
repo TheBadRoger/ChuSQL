@@ -24,6 +24,8 @@
   `known-issues.txt`。
 
 ## 协作规则
+- 全量门禁入口：`gate-check/run-gate.ps1`（三条车道并行，日志写 `gate-check/logs/`）。
+- 门禁由项目所有者手动运行；agent 只跑改动模块的测试，拿到门禁结果后再提交。
 - engine / web / storage 使用规定测试入口。
 - 改动说明只在交流中记录。
 
