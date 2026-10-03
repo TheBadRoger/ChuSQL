@@ -8,8 +8,8 @@ use crate::config::{self, Config, Loaded};
 use crate::heap::{scalar_int, HeapTable};
 use crate::log;
 use crate::protocol::{
-    reserved_table, Account, ColumnStatWire, IndexWire, Request, Response, Row, SchemaColumn, StorageOp,
-    TableSchemaWire, USERS_TABLE,
+    blocked_table, reserved_table, Account, ColumnStatWire, IndexWire, Request, Response, Row,
+    SchemaColumn, StorageOp, TableSchemaWire, USERS_TABLE,
 };
 use crate::wal::{committed_ops, Wal, WalOp};
 use crate::{log_debug, log_error, log_info, log_warn};
@@ -386,7 +386,7 @@ impl Server {
                 | StorageOp::Delete { table, .. }
                 | StorageOp::Replace { table, .. } => table,
             };
-            if reserved_table(table) {
+            if blocked_table(table) {
                 return Err(std::io::Error::other("reserved system table"));
             }
             if table.is_empty() || !table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
@@ -604,6 +604,7 @@ impl Server {
 
     /// 老数据迁移：类型名规范、缺列补 null
     fn migrate_data(&self) -> std::io::Result<()> {
+        self.migrate_table_names()?;
         let names: Vec<String> = self
             .catalog
             .lock()
@@ -647,6 +648,51 @@ impl Server {
             catalog.save(self.catalog_path())?;
         }
         Ok(())
+    }
+
+    /// 老目录里的角色与授权表改到内部前缀
+    fn migrate_table_names(&self) -> std::io::Result<()> {
+        for (from, to) in LEGACY_TABLE_RENAMES {
+            let indexes = {
+                let c = self
+                    .catalog
+                    .lock()
+                    .map_err(|_| std::io::Error::other("catalog lock poisoned"))?;
+                match c.describe(from) {
+                    Some(schema) if c.describe(to).is_none() => {
+                        schema.indexes.iter().map(|i| i.column.clone()).collect::<Vec<String>>()
+                    }
+                    _ => continue,
+                }
+            };
+            self.rename_table_files(from, to, &indexes);
+            {
+                let mut c = self
+                    .catalog
+                    .lock()
+                    .map_err(|_| std::io::Error::other("catalog lock poisoned"))?;
+                if !c.rename_table(from, to)? {
+                    continue;
+                }
+                c.save(self.catalog_path())?;
+            }
+            if let Ok(mut tables) = self.tables.lock() {
+                tables.remove(from);
+            }
+            log_info!(core, "renamed system table {} to {}", from, to);
+        }
+        Ok(())
+    }
+
+    /// 把一张表的数据文件与索引文件改名
+    fn rename_table_files(&self, from: &str, to: &str, indexes: &[String]) {
+        if !self.table_path(from).exists() {
+            return;
+        }
+        let _ = std::fs::rename(self.table_path(from), self.table_path(to));
+        for column in std::iter::once("id").chain(indexes.iter().map(String::as_str)) {
+            let _ = std::fs::rename(self.index_path(from, column), self.index_path(to, column));
+        }
     }
 
     /// 建索引前的检查：内置列、未知表列、重复索引
@@ -963,7 +1009,7 @@ impl Server {
             return Response::Error { message: "invalid column name".into() };
         }
         if let Some(table) = req.table() {
-            if reserved_table(table) {
+            if blocked_table(table) {
                 return Response::Error { message: "reserved system table".into() };
             }
             if table.is_empty() || !table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
@@ -1192,7 +1238,7 @@ impl Server {
                 let schemas: Vec<TableSchemaWire> = c
                     .all_tables()
                     .into_iter()
-                    .filter(|(name, _)| !reserved_table(name))
+                    .filter(|(name, _)| !blocked_table(name))
                     .map(|(name, ts)| TableSchemaWire {
                         table: name.to_string(),
                         columns: ts.columns.clone(),
@@ -1364,10 +1410,10 @@ impl Server {
         }
     }
 
-    /// 只列出数据字典中的业务表
+    /// 列出业务表与授权服务用的三张系统表
     fn list_tables(&self) -> std::io::Result<Vec<String>> {
         let c = self.catalog.lock().map_err(|_| std::io::Error::other("catalog lock poisoned"))?;
-        Ok(c.table_names().into_iter().filter(|t| !reserved_table(t)).collect())
+        Ok(c.table_names().into_iter().filter(|t| !blocked_table(t)).collect())
     }
 
     /// 查一张表的 schema
@@ -1566,6 +1612,13 @@ impl Drop for Server {
 /// 系统库名：账号表住在这里，其中的表都是系统表。服务启动时只建它一个，
 /// 别的库一律要显式建（没有默认工作库）。
 const SYSTEM_DATABASE: &str = "system";
+
+/// 老目录里角色与授权表的旧名对照
+const LEGACY_TABLE_RENAMES: [(&str, &str); 3] = [
+    ("sys_roles", "__system_roles"),
+    ("sys_grants", "__system_grants"),
+    ("sys_members", "__system_members"),
+];
 
 /// 保留库：不能建、不能删。
 fn reserved_database(name: &str) -> bool {

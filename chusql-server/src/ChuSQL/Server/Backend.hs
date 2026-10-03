@@ -188,9 +188,9 @@ memoryBackendWith trusted name ref =
         }
   where
     -- | 按视角过滤库里的表
-    scoped = if trusted then filter (not . reserved . fst) else visible
+    scoped = if trusted then filter (not . blocked . fst) else visible
     -- | 该视角下要隐藏的表
-    hidden = if trusted then reserved else internalTable
+    hidden = if trusted then blocked else internalTable
     -- | 取结果列名，空结果回落到解析
     colsOf db stmt rows = case rows of
         [] -> columnsFromStatement db stmt
@@ -352,15 +352,15 @@ systemDatabaseName = "system"
 usersTable :: String
 usersTable = "__system_users"
 
--- | 角色与授权表的名字，不带内部前缀
+-- | 角色与授权表的名字，在系统库里但服务自己要读写
 rolesTable :: String
-rolesTable = "sys_roles"
+rolesTable = "__system_roles"
 
 grantsTable :: String
-grantsTable = "sys_grants"
+grantsTable = "__system_grants"
 
 membersTable :: String
-membersTable = "sys_members"
+membersTable = "__system_members"
 
 internalNames :: [String]
 internalNames = [rolesTable, grantsTable, membersTable]
@@ -369,9 +369,17 @@ internalNames = [rolesTable, grantsTable, membersTable]
 reserved :: String -> Bool
 reserved = T.isPrefixOf "__system_" . T.toLower . T.pack
 
+-- | 是不是服务自己要经请求通道读写的表
+privilegeTable :: String -> Bool
+privilegeTable name = T.unpack (T.toLower (T.pack name)) `elem` internalNames
+
 -- | 是不是服务自己的内部表
 internalTable :: String -> Bool
-internalTable name = reserved name || T.unpack (T.toLower (T.pack name)) `elem` internalNames
+internalTable name = reserved name || privilegeTable name
+
+-- | 外部语句能不能碰这张表
+blocked :: String -> Bool
+blocked name = reserved name && not (privilegeTable name)
 
 -- | 去掉内部表
 visible :: Database -> Database

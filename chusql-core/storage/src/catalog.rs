@@ -202,6 +202,23 @@ impl Catalog {
         Ok(())
     }
 
+    /// 表改名到指定名字
+    pub fn rename_table(&mut self, from: &str, to: &str) -> io::Result<bool> {
+        let Some(entry) = self.tables.remove(from) else {
+            return Ok(false);
+        };
+        if self.tables.contains_key(to) {
+            self.tables.insert(from.to_string(), entry);
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("table already exists: {}", to),
+            ));
+        }
+        self.seen.remove(from);
+        self.tables.insert(to.to_string(), entry);
+        Ok(true)
+    }
+
     /// ALTER：整列定义换成新的，并清掉二级索引与统计
     pub fn set_columns(&mut self, table: &str, columns: Vec<SchemaColumn>) -> io::Result<()> {
         let entry = self

@@ -553,6 +553,25 @@ privilegeSpec = describe "server privileges" $ do
             Left err -> expectationFailure err
             Right stmt -> authorize service root testDatabase stmt `shouldReturn` Right ()
 
+    it "keeps the role tables on the real storage" $ withIpcStorage $ do
+        base <- ipcBackend
+        service <- newPrivileges base
+        created <- runPrivilegeCommand service (Root testRootName) testDatabase (CreateRoleCommand "reader")
+        created `shouldBe` Right ()
+        views <- listRoleViews service
+        fmap (map roleName) views `shouldBe` Right ["reader"]
+        -- 改名后真存储上仍要读得到角色表
+        let system = beWithDatabase base "system"
+        stored <- beStatement system "SELECT * FROM __system_roles"
+        case stored of
+            Left err -> expectationFailure ("select __system_roles: " ++ err)
+            Right result -> concatMap (map snd) (srRows result) `shouldContain` [VStr "reader"]
+        -- 账号表不给语句通道看到
+        denied <- beStatement system "SELECT * FROM __system_users"
+        case denied of
+            Left _ -> pure ()
+            Right result -> expectationFailure ("account table must stay hidden: " ++ show (srRows result))
+
 -- 真存储夹具：一个用例一份数据目录，跑完关链路删干净
 
 -- | 本次用例的数据目录（用例串行跑，固定名够用）
