@@ -11,13 +11,15 @@ module ChuSQL.Core.Engine.Builtin
     , Operator (..)
     , operatorOfExpr
     , operatorSymbol
+    , operatorOfCompare
+    , compareNode
     , executeOperator
     , threeValuedNot
     , inValues
     ) where
 
 import ChuSQL.Core.Model (Value (..), compareValue)
-import ChuSQL.Core.Engine.Syntax.AST (Expr (..))
+import ChuSQL.Core.Engine.Syntax.AST (CompareOp (..), Expr (..))
 import Control.Monad (foldM)
 import Data.Char (toLower)
 
@@ -176,6 +178,24 @@ operatorOfExpr (NotEq _ _) = Just OpNe
 operatorOfExpr (And _ _) = Just OpAnd
 operatorOfExpr (Or _ _) = Just OpOr
 operatorOfExpr _ = Nothing
+
+-- | 量词比较里的比较运算符
+operatorOfCompare :: CompareOp -> Operator
+operatorOfCompare CmpEq = OpEq
+operatorOfCompare CmpNe = OpNe
+operatorOfCompare CmpGt = OpGt
+operatorOfCompare CmpGtE = OpGtE
+operatorOfCompare CmpLt = OpLt
+operatorOfCompare CmpLtE = OpLtE
+
+-- | 量词比较在字面量上的节点
+compareNode :: CompareOp -> Expr -> Expr -> Expr
+compareNode CmpEq = Eq
+compareNode CmpNe = NotEq
+compareNode CmpGt = Gt
+compareNode CmpGtE = GtE
+compareNode CmpLt = Lt
+compareNode CmpLtE = LtE
 
 -- | 运算符求值：算错个数是内部错误
 executeOperator :: Operator -> [Value] -> Either String Value

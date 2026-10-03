@@ -292,6 +292,7 @@ exprTables expr = case expr of
     ScalarSub sub -> statementTables (subqueryStatement sub)
     ExistsSub sub _ -> statementTables (subqueryStatement sub)
     InSub value sub _ -> exprTables value ++ statementTables (subqueryStatement sub)
+    QuantCmp _ value sub _ -> exprTables value ++ statementTables (subqueryStatement sub)
     InList value items _ -> concatMap exprTables (value : items)
     Add a b -> both a b
     Sub a b -> both a b

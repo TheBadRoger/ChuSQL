@@ -47,7 +47,7 @@ csql -f json -e "SELECT count(*) FROM orders"
 
 查询写法：
 
-- `SELECT` 支持 `WHERE`、`ORDER BY`、`LIMIT`、`JOIN` / `LEFT JOIN`、`GROUP BY` 与聚合，以及标量 / `IN` / `EXISTS` 子查询。
+- `SELECT` 支持 `WHERE`、`ORDER BY`、`LIMIT`、`JOIN` / `LEFT JOIN`、`GROUP BY` 与聚合，以及标量 / `IN` / `EXISTS` 子查询和量词比较（`op ANY` / `op ALL`）。
 - 来源可以是派生表：`SELECT d.name FROM (SELECT name FROM users) d`。派生表必须带别名，内层不能引用外层列；输出列取裸列名（内层写 `u.id`，外层用 `d.id` 引用）。
 - 投影列可以起别名：`SELECT count(*) AS total FROM orders`，别名就是结果集的列名。`ORDER BY` 仍按来源列解析，要引用派生表的列得写限定名（如 `ORDER BY d.total`）。
 - 鉴权覆盖整棵来源树：查派生表时内层表也要有权限，只有外层引用的表有权限不够。
@@ -57,6 +57,12 @@ csql -f json -e "SELECT count(*) FROM orders"
 - 支持 `=`、`<>`（也可写 `!=`）、`>`、`>=`、`<`、`<=`；`<>` 与 `!=` 是同一个运算符。
 - `>`、`>=`、`<`、`<=` 在列上有索引时会改写成索引范围扫描；`>=` / `<=` 是闭区间，端点值本身也在结果里。
 - 任一操作数为 `NULL` 时比较结果是 `NULL`，`WHERE` 只保留结果为真的行。
+
+量词比较：
+
+- `值 op ANY (SELECT 单列 …)` 表示子查询里至少有一行让比较成立；`值 op ALL (…)` 表示每一行都成立。
+- `ANY` 的空子查询为假、`ALL` 的空子查询为真；子查询里出现 `NULL` 时按 `AND` / `OR` 的三值规则，条件可能为 `NULL`（`WHERE` 里等同不通过）。
+- 取反写相反的运算符即可：`<> ALL` 与 `NOT IN` 同义，`<> ANY` 表示不存在相等的行。
 
 公共表表达式：
 

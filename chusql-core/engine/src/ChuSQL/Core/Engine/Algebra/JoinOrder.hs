@@ -65,6 +65,7 @@ scaleRows db p x rows = case p of
     GtE _ _ -> quarter
     LtE _ _ -> quarter
     NotEq _ _ -> quarter
+    QuantCmp _ _ _ _ -> quarter
     And a b -> max 1 (min (scaleRows db a x rows) (scaleRows db b x rows))
     _ -> quarter
   where

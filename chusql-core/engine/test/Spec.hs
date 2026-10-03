@@ -602,6 +602,55 @@ main = hspec $ do
                 ids (And (Gt (Col "code") (LitInt 501)) (Lt (Col "code") (LitInt 502)))
                     `shouldReturn` Right []
 
+    describe "ChuSQL.Core.Engine (ANY / ALL)" $ do
+        -- sql：在默认库上跑 SQL 取结果行
+        let sql input = parseStatement input >>= rowsOf . runStatement testDB
+            -- values：只取结果里的值
+            values input = fmap (map (map snd)) (sql input)
+
+        it "parses > ANY into a quantified comparison" $ do
+            parseStatement "SELECT name FROM users WHERE age > ANY (SELECT age FROM orders)"
+                `shouldBe` Right (Select ["name"] (FromTable Nothing "users") (Just (QuantCmp CmpGt (Col "age") (Subquery (Select ["age"] (FromTable Nothing "orders") Nothing [] [] Nothing) []) AnyQ)) [] [] Nothing)
+
+        it "parses <> ALL into a quantified comparison" $ do
+            parseStatement "SELECT name FROM users WHERE age <> ALL (SELECT age FROM orders)"
+                `shouldBe` Right (Select ["name"] (FromTable Nothing "users") (Just (QuantCmp CmpNe (Col "age") (Subquery (Select ["age"] (FromTable Nothing "orders") Nothing [] [] Nothing) []) AllQ)) [] [] Nothing)
+
+        it "still reads plain comparisons" $ do
+            values "SELECT name FROM users WHERE age > 20 ORDER BY name"
+                `shouldBe` Right [[VStr "Alice"], [VStr "Carol"]]
+
+        it "satisfies ANY when at least one row matches" $ do
+            values "SELECT name FROM users WHERE age > ANY (SELECT age FROM users WHERE name = 'Bob')"
+                `shouldBe` Right [[VStr "Alice"], [VStr "Carol"]]
+            values "SELECT name FROM users WHERE age = ANY (SELECT age FROM users WHERE name = 'Bob')"
+                `shouldBe` Right [[VStr "Bob"]]
+
+        it "satisfies ALL only when every row matches" $ do
+            values "SELECT name FROM users WHERE age >= ALL (SELECT age FROM users)"
+                `shouldBe` Right [[VStr "Carol"]]
+            values "SELECT name FROM users WHERE age > ALL (SELECT age FROM users)" `shouldBe` Right []
+
+        it "treats an empty subquery as true for ALL and false for ANY" $ do
+            values "SELECT name FROM users WHERE age > ALL (SELECT age FROM users WHERE name = 'Nobody')"
+                `shouldBe` Right [[VStr "Alice"], [VStr "Bob"], [VStr "Carol"]]
+            values "SELECT name FROM users WHERE age > ANY (SELECT age FROM users WHERE name = 'Nobody')"
+                `shouldBe` Right []
+
+        it "keeps NULL in the subquery three-valued" $ do
+            values "SELECT name FROM users WHERE age > ANY (SELECT NULL)" `shouldBe` Right []
+            values "SELECT name FROM users WHERE age > ALL (SELECT NULL)" `shouldBe` Right []
+
+        it "agrees with IN on the equality form" $ do
+            sql "SELECT name FROM users WHERE id = ANY (SELECT id FROM orders)"
+                `shouldBe` sql "SELECT name FROM users WHERE id IN (SELECT id FROM orders)"
+
+        it "rejects a multi-column or mistyped quantifier subquery" $ do
+            isLeft (sql "SELECT name FROM users WHERE age > ANY (SELECT id, name FROM users)")
+                `shouldBe` True
+            isLeft (sql "SELECT name FROM users WHERE name > ANY (SELECT id FROM users)")
+                `shouldBe` True
+
     describe "ChuSQL.Core.Engine (SELECT)" $ do
         -- sql：在默认库上跑 SQL 取结果行
         let sql input = parseStatement input >>= rowsOf . runStatement testDB
