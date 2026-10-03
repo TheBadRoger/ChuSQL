@@ -518,6 +518,90 @@ main = hspec $ do
         it "reports an unknown table for a name that is not a CTE" $ do
             sql "WITH t AS (SELECT name FROM users) SELECT x.name FROM x" `shouldSatisfy` isLeft
 
+    describe "ChuSQL.Core.Engine (比较运算符)" $ do
+        -- sql：在默认库上跑 SQL 取结果行
+        let sql input = parseStatement input >>= rowsOf . runStatement testDB
+            -- values：只取结果里的值
+            values input = fmap (map (map snd)) (sql input)
+
+        it "parses >= into GtE" $ do
+            parseStatement "SELECT name FROM users WHERE age >= 18"
+                `shouldBe` Right (Select ["name"] (FromTable Nothing "users") (Just (GtE (Col "age") (LitInt 18))) [] [] Nothing)
+
+        it "parses <= into LtE" $ do
+            parseStatement "SELECT name FROM users WHERE age <= 30"
+                `shouldBe` Right (Select ["name"] (FromTable Nothing "users") (Just (LtE (Col "age") (LitInt 30))) [] [] Nothing)
+
+        it "parses <> and != into the same node" $ do
+            sql "SELECT name FROM users WHERE age <> 17"
+                `shouldBe` sql "SELECT name FROM users WHERE age != 17"
+            values "SELECT name FROM users WHERE age <> 17 ORDER BY name"
+                `shouldBe` Right [[VStr "Alice"], [VStr "Carol"]]
+
+        it "runs >= and <=" $ do
+            values "SELECT name FROM users WHERE age >= 25 ORDER BY name"
+                `shouldBe` Right [[VStr "Alice"], [VStr "Carol"]]
+            values "SELECT name FROM users WHERE age <= 20" `shouldBe` Right [[VStr "Bob"]]
+
+        it "keeps comparisons with NULL three-valued" $ do
+            executeOperator OpGtE [VNull, VInt 1] `shouldBe` Right VNull
+            executeOperator OpLtE [VInt 1, VNull] `shouldBe` Right VNull
+            executeOperator OpNe [VNull, VInt 1] `shouldBe` Right VNull
+            executeOperator OpGtE [VInt 1, VFloat 1.0] `shouldBe` Right (VBool True)
+            executeOperator OpNe [VInt 1, VFloat 1.0] `shouldBe` Right (VBool False)
+
+        it "rewrites >= and <= into an inclusive index range" $ do
+            let stat rows distinct indexes = TableMeta rows [(c, d, False) | (c, d) <- distinct] indexes
+                dbWith m = [("users", Table "users" [("id", TInt), ("name", TStr)] [] (Just m))]
+                indexed = dbWith (stat 10000 [("id", 10000)] ["id"])
+                low = Filter (GtE (Col "id") (LitInt 2)) (Scan Nothing "users" Nothing)
+                both = Filter (And (GtE (Col "id") (LitInt 1)) (LtE (Col "id") (LitInt 3))) (Scan Nothing "users" Nothing)
+                halfOpenTop = Filter (And (GtE (Col "id") (LitInt 1)) (Lt (Col "id") (LitInt 3))) (Scan Nothing "users" Nothing)
+                halfOpenBottom = Filter (And (Gt (Col "id") (LitInt 1)) (LtE (Col "id") (LitInt 3))) (Scan Nothing "users" Nothing)
+            optimize indexed low `shouldBe` Range Nothing "users" "id" (Just (VInt 2, True)) Nothing
+            optimize indexed both
+                `shouldBe` Range Nothing "users" "id" (Just (VInt 1, True)) (Just (VInt 3, True))
+            -- 开区间那一端标记取反
+            optimize indexed halfOpenTop
+                `shouldBe` Range Nothing "users" "id" (Just (VInt 1, True)) (Just (VInt 3, False))
+            optimize indexed halfOpenBottom
+                `shouldBe` Range Nothing "users" "id" (Just (VInt 1, False)) (Just (VInt 3, True))
+            optimize indexed (Filter (LtE (Col "id") (LitInt 9)) (Scan Nothing "users" Nothing))
+                `shouldBe` Range Nothing "users" "id" Nothing (Just (VInt 9, True))
+            -- 统计说索引不划算时保持原样，交给全表扫
+            optimize (dbWith (stat 10000 [("id", 10000)] [])) low `shouldBe` low
+
+        it "uses an inclusive range on the real storage" $ do
+            withTestSession $ \srv -> withServerEnv srv $ do
+                _ <- runIPCStorage (runStatementM (CreateTable "rng_t" [("id", TInt), ("code", TInt)]))
+                _ <-
+                    runIPCStorage
+                        ( runStatementM
+                            ( Insert
+                                "rng_t"
+                                ["id", "code"]
+                                [ [LitInt 1, LitInt 500]
+                                , [LitInt 2, LitInt 501]
+                                , [LitInt 3, LitInt 502]
+                                , [LitInt 4, LitInt 503]
+                                ]
+                            )
+                        )
+                _ <- runIPCStorage (runStatementM (CreateIndex "rng_t" "code"))
+                -- ids：按条件取 id，只比较值
+                let ids cond =
+                        fmap (map (map snd))
+                            <$> runIPCStorage (runStatementM (makeSelect ["id"] "rng_t" (Just cond)))
+                ids (And (GtE (Col "code") (LitInt 501)) (LtE (Col "code") (LitInt 502)))
+                    `shouldReturn` Right [[VInt 2], [VInt 3]]
+                -- 闭端含边界、开端不含边界
+                ids (And (Gt (Col "code") (LitInt 501)) (LtE (Col "code") (LitInt 502)))
+                    `shouldReturn` Right [[VInt 3]]
+                ids (And (GtE (Col "code") (LitInt 501)) (Lt (Col "code") (LitInt 502)))
+                    `shouldReturn` Right [[VInt 2]]
+                ids (And (Gt (Col "code") (LitInt 501)) (Lt (Col "code") (LitInt 502)))
+                    `shouldReturn` Right []
+
     describe "ChuSQL.Core.Engine (SELECT)" $ do
         -- sql：在默认库上跑 SQL 取结果行
         let sql input = parseStatement input >>= rowsOf . runStatement testDB
@@ -2660,6 +2744,7 @@ planTables op = case op of
     Sort _ x -> planTables x
     Limit _ x -> planTables x
     Join _ l r _ -> planTables l ++ planTables r
+    Derived _ x -> planTables x
     Unit -> []
 
 -- | 计划里每个 Join 节点是不是 LEFT JOIN（先序）
@@ -2671,6 +2756,7 @@ leftJoinKinds (Aggregate _ _ x) = leftJoinKinds x
 leftJoinKinds (Filter _ x) = leftJoinKinds x
 leftJoinKinds (Sort _ x) = leftJoinKinds x
 leftJoinKinds (Limit _ x) = leftJoinKinds x
+leftJoinKinds (Derived _ x) = leftJoinKinds x
 leftJoinKinds _ = []
 
 -- | 取计划里第一个过滤条件
@@ -2688,6 +2774,7 @@ firstFilterCond (Join _ l r _) = case firstFilterCond l of
 firstFilterCond (Scan _ _ _) = Nothing
 firstFilterCond (Lookup _ _ _ _) = Nothing
 firstFilterCond (Range _ _ _ _ _) = Nothing
+firstFilterCond (Derived _ x) = firstFilterCond x
 
 -- | 判断计划里是否还有过滤节点
 anyFilter :: RelOp -> Bool
@@ -2702,6 +2789,7 @@ anyFilter (Join _ l r _) = anyFilter l || anyFilter r
 anyFilter (Scan _ _ _) = False
 anyFilter (Lookup _ _ _ _) = False
 anyFilter (Range _ _ _ _ _) = False
+anyFilter (Derived _ x) = anyFilter x
 
 -- | 去掉计划里的投影节点
 stripProjects :: RelOp -> RelOp
@@ -2716,6 +2804,7 @@ stripProjects (Join k l r c) = Join k (stripProjects l) (stripProjects r) c
 stripProjects (Scan a t _) = Scan a t Nothing
 stripProjects (Lookup a t c k) = Lookup a t c k
 stripProjects (Range a t c lo hi) = Range a t c lo hi
+stripProjects (Derived a x) = Derived a (stripProjects x)
 
 -- | 解析并做投影下推，返回计划
 projectedPlan :: String -> Either String RelOp

@@ -107,6 +107,9 @@ data Expr
     | Gt Expr Expr
     | Lt Expr Expr
     | Eq Expr Expr
+    | GtE Expr Expr
+    | LtE Expr Expr
+    | NotEq Expr Expr
     | And Expr Expr
     | Or Expr Expr
     | IsNull Expr

@@ -137,6 +137,9 @@ inferExpr db place env (Neg a) = do
 inferExpr db place env (Gt a b) = comparison db place env a b
 inferExpr db place env (Lt a b) = comparison db place env a b
 inferExpr db place env (Eq a b) = comparison db place env a b
+inferExpr db place env (GtE a b) = comparison db place env a b
+inferExpr db place env (LtE a b) = comparison db place env a b
+inferExpr db place env (NotEq a b) = comparison db place env a b
 inferExpr db place env (And a b) = boolean db place env a b
 inferExpr db place env (Or a b) = boolean db place env a b
 inferExpr db place env (IsNull a) = inferExpr db place env a >> Right (InferType CBool)
@@ -597,6 +600,9 @@ resolveExpr db env outer f e = case e of
     Gt a b -> binary Gt a b
     Lt a b -> binary Lt a b
     Eq a b -> binary Eq a b
+    GtE a b -> binary GtE a b
+    LtE a b -> binary LtE a b
+    NotEq a b -> binary NotEq a b
     And a b -> binary And a b
     Or a b -> binary Or a b
     IsNull a -> IsNull <$> resolveExpr db env outer f a
