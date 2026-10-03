@@ -409,6 +409,9 @@ evalRelOpIn db outer (Sort spec op) = do
 evalRelOpIn db outer (Limit n op) = do
     rows <- evalRelOpIn db outer op
     pure (fmap (take n) rows)
+evalRelOpIn db outer (Derived mAlias op) = do
+    rows <- evalRelOpIn db outer op
+    pure (fmap (prefixRows mAlias) rows)
 evalRelOpIn db outer (Join kind l r c) = do
     lres <- evalRelOpIn db outer l
     case lres of

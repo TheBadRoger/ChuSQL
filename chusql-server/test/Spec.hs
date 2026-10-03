@@ -643,6 +643,15 @@ privilegeSpec = describe "server privileges" $ do
             Left err -> expectationFailure err
             Right stmt -> authorize service root testDatabase stmt `shouldReturn` Right ()
 
+    it "requires the privilege on the table inside a derived table" $ withPrivileges $ \service root -> do
+        _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
+        _ <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "reader" False)
+        _ <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "reader" ["alice"])
+        authorizeSql service (Ordinary testAccount) "SELECT d.name FROM (SELECT name FROM users) d"
+            `shouldReturn` Right ()
+        authorizeSql service (Ordinary testAccount) "SELECT d.name FROM (SELECT product FROM orders) d"
+            `shouldReturn` Left (PrivilegeError "forbidden" "permission denied: SELECT ON orders")
+
     it "keeps the role tables on the real storage" $ withIpcStorage $ do
         base <- ipcBackend
         service <- newPrivileges base

@@ -21,6 +21,7 @@ pass db _ (Aggregate keys aggs x) = Aggregate keys aggs (pass db False x)
 pass db free (Project cols x) = Project cols (pass db free x)
 pass db free (Compute items x) = Compute items (pass db free x)
 pass db free (Filter p x) = Filter p (pass db free x)
+pass db free (Derived a x) = Derived a (pass db free x)
 pass db free (Join kind l r c)
     | free
     , Just (leaves, conds) <- innerChain (Join kind l r c)

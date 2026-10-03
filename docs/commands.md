@@ -45,6 +45,13 @@ csql -f json -e "SELECT count(*) FROM orders"
 - 只有候选唯一时才自动推导前缀；同名的表或列出现在多个候选上会以 `ambiguous table` / `ambiguous column` 报错，需要写全。
 - `FROM orders AS o` 之后只能用 `o.id`，不能再写 `orders.id`。
 
+查询写法：
+
+- `SELECT` 支持 `WHERE`、`ORDER BY`、`LIMIT`、`JOIN` / `LEFT JOIN`、`GROUP BY` 与聚合，以及标量 / `IN` / `EXISTS` 子查询。
+- 来源可以是派生表：`SELECT d.name FROM (SELECT name FROM users) d`。派生表必须带别名，内层不能引用外层列；输出列取裸列名（内层写 `u.id`，外层用 `d.id` 引用）。
+- 投影列可以起别名：`SELECT count(*) AS total FROM orders`，别名就是结果集的列名。`ORDER BY` 仍按来源列解析，要引用派生表的列得写限定名（如 `ORDER BY d.total`）。
+- 鉴权覆盖整棵来源树：查派生表时内层表也要有权限，只有外层引用的表有权限不够。
+
 事务：
 
 - `BEGIN`（或 `START TRANSACTION`）开始显式事务，`COMMIT` 提交，`ROLLBACK` 回滚。
