@@ -29,6 +29,7 @@ import ChuSQL.Server.Backend (
 import ChuSQL.Server.Catalog (
     Catalog,
     addGrant,
+    addGrantOption,
     addMember,
     dropRole,
     eachAction,
@@ -37,10 +38,12 @@ import ChuSQL.Server.Catalog (
     normalizeObject,
     normalizeRole,
     normalizeUser,
+    readGrantOptions,
     readGrants,
     readMembers,
     readRoleNames,
     removeGrant,
+    removeGrantOption,
     removeMember,
     withCatalogLock,
     ensureCatalog,
@@ -68,7 +71,7 @@ data Membership = Membership
 data PrivilegeCommand
     = CreateRoleCommand Text
     | DropRoleCommand Text
-    | GrantPrivilegesCommand [Text] Text Text
+    | GrantPrivilegesCommand [Text] Text Text Bool
     | RevokePrivilegesCommand [Text] Text Text
     | GrantRoleCommand Text [Text]
     | RevokeRoleCommand Text [Text]
@@ -87,24 +90,24 @@ privilegeCommand :: Statement -> Maybe PrivilegeCommand
 privilegeCommand stmt = case stmt of
     CreateRole name -> Just (CreateRoleCommand (T.pack name))
     DropRole name -> Just (DropRoleCommand (T.pack name))
-    GrantPrivileges privs obj role ->
-        Just (GrantPrivilegesCommand (map T.toLower (map T.pack privs)) (T.pack obj) (T.pack role))
+    GrantPrivileges privs obj role withOption ->
+        Just (GrantPrivilegesCommand (map T.toLower (map T.pack privs)) (T.pack obj) (T.pack role) withOption)
     RevokePrivileges privs obj role ->
         Just (RevokePrivilegesCommand (map T.toLower (map T.pack privs)) (T.pack obj) (T.pack role))
     GrantRole role members -> Just (GrantRoleCommand (T.pack role) (map T.pack members))
     RevokeRole role members -> Just (RevokeRoleCommand (T.pack role) (map T.pack members))
     _ -> Nothing
 
--- | 执行管理命令：只有管理员能跑，命令提到的角色必须已经存在
+-- | 执行管理命令：管理员全通，普通身份只能转授自己拿到的权限
 runPrivilegeCommand :: Privileges -> Principal -> Text -> PrivilegeCommand -> IO (Either PrivilegeError ())
 runPrivilegeCommand service principal database command
-    | not (principalIsRoot principal) = pure (Left forbidden)
     | needsDatabase = pure (Left (PrivilegeError "no_database" "no database selected"))
-    | otherwise = withTables service (applyCommand service database command)
+    | principalIsRoot principal = withTables service (applyCommand service database command)
+    | otherwise = withTables service (delegateCommand service principal database command)
   where
     -- | 授权到具体对象时需要先选库
     needsDatabase = T.null database && case command of
-        GrantPrivilegesCommand _ object _ -> T.strip object /= "*"
+        GrantPrivilegesCommand _ object _ _ -> T.strip object /= "*"
         RevokePrivilegesCommand _ object _ -> T.strip object /= "*"
         _ -> False
 
@@ -164,10 +167,18 @@ requiredActions stmt = case stmt of
 
 -- | 每项 (表, 权限) 都要被某条授权覆盖
 checkAll :: Text -> [Grant] -> [(Text, Text)] -> Either PrivilegeError ()
-checkAll database grants needed = case [pair | pair@(table, privilege) <- needed, not (covered table privilege)] of
+checkAll database grants needed = checkCovered database grants needed "permission denied: "
+
+-- | 转授权要查 grant option，报错口径与普通鉴权分开
+checkOptions :: Text -> [Grant] -> [(Text, Text)] -> Either PrivilegeError ()
+checkOptions database grants needed = checkCovered database grants needed "grant option required: "
+
+-- | 覆盖检查的公共实现
+checkCovered :: Text -> [Grant] -> [(Text, Text)] -> Text -> Either PrivilegeError ()
+checkCovered database grants needed prefix = case [pair | pair@(table, privilege) <- needed, not (covered table privilege)] of
     [] -> Right ()
     ((table, privilege) : _) ->
-        Left (PrivilegeError "forbidden" ("permission denied: " <> T.toUpper privilege <> " ON " <> table))
+        Left (PrivilegeError "forbidden" (prefix <> T.toUpper privilege <> " ON " <> table))
   where
     -- | 某一项是否被授权覆盖
     covered table privilege =
@@ -176,19 +187,25 @@ checkAll database grants needed = case [pair | pair@(table, privilege) <- needed
                 (\grant -> (grantObject grant == "*" || grantObject grant == target) && grantPrivilege grant == privilege)
                 grants
 
--- | 一个用户实际能用的授权：所属角色加上继承来的
+-- | 一个用户实际能用的授权：含角色继承
 grantsOfUser :: Privileges -> Text -> IO (Either PrivilegeError [Grant])
 grantsOfUser service user = do
     members <- catalog (readMembers (pvCatalog service))
     grants <- catalog (readGrants (pvCatalog service))
+    options <- catalog (readGrantOptions (pvCatalog service))
     roles <- roleNames service
     pure $ do
         memberRows <- members
         grantRows <- grants
+        optionRows <- options
         known <- roles
         let edges = roleEdges memberRows known
             mine = closureUp edges [role | (role, member) <- memberRows, member == normalizeUser user]
-        pure [grant | grant <- grantRows, grantRole grant `elem` mine]
+        pure [grant | grant <- grantRows ++ optionRows, grantRole grant `elem` mine]
+
+-- | 一个用户手里的 grant option，只有这些能再转授
+optionsOfUser :: Privileges -> Text -> IO (Either PrivilegeError [Grant])
+optionsOfUser service user = fmap (fmap (filter grantable)) (grantsOfUser service user)
 
 -- | 角色到角色的成员边：父角色在前
 roleEdges :: [(Text, Text)] -> [Text] -> [(Text, Text)]
@@ -203,11 +220,28 @@ closureUp edges = go
         let more = [parent | (parent, child) <- edges, child `elem` known, parent `notElem` known]
          in if null more then known else go (known ++ more)
 
--- | 一个角色挂着的授权
+-- | 一个角色挂着的授权，带 grant option 的会标出来
 roleGrantsOf :: Privileges -> Text -> IO (Either PrivilegeError [Grant])
 roleGrantsOf service role = do
     grants <- catalog (readGrants (pvCatalog service))
-    pure (filter (\grant -> grantRole grant == normalizeRole role) <$> grants)
+    options <- catalog (readGrantOptions (pvCatalog service))
+    pure (do
+        rows <- grants
+        optionRows <- options
+        let mine = filter (\grant -> grantRole grant == normalizeRole role) rows
+        pure (markOptions mine optionRows))
+
+-- | 给授权标上有没有对应的 grant option
+markOptions :: [Grant] -> [Grant] -> [Grant]
+markOptions grants options = [grant {grantable = hasOption grant} | grant <- grants]
+  where
+    -- | 有没有一条同角色同权限同对象的 option
+    hasOption grant = any (same grant) options
+    -- | 两条授权指向同一处
+    same one other =
+        grantRole one == grantRole other
+            && grantPrivilege one == grantPrivilege other
+            && grantObject one == grantObject other
 
 -- | 角色名清单（统一小写）
 roleNames :: Privileges -> IO (Either PrivilegeError [Text])
@@ -244,20 +278,20 @@ applyCommand service database command = case command of
         case allowed of
             Left err -> pure (Left err)
             Right () -> catalog (dropRole (pvCatalog service) role)
-    GrantPrivilegesCommand privileges object role -> do
+    GrantPrivilegesCommand privileges object role withOption -> do
         allowed <- requireRole service role
         case allowed of
             Left err -> pure (Left err)
             Right () ->
                 eachAction (expandPrivileges privileges) $ \privilege ->
-                    catalog (addGrant (pvCatalog service) role privilege (normalizeObject database object))
+                    grantOne service withOption role privilege (normalizeObject database object)
     RevokePrivilegesCommand privileges object role -> do
         allowed <- requireRole service role
         case allowed of
             Left err -> pure (Left err)
             Right () ->
                 eachAction (expandPrivileges privileges) $ \privilege ->
-                    catalog (removeGrant (pvCatalog service) role privilege (normalizeObject database object))
+                    revokeOne service role privilege (normalizeObject database object)
     GrantRoleCommand role members -> do
         allowed <- requireRole service role
         case allowed of
@@ -272,6 +306,43 @@ applyCommand service database command = case command of
         case allowed of
             Left err -> pure (Left err)
             Right () -> eachAction users $ \user -> catalog (removeMember (pvCatalog service) role user)
+
+-- | 落一条授权，带 grant option 的再落一条转授权
+grantOne :: Privileges -> Bool -> Text -> Text -> Text -> IO (Either PrivilegeError ())
+grantOne service withOption role privilege object = do
+    written <- catalog (addGrant (pvCatalog service) role privilege object)
+    case written of
+        Left err -> pure (Left err)
+        Right ()
+            | withOption -> catalog (addGrantOption (pvCatalog service) role privilege object)
+            | otherwise -> pure (Right ())
+
+-- | 收一条授权，连同它的 grant option
+revokeOne :: Privileges -> Text -> Text -> Text -> IO (Either PrivilegeError ())
+revokeOne service role privilege object = do
+    dropped <- catalog (removeGrant (pvCatalog service) role privilege object)
+    case dropped of
+        Left err -> pure (Left err)
+        Right () -> catalog (removeGrantOption (pvCatalog service) role privilege object)
+
+-- | 普通身份转授权：只放行 GRANT
+delegateCommand :: Privileges -> Principal -> Text -> PrivilegeCommand -> IO (Either PrivilegeError ())
+delegateCommand service principal database command = case command of
+    GrantPrivilegesCommand privileges object role _ -> do
+        allowed <- requireRole service role
+        case allowed of
+            Left err -> pure (Left err)
+            Right () -> do
+                owned <- optionsOfUser service (principalName principal)
+                case owned >>= \found -> checkOptions database found needed of
+                    Left err -> pure (Left err)
+                    Right () -> applyCommand service database command
+    _ -> pure (Left forbidden)
+  where
+    -- | 命令里每个 (对象, 权限) 都要对得上
+    needed = case command of
+        GrantPrivilegesCommand privileges object _ _ -> [(object, privilege) | privilege <- expandPrivileges privileges]
+        _ -> []
 
 -- | 加一条成员边：名字是角色就查环，否则当用户加
 grantMember :: Privileges -> [Text] -> Text -> Text -> IO (Either PrivilegeError ())

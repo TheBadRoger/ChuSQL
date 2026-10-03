@@ -26,11 +26,12 @@ import qualified Data.Text as T
 
 -- server 线上协议的编解码：一行一条 JSON（UTF-8）。
 
--- | 一条角色授权：角色 + 具体权限 + 对象
+-- | 一条角色授权：角色 + 具体权限 + 对象，可带转授权
 data Grant = Grant
     { grantRole :: Text
     , grantPrivilege :: Text
     , grantObject :: Text
+    , grantable :: Bool
     }
     deriving (Show, Eq, Ord)
 
@@ -49,12 +50,17 @@ instance ToJSON Grant where
             [ "role" .= grantRole grant
             , "privilege" .= grantPrivilege grant
             , "object" .= grantObject grant
+            , "grantable" .= grantable grant
             ]
 
 -- | 从 JSON 读一条授权
 instance FromJSON Grant where
     parseJSON = withObject "Grant" $ \o ->
-        Grant <$> o .: "role" <*> o .: "privilege" <*> o .: "object"
+        Grant
+            <$> o .: "role"
+            <*> o .: "privilege"
+            <*> o .: "object"
+            <*> o .:? "grantable" .!= False
 
 -- | 一个角色转成 JSON
 instance ToJSON RoleView where

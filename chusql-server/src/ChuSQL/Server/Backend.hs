@@ -11,6 +11,7 @@ module ChuSQL.Server.Backend (
     ipcBackend,
     memoryBackend,
     membersTable,
+    optionsTable,
     rolesTable,
     statementNeedsDatabase,
     statementTables,
@@ -359,11 +360,15 @@ rolesTable = "__system_roles"
 grantsTable :: String
 grantsTable = "__system_grants"
 
+-- | 带 grant option 的授权单独一张表
+optionsTable :: String
+optionsTable = "__system_grant_options"
+
 membersTable :: String
 membersTable = "__system_members"
 
 internalNames :: [String]
-internalNames = [rolesTable, grantsTable, membersTable]
+internalNames = [rolesTable, grantsTable, optionsTable, membersTable]
 
 -- | 名字是否带内部表前缀
 reserved :: String -> Bool

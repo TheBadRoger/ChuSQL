@@ -262,6 +262,11 @@ asInt :: A.Value -> Int
 asInt (A.Number n) = round n
 asInt _ = -1
 
+-- | 当布尔看
+asBool :: A.Value -> Bool
+asBool (A.Bool b) = b
+asBool _ = False
+
 -- | 第 i 个元素，越界给 Nothing
 nth :: Int -> [a] -> Maybe a
 nth i xs = case drop i xs of
@@ -851,6 +856,28 @@ roleSpec env = describe "roles and grants" $ do
             expectStatusWith "revoke without a body" revoked 400
             dropped <- deleteAs hs "/api/roles/analyst"
             expectStatusWith "drop role" dropped 200
+
+        it "carries the grant option through the API" $ do
+            hs <- adminHeaders
+            ensureDatabase hs testDatabaseName
+            created <- postAs hs "/api/roles" (encode (object ["name" .= ("passer" :: Text)]))
+            expectStatusWith "create passer" created 200
+            granted <-
+                postAs
+                    (withDb testDatabaseName hs)
+                    "/api/roles/passer/grants"
+                    (encode (object ["object" .= testDatabaseName, "privileges" .= (["select"] :: [Text]), "grantOption" .= True]))
+            expectStatusWith "grant with option" granted 200
+            listed <- getAs hs "/api/roles"
+            expectStatusWith "list roles" listed 200
+            let matching = [view | view <- items (jsonBody listed), asText (at "name" view) == "passer"]
+            check ((concatMap (map (asBool . at "grantable") . items . at "grants") matching) `shouldBe` [True])
+            refused <-
+                postAs
+                    hs
+                    "/api/roles/passer/grants"
+                    (encode (object ["object" .= testDatabaseName, "privileges" .= (["select"] :: [Text]), "grantOption" .= ("yes" :: Text)]))
+            expectStatusWith "non-boolean grant option" refused 400
 
 -- SQL 控制台 -----------------------------------------------------------------
 

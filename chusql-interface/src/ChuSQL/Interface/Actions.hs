@@ -341,12 +341,20 @@ dropRoleSql name = do
     pure ("DROP ROLE " ++ T.unpack role)
 
 -- | 构造 GRANT 权限 ON 对象 TO 角色
-grantPrivilegesSql :: [Text] -> Text -> Text -> Either String String
-grantPrivilegesSql privileges object role = do
+grantPrivilegesSql :: [Text] -> Text -> Text -> Bool -> Either String String
+grantPrivilegesSql privileges object role withOption = do
     words' <- privilegeWords privileges
     target <- grantObject object
     who <- roleName role
-    pure ("GRANT " ++ T.unpack (T.intercalate ", " words') ++ " ON " ++ T.unpack target ++ " TO " ++ T.unpack who)
+    pure
+        ( "GRANT " ++ T.unpack (T.intercalate ", " words') ++ " ON " ++ T.unpack target
+            ++ " TO " ++ T.unpack who ++ tailText
+        )
+  where
+    -- | 转授权后缀
+    tailText
+        | withOption = " WITH GRANT OPTION"
+        | otherwise = ""
 
 -- | 构造 REVOKE 权限 ON 对象 FROM 角色
 revokePrivilegesSql :: [Text] -> Text -> Text -> Either String String

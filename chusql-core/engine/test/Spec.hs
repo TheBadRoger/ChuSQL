@@ -683,13 +683,21 @@ main = hspec $ do
 
         it "parses privilege grants on one table, on another database's table or on everything" $ do
             parseStatement "GRANT SELECT ON users TO analyst"
-                `shouldBe` Right (GrantPrivileges ["SELECT"] "users" "analyst")
+                `shouldBe` Right (GrantPrivileges ["SELECT"] "users" "analyst" False)
             parseStatement "grant select, insert on users to analyst"
-                `shouldBe` Right (GrantPrivileges ["SELECT", "INSERT"] "users" "analyst")
+                `shouldBe` Right (GrantPrivileges ["SELECT", "INSERT"] "users" "analyst" False)
             parseStatement "GRANT ALL ON sales.orders TO analyst"
-                `shouldBe` Right (GrantPrivileges ["ALL"] "sales.orders" "analyst")
+                `shouldBe` Right (GrantPrivileges ["ALL"] "sales.orders" "analyst" False)
             parseStatement "GRANT DELETE ON * TO analyst"
-                `shouldBe` Right (GrantPrivileges ["DELETE"] "*" "analyst")
+                `shouldBe` Right (GrantPrivileges ["DELETE"] "*" "analyst" False)
+
+        it "parses WITH GRANT OPTION on a privilege grant" $ do
+            parseStatement "GRANT SELECT ON users TO analyst WITH GRANT OPTION"
+                `shouldBe` Right (GrantPrivileges ["SELECT"] "users" "analyst" True)
+            parseStatement "grant select, insert on * to analyst with grant option"
+                `shouldBe` Right (GrantPrivileges ["SELECT", "INSERT"] "*" "analyst" True)
+            parseStatement "GRANT SELECT ON users TO analyst WITH"
+                `shouldSatisfy` isLeft
 
         it "parses REVOKE symmetrically" $ do
             parseStatement "REVOKE SELECT ON users FROM analyst"
@@ -717,7 +725,9 @@ main = hspec $ do
             (parseStatement "CREATE ROLE select" >>= prepare testDB) `shouldSatisfy` isLeft
             (parseStatement "DROP ROLE insert" >>= prepare testDB) `shouldSatisfy` isLeft
             (parseStatement "GRANT SELECT ON users TO analyst" >>= prepare testDB)
-                `shouldBe` Right (GrantPrivileges ["SELECT"] "users" "analyst")
+                `shouldBe` Right (GrantPrivileges ["SELECT"] "users" "analyst" False)
+            (parseStatement "GRANT SELECT ON users TO analyst WITH GRANT OPTION" >>= prepare testDB)
+                `shouldBe` Right (GrantPrivileges ["SELECT"] "users" "analyst" True)
             (parseStatement "GRANT SELECT ON users TO select" >>= prepare testDB) `shouldSatisfy` isLeft
             (parseStatement "REVOKE SELECT ON users FROM analyst" >>= prepare testDB)
                 `shouldBe` Right (RevokePrivileges ["SELECT"] "users" "analyst")

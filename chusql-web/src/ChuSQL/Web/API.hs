@@ -1212,6 +1212,7 @@ grantJson grant =
     object
         [ "privilege" .= grantPrivilege grant
         , "object" .= grantObject grant
+        , "grantable" .= grantable grant
         ]
 
 -- | 建角色
@@ -1236,7 +1237,8 @@ grantRoleH env = do
     role <- pathParam "name"
     withJsonObject env $ \o -> case grantFields o of
         Left err -> reply400 "bad_request" err
-        Right (privileges, objectName) -> runPrivilegeSql ws (grantPrivilegesSql privileges objectName role)
+        Right (privileges, objectName, withOption) ->
+            runPrivilegeSql ws (grantPrivilegesSql privileges objectName role withOption)
 
 -- | 收角色的权限
 revokeRoleH :: AppEnv -> ActionM ()
@@ -1245,7 +1247,7 @@ revokeRoleH env = do
     role <- pathParam "name"
     withJsonObject env $ \o -> case grantFields o of
         Left err -> reply400 "bad_request" err
-        Right (privileges, objectName) -> runPrivilegeSql ws (revokePrivilegesSql privileges objectName role)
+        Right (privileges, objectName, _) -> runPrivilegeSql ws (revokePrivilegesSql privileges objectName role)
 
 -- | 把用户加进角色
 addRoleMemberH :: AppEnv -> ActionM ()
@@ -1264,14 +1266,18 @@ removeRoleMemberH env = do
     user <- pathParam "user"
     runPrivilegeSql ws (revokeRoleSql role [user])
 
--- | 权限（一条或一串）与对象
-grantFields :: A.Object -> Either Text ([Text], Text)
+-- | 权限（一条或一串）、对象与是否带转授权
+grantFields :: A.Object -> Either Text ([Text], Text, Bool)
 grantFields o = do
     objectName <- textField "object" o
     privileges <- case KM.lookup "privileges" o of
         Just (A.Array xs) -> mapM stringValue (V.toList xs)
         _ -> Left "missing or non-array field: privileges"
-    if null privileges then Left "at least one privilege is required" else pure (privileges, objectName)
+    withOption <- case KM.lookup "grantOption" o of
+        Nothing -> Right False
+        Just (A.Bool flag) -> Right flag
+        _ -> Left "grantOption must be a boolean"
+    if null privileges then Left "at least one privilege is required" else pure (privileges, objectName, withOption)
 
 -- | 成员（一条或一串）
 memberFields :: A.Object -> Either Text [Text]

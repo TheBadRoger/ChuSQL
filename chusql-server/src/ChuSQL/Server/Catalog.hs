@@ -14,6 +14,9 @@ module ChuSQL.Server.Catalog
     , readGrants
     , addGrant
     , removeGrant
+    , readGrantOptions
+    , addGrantOption
+    , removeGrantOption
     , readMembers
     , addMember
     , removeMember
@@ -22,7 +25,7 @@ module ChuSQL.Server.Catalog
 import ChuSQL.Core.Model (Row, Value (..))
 import ChuSQL.Interface.Actions (sqlLiteral)
 import ChuSQL.Interface.Protocol (Grant (..))
-import ChuSQL.Server.Backend (Backend (..), StatementResult (..), grantsTable, membersTable, rolesTable)
+import ChuSQL.Server.Backend (Backend (..), StatementResult (..), grantsTable, membersTable, optionsTable, rolesTable)
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Data.List (intercalate, isInfixOf)
 import Data.Text (Text)
@@ -75,6 +78,7 @@ ensureCatalog catalog = eachAction tableDefs (createTable catalog)
     tableDefs =
         [ (rolesTable, "(name VARCHAR(64))")
         , (grantsTable, "(role VARCHAR(64), privilege VARCHAR(16), object VARCHAR(128))")
+        , (optionsTable, "(role VARCHAR(64), privilege VARCHAR(16), object VARCHAR(128))")
         , (membersTable, "(role VARCHAR(64), member VARCHAR(64))")
         ]
 
@@ -111,9 +115,10 @@ dropRole catalog role = do
     second <- exec catalog ("DELETE FROM " ++ grantsTable ++ " WHERE role = " ++ roleLiteral role)
     third <- exec catalog ("DELETE FROM " ++ membersTable ++ " WHERE role = " ++ roleLiteral role)
     fourth <- exec catalog ("DELETE FROM " ++ membersTable ++ " WHERE member = " ++ roleLiteral role)
-    pure (sequence_ [first, second, third, fourth])
+    fifth <- exec catalog ("DELETE FROM " ++ optionsTable ++ " WHERE role = " ++ roleLiteral role)
+    pure (sequence_ [first, second, third, fourth, fifth])
 
--- | 全部授权
+-- | 全部授权，都不带 grant option
 readGrants :: Catalog -> IO (Either String [Grant])
 readGrants catalog = fmap (fmap (map grantOf)) (readRows catalog grantsTable)
 
@@ -127,7 +132,23 @@ addGrant catalog role privilege object = do
 
 -- | 取消一条授权
 removeGrant :: Catalog -> Text -> Text -> Text -> IO (Either String ())
-removeGrant catalog role privilege object = exec catalog (deleteGrantSql role privilege object)
+removeGrant catalog role privilege object = exec catalog (deleteGrantSql grantsTable role privilege object)
+
+-- | 全部带 grant option 的授权
+readGrantOptions :: Catalog -> IO (Either String [Grant])
+readGrantOptions catalog = fmap (fmap (map optionOf)) (readRows catalog optionsTable)
+
+-- | 记一条带 grant option 的授权，同名的先清掉
+addGrantOption :: Catalog -> Text -> Text -> Text -> IO (Either String ())
+addGrantOption catalog role privilege object = do
+    cleared <- removeGrantOption catalog role privilege object
+    case cleared of
+        Left err -> pure (Left err)
+        Right () -> exec catalog (insertSql optionsTable ["role", "privilege", "object"] [normalizeRole role, privilege, object])
+
+-- | 取消一条带 grant option 的授权
+removeGrantOption :: Catalog -> Text -> Text -> Text -> IO (Either String ())
+removeGrantOption catalog role privilege object = exec catalog (deleteGrantSql optionsTable role privilege object)
 
 -- | 全部成员关系
 readMembers :: Catalog -> IO (Either String [(Text, Text)])
@@ -164,16 +185,21 @@ grantOf row =
         { grantRole = normalizeRole (cell "role" row)
         , grantPrivilege = T.toLower (T.strip (cell "privilege" row))
         , grantObject = T.toLower (T.strip (cell "object" row))
+        , grantable = False
         }
+
+-- | 一行带 grant option 的授权记录
+optionOf :: Row -> Grant
+optionOf row = (grantOf row) {grantable = True}
 
 -- | 一行成员关系
 memberOf :: Row -> (Text, Text)
 memberOf row = (normalizeRole (cell "role" row), normalizeUser (cell "member" row))
 
 -- | 拼一条删授权的语句
-deleteGrantSql :: Text -> Text -> Text -> String
-deleteGrantSql role privilege object =
-    "DELETE FROM " ++ grantsTable ++ " WHERE role = " ++ roleLiteral role
+deleteGrantSql :: String -> Text -> Text -> Text -> String
+deleteGrantSql table role privilege object =
+    "DELETE FROM " ++ table ++ " WHERE role = " ++ roleLiteral role
         ++ " AND privilege = " ++ literal privilege ++ " AND object = " ++ literal object
 
 -- | 拼一条插入语句
