@@ -176,16 +176,32 @@ checkAll database grants needed = case [pair | pair@(table, privilege) <- needed
                 (\grant -> (grantObject grant == "*" || grantObject grant == target) && grantPrivilege grant == privilege)
                 grants
 
--- | 一个用户实际能用的授权：他所属角色身上的那些
+-- | 一个用户实际能用的授权：所属角色加上继承来的
 grantsOfUser :: Privileges -> Text -> IO (Either PrivilegeError [Grant])
 grantsOfUser service user = do
     members <- catalog (readMembers (pvCatalog service))
     grants <- catalog (readGrants (pvCatalog service))
+    roles <- roleNames service
     pure $ do
         memberRows <- members
         grantRows <- grants
-        let mine = [role | (role, member) <- memberRows, member == normalizeUser user]
+        known <- roles
+        let edges = roleEdges memberRows known
+            mine = closureUp edges [role | (role, member) <- memberRows, member == normalizeUser user]
         pure [grant | grant <- grantRows, grantRole grant `elem` mine]
+
+-- | 角色到角色的成员边：父角色在前
+roleEdges :: [(Text, Text)] -> [Text] -> [(Text, Text)]
+roleEdges members roles = [pair | pair@(_, child) <- members, child `elem` roles]
+
+-- | 向上闭包：这群角色直接或间接所属的全部角色
+closureUp :: [(Text, Text)] -> [Text] -> [Text]
+closureUp edges = go
+  where
+    -- | 展开一轮，没有再新增就停
+    go known =
+        let more = [parent | (parent, child) <- edges, child `elem` known, parent `notElem` known]
+         in if null more then known else go (known ++ more)
 
 -- | 一个角色挂着的授权
 roleGrantsOf :: Privileges -> Text -> IO (Either PrivilegeError [Grant])
@@ -197,7 +213,7 @@ roleGrantsOf service role = do
 roleNames :: Privileges -> IO (Either PrivilegeError [Text])
 roleNames service = catalog (readRoleNames (pvCatalog service))
 
--- | 一个角色的成员清单
+-- | 一个角色的直接成员：用户与子角色
 membersOfRole :: Privileges -> Text -> IO (Either PrivilegeError [Text])
 membersOfRole service role = do
     members <- catalog (readMembers (pvCatalog service))
@@ -242,23 +258,45 @@ applyCommand service database command = case command of
             Right () ->
                 eachAction (expandPrivileges privileges) $ \privilege ->
                     catalog (removeGrant (pvCatalog service) role privilege (normalizeObject database object))
-    GrantRoleCommand role users -> do
+    GrantRoleCommand role members -> do
         allowed <- requireRole service role
         case allowed of
             Left err -> pure (Left err)
-            Right () ->
-                eachAction users $ \user -> do
-                    known <- membersOfRole service role
-                    case known of
-                        Left err -> pure (Left err)
-                        Right members
-                            | normalizeUser user `elem` members -> pure (Right ())
-                            | otherwise -> catalog (addMember (pvCatalog service) role user)
+            Right () -> do
+                known <- roleNames service
+                case known of
+                    Left err -> pure (Left err)
+                    Right roles -> eachAction members (grantMember service roles role)
     RevokeRoleCommand role users -> do
         allowed <- requireRole service role
         case allowed of
             Left err -> pure (Left err)
             Right () -> eachAction users $ \user -> catalog (removeMember (pvCatalog service) role user)
+
+-- | 加一条成员边：名字是角色就查环，否则当用户加
+grantMember :: Privileges -> [Text] -> Text -> Text -> IO (Either PrivilegeError ())
+grantMember service roles role member = do
+    current <- membersOfRole service role
+    case current of
+        Left err -> pure (Left err)
+        Right known
+            | normalizeUser member `elem` known -> pure (Right ())
+            | normalizeRole member `notElem` roles -> catalog (addMember (pvCatalog service) role member)
+            | otherwise -> do
+                edges <- membershipEdges service
+                case edges of
+                    Left err -> pure (Left err)
+                    Right pairs
+                        | normalizeRole member `elem` closureUp pairs [normalizeRole role] ->
+                            pure (Left (cycleMember role member))
+                        | otherwise -> catalog (addMember (pvCatalog service) role member)
+
+-- | 只保留两端都是角色的成员边
+membershipEdges :: Privileges -> IO (Either PrivilegeError [(Text, Text)])
+membershipEdges service = do
+    members <- catalog (readMembers (pvCatalog service))
+    roles <- roleNames service
+    pure (roleEdges <$> members <*> roles)
 
 -- | 全程持锁，先保证系统表存在再跑动作
 withTables :: Privileges -> IO (Either PrivilegeError a) -> IO (Either PrivilegeError a)
@@ -286,6 +324,11 @@ forbidden = PrivilegeError "forbidden" "administrator required"
 -- | 未知角色的错误
 unknownRole :: Text -> PrivilegeError
 unknownRole role = PrivilegeError "not_found" ("unknown role: " <> role)
+
+-- | 角色成员成环的错误
+cycleMember :: Text -> Text -> PrivilegeError
+cycleMember role member =
+    PrivilegeError "conflict" ("role membership would create a cycle: " <> normalizeRole role <> " and " <> normalizeRole member)
 
 -- | 存储错误转成权限错误
 storageError :: String -> PrivilegeError

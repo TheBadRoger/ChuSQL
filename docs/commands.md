@@ -89,14 +89,19 @@ DROP USER alice;
 
 ```sql
 CREATE ROLE analyst;
+CREATE ROLE reviewer;
 GRANT SELECT ON orders TO analyst;
-GRANT analyst TO alice;
+GRANT analyst TO reviewer;
+GRANT reviewer TO alice;
 REVOKE SELECT ON orders FROM analyst;
-REVOKE analyst FROM alice;
+REVOKE analyst FROM reviewer;
+REVOKE reviewer FROM alice;
 DROP ROLE analyst;
 ```
 
 当前表级权限包括：`SELECT`、`INSERT`、`UPDATE`、`DELETE` 和 `ALL`。
+
+角色可以互相继承：`GRANT analyst TO reviewer` 让 `reviewer` 拿到 `analyst` 的授权，并把 `analyst` 记为 `reviewer` 的成员；继承会沿成员关系传递，成环的授权被拒绝（报 `conflict`），自继承同样拒绝。删角色时它的两向成员关系一起清掉。被授权者是不是角色，看名字是否在 `__system_roles` 里；用户名与角色名同名时按角色算。
 
 管理员拥有完整权限；数据库、表、索引等结构管理操作仅允许管理员执行。
 
