@@ -300,6 +300,9 @@ exprTables expr = case expr of
     Gt a b -> both a b
     Lt a b -> both a b
     Eq a b -> both a b
+    GtE a b -> both a b
+    LtE a b -> both a b
+    NotEq a b -> both a b
     And a b -> both a b
     Or a b -> both a b
     Neg a -> exprTables a

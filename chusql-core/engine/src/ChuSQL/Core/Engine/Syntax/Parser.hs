@@ -112,7 +112,10 @@ operatorTable =
     [ [Prefix (Neg <$ symbol "-")]
     , [InfixL (Mul <$ symbol "*"), InfixL (Div <$ symbol "/")]
     , [InfixL (Add <$ symbol "+"), InfixL (Sub <$ symbol "-")]
-    , [ InfixN (Gt <$ symbol ">")
+    , [ InfixN (NotEq <$ try (symbol "<>" <|> symbol "!="))
+        , InfixN (GtE <$ try (symbol ">="))
+        , InfixN (LtE <$ try (symbol "<="))
+        , InfixN (Gt <$ symbol ">")
         , InfixN (Lt <$ symbol "<")
         , InfixN (Eq <$ symbol "=")
         ]
@@ -695,6 +698,9 @@ expandExpr env e = case e of
     Gt a b -> Gt <$> go a <*> go b
     Lt a b -> Lt <$> go a <*> go b
     Eq a b -> Eq <$> go a <*> go b
+    GtE a b -> GtE <$> go a <*> go b
+    LtE a b -> LtE <$> go a <*> go b
+    NotEq a b -> NotEq <$> go a <*> go b
     And a b -> And <$> go a <*> go b
     Or a b -> Or <$> go a <*> go b
     Neg a -> Neg <$> go a

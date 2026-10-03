@@ -144,6 +144,9 @@ foldConstants (Neg a) = foldNode (Neg (foldConstants a))
 foldConstants (Gt a b) = foldNode (Gt (foldConstants a) (foldConstants b))
 foldConstants (Lt a b) = foldNode (Lt (foldConstants a) (foldConstants b))
 foldConstants (Eq a b) = foldNode (Eq (foldConstants a) (foldConstants b))
+foldConstants (GtE a b) = foldNode (GtE (foldConstants a) (foldConstants b))
+foldConstants (LtE a b) = foldNode (LtE (foldConstants a) (foldConstants b))
+foldConstants (NotEq a b) = foldNode (NotEq (foldConstants a) (foldConstants b))
 foldConstants (And a b) = foldNode (And (foldConstants a) (foldConstants b))
 foldConstants (Or a b) = foldNode (Or (foldConstants a) (foldConstants b))
 foldConstants e = e
@@ -180,6 +183,32 @@ rewriteNode db (Filter (Lt (Col k) (LitInt v)) (Scan mAlias t Nothing))
     | worthRange db t (unqualify mAlias k) = Range mAlias t (unqualify mAlias k) Nothing (Just (VInt v, False))
 rewriteNode db (Filter (Lt (Col k) (LitStr v)) (Scan mAlias t Nothing))
     | worthRange db t (unqualify mAlias k) = Range mAlias t (unqualify mAlias k) Nothing (Just (VStr v, False))
+rewriteNode db (Filter (And (GtE (Col k1) (LitInt lo)) (LtE (Col k2) (LitInt hi))) (Scan mAlias t Nothing))
+    | k1 == k2 && worthRange db t (unqualify mAlias k1) =
+        Range mAlias t (unqualify mAlias k1) (Just (VInt lo, True)) (Just (VInt hi, True))
+rewriteNode db (Filter (And (GtE (Col k1) (LitInt lo)) (Lt (Col k2) (LitInt hi))) (Scan mAlias t Nothing))
+    | k1 == k2 && worthRange db t (unqualify mAlias k1) =
+        Range mAlias t (unqualify mAlias k1) (Just (VInt lo, True)) (Just (VInt hi, False))
+rewriteNode db (Filter (And (Gt (Col k1) (LitInt lo)) (LtE (Col k2) (LitInt hi))) (Scan mAlias t Nothing))
+    | k1 == k2 && worthRange db t (unqualify mAlias k1) =
+        Range mAlias t (unqualify mAlias k1) (Just (VInt lo, False)) (Just (VInt hi, True))
+rewriteNode db (Filter (And (GtE (Col k1) (LitStr lo)) (LtE (Col k2) (LitStr hi))) (Scan mAlias t Nothing))
+    | k1 == k2 && worthRange db t (unqualify mAlias k1) =
+        Range mAlias t (unqualify mAlias k1) (Just (VStr lo, True)) (Just (VStr hi, True))
+rewriteNode db (Filter (And (GtE (Col k1) (LitStr lo)) (Lt (Col k2) (LitStr hi))) (Scan mAlias t Nothing))
+    | k1 == k2 && worthRange db t (unqualify mAlias k1) =
+        Range mAlias t (unqualify mAlias k1) (Just (VStr lo, True)) (Just (VStr hi, False))
+rewriteNode db (Filter (And (Gt (Col k1) (LitStr lo)) (LtE (Col k2) (LitStr hi))) (Scan mAlias t Nothing))
+    | k1 == k2 && worthRange db t (unqualify mAlias k1) =
+        Range mAlias t (unqualify mAlias k1) (Just (VStr lo, False)) (Just (VStr hi, True))
+rewriteNode db (Filter (GtE (Col k) (LitInt v)) (Scan mAlias t Nothing))
+    | worthRange db t (unqualify mAlias k) = Range mAlias t (unqualify mAlias k) (Just (VInt v, True)) Nothing
+rewriteNode db (Filter (GtE (Col k) (LitStr v)) (Scan mAlias t Nothing))
+    | worthRange db t (unqualify mAlias k) = Range mAlias t (unqualify mAlias k) (Just (VStr v, True)) Nothing
+rewriteNode db (Filter (LtE (Col k) (LitInt v)) (Scan mAlias t Nothing))
+    | worthRange db t (unqualify mAlias k) = Range mAlias t (unqualify mAlias k) Nothing (Just (VInt v, True))
+rewriteNode db (Filter (LtE (Col k) (LitStr v)) (Scan mAlias t Nothing))
+    | worthRange db t (unqualify mAlias k) = Range mAlias t (unqualify mAlias k) Nothing (Just (VStr v, True))
 rewriteNode db (Filter p (Join kind l r c))
     | not (hasDivision p || planHasDivision (Join kind l r c)) =
         case kind of

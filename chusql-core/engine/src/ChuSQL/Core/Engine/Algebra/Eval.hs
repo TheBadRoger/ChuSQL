@@ -327,6 +327,9 @@ substSubqueries db e env = case e of
     Gt a b -> bin Gt a b
     Lt a b -> bin Lt a b
     Eq a b -> bin Eq a b
+    GtE a b -> bin GtE a b
+    LtE a b -> bin LtE a b
+    NotEq a b -> bin NotEq a b
     And a b -> bin And a b
     Or a b -> bin Or a b
     IsNull a -> un IsNull a

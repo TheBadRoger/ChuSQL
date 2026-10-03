@@ -28,6 +28,9 @@ evalExpr (Neg a) row = do
 evalExpr (Gt a b) row = liftOperator OpGt a b row
 evalExpr (Lt a b) row = liftOperator OpLt a b row
 evalExpr (Eq a b) row = liftOperator OpEq a b row
+evalExpr (GtE a b) row = liftOperator OpGtE a b row
+evalExpr (LtE a b) row = liftOperator OpLtE a b row
+evalExpr (NotEq a b) row = liftOperator OpNe a b row
 evalExpr (And a b) row = liftOperator OpAnd a b row
 evalExpr (Or a b) row = liftOperator OpOr a b row
 evalExpr (IsNull a) row = do
@@ -61,6 +64,9 @@ colsInExpr (Neg a) = colsInExpr a
 colsInExpr (Gt a b) = colsInExpr a ++ colsInExpr b
 colsInExpr (Lt a b) = colsInExpr a ++ colsInExpr b
 colsInExpr (Eq a b) = colsInExpr a ++ colsInExpr b
+colsInExpr (GtE a b) = colsInExpr a ++ colsInExpr b
+colsInExpr (LtE a b) = colsInExpr a ++ colsInExpr b
+colsInExpr (NotEq a b) = colsInExpr a ++ colsInExpr b
 colsInExpr (And a b) = colsInExpr a ++ colsInExpr b
 colsInExpr (Or a b) = colsInExpr a ++ colsInExpr b
 colsInExpr (IsNull a) = colsInExpr a
@@ -87,6 +93,9 @@ hasDivision e = case e of
     Gt a b -> both a b
     Lt a b -> both a b
     Eq a b -> both a b
+    GtE a b -> both a b
+    LtE a b -> both a b
+    NotEq a b -> both a b
     And a b -> both a b
     Or a b -> both a b
     _ -> False
@@ -109,6 +118,9 @@ hasSubquery e = case e of
     Gt a b -> both a b
     Lt a b -> both a b
     Eq a b -> both a b
+    GtE a b -> both a b
+    LtE a b -> both a b
+    NotEq a b -> both a b
     And a b -> both a b
     Or a b -> both a b
     IsNull a -> hasSubquery a
@@ -140,6 +152,9 @@ aggregatesIn e = case e of
     Gt a b -> both a b
     Lt a b -> both a b
     Eq a b -> both a b
+    GtE a b -> both a b
+    LtE a b -> both a b
+    NotEq a b -> both a b
     And a b -> both a b
     Or a b -> both a b
     IsNull a -> aggregatesIn a
@@ -165,6 +180,9 @@ bareColumns e = case e of
     Gt a b -> both a b
     Lt a b -> both a b
     Eq a b -> both a b
+    GtE a b -> both a b
+    LtE a b -> both a b
+    NotEq a b -> both a b
     And a b -> both a b
     Or a b -> both a b
     IsNull a -> bareColumns a

@@ -137,6 +137,9 @@ data Operator
     | OpGt
     | OpLt
     | OpEq
+    | OpGtE
+    | OpLtE
+    | OpNe
     | OpAnd
     | OpOr
     deriving (Show, Eq, Enum, Bounded)
@@ -151,6 +154,9 @@ operatorSymbol OpNeg = "-"
 operatorSymbol OpGt = ">"
 operatorSymbol OpLt = "<"
 operatorSymbol OpEq = "="
+operatorSymbol OpGtE = ">="
+operatorSymbol OpLtE = "<="
+operatorSymbol OpNe = "<>"
 operatorSymbol OpAnd = "AND"
 operatorSymbol OpOr = "OR"
 
@@ -164,6 +170,9 @@ operatorOfExpr (Neg _) = Just OpNeg
 operatorOfExpr (Gt _ _) = Just OpGt
 operatorOfExpr (Lt _ _) = Just OpLt
 operatorOfExpr (Eq _ _) = Just OpEq
+operatorOfExpr (GtE _ _) = Just OpGtE
+operatorOfExpr (LtE _ _) = Just OpLtE
+operatorOfExpr (NotEq _ _) = Just OpNe
 operatorOfExpr (And _ _) = Just OpAnd
 operatorOfExpr (Or _ _) = Just OpOr
 operatorOfExpr _ = Nothing
@@ -175,6 +184,9 @@ executeOperator op vs = case (op, vs) of
     (OpGt, [x, y]) -> compareValues (== GT) x y
     (OpLt, [x, y]) -> compareValues (< EQ) x y
     (OpEq, [x, y]) -> compareValues (== EQ) x y
+    (OpGtE, [x, y]) -> compareValues (>= EQ) x y
+    (OpLtE, [x, y]) -> compareValues (<= EQ) x y
+    (OpNe, [x, y]) -> compareValues (/= EQ) x y
     (OpAnd, [x, y]) -> andValues x y
     (OpOr, [x, y]) -> orValues x y
     (_, [x, y]) | Just a <- arithOf op -> evalArith a x y

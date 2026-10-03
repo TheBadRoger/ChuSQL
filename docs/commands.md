@@ -52,6 +52,12 @@ csql -f json -e "SELECT count(*) FROM orders"
 - 投影列可以起别名：`SELECT count(*) AS total FROM orders`，别名就是结果集的列名。`ORDER BY` 仍按来源列解析，要引用派生表的列得写限定名（如 `ORDER BY d.total`）。
 - 鉴权覆盖整棵来源树：查派生表时内层表也要有权限，只有外层引用的表有权限不够。
 
+比较运算符：
+
+- 支持 `=`、`<>`（也可写 `!=`）、`>`、`>=`、`<`、`<=`；`<>` 与 `!=` 是同一个运算符。
+- `>`、`>=`、`<`、`<=` 在列上有索引时会改写成索引范围扫描；`>=` / `<=` 是闭区间，端点值本身也在结果里。
+- 任一操作数为 `NULL` 时比较结果是 `NULL`，`WHERE` 只保留结果为真的行。
+
 公共表表达式：
 
 - `WITH 名字 AS (SELECT …), 另一个 AS (SELECT …) SELECT … FROM 名字` 先定义再引用，名字可以带列清单（`WITH t(who) AS (SELECT name FROM users) …`）。
