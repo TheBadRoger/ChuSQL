@@ -2,6 +2,7 @@
 
 module Main where
 
+import ChuSQL.Core.Engine.Algebra.Cost (rangeRows, selectivityOf)
 import ChuSQL.Core.Engine.Algebra.Eval (evalRelOp, evalRelOpM)
 import ChuSQL.Core.Engine.Algebra.Expr (colsInExpr, evalExpr)
 import ChuSQL.Core.Engine.Algebra.Op (RelOp (..), renderPlan)
@@ -71,7 +72,7 @@ chainA =
         { tableName = "a"
         , tableCols = [("id", TInt), ("name", TStr)]
         , tableRows = [[("id", VInt n), ("name", VStr ("a" ++ show n))] | n <- [1 .. 6]]
-        , tableMeta = Just (TableMeta 6 [("id", 6, False)] ["id"])
+        , tableMeta = Just (TableMeta 6 [("id", 6, False)] [] ["id"])
         }
 
 -- | 连接链测试表 b：4 行，a_id 各不相同
@@ -81,7 +82,7 @@ chainB =
         { tableName = "b"
         , tableCols = [("id", TInt), ("a_id", TInt)]
         , tableRows = [[("id", VInt n), ("a_id", VInt n)] | n <- [1 .. 4]]
-        , tableMeta = Just (TableMeta 4 [("id", 4, False), ("a_id", 4, False)] ["id"])
+        , tableMeta = Just (TableMeta 4 [("id", 4, False), ("a_id", 4, False)] [] ["id"])
         }
 
 -- | 连接链测试表 c：2 行，b_id 各不相同
@@ -91,7 +92,7 @@ chainC =
         { tableName = "c"
         , tableCols = [("id", TInt), ("b_id", TInt)]
         , tableRows = [[("id", VInt n), ("b_id", VInt n)] | n <- [1, 2]]
-        , tableMeta = Just (TableMeta 2 [("id", 2, False), ("b_id", 2, False)] ["id"])
+        , tableMeta = Just (TableMeta 2 [("id", 2, False), ("b_id", 2, False)] [] ["id"])
         }
 
 -- | 三张表组成的连接链测试库
@@ -551,7 +552,7 @@ main = hspec $ do
             executeOperator OpNe [VInt 1, VFloat 1.0] `shouldBe` Right (VBool False)
 
         it "rewrites >= and <= into an inclusive index range" $ do
-            let stat rows distinct indexes = TableMeta rows [(c, d, False) | (c, d) <- distinct] indexes
+            let stat rows distinct indexes = TableMeta rows [(c, d, False) | (c, d) <- distinct] [] indexes
                 dbWith m = [("users", Table "users" [("id", TInt), ("name", TStr)] [] (Just m))]
                 indexed = dbWith (stat 10000 [("id", 10000)] ["id"])
                 low = Filter (GtE (Col "id") (LitInt 2)) (Scan Nothing "users" Nothing)
@@ -1509,6 +1510,44 @@ main = hspec $ do
                     [ [("name", VStr "Carol")]
                     ]
 
+    describe "ChuSQL.Core.Engine.Algebra.Cost (直方图)" $ do
+        it "builds a 16-bucket histogram from the numeric values" $ do
+            let hist = histogramOf [VInt n | n <- [0 .. 99]]
+            fmap histLow hist `shouldBe` Just 0
+            fmap histHigh hist `shouldBe` Just 99
+            fmap (length . histBuckets) hist `shouldBe` Just 16
+            fmap (sum . histBuckets) hist `shouldBe` Just 100
+            -- 非数值与 NULL 不参与；只有一个值都落第 0 桶
+            histogramOf [VStr "a", VNull] `shouldBe` Nothing
+            histogramOf [VInt 5, VNull, VStr "a"] `shouldBe` Just (Histogram 5 5 (1 : replicate 15 0))
+
+        it "estimates a range from the histogram buckets" $ do
+            let hist = Histogram 0 1600 (replicate 16 100)
+                meta = TableMeta 1600 [] [("id", hist)] ["id"]
+                plain = TableMeta 1600 [] [] []
+            rangeRows meta "id" (Just (VInt 0, True)) (Just (VInt 100, True)) `shouldBe` 100
+            rangeRows meta "id" Nothing Nothing `shouldBe` 1600
+            selectivityOf meta "id" (Just (VInt 0, True)) (Just (VInt 100, True)) `shouldBe` Just 0.0625
+            -- 没有直方图退回四分之一
+            rangeRows plain "id" Nothing Nothing `shouldBe` 400
+            selectivityOf plain "id" Nothing Nothing `shouldBe` Nothing
+
+        it "uses the histogram to reject a range that would scan most rows" $ do
+            let buckets = replicate 8 63 ++ replicate 8 62
+                withHist = TableMeta 1000 [("id", 1000, False)] [("id", Histogram 0 1600 buckets)] ["id"]
+                plain = TableMeta 1000 [("id", 1000, False)] [] ["id"]
+                dbWith m = [("users", Table "users" [("id", TInt), ("name", TStr)] [] (Just m))]
+                narrow = Filter (And (GtE (Col "id") (LitInt 10)) (LtE (Col "id") (LitInt 20))) (Scan Nothing "users" Nothing)
+                wide = Filter (Gt (Col "id") (LitInt 0)) (Scan Nothing "users" Nothing)
+            -- 直方图说这个窄范围只命中十几行：改写
+            optimize (dbWith withHist) narrow
+                `shouldBe` Range Nothing "users" "id" (Just (VInt 10, True)) (Just (VInt 20, True))
+            -- 直方图说这条范围覆盖全表：索引不比全表扫便宜，不改写
+            optimize (dbWith withHist) wide `shouldBe` wide
+            -- 没有直方图按四分之一算，仍然改写
+            optimize (dbWith plain) wide
+                `shouldBe` Range Nothing "users" "id" (Just (VInt 0, False)) Nothing
+
     describe "ChuSQL.Core.Engine.Algebra.Optimize" $ do
         it "keeps single-table WHERE results identical" $ do
             sameResultAsUnoptimized "SELECT name FROM users WHERE age > 18"
@@ -1559,7 +1598,7 @@ main = hspec $ do
                 `shouldBe` Right (Just (LitBool False))
 
         it "picks the index only when the statistics make it cheaper" $ do
-            let stat rows distinct indexes = TableMeta rows [(c, d, False) | (c, d) <- distinct] indexes
+            let stat rows distinct indexes = TableMeta rows [(c, d, False) | (c, d) <- distinct] [] indexes
                 dbWith m = [("users", Table "users" [("id", TInt), ("name", TStr)] [] (Just m))]
                 unknown = [("users", Table "users" [("id", TInt), ("name", TStr)] [] Nothing)]
                 point = Filter (Eq (Col "id") (LitInt 1)) (Scan Nothing "users" Nothing)
@@ -2689,7 +2728,7 @@ rowShards width rows
 
 -- | 声明 1000 行的大表
 bigTable :: Table
-bigTable = users {tableName = "big", tableMeta = Just (TableMeta 1000 [("id", 1000, False)] ["id"])}
+bigTable = users {tableName = "big", tableMeta = Just (TableMeta 1000 [("id", 1000, False)] [] ["id"])}
 
 -- | 只装大表的库
 bigDB :: Database

@@ -319,7 +319,7 @@ exprTables expr = case expr of
     -- | 两侧都取表名
     both a b = exprTables a ++ exprTables b
 
--- | 一张表的线上信息（内存实现：没有索引，统计现算）
+-- | 一张表的线上信息（内存实现：没有索引，统计与直方图现算）
 tableInfoOf :: (String, Table) -> TableInfo
 tableInfoOf (name, tbl) =
     TableInfo
@@ -328,10 +328,14 @@ tableInfoOf (name, tbl) =
         , tiRows = length (tableRows tbl)
         , tiIndexes = []
         , tiStats = [(c, distinctOf c, False) | (c, _) <- tableCols tbl]
+        , tiHistograms = [(c, h) | (c, _) <- tableCols tbl, Just h <- [histogramOf (columnValues c)]]
         }
   where
+    -- | 一列的所有值
+    columnValues c = [v | r <- tableRows tbl, Just v <- [lookup c r]]
+
     -- | 一列的不同值个数
-    distinctOf c = length (nub [v | r <- tableRows tbl, Just v <- [lookup c r]])
+    distinctOf c = length (nub (columnValues c))
 
 -- | 本地列类型转线上字符串（和 IPC 那边同一套写法）
 wireType :: Column -> String

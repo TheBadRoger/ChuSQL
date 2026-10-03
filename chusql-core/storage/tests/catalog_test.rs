@@ -83,6 +83,47 @@ fn remove_column_drops_definition_stats_and_index() {
     assert!(c.remove_column("nope", "code").is_err());
 }
 
+/// 直方图随插入累计、随删除递减，值跑出区间就拓宽
+#[test]
+fn stats_track_a_histogram_for_numeric_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.json");
+
+    let mut c = Catalog::load(&path).unwrap();
+    let rows: Vec<Row> = (0..100)
+        .map(|n| row(&[("id", json!(n)), ("name", json!(format!("u{}", n)))]))
+        .collect();
+    c.rebuild_stats("t", &rows);
+
+    let s = c.describe("t").unwrap();
+    let id = s.stats.get("id").unwrap();
+    assert_eq!(id.distinct, 100);
+    assert_eq!(id.lo, Some(0.0));
+    assert_eq!(id.hi, Some(99.0));
+    assert_eq!(id.hist.len(), 16);
+    assert_eq!(id.hist.iter().sum::<u64>(), 100);
+    let name = s.stats.get("name").unwrap();
+    assert!(name.hist.is_empty(), "字符串列不进直方图");
+    assert_eq!(name.lo, None);
+
+    c.record_insert("t", &row(&[("id", json!(1000)), ("name", json!("x"))]));
+    let s = c.describe("t").unwrap();
+    let id = s.stats.get("id").unwrap();
+    assert_eq!(id.lo, Some(0.0));
+    assert_eq!(id.hi, Some(1000.0));
+    assert_eq!(id.hist.iter().sum::<u64>(), 101);
+
+    c.record_delete("t", &[row(&[("id", json!(1000)), ("name", json!("x"))])]);
+    let s = c.describe("t").unwrap();
+    assert_eq!(s.stats.get("id").unwrap().hist.iter().sum::<u64>(), 100);
+
+    c.record_delete("t", &rows);
+    let s = c.describe("t").unwrap();
+    let id = s.stats.get("id").unwrap();
+    assert_eq!(id.lo, None, "删空之后直方图清掉");
+    assert_eq!(id.hist.iter().sum::<u64>(), 0);
+}
+
 /// 老类型名并到新写法，参数保留，未知类型原样
 #[test]
 fn normalize_type_maps_legacy_names() {

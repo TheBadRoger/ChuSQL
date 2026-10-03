@@ -12,6 +12,7 @@ use crate::protocol::{Row, SchemaColumn};
 // 数据字典：记每张表有哪些列、什么类型、多少行、有哪些索引，以及列级统计。
 
 const STATS_DISTINCT_CAP: u64 = 4096;
+const HIST_BUCKETS: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexSchema {
@@ -23,6 +24,12 @@ pub struct ColumnStat {
     pub distinct: u64,
     #[serde(default)]
     pub capped: bool,
+    #[serde(default)]
+    pub lo: Option<f64>,
+    #[serde(default)]
+    pub hi: Option<f64>,
+    #[serde(default)]
+    pub hist: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -152,6 +159,14 @@ impl Catalog {
                 if seen.remove(&fold(name, value_hash(v))) {
                     stat.distinct = stat.distinct.saturating_sub(1);
                 }
+                hist_remove(stat, v);
+            }
+        }
+        if entry.row_count == 0 {
+            for stat in entry.stats.values_mut() {
+                stat.lo = None;
+                stat.hi = None;
+                stat.hist.clear();
             }
         }
     }
@@ -187,6 +202,7 @@ impl Catalog {
                     seen.clear();
                 }
             }
+            hist_add(stat, v);
         }
     }
 
@@ -396,4 +412,64 @@ fn fold(column: &str, value_hash: u64) -> u64 {
     column.hash(&mut h);
     value_hash.hash(&mut h);
     h.finish()
+}
+
+/// 值落在第几个桶；区间退化时都算第 0 桶
+fn hist_index(lo: f64, hi: f64, v: f64) -> usize {
+    if hi <= lo {
+        return 0;
+    }
+    let scaled = ((v - lo) / (hi - lo) * HIST_BUCKETS as f64).floor();
+    scaled.clamp(0.0, (HIST_BUCKETS - 1) as f64) as usize
+}
+
+/// 区间拓宽时把旧桶按中点并进来，只保总量
+fn hist_merge(old: &[u64], old_lo: f64, old_hi: f64, new_lo: f64, new_hi: f64) -> Vec<u64> {
+    let mut out = vec![0u64; HIST_BUCKETS];
+    for (i, count) in old.iter().enumerate() {
+        if *count == 0 {
+            continue;
+        }
+        let mid = if old_hi > old_lo {
+            old_lo + (old_hi - old_lo) * (i as f64 + 0.5) / old.len() as f64
+        } else {
+            old_lo
+        };
+        out[hist_index(new_lo, new_hi, mid)] += *count;
+    }
+    out
+}
+
+/// 把一个值并进直方图；值跑出区间就拓宽区间
+fn hist_add(stat: &mut ColumnStat, v: &serde_json::Value) {
+    let Some(x) = v.as_f64() else { return };
+    match (stat.lo, stat.hi) {
+        (Some(lo), Some(hi)) if stat.hist.len() == HIST_BUCKETS => {
+            if x < lo || x > hi {
+                let (nlo, nhi) = (lo.min(x), hi.max(x));
+                stat.hist = hist_merge(&stat.hist, lo, hi, nlo, nhi);
+                stat.lo = Some(nlo);
+                stat.hi = Some(nhi);
+            }
+            let index = hist_index(stat.lo.unwrap_or(x), stat.hi.unwrap_or(x), x);
+            stat.hist[index] += 1;
+        }
+        _ => {
+            stat.lo = Some(x);
+            stat.hi = Some(x);
+            stat.hist = vec![0u64; HIST_BUCKETS];
+            stat.hist[0] = 1;
+        }
+    }
+}
+
+/// 从直方图里减掉一个值；值在区间外就不动
+fn hist_remove(stat: &mut ColumnStat, v: &serde_json::Value) {
+    let Some(x) = v.as_f64() else { return };
+    let (Some(lo), Some(hi)) = (stat.lo, stat.hi) else { return };
+    if x < lo || x > hi || stat.hist.len() != HIST_BUCKETS {
+        return;
+    }
+    let index = hist_index(lo, hi, x);
+    stat.hist[index] = stat.hist[index].saturating_sub(1);
 }

@@ -1,6 +1,6 @@
 module ChuSQL.Core.Engine.Algebra.JoinOrder (reorderJoins) where
 
-import ChuSQL.Core.Engine.Algebra.Cost (pointRows, rangeRows, tableMetaOf)
+import ChuSQL.Core.Engine.Algebra.Cost (pointRows, rangeRows, selectivityOf, tableMetaOf)
 import ChuSQL.Core.Engine.Algebra.Expr (colsInExpr, hasDivision)
 import ChuSQL.Core.Engine.Algebra.Op (RelOp (..), relOpCols)
 import ChuSQL.Core.Engine.Syntax.AST (Expr (..), JoinKind (..))
@@ -45,7 +45,7 @@ leafRows :: Database -> RelOp -> Maybe Int
 leafRows db op = case op of
     Scan _ t _ -> rowCountOf db t
     Lookup _ t c _ -> pointRows <$> tableMetaOf db t <*> pure c
-    Range _ t _ _ _ -> rangeRows <$> tableMetaOf db t
+    Range _ t c lo hi -> (\m -> rangeRows m c lo hi) <$> tableMetaOf db t
     Filter p x -> scaleRows db p x <$> leafRows db x
     Project _ x -> leafRows db x
     _ -> Nothing
@@ -54,12 +54,20 @@ leafRows db op = case op of
 rowCountOf :: Database -> String -> Maybe Int
 rowCountOf db t = metaRowCount <$> tableMetaOf db t
 
--- | 过滤之后的大致行数：等值看不同值数，其他按四分之一
+-- | 行数估算：等值看不同值数，区间看直方图，其余四分之一
 scaleRows :: Database -> Expr -> RelOp -> Int -> Int
 scaleRows db p x rows = case p of
     Eq (Col k) _ -> case distinctOf db x k of
         Just d | d > 1 -> max 1 (rows `div` d)
         _ -> quarter
+    Gt (Col k) (LitInt v) -> pick k (Just (VInt v, False)) Nothing
+    Gt (Col k) (LitStr v) -> pick k (Just (VStr v, False)) Nothing
+    GtE (Col k) (LitInt v) -> pick k (Just (VInt v, True)) Nothing
+    GtE (Col k) (LitStr v) -> pick k (Just (VStr v, True)) Nothing
+    Lt (Col k) (LitInt v) -> pick k Nothing (Just (VInt v, False))
+    Lt (Col k) (LitStr v) -> pick k Nothing (Just (VStr v, False))
+    LtE (Col k) (LitInt v) -> pick k Nothing (Just (VInt v, True))
+    LtE (Col k) (LitStr v) -> pick k Nothing (Just (VStr v, True))
     Gt _ _ -> quarter
     Lt _ _ -> quarter
     GtE _ _ -> quarter
@@ -70,6 +78,11 @@ scaleRows db p x rows = case p of
     _ -> quarter
   where
     quarter = max 1 (rows `div` 4)
+    pick k lo hi = case leafSource x of
+        Just (alias, t)
+            | Just m <- tableMetaOf db t
+            , Just s <- selectivityOf m (unqualify alias k) lo hi -> max 1 (round (fromIntegral rows * s))
+        _ -> quarter
 
 -- | 叶子对应的别名与表名
 leafSource :: RelOp -> Maybe (Maybe String, String)

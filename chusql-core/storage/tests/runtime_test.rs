@@ -1554,6 +1554,11 @@ fn stats_report_distinct_values() {
     assert!(r.contains(r#""row_count":3"#), "row_count: {}", r);
     assert!(r.contains(r#""name":"age","distinct":2"#), "age has 2 distinct values: {}", r);
     assert!(r.contains(r#""name":"id","distinct":3"#), "id has 3 distinct values: {}", r);
+    assert!(
+        r.contains(r#""name":"age","distinct":2,"capped":false,"lo":30.0,"hi":41.0"#),
+        "age carries a histogram range: {}",
+        r
+    );
 
     send(&mut c, r#"{"method":"delete_keys","table":"stat_t","keys":[1]}"#);
     let r = send(&mut c, r#"{"method":"describe_table","table":"stat_t"}"#);
