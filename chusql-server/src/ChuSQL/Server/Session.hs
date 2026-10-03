@@ -6,6 +6,7 @@ module ChuSQL.Server.Session
     , SessionError (..)
     , engineErrorCode
     , newSession
+    , newSessionWith
     , sessionUser
     , sessionIsAdmin
     , sessionDatabase
@@ -36,7 +37,7 @@ import ChuSQL.Interface.Auth (defaultSessionPolicy, newSessionStore)
 import ChuSQL.Server.Accounts
 import ChuSQL.Server.Backend (Backend (..), StatementResult (..), columnsFromStatement)
 import ChuSQL.Server.Policy (configurePasswordPolicy)
-import ChuSQL.Server.Privileges (PrivilegeCommand, PrivilegeError (..), Privileges, RoleView, authorize, filterTables, listRoleViews, newPrivileges, privilegeCommand, runPrivilegeCommand)
+import ChuSQL.Server.Privileges (PrivilegeCommand, PrivilegeError (..), Privileges, RoleView, affectedAccounts, authorize, filterTables, listRoleViews, newPrivileges, privilegeCommand, runPrivilegeCommand)
 import Control.Exception (IOException, try)
 import Data.Bifunctor (first)
 import Data.Char (isAlpha, isAlphaNum)
@@ -67,6 +68,7 @@ data Session = Session
     , ssPrincipal :: IORef (Maybe Principal)
     , ssSettingsFile :: FilePath
     , ssTransaction :: IORef (Maybe Transaction)
+    , ssChanged :: [Text] -> IO ()
     }
 
 -- | 一条会话里的显式事务：开事务时的快照、事务内改到的状态与保存点栈
@@ -78,7 +80,11 @@ data Transaction = Transaction
 
 -- | 开一个会话：账号与角色服务、配置策略都和 Web 端一致
 newSession :: Backend -> Text -> FilePath -> IO Session
-newSession backend name settingsFile = do
+newSession backend name settingsFile = newSessionWith backend name settingsFile (const (pure ()))
+
+-- | 开会话并接上账号变更通知回调
+newSessionWith :: Backend -> Text -> FilePath -> ([Text] -> IO ()) -> IO Session
+newSessionWith backend name settingsFile changed = do
     sessions <- newSessionStore getCurrentTime defaultSessionPolicy
     accountsService <- newAccounts backend sessions name
     privileges <- newPrivileges backend
@@ -87,7 +93,7 @@ newSession backend name settingsFile = do
     current <- newIORef ""
     principal <- newIORef Nothing
     transaction <- newIORef Nothing
-    pure (Session backend accountsService privileges current principal settingsFile transaction)
+    pure (Session backend accountsService privileges current principal settingsFile transaction changed)
 
 -- | 当前生效的口令策略（只有管理员能看）
 policyOf :: Session -> IO (Either Text PasswordPolicy)
@@ -529,7 +535,7 @@ currentBackend session = do
     name <- readIORef (ssCurrent session)
     pure (beWithDatabase (ssBackend session) (T.unpack name))
 
--- | 账号语句走账号服务，普通账号一律拒绝
+-- | 账号语句走账号服务，普通账号一律拒绝；改完通知受影响账号
 runAccount :: Session -> AccountCommand -> IO (Either SessionError QueryResult)
 runAccount session command = do
     who <- readIORef (ssPrincipal session)
@@ -537,9 +543,20 @@ runAccount session command = do
         Nothing -> pure (Left (SessionError "unauthorized" "sign in first"))
         Just principal -> do
             result <- runAccountCommand (ssAccounts session) principal command
-            pure (either (Left . accountErrorOf) (const (Right (emptyResult Nothing))) result)
+            case result of
+                Left err -> pure (Left (accountErrorOf err))
+                Right () -> do
+                    notifyChanged session (accountCommandUsers command)
+                    pure (Right (emptyResult Nothing))
 
--- | 角色语句走权限服务，普通账号拒绝
+-- | 一条账号命令影响的账号
+accountCommandUsers :: AccountCommand -> [Text]
+accountCommandUsers command = case command of
+    CreateAccount _ _ -> []
+    ResetAccountPassword name _ -> [name]
+    DropAccount name -> [name]
+
+-- | 角色语句走权限服务，普通账号拒绝；改完通知受影响账号
 runPrivilege :: Session -> PrivilegeCommand -> IO (Either SessionError QueryResult)
 runPrivilege session command = do
     who <- readIORef (ssPrincipal session)
@@ -547,8 +564,18 @@ runPrivilege session command = do
         Nothing -> pure (Left (SessionError "unauthorized" "sign in first"))
         Just principal -> do
             database <- readIORef (ssCurrent session)
+            -- 受影响账号要趁命令落地之前算：删角色之后成员就查不到了
+            affected <- affectedAccounts (ssPrivileges session) command
             result <- runPrivilegeCommand (ssPrivileges session) principal database command
-            pure (either (Left . privilegeErrorOf) (const (Right (emptyResult Nothing))) result)
+            case result of
+                Left err -> pure (Left (privilegeErrorOf err))
+                Right () -> do
+                    notifyChanged session affected
+                    pure (Right (emptyResult Nothing))
+
+-- | 通知变更：把受影响的账号交给会话的变更钩子
+notifyChanged :: Session -> [Text] -> IO ()
+notifyChanged session names = ssChanged session (filter (not . T.null) names)
 
 -- | 账号错误转成会话错误
 accountErrorOf :: AccountError -> SessionError

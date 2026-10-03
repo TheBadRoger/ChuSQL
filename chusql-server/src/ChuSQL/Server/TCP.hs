@@ -5,6 +5,8 @@ module ChuSQL.Server.TCP (
     defaultServerConfig,
     loadServerConfigAt,
     ServerEnv (..),
+    LiveConnections,
+    newLiveConnections,
     newServerEnv,
     ServerHandle (..),
     startServer,
@@ -17,13 +19,15 @@ import ChuSQL.Interface.Protocol (ClientRequest (..), ServerResponse (..), decod
 import ChuSQL.Interface.RateLimit (RateLimiter, rateLimitBlock, rateLimitClear, rateLimitRecord)
 import qualified ChuSQL.Core.Engine.Error as E
 import ChuSQL.Server.Backend (Backend (..))
-import ChuSQL.Server.Session (QueryResult (..), Session, SessionError (..), accounts, authenticateSessionCoded, catalog, databases, newSession, policyOf, reloadPolicy, roleViews, runStatementCoded, sessionIsAdmin, sessionUser)
+import ChuSQL.Server.Session (QueryResult (..), Session, SessionError (..), accounts, authenticateSessionCoded, catalog, databases, newSessionWith, policyOf, reloadPolicy, roleViews, runStatementCoded, sessionIsAdmin, sessionUser)
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar)
-import Control.Exception (IOException, try)
-import Control.Monad (void)
+import Control.Exception (IOException, finally, try)
+import Control.Monad (filterM, void)
 import qualified Data.ByteString.Char8 as BSC
 import qualified Data.ByteString.Lazy.Char8 as BLC
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -45,6 +49,8 @@ import Network.Socket (
     getSocketName,
     listen,
     setSocketOption,
+    shutdown,
+    ShutdownCmd (ShutdownBoth),
     socket,
     socketToHandle,
   )
@@ -52,6 +58,41 @@ import System.IO (BufferMode (LineBuffering), IOMode (ReadWriteMode), hClose, hF
 import System.IO.Error (isEOFError)
 
 -- TCP 服务器：监听端口，一连接一会话，按一行一 JSON 收发协议消息。
+
+-- 在线连接与服务器环境
+
+-- | 在线连接登记：账号名加一个「关掉这条连接」的动作
+data LiveConnections = LiveConnections
+    { lcNext :: IORef Int
+    , lcLive :: MVar (Map.Map Int (IORef (Maybe Text), IO ()))
+    }
+
+-- | 建一张空的在线连接登记表
+newLiveConnections :: IO LiveConnections
+newLiveConnections = LiveConnections <$> newIORef 0 <*> newMVar Map.empty
+
+-- | 登记一条连接，返回注销动作
+registerConnection :: LiveConnections -> IORef (Maybe Text) -> IO () -> IO (IO ())
+registerConnection live who kick = do
+    n <- atomicModifyIORef' (lcNext live) (\i -> (i + 1, i))
+    modifyMVar_ (lcLive live) (pure . Map.insert n (who, kick))
+    pure (modifyMVar_ (lcLive live) (pure . Map.delete n))
+
+-- | 断开这些账号的在线连接，返回断开的条数
+dropConnectionsOf :: LiveConnections -> [Text] -> IO Int
+dropConnectionsOf live names = do
+    let wanted = map T.toLower (filter (not . T.null) names)
+    entries <- readMVar (lcLive live)
+    hits <- filterM (isOf wanted) (Map.elems entries)
+    mapM_ (tryKick . snd) hits
+    pure (length hits)
+  where
+    -- | 这条连接登录的账号在名单里吗
+    isOf wanted (who, _) = do
+        current <- readIORef who
+        pure (maybe False (\name -> T.toLower name `elem` wanted) current)
+    -- | 踢人失败不当错误：对端可能已经自己走了
+    tryKick kick = void (try kick :: IO (Either IOException ()))
 
 -- 服务器
 
@@ -61,12 +102,14 @@ data ServerEnv = ServerEnv
     , srvSettingsFile :: FilePath
     , srvConfig :: ServerConfig
     , srvLimiter :: RateLimiter
+    , srvLive :: LiveConnections
     }
 
 -- | 组装服务器环境：每个连接再各开一个会话
 newServerEnv :: Backend -> Text -> FilePath -> ServerConfig -> RateLimiter -> IO ServerEnv
-newServerEnv backend rootName settingsFile config limiter =
-    pure (ServerEnv backend rootName settingsFile config limiter)
+newServerEnv backend rootName settingsFile config limiter = do
+    live <- newLiveConnections
+    pure (ServerEnv backend rootName settingsFile config limiter live)
 
 data ServerHandle = ServerHandle
     { shPort :: Int
@@ -148,31 +191,48 @@ reportConnection env conn = do
         Left err -> hPutStrLn stderr ("connection failed: " ++ show err)
         Right () -> pure ()
 
+-- | 一条连接上跨请求的状态：登录账号、已被断开与注销动作
+data Connection = Connection
+    { cnWho :: IORef (Maybe Text)
+    , cnDropped :: IORef Bool
+    }
+
 -- | 一个连接一个会话：一行一条 JSON，读到 EOF 就收工
 serveConnection :: ServerEnv -> Socket -> IO ()
 serveConnection env conn = do
     h <- socketToHandle conn ReadWriteMode
     hSetBuffering h LineBuffering
     hSetNewlineMode h noNewlineTranslation
-    session <- newSession (srvBackend env) (srvRootName env) (srvSettingsFile env)
-    outcome <- try (loop h session) :: IO (Either IOException ())
+    who <- newIORef Nothing
+    dropped <- newIORef False
+    let kick = do
+            writeIORef dropped True
+            void (try (shutdown conn ShutdownBoth) :: IO (Either IOException ()))
+    unregister <- registerConnection (srvLive env) who kick
+    let connection = Connection who dropped
+    session <- newSessionWith (srvBackend env) (srvRootName env) (srvSettingsFile env) (\names -> void (dropConnectionsOf (srvLive env) names))
+    outcome <- try (loop h session connection `finally` unregister) :: IO (Either IOException ())
     case outcome of
         Left err | not (isEOFError err) -> hPutStrLn stderr ("connection error: " ++ show err)
         _ -> pure ()
     void (try (hClose h) :: IO (Either IOException ()))
   where
     -- | 逐行读请求并应答
-    loop h session = do
+    loop h session connection = do
         line <- BSC.hGetLine h
         let cleaned = BSC.dropWhileEnd (== '\r') line
         if BSC.length cleaned > scMaxMessage (srvConfig env)
-            then send h (RespError "too_large" "request line too large") >> loop h session
+            then send h (RespError "too_large" "request line too large") >> loop h session connection
             else case decodeRequest cleaned of
-                Left message -> send h (RespError "bad_request" message) >> loop h session
+                Left message -> send h (RespError "bad_request" message) >> loop h session connection
                 Right request -> do
-                    (response, keepGoing) <- dispatch env session request
-                    send h response
-                    if keepGoing then loop h session else pure ()
+                    expired <- readIORef (cnDropped connection)
+                    if expired
+                        then send h (RespError "unauthorized" "session was dropped by an account change")
+                        else do
+                            (response, keepGoing) <- dispatch env session connection request
+                            send h response
+                            if keepGoing then loop h session connection else pure ()
     -- | 发一条响应并冲缓冲
     send h response = do
         BLC.hPutStr h (encodeResponse response)
@@ -180,13 +240,16 @@ serveConnection env conn = do
         hFlush h
 
 -- | 一条请求一条响应，quit 后停连接
-dispatch :: ServerEnv -> Session -> ClientRequest -> IO (ServerResponse, Bool)
-dispatch env session request = case request of
+dispatch :: ServerEnv -> Session -> Connection -> ClientRequest -> IO (ServerResponse, Bool)
+dispatch env session connection request = case request of
     ReqHello version
         | version == protocolVersion -> pure (RespHello protocolVersion, True)
         | otherwise -> pure (RespError "bad_request" ("unsupported protocol version: " <> tshow version), True)
     ReqLogin user password -> do
         response <- login env session user password
+        case response of
+            RespLogin who _ -> writeIORef (cnWho connection) (Just who)
+            _ -> pure ()
         pure (response, True)
     ReqQuery sql -> do
         who <- sessionUser session

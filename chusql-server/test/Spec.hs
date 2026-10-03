@@ -23,6 +23,7 @@ import ChuSQL.Server.Privileges (
     PrivilegeCommand (..),
     PrivilegeError (..),
     Privileges,
+    affectedAccounts,
     authorize,
     listRoleViews,
     newPrivileges,
@@ -480,6 +481,67 @@ tcpServerSpec = do
                         blocked <- tcpQuery other "select * from users"
                         asText (at "code" blocked) `shouldBe` "unauthorized"
 
+    describe "TCP server: account changes drop live sessions" $ do
+        it "disconnects a member whose role was revoked" $
+            withTcpServer defaultServerConfig $ \_ handle ->
+                withConnection handle $ \admin -> do
+                    _ <- tcpLogin admin "admin" "s3cret"
+                    _ <- tcpQuery admin "create user bob identified by 'bob-password-1'"
+                    _ <- tcpQuery admin "create role reader"
+                    _ <- tcpQuery admin "use test"
+                    _ <- tcpQuery admin "grant select on users to reader"
+                    _ <- tcpQuery admin "grant reader to bob"
+                    withConnection handle $ \bob -> do
+                        _ <- tcpLogin bob "bob" "bob-password-1"
+                        _ <- tcpQuery bob "use test"
+                        allowed <- tcpQuery bob "select name from users"
+                        asText (at "status" allowed) `shouldBe` "result"
+                        _ <- tcpQuery admin "revoke reader from bob"
+                        tcpClosed bob
+        it "disconnects every member of a role that was dropped" $
+            withTcpServer defaultServerConfig $ \_ handle ->
+                withConnection handle $ \admin -> do
+                    _ <- tcpLogin admin "admin" "s3cret"
+                    _ <- tcpQuery admin "create user bob identified by 'bob-password-1'"
+                    _ <- tcpQuery admin "create role reader"
+                    _ <- tcpQuery admin "grant reader to bob"
+                    withConnection handle $ \bob -> do
+                        _ <- tcpLogin bob "bob" "bob-password-1"
+                        _ <- tcpQuery admin "drop role reader"
+                        tcpClosed bob
+        it "disconnects an account whose password was reset" $
+            withTcpServer defaultServerConfig $ \_ handle ->
+                withConnection handle $ \admin -> do
+                    _ <- tcpLogin admin "admin" "s3cret"
+                    _ <- tcpQuery admin "create user bob identified by 'bob-password-1'"
+                    withConnection handle $ \bob -> do
+                        _ <- tcpLogin bob "bob" "bob-password-1"
+                        _ <- tcpQuery admin "alter user bob identified by 'bob-password-2'"
+                        tcpClosed bob
+                    withConnection handle $ \again -> do
+                        relogin <- tcpLogin again "bob" "bob-password-2"
+                        asText (at "status" relogin) `shouldBe` "ok"
+        it "disconnects an account that was dropped" $
+            withTcpServer defaultServerConfig $ \_ handle ->
+                withConnection handle $ \admin -> do
+                    _ <- tcpLogin admin "admin" "s3cret"
+                    _ <- tcpQuery admin "create user bob identified by 'bob-password-1'"
+                    withConnection handle $ \bob -> do
+                        _ <- tcpLogin bob "bob" "bob-password-1"
+                        _ <- tcpQuery admin "drop user bob"
+                        tcpClosed bob
+        it "leaves the connections of untouched accounts alone" $
+            withTcpServer defaultServerConfig $ \_ handle ->
+                withConnection handle $ \admin -> do
+                    _ <- tcpLogin admin "admin" "s3cret"
+                    _ <- tcpQuery admin "create user bob identified by 'bob-password-1'"
+                    withConnection handle $ \bob -> do
+                        _ <- tcpLogin bob "bob" "bob-password-1"
+                        _ <- tcpQuery admin "create user carol identified by 'carol-password-1'"
+                        _ <- tcpQuery admin "alter user carol identified by 'carol-password-2'"
+                        still <- tcpQuery bob "use test"
+                        asText (at "status" still) `shouldBe` "result"
+
 -- 权限服务夹具：内存后端上的系统库视角
 
 -- | 一个普通账号
@@ -694,6 +756,17 @@ privilegeSpec = describe "server privileges" $ do
             `shouldReturn` Right ()
         authorizeSql service (Ordinary testAccount) "SELECT name FROM users WHERE id > ANY (SELECT id FROM orders)"
             `shouldReturn` Left (PrivilegeError "forbidden" "permission denied: SELECT ON orders")
+
+    it "lists the accounts a role change touches, members included" $ withPrivileges $ \service root -> do
+        _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
+        _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "inner")
+        _ <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "inner" ["reader"])
+        _ <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "reader" ["alice"])
+        directly <- affectedAccounts service (RevokeRoleCommand "inner" ["bob"])
+        directly `shouldMatchList` ["inner", "bob", "reader", "alice"]
+        dropped <- affectedAccounts service (DropRoleCommand "inner")
+        dropped `shouldMatchList` ["inner", "reader", "alice"]
+        affectedAccounts service (CreateRoleCommand "other") `shouldReturn` []
 
     it "keeps the role tables on the real storage" $ withIpcStorage $ do
         base <- ipcBackend

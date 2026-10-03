@@ -7,6 +7,7 @@ module ChuSQL.Server.Privileges (
     PrivilegeError (..),
     Privileges,
     RoleView (..),
+    affectedAccounts,
     authorize,
     authorizeTables,
     filterTables,
@@ -110,6 +111,33 @@ runPrivilegeCommand service principal database command
         GrantPrivilegesCommand _ object _ _ -> T.strip object /= "*"
         RevokePrivilegesCommand _ object _ -> T.strip object /= "*"
         _ -> False
+
+-- | 一条命令会影响的账号：角色连它的成员一起展开，账号名原样留下
+affectedAccounts :: Privileges -> PrivilegeCommand -> IO [Text]
+affectedAccounts service command = do
+    known <- roleNames service
+    case known of
+        Left _ -> pure (direct command)
+        Right roles -> walk roles [] (direct command)
+  where
+    -- | 命令直接点到的名字
+    direct cmd = case cmd of
+        CreateRoleCommand _ -> []
+        DropRoleCommand role -> [role]
+        GrantPrivilegesCommand _ _ role _ -> [role]
+        RevokePrivilegesCommand _ _ role -> [role]
+        GrantRoleCommand _ members -> members
+        RevokeRoleCommand _ members -> members
+    -- | 是角色就接着往下走它的成员，走过的名字不再走第二遍
+    walk roles seen [] = pure (reverse seen)
+    walk roles seen (name : rest)
+        | name `elem` seen = walk roles seen rest
+        | normalizeRole name `elem` roles = do
+            members <- membersOfRole service name
+            case members of
+                Left _ -> walk roles (name : seen) rest
+                Right found -> walk roles (name : seen) (found ++ rest)
+        | otherwise = walk roles (name : seen) rest
 
 -- | 语句鉴权：管理员全通，普通身份按需查
 authorize :: Privileges -> Principal -> Text -> Statement -> IO (Either PrivilegeError ())

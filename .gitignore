@@ -41,6 +41,9 @@ chusql-core/storage/data/
 # 一键启动脚本的默认数据目录与日志，不入库
 localdata/
 
+# 门禁运行时目录：脚本与 README 入库，临时目录与日志不入库
+gate-check/tmp/
+
 # 本机打出来的发行包（scripts/package.sh / package.ps1 的产物），不入库
 releases/
 
