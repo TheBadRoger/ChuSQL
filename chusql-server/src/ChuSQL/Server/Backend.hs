@@ -6,7 +6,6 @@ module ChuSQL.Server.Backend (
     columnsFromStatement,
     currentStamp,
     exprTables,
-    inDatabase,
     internalTable,
     grantsTable,
     ipcBackend,
@@ -23,20 +22,23 @@ module ChuSQL.Server.Backend (
 import ChuSQL.Core.Engine (runStatement, runStatementM)
 import ChuSQL.Core.Model
 import ChuSQL.Core.Engine.Semantic (prepare)
-import ChuSQL.Core.Engine.Storage (MonadStorage (schema))
+import ChuSQL.Core.Engine.Storage (MonadStorage (schema, snapshot))
 import ChuSQL.Core.Engine.Storage.IPC (
     Account (..),
+    Env,
     IPCStorage (..),
     Request (..),
     Response (..),
     SchemaColumn (..),
     TableInfo (..),
+    envForDatabase,
     sendRawRequest,
     sendRequest,
  )
 import ChuSQL.Core.Engine.Syntax.AST
 import ChuSQL.Core.Engine.Syntax.Parser (parseStatement)
-import Control.Concurrent.MVar (MVar, modifyMVar, newMVar, readMVar, withMVar)
+import ChuSQL.Core.Protocol (TxnOp (..))
+import Control.Concurrent.MVar (MVar, modifyMVar, readMVar)
 import Data.List (nub)
 import Data.Text (Text)
 import Data.Time (getCurrentTime)
@@ -61,6 +63,10 @@ data Backend = Backend
     , beDatabases :: IO (Either String [String])
     -- | 原样转发一条存储请求
     , beStorage :: A.Value -> IO (Either String A.Value)
+    -- | 取一份整库快照，当事务的起点
+    , beSnapshot :: IO (Either String Database)
+    -- | 事务提交：把一批写操作交给存储层应用
+    , beApplyTransaction :: [TxnOp] -> IO (Either String ())
     }
 
 -- | 按给定列名取列，固定列顺序
@@ -73,36 +79,46 @@ columnsFromStatement db stmt = case prepare db stmt of
 -- | 走本地存储链路的后端
 ipcBackend :: IO Backend
 ipcBackend = do
-    lock <- newMVar ()
     let backend current = Backend
-            { beStatement = \sql -> withMVar lock $ \_ -> runIpc current sql
-            , beCatalog = withMVar lock $ \_ -> do
+            { beStatement = \sql -> runIpc current sql
+            , beCatalog = do
                 response <- sendRequest (ReqInDatabase current ReqListCatalog)
                 pure $ case response of
                     RespCatalog infos -> Right infos
                     RespError err -> Left err
                     _ -> Left "unexpected catalog response"
-            , bePing = withMVar lock $ \_ -> do
+            , bePing = do
                 resp <- sendRequest ReqPing
                 pure (case resp of RespPong -> True; _ -> False)
-            , beAccounts = \req -> withMVar lock $ \_ -> do
+            , beAccounts = \req -> do
                 response <- sendRequest req
                 pure $ case response of
                     RespAccounts accounts -> Right accounts
                     RespError err -> Left err
                     _ -> Left "unexpected account response"
             , beWithDatabase = backend
-            , beDatabases = withMVar lock $ \_ -> do
+            , beDatabases = do
                 response <- sendRequest (ReqDatabase "list_databases" "")
                 pure $ case response of
                     RespTables names -> Right names
                     RespError err -> Left err
                     _ -> Left "unexpected database response"
-            , beStorage = \payload -> withMVar lock $ \_ -> runRaw payload
+            , beStorage = \payload -> runRaw payload
+            , beSnapshot = Right <$> runIPCStorageIn (snapshot :: IPCStorage Database) (sessionEnv current)
+            , beApplyTransaction = \ops -> do
+                response <- sendRequest (ReqInDatabase current (ReqApplyTransaction ops))
+                pure $ case response of
+                    RespOk -> Right ()
+                    RespError err -> Left err
+                    _ -> Left "unexpected transaction response"
             }
     -- 没有默认库：没选库时 current 是空串，任何请求都得先选库
     pure (backend "")
   where
+    -- | 会话的存储环境：库名跟这条连接走
+    sessionEnv :: String -> Env
+    sessionEnv current = envForDatabase (if null current then Nothing else Just current)
+
     -- | 转发一条存储请求并解析响应
     runRaw :: A.Value -> IO (Either String A.Value)
     runRaw payload = do
@@ -113,18 +129,21 @@ ipcBackend = do
                 Left err -> Left ("storage response is not valid JSON: " ++ err)
                 Right value -> Right value
 
-    -- | 走存储链路跑一条语句
+    -- | 走存储链路跑一条语句：表名不再补当前库前缀
+    -- 引擎侧的数据字典按当前库过滤之后键是裸表名，补前缀会让查表落空；
+    -- 库名由 database 字段随请求带走，存储层自己按它分发。
     runIpc :: String -> String -> IO (Either String StatementResult)
-    runIpc current sql = case fmap (inDatabase current) (parseStatement sql) of
+    runIpc current sql = case parseStatement sql of
         Left e -> pure (Left e)
         Right stmt -> do
-            result <- runIPCStorage (runStatementM stmt)
+            let env = sessionEnv current
+            result <- runIPCStorageIn (runStatementM stmt) env
             case result of
                 Left e -> pure (Left e)
                 Right rows -> do
                     cols <- case rows of
                         [] -> do
-                            db <- runIPCStorage (schema :: IPCStorage Database)
+                            db <- runIPCStorageIn (schema :: IPCStorage Database) env
                             pure (columnsFromStatement db stmt)
                         (r : _) -> pure (map fst r)
                     pure (Right (StatementResult cols rows))
@@ -162,6 +181,10 @@ memoryBackendWith trusted name ref =
         , beWithDatabase = withDatabase
         , beDatabases = pure (Right (nub [name, systemDatabaseName]))
         , beStorage = \_ -> pure (Left "storage is not available in this backend")
+        , beSnapshot = Right . scoped <$> readMVar ref
+        , beApplyTransaction = \ops -> modifyMVar ref $ \db -> case applyTransactionMemory ops db of
+            Left err -> pure (db, Left err)
+            Right db' -> pure (db', Right ())
         }
   where
     -- | 按视角过滤库里的表
@@ -185,6 +208,8 @@ unavailableDatabase :: String -> Backend -> Backend
 unavailableDatabase message backend = backend
     { beStatement = \_ -> pure (Left message)
     , beCatalog = pure (Left message)
+    , beSnapshot = pure (Left message)
+    , beApplyTransaction = \_ -> pure (Left message)
     }
 
 -- | 未选库时的视角：只放行不碰表的语句
@@ -196,76 +221,34 @@ noDatabaseBackend backend = backend
             | statementNeedsDatabase stmt -> pure (Left "no database selected")
             | otherwise -> beStatement backend sql
     , beCatalog = pure (Left "no database selected")
+    , beSnapshot = pure (Left "no database selected")
+    , beApplyTransaction = \_ -> pure (Left "no database selected")
     }
 
--- | 给语句里的裸表名补上当前库前缀，子查询里的表名也一起改
-inDatabase :: String -> Statement -> Statement
-inDatabase current = walk
+-- | 把一批事务写操作应用到内存库：先按 id 删，再按追加写
+applyTransactionMemory :: [TxnOp] -> Database -> Either String Database
+applyTransactionMemory ops db = foldl step (Right db) ops
   where
-    -- | 递归改写语句里的表名
-    walk :: Statement -> Statement
-    walk stmt = case stmt of
-        q@Select{} ->
-            q
-                { selectFrom = source (selectFrom q)
-                , selectWhere = fmap expr (selectWhere q)
-                }
-        q@SelectExpr{} ->
-            q
-                { selectItems = [(label, expr e) | (label, e) <- selectItems q]
-                , selectFrom = source (selectFrom q)
-                , selectWhere = fmap expr (selectWhere q)
-                }
-        Insert t cols rows -> Insert (table t) cols (map (map expr) rows)
-        Delete t cond -> Delete (table t) (fmap expr cond)
-        Update t assigns cond -> Update (table t) [(c, expr e) | (c, e) <- assigns] (fmap expr cond)
-        CreateTable t cols -> CreateTable (table t) cols
-        DropTable t -> DropTable (table t)
-        CreateIndex t c -> CreateIndex (table t) c
-        DropIndex t c -> DropIndex (table t) c
-        DropColumn t c -> DropColumn (table t) c
-        AddColumn t def -> AddColumn (table t) def
-        RenameColumn t old new -> RenameColumn (table t) old new
-        AlterColumnType t c ty -> AlterColumnType (table t) c ty
-        AlterColumnDefault t c v -> AlterColumnDefault (table t) c v
-        AlterColumnNull t c b -> AlterColumnNull (table t) c b
-        other -> other
+    step acc op = do
+        current <- acc
+        case op of
+            TxnDelete name keys -> do
+                table <- lookupTable current name
+                pure (put (name, table {tableRows = [r | r <- tableRows table, not (doomed keys r)]}) current)
+            TxnUpsert name rows -> do
+                table <- lookupTable current name
+                pure (put (name, table {tableRows = tableRows table ++ rows}) current)
+            TxnReplace name rows -> do
+                table <- lookupTable current name
+                pure (put (name, table {tableRows = rows}) current)
 
-    -- | 给单个表名补库前缀，已限定或没选库就原样
-    table t | '.' `elem` t || null current = t
-            | otherwise = current ++ "." ++ t
+    -- | 换掉一张表，其余保持原顺序
+    put entry = map (\one@(name, _) -> if name == fst entry then entry else one)
 
-    -- | 改写 FROM 子句
-    source FromUnit = FromUnit
-    source (FromTable a t) = FromTable a (table t)
-    source (FromJoin k l a t e) = FromJoin k (source l) a (table t) (expr e)
-
-    -- | 改写表达式里的子查询
-    expr (ScalarSub sq) = ScalarSub (sub sq)
-    expr (ExistsSub sq neg) = ExistsSub (sub sq) neg
-    expr (InSub a sq neg) = InSub (expr a) (sub sq) neg
-    expr (InList a items neg) = InList (expr a) (map expr items) neg
-    expr (Add a b) = Add (expr a) (expr b)
-    expr (Sub a b) = Sub (expr a) (expr b)
-    expr (Mul a b) = Mul (expr a) (expr b)
-    expr (Div a b) = Div (expr a) (expr b)
-    expr (Neg a) = Neg (expr a)
-    expr (Gt a b) = Gt (expr a) (expr b)
-    expr (Lt a b) = Lt (expr a) (expr b)
-    expr (Eq a b) = Eq (expr a) (expr b)
-    expr (And a b) = And (expr a) (expr b)
-    expr (Or a b) = Or (expr a) (expr b)
-    expr (IsNull a) = IsNull (expr a)
-    expr (IsNotNull a) = IsNotNull (expr a)
-    expr (CountOf a) = CountOf (expr a)
-    expr (SumOf a) = SumOf (expr a)
-    expr (AvgOf a) = AvgOf (expr a)
-    expr (MinOf a) = MinOf (expr a)
-    expr (MaxOf a) = MaxOf (expr a)
-    expr other = other
-
-    -- | 改写一个子查询
-    sub sq = sq {subqueryStatement = walk (subqueryStatement sq)}
+    -- | 这一行要不要删：按行里的 id 列比
+    doomed keys r = case lookup "id" r of
+        Just (VInt k) -> k `elem` keys
+        _ -> False
 
 -- | 语句里出现的表
 statementTables :: Statement -> [Text]

@@ -15,6 +15,9 @@ module ChuSQL.Core.Model
     , colNames
     , colType
     , lookupTable
+    , resolveTable
+    , lastTablePart
+    , deriveQualifier
     , allColumns
     , qualify
     , unqualify
@@ -470,6 +473,32 @@ colType t c = lookup c (tableCols t)
 lookupTable :: Database -> String -> Either String Table
 lookupTable db t = maybe (Left ("unknown table: " ++ t)) Right (lookup t db)
 
+-- | 取表名引用的最后一段
+lastTablePart :: String -> String
+lastTablePart = reverse . takeWhile (/= '.') . reverse
+
+-- | 推导列前缀：有别名用别名，否则取表名末段
+deriveQualifier :: Maybe String -> String -> String
+deriveQualifier (Just a) _ = a
+deriveQualifier Nothing t = lastTablePart t
+
+-- | 按名查表并返回 schema 键：精确、前缀、唯一后缀
+resolveTable :: Database -> String -> Either String (String, Table)
+resolveTable db name = case lookup name db of
+    Just table -> Right (name, table)
+    Nothing
+        | '.' `elem` name, Just table <- lookup bare db -> Right (bare, table)
+        | [(key, table)] <- suffixed -> Right (key, table)
+        | otherwise -> Left (miss suffixed)
+  where
+    -- | 引用里去掉库前缀的那一段
+    bare = lastTablePart name
+    -- | schema 里以这个表名收尾的键：`sales.users` 能推出裸表名引用
+    suffixed = [(key, table) | (key, table) <- db, ('.' : name) `isSuffixOf` key]
+    -- | 一个候选都没有就是查无此表，多于一个就是有歧义
+    miss [] = "unknown table: " ++ name
+    miss _ = "ambiguous table: " ++ name
+
 -- | 通配列名
 allColumns :: String
 allColumns = "*"
@@ -491,5 +520,5 @@ resolveColumn name env = case [(k, v) | (k, v) <- env, matches k] of
     [] -> Left ("unknown column: " ++ name)
     _ -> Left ("ambiguous column: " ++ name)
   where
-    -- | 裸名或带后缀的名称
-    matches k = k == name || ('.' : name) `isSuffixOf` k
+    -- | 裸名、补充了库前缀的写法，或 schema 键自带库前缀的写法
+    matches k = k == name || ('.' : name) `isSuffixOf` k || ('.' : k) `isSuffixOf` name

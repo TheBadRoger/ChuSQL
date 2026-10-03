@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::protocol::{Account, Row, SchemaColumn, USERS_TABLE};
 
-// 预写日志：先记操作并 fsync，再改数据；重启重放残留。
+// 预写日志：先记操作并 fsync，再改数据；重启按 LSN 重放已提交的组。
 
 const OP_INSERT: u8 = 1;
 const OP_REPLACE_ALL: u8 = 2;
@@ -18,6 +18,7 @@ const OP_ACCOUNTS: u8 = 6;
 const OP_REPLACE_SCHEMA: u8 = 7;
 const OP_HIDE_COLUMN: u8 = 8;
 const OP_COMPACT: u8 = 9;
+const OP_COMMIT: u8 = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum WalOp {
@@ -50,6 +51,8 @@ pub enum WalOp {
         columns: Vec<SchemaColumn>,
         rows: Vec<Row>,
     },
+    /// 一组写操作的提交标记；没有标记的组算未提交
+    Commit,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -67,6 +70,13 @@ struct ReplaceSchemaPayload {
 pub struct Wal {
     path: PathBuf,
     handle: Mutex<Option<File>>,
+    next_lsn: Mutex<u64>,
+}
+
+/// 一次扫描的结果：记录与完好字节长度
+pub struct WalScan {
+    pub records: Vec<(u64, WalOp)>,
+    pub good_len: usize,
 }
 
 impl Wal {
@@ -75,12 +85,18 @@ impl Wal {
         Wal {
             path: path.as_ref().to_path_buf(),
             handle: Mutex::new(None),
+            next_lsn: Mutex::new(0),
         }
     }
 
     /// 日志文件路径
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// 检查点文件路径
+    pub fn checkpoint_path(&self) -> PathBuf {
+        self.path.with_extension("checkpoint")
     }
 
     /// 拿常驻句柄（没有就开一个）
@@ -99,6 +115,15 @@ impl Wal {
         f(slot.as_mut().expect("just opened"))
     }
 
+    /// 把一段记录写到文件尾
+    fn write_at_end(&self, bytes: &[u8]) -> io::Result<()> {
+        self.with_handle(|f| {
+            f.seek(SeekFrom::End(0))?;
+            f.write_all(bytes)?;
+            f.sync_data()
+        })
+    }
+
     /// 截断到空并落盘
     pub fn clear(&self) -> io::Result<()> {
         self.with_handle(|f| {
@@ -112,34 +137,136 @@ impl Wal {
         self.with_handle(truncate)
     }
 
-    /// 追加一条并 fsync
-    pub fn append(&self, op: &WalOp) -> io::Result<()> {
-        let bytes = encode(op)?;
+    /// 截到指定长度（去掉撕裂的尾巴）
+    pub fn truncate_to(&self, len: usize) -> io::Result<()> {
         self.with_handle(|f| {
-            f.write_all(&bytes)?;
+            f.set_len(len as u64)?;
+            f.seek(SeekFrom::Start(0))?;
             f.sync_data()
         })
     }
 
-    /// 读当前 WAL；空则 None
+    /// 追加一条并 fsync
+    pub fn append(&self, op: &WalOp) -> io::Result<()> {
+        let bytes = self.encode_next(op)?;
+        self.write_at_end(&bytes)
+    }
+
+    /// 追加一组操作与提交标记，返回提交 LSN
+    pub fn append_group(&self, ops: &[WalOp]) -> io::Result<u64> {
+        let mut frames = Vec::new();
+        for op in ops {
+            frames.extend_from_slice(&self.encode_next(op)?);
+        }
+        let commit_lsn = self.take_lsn()?;
+        frames.extend_from_slice(&encode(&WalOp::Commit, commit_lsn)?);
+        self.write_at_end(&frames)?;
+        Ok(commit_lsn)
+    }
+
+    /// 读当前 WAL 的第一条操作；空则 None
     pub fn read(&self) -> io::Result<Option<WalOp>> {
+        let scan = self.read_all()?;
+        Ok(scan.records.into_iter().find_map(|(_, op)| {
+            if op == WalOp::Commit {
+                None
+            } else {
+                Some(op)
+            }
+        }))
+    }
+
+    /// 读全部记录，撕裂或损坏的尾巴按长度截断
+    pub fn read_all(&self) -> io::Result<WalScan> {
         if !self.path.exists() {
-            return Ok(None);
+            return Ok(WalScan {
+                records: Vec::new(),
+                good_len: 0,
+            });
         }
         let mut f = File::open(&self.path)?;
         let mut buf = Vec::new();
         f.read_to_end(&mut buf)?;
-        if buf.is_empty() {
+        let mut records = Vec::new();
+        let mut offset = 0usize;
+        while offset + 4 <= buf.len() {
+            let body_len =
+                u32::from_le_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]])
+                    as usize;
+            let end = offset + 4 + body_len;
+            if end > buf.len() {
+                break;
+            }
+            match decode_body(&buf[offset + 4..end]) {
+                Ok(record) => {
+                    records.push(record);
+                    offset = end;
+                }
+                Err(_) => break,
+            }
+        }
+        Ok(WalScan {
+            records,
+            good_len: offset,
+        })
+    }
+
+    /// 记录检查点：到此为止的 LSN 都已落盘
+    pub fn write_checkpoint(&self, lsn: u64) -> io::Result<()> {
+        let mut f = File::create(self.checkpoint_path())?;
+        f.write_all(&lsn.to_le_bytes())?;
+        f.sync_all()
+    }
+
+    /// 读检查点 LSN
+    pub fn read_checkpoint(&self) -> io::Result<Option<u64>> {
+        let path = self.checkpoint_path();
+        if !path.exists() {
             return Ok(None);
         }
-        match decode(&buf) {
-            Ok(opt) => Ok(opt),
-            Err(e) => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("corrupt WAL: {}", e),
-            )),
+        let bytes = std::fs::read(&path)?;
+        if bytes.len() < 8 {
+            return Ok(None);
+        }
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&bytes[..8]);
+        Ok(Some(u64::from_le_bytes(raw)))
+    }
+
+    /// 取下一条 LSN
+    fn take_lsn(&self) -> io::Result<u64> {
+        let mut slot = self.next_lsn.lock().unwrap();
+        if *slot == 0 {
+            let last = self.read_all()?.records.last().map(|(lsn, _)| *lsn).unwrap_or(0);
+            *slot = last + 1;
+        }
+        let lsn = *slot;
+        *slot += 1;
+        Ok(lsn)
+    }
+
+    /// 编一条带新 LSN 的记录
+    fn encode_next(&self, op: &WalOp) -> io::Result<Vec<u8>> {
+        let lsn = self.take_lsn()?;
+        encode(op, lsn)
+    }
+}
+
+/// 已提交的记录：提交标记前的整组；无标记的单条按旧格式算已提交
+pub fn committed_ops(records: &[(u64, WalOp)]) -> Vec<(u64, WalOp)> {
+    let mut out = Vec::new();
+    let mut pending: Vec<(u64, WalOp)> = Vec::new();
+    for (lsn, op) in records {
+        if *op == WalOp::Commit {
+            out.append(&mut pending);
+        } else {
+            pending.push((*lsn, op.clone()));
         }
     }
+    if pending.len() == 1 {
+        out.append(&mut pending);
+    }
+    out
 }
 
 /// 清空文件并把读写位置归零
@@ -150,7 +277,7 @@ fn truncate(f: &mut File) -> io::Result<()> {
 }
 
 /// 把操作编成字节
-fn encode(op: &WalOp) -> io::Result<Vec<u8>> {
+fn encode(op: &WalOp, lsn: u64) -> io::Result<Vec<u8>> {
     let (op_type, table, payload) = match op {
         WalOp::HideColumn { table, column } => (OP_HIDE_COLUMN, table.clone(),
             serde_json::to_vec(column).map_err(io::Error::other)?),
@@ -192,11 +319,11 @@ fn encode(op: &WalOp) -> io::Result<Vec<u8>> {
             .map_err(io::Error::other)?;
             (OP_REPLACE_SCHEMA, table.clone(), p)
         }
+        WalOp::Commit => (OP_COMMIT, String::new(), Vec::new()),
     };
 
     let table_bytes = table.as_bytes();
 
-    let lsn: u64 = 1;
     let mut body = Vec::with_capacity(8 + 1 + 2 + table_bytes.len() + payload.len());
     body.extend_from_slice(&lsn.to_le_bytes());
     body.push(op_type);
@@ -210,20 +337,12 @@ fn encode(op: &WalOp) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// 从字节解回操作
-fn decode(buf: &[u8]) -> Result<Option<WalOp>, String> {
-    if buf.len() < 4 {
-        return Ok(None);
-    }
-    let body_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-    if buf.len() < 4 + body_len {
-        return Ok(None);
-    }
-    let body = &buf[4..4 + body_len];
+/// 从一个帧体解出 LSN 与操作
+fn decode_body(body: &[u8]) -> Result<(u64, WalOp), String> {
     if body.len() < 8 + 1 + 2 {
         return Err("body too short".into());
     }
-    let _lsn = u64::from_le_bytes([
+    let lsn = u64::from_le_bytes([
         body[0], body[1], body[2], body[3], body[4], body[5], body[6], body[7],
     ]);
     let op_type = body[8];
@@ -236,6 +355,7 @@ fn decode(buf: &[u8]) -> Result<Option<WalOp>, String> {
     let payload = &body[11 + table_len..];
 
     let op = match op_type {
+        OP_COMMIT => WalOp::Commit,
         OP_HIDE_COLUMN => {
             let column = serde_json::from_slice(payload)
                 .map_err(|e| format!("bad hide_column payload: {e}"))?;
@@ -292,5 +412,5 @@ fn decode(buf: &[u8]) -> Result<Option<WalOp>, String> {
         }
         other => return Err(format!("unknown op type: {}", other)),
     };
-    Ok(Some(op))
+    Ok((lsn, op))
 }

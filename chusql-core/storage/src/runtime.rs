@@ -8,9 +8,10 @@ use crate::config::{self, Config, Loaded};
 use crate::heap::{scalar_int, HeapTable};
 use crate::log;
 use crate::protocol::{
-    reserved_table, Account, ColumnStatWire, IndexWire, Request, Response, Row, SchemaColumn, TableSchemaWire, USERS_TABLE,
+    reserved_table, Account, ColumnStatWire, IndexWire, Request, Response, Row, SchemaColumn, StorageOp,
+    TableSchemaWire, USERS_TABLE,
 };
-use crate::wal::{Wal, WalOp};
+use crate::wal::{committed_ops, Wal, WalOp};
 use crate::{log_debug, log_error, log_info, log_warn};
 
 // 进程内存储运行时：Haskell 侧经 ffi.rs 调进来。
@@ -196,6 +197,7 @@ impl Server {
     /// 把一条 WAL 操作落到磁盘
     fn apply_op(&self, op: &WalOp) -> std::io::Result<()> {
         match op {
+            WalOp::Commit => Ok(()),
             WalOp::HideColumn { table, column } => {
                 let mut c = self.catalog.lock().map_err(|_| std::io::Error::other("catalog lock poisoned"))?;
                 c.remove_column(table, column)?;
@@ -311,52 +313,119 @@ impl Server {
         if self.recovery_required.load(Ordering::Acquire) {
             return Err(std::io::Error::other("storage recovery required"));
         }
-        {
-            let c = self.catalog.lock().map_err(|_| std::io::Error::other("catalog lock poisoned"))?;
-            let validate = |table: &str, rows: &[Row]| -> std::io::Result<()> {
-                let Some(schema) = c.describe(table) else { return Ok(()); };
-                if let Some(name) = rows.iter().flat_map(|r| r.keys()).find(|k| schema.dropped_columns.contains(*k)) {
-                    return Err(std::io::Error::other(format!("unknown column: {name}")));
-                }
-                Ok(())
-            };
-            match op {
-                WalOp::Insert { table, row } => validate(table, std::slice::from_ref(row))?,
-                WalOp::InsertBatch { table, rows } | WalOp::ReplaceAll { table, rows } => validate(table, rows)?,
-                WalOp::HideColumn { table, column }
-                    if !c.describe(table).is_some_and(|s| s.columns.iter().any(|col| &col.name == column)) =>
-                {
-                    return Err(std::io::Error::other(format!("unknown column: {column}")));
-                }
-                _ => {}
+        self.validate_op(op)?;
+        self.group_via_wal(std::slice::from_ref(op))
+    }
+
+    /// 校验一条操作：命中被删的列就拒绝
+    fn validate_op(&self, op: &WalOp) -> std::io::Result<()> {
+        let c = self.catalog.lock().map_err(|_| std::io::Error::other("catalog lock poisoned"))?;
+        let validate = |table: &str, rows: &[Row]| -> std::io::Result<()> {
+            let Some(schema) = c.describe(table) else { return Ok(()); };
+            if let Some(name) = rows.iter().flat_map(|r| r.keys()).find(|k| schema.dropped_columns.contains(*k)) {
+                return Err(std::io::Error::other(format!("unknown column: {name}")));
             }
+            Ok(())
+        };
+        match op {
+            WalOp::Insert { table, row } => validate(table, std::slice::from_ref(row))?,
+            WalOp::InsertBatch { table, rows } | WalOp::ReplaceAll { table, rows } => validate(table, rows)?,
+            WalOp::HideColumn { table, column }
+                if !c.describe(table).is_some_and(|s| s.columns.iter().any(|col| &col.name == column)) =>
+            {
+                return Err(std::io::Error::other(format!("unknown column: {column}")));
+            }
+            _ => {}
         }
+        Ok(())
+    }
+
+    /// 事务提交：一组写操作加一个提交标记，一次落盘
+    ///
+    /// 组里每条都过 `validate_op`，跟单条写一致；调用方 `dispatch` 已经持有
+    /// `gate.write`，因此整批对外原子可见。崩在提交标记之前，这组记录在恢复
+    /// 时整组丢弃；崩在标记之后，逐条按「是否已生效」补写。
+    fn apply_transaction(&self, ops: &[StorageOp]) -> std::io::Result<()> {
+        let _guard = self.write_lock.lock().unwrap();
+        if self.recovery_required.load(Ordering::Acquire) {
+            return Err(std::io::Error::other("storage recovery required"));
+        }
+        let mut wal_ops = Vec::with_capacity(ops.len());
+        for op in ops {
+            let table = match op {
+                StorageOp::Upsert { table, .. }
+                | StorageOp::Delete { table, .. }
+                | StorageOp::Replace { table, .. } => table,
+            };
+            if reserved_table(table) {
+                return Err(std::io::Error::other("reserved system table"));
+            }
+            if table.is_empty() || !table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                return Err(std::io::Error::other("invalid table name"));
+            }
+            let wal_op = match op {
+                StorageOp::Upsert { table, rows } => WalOp::InsertBatch {
+                    table: table.clone(),
+                    rows: rows.clone(),
+                },
+                StorageOp::Delete { table, ids } => WalOp::DeleteKeys {
+                    table: table.clone(),
+                    keys: ids.clone(),
+                },
+                StorageOp::Replace { table, rows } => WalOp::ReplaceAll {
+                    table: table.clone(),
+                    rows: rows.clone(),
+                },
+            };
+            self.validate_op(&wal_op)?;
+            wal_ops.push(wal_op);
+        }
+        self.group_via_wal(&wal_ops)
+    }
+
+    /// 一组操作加提交标记落盘，成功后清空日志
+    fn group_via_wal(&self, ops: &[WalOp]) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.cfg.data_dir)?;
         let wal = &self.wal;
-
         wal.truncate()?;
-
-        wal.append(op)?;
-
-        let result = self.apply_op(op);
-
-        if result.is_err() && matches!(op, WalOp::HideColumn { .. }) {
-            self.recovery_required.store(true, Ordering::Release);
-            return result;
+        let commit_lsn = wal.append_group(ops)?;
+        for op in ops {
+            let result = self.apply_op(op);
+            if result.is_err() && matches!(op, WalOp::HideColumn { .. }) {
+                self.recovery_required.store(true, Ordering::Release);
+                return result;
+            }
+            result?;
         }
-
-        if result.is_ok() {
+        for op in ops {
             self.flush_op_tables(op)?;
         }
-
+        self.flush_all_tables()?;
         wal.clear()?;
-        result
+        log_debug!(core, "WAL committed group at LSN {}", commit_lsn);
+        Ok(())
+    }
+
+    /// 把打开的表都 fsync 一遍
+    fn flush_all_tables(&self) -> std::io::Result<()> {
+        let handles: Vec<Arc<Mutex<HeapTable>>> = self
+            .tables
+            .lock()
+            .map_err(|_| std::io::Error::other("table lock poisoned"))?
+            .values()
+            .cloned()
+            .collect();
+        for handle in handles {
+            handle.lock().map_err(|_| std::io::Error::other("heap lock poisoned"))?.flush()?;
+        }
+        Ok(())
     }
 
     /// 把涉及的表写回磁盘
     fn flush_op_tables(&self, op: &WalOp) -> std::io::Result<()> {
         let table = match op {
             WalOp::HideColumn { .. } => return Ok(()),
+            WalOp::Commit => return Ok(()),
             WalOp::Accounts { .. } => USERS_TABLE,
             WalOp::Insert { table, .. }
             | WalOp::InsertBatch { table, .. }
@@ -369,21 +438,97 @@ impl Server {
         self.with_table(table, |t| t.flush())
     }
 
-    /// 启动时重放残留 WAL
+    /// 重放残留 WAL：已提交组重放，未提交组丢弃
     fn recover_wal(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.cfg.data_dir)?;
         let wal = &self.wal;
-        match wal.read()? {
-            None => Ok(()),
-            Some(op) => {
-                log_warn!(core, "replaying incomplete WAL entry");
-                self.apply_op(&op)?;
-                self.flush_op_tables(&op)?;
-                wal.clear()?;
-                log_info!(core, "WAL replay complete");
-                Ok(())
+        let scan = wal.read_all()?;
+        if scan.records.is_empty() {
+            if scan.good_len > 0 {
+                wal.truncate_to(scan.good_len)?;
             }
+            return Ok(());
         }
+        let records = committed_ops(&scan.records);
+        if records.is_empty() {
+            log_warn!(core, "discarding uncommitted WAL records");
+            wal.clear()?;
+            return Ok(());
+        }
+        let max_lsn = scan
+            .records
+            .iter()
+            .rev()
+            .find(|(_, op)| *op == WalOp::Commit)
+            .map(|(lsn, _)| *lsn)
+            .or_else(|| records.last().map(|(lsn, _)| *lsn))
+            .unwrap_or(0);
+        log_warn!(core, "replaying {} committed WAL records", records.len());
+        for (_, op) in &records {
+            self.replay_op(op)?;
+            self.flush_op_tables(op)?;
+        }
+        self.flush_all_tables()?;
+        wal.write_checkpoint(max_lsn)?;
+        wal.clear()?;
+        log_info!(core, "WAL replay complete");
+        Ok(())
+    }
+
+    /// 重放一条操作：数据已经生效的不再重复写
+    fn replay_op(&self, op: &WalOp) -> std::io::Result<()> {
+        if self.op_already_applied(op)? {
+            log_debug!(core, "WAL record already applied, skipping");
+            return Ok(());
+        }
+        self.apply_op(op)
+    }
+
+    /// 这条操作对应的数据是不是已经落盘了
+    fn op_already_applied(&self, op: &WalOp) -> std::io::Result<bool> {
+        match op {
+            WalOp::Insert { table, row } => self.applied_rows(table, std::slice::from_ref(row)),
+            WalOp::InsertBatch { table, rows } => self.applied_rows(table, rows),
+            WalOp::ReplaceAll { table, rows } => {
+                if self.catalog.lock().unwrap().describe(table).is_none() {
+                    return Ok(false);
+                }
+                let stored = self.with_table(table, |t| t.scan())?;
+                Ok(stored == *rows)
+            }
+            WalOp::DeleteKeys { table, keys } => {
+                if keys.is_empty() {
+                    return Ok(true);
+                }
+                if self.catalog.lock().unwrap().describe(table).is_none() {
+                    return Ok(false);
+                }
+                let rows = self.with_table(table, |t| t.scan())?;
+                let present = rows.iter().any(|row| {
+                    row.get("id")
+                        .and_then(scalar_int)
+                        .is_some_and(|id| keys.contains(&id))
+                });
+                Ok(!present)
+            }
+            WalOp::HideColumn { table, column } => {
+                let c = self.catalog.lock().unwrap();
+                Ok(c.describe(table).is_some_and(|s| !s.columns.iter().any(|col| &col.name == column)))
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// 这些行是不是都已经在表里
+    fn applied_rows(&self, table: &str, rows: &[Row]) -> std::io::Result<bool> {
+        if rows.is_empty() {
+            return Ok(true);
+        }
+        if self.catalog.lock().unwrap().describe(table).is_none() {
+            return Ok(false);
+        }
+        let stored = self.with_table(table, |t| t.scan())?;
+        Ok(rows.iter().all(|row| stored.iter().any(|one| one == row)))
     }
 
     /// 启动时重建列统计
@@ -607,6 +752,11 @@ impl Server {
             .unwrap_or(false)
     }
 
+    /// 最近一次落盘的检查点 LSN
+    fn last_checkpoint(&self) -> u64 {
+        self.wal.read_checkpoint().ok().flatten().unwrap_or(0)
+    }
+
     /// 读账号表；表没登记或数据文件缺失都算错
     fn load_accounts(&self) -> std::io::Result<Vec<Account>> {
         use std::io::Error;
@@ -774,14 +924,27 @@ impl Server {
             }
             Request::BootstrapSystem { user, password_hash } => {
                 match self.bootstrap_system(user.as_deref(), password_hash.as_deref()) {
-                    Ok(_) => Response::System { initialized: true },
+                    Ok(_) => Response::System { initialized: true, last_lsn: self.last_checkpoint() },
                     Err(e) => Response::Error { message: e.to_string() },
                 }
             }
-            Request::SystemStatus => Response::System { initialized: self.system_initialized() },
+            Request::SystemStatus => Response::System { initialized: self.system_initialized(), last_lsn: self.last_checkpoint() },
             Request::Ping => {
                 log_debug!(request, "ping");
                 Response::Pong
+            }
+
+            Request::ApplyTransaction { ops } => {
+                log_debug!(request, "apply_transaction ops={}", ops.len());
+                match self.apply_transaction(&ops) {
+                    Ok(()) => Response::Ok,
+                    Err(e) => {
+                        log_warn!(request, "apply_transaction: {}", e);
+                        Response::Error {
+                            message: format!("apply_transaction: {e}"),
+                        }
+                    }
+                }
             }
 
             Request::Scan { table, columns } => {
@@ -1347,8 +1510,8 @@ fn reserved_database(name: &str) -> bool {
 /// 每个库拥有独立的目录、字典、句柄和 WAL。
 struct Databases {
     root: Config,
-    system: Server,
-    named: Mutex<HashMap<String, Server>>,
+    system: Arc<Server>,
+    named: Mutex<HashMap<String, Arc<Server>>>,
 }
 
 impl Databases {
@@ -1356,7 +1519,7 @@ impl Databases {
     fn new(cfg: Config) -> std::io::Result<Self> {
         // 系统库按需创建：目录、字典与系统表缺失时自动补齐。
         // 其余库只在 data/databases/<name>/ 下已存在时才装载，启动不会凭空建库。
-        let system = Self::open(&cfg, SYSTEM_DATABASE)?;
+        let system = Arc::new(Self::open(&cfg, SYSTEM_DATABASE)?);
         let root = cfg.data_dir.join("databases");
         std::fs::create_dir_all(&root)?;
         let canonical_root = std::fs::canonicalize(&root)?;
@@ -1379,7 +1542,7 @@ impl Databases {
                 server.rebuild_stats()?;
                 server.migrate_data()?;
                 server.compact_tables()?;
-                named.insert(name, server);
+                named.insert(name, Arc::new(server));
             }
         }
         Ok(Self { root: cfg, system, named: Mutex::new(named) })
@@ -1413,9 +1576,13 @@ impl Databases {
         let mut named = self.named.lock().map_err(|_| Error::other("database lock poisoned"))?;
         match method.as_str() {
             "all_catalogs" => {
+                let servers: Vec<(String, Arc<Server>)> =
+                    std::iter::once((SYSTEM_DATABASE.to_string(), Arc::clone(&self.system)))
+                        .chain(named.iter().map(|(name, server)| (name.clone(), Arc::clone(server))))
+                        .collect();
+                drop(named);
                 let mut schemas = Vec::new();
-                for (database, server) in std::iter::once((SYSTEM_DATABASE, &self.system))
-                    .chain(named.iter().map(|(name, server)| (name.as_str(), server))) {
+                for (database, server) in servers {
                     match server.handle_request(Request::ListCatalog) {
                         Response::Catalog { schemas: entries } => {
                             for mut entry in entries {
@@ -1442,23 +1609,30 @@ impl Databases {
                 std::fs::create_dir(&cfg.data_dir)?;
                 let server = Server::new(cfg)?;
                 server.catalog.lock().map_err(|_| Error::other("catalog lock poisoned"))?.save(server.catalog_path())?;
-                named.insert(name, server);
+                named.insert(name, Arc::new(server));
                 return Ok(Response::Ok);
             }
             "drop_database" => {
                 if name == SYSTEM_DATABASE { return Err(Error::other("cannot drop the system database")); }
-                let server = named.get(&name).ok_or_else(|| Error::other("unknown database"))?;
+                let holder = named.remove(&name).ok_or_else(|| Error::other("unknown database"))?;
+                let server = match Arc::try_unwrap(holder) {
+                    Ok(server) => server,
+                    Err(holder) => {
+                        named.insert(name, holder);
+                        return Err(Error::other("database is in use"));
+                    }
+                };
                 let root = std::fs::canonicalize(self.root.data_dir.join("databases"))?;
                 let target = std::fs::canonicalize(&server.cfg.data_dir)?;
                 if target.parent() != Some(root.as_path()) || !target.join("catalog.json").is_file() {
                     return Err(Error::other("invalid database directory"));
                 }
                 let config = server.cfg.clone();
-                drop(named.remove(&name));
+                drop(server);
                 let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(Error::other)?.as_nanos();
                 let tombstone = root.join(format!(".dropped-{name}-{stamp}"));
                 if let Err(error) = std::fs::rename(&target, &tombstone) {
-                    named.insert(name, Server::new(config)?);
+                    named.insert(name, Arc::new(Server::new(config)?));
                     return Err(error);
                 }
                 std::fs::remove_dir_all(&tombstone).map_err(|e| Error::other(format!("database dropped; directory cleanup failed: {e}")))?;
@@ -1482,10 +1656,10 @@ impl Databases {
             | Request::AccountReset { .. } | Request::AccountLogin { .. }
             | Request::AccountDrop { .. } | Request::BootstrapSystem { .. }
             | Request::SystemStatus | Request::Ping);
-        let server = if global { &self.system }
-            else if selected.is_empty() { return Err(Error::other("no database selected")); }
-            else if selected == SYSTEM_DATABASE { &self.system }
-            else { named.get(&selected).ok_or_else(|| Error::other("unknown database"))? };
+        if !global && selected.is_empty() { return Err(Error::other("no database selected")); }
+        let server = if global || selected == SYSTEM_DATABASE { Arc::clone(&self.system) }
+            else { Arc::clone(named.get(&selected).ok_or_else(|| Error::other("unknown database"))?) };
+        drop(named);
         Ok(server.handle_request(request))
     }
 }

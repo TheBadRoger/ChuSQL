@@ -3,14 +3,20 @@
 
 module Main (main) where
 
-import ChuSQL.Core.Engine.Storage.IPC (Account (..), Request (ReqAccountReset))
+import ChuSQL.Core.Engine.Storage.IPC (
+    Account (..),
+    Request (ReqAccountReset),
+    closeConnection,
+    localStorageLink,
+    setStorageLink,
+ )
 import ChuSQL.Core.Engine.Syntax.Parser (parseStatement)
-import ChuSQL.Core.Model (Database, Table (..), Value (..), pattern TInt, pattern TStr)
+import ChuSQL.Core.Model (Database, Row, Table (..), Value (..), pattern TInt, pattern TStr)
 import ChuSQL.Interface.Auth (hashPasswordWith)
 import ChuSQL.Interface.Protocol (ClientRequest (..), Grant (..), RoleView (..), ServerResponse (..), decodeRequest, encodeResponse)
 import ChuSQL.Interface.RateLimit (newRateLimiter)
 import ChuSQL.Server.Accounts (Principal (..), ensureRootAccount)
-import ChuSQL.Server.Backend (Backend (..), memoryBackend)
+import ChuSQL.Server.Backend (Backend (..), StatementResult (..), ipcBackend, memoryBackend)
 import ChuSQL.Server.Privileges (
     PrivilegeCommand (..),
     PrivilegeError (..),
@@ -20,7 +26,7 @@ import ChuSQL.Server.Privileges (
     newPrivileges,
     runPrivilegeCommand,
  )
-import ChuSQL.Server.Session (QueryResult (..))
+import ChuSQL.Server.Session (QueryResult (..), Session, SessionError (..), newSession, runStatementCoded)
 import ChuSQL.Server.TCP (
     ServerConfig (..),
     ServerEnv,
@@ -30,8 +36,8 @@ import ChuSQL.Server.TCP (
     newServerEnv,
     startServer,
  )
-import Control.Concurrent (threadDelay)
-import Control.Concurrent.MVar (newMVar)
+import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, putMVar, takeMVar)
 import Control.Exception (IOException, bracket, finally, try)
 import Control.Monad (void)
 import Data.Aeson (decode)
@@ -59,7 +65,7 @@ import Network.Socket (
     socketToHandle,
     withSocketsDo,
  )
-import System.Directory (doesFileExist, getTemporaryDirectory, removeFile)
+import System.Directory (createDirectoryIfMissing, doesFileExist, getTemporaryDirectory, removeFile, removePathForcibly)
 import System.FilePath ((</>))
 import System.IO (
     BufferMode (LineBuffering),
@@ -87,6 +93,8 @@ spec = do
     tcpSpec
     tcpServerSpec
     privilegeSpec
+    transactionSpec
+    ipcConcurrencySpec
 
 -- 夹具：内存后端装在 MVar 里，跟 Web 测试同一套表
 
@@ -544,4 +552,239 @@ privilegeSpec = describe "server privileges" $ do
         case parseStatement "SELECT * FROM users" of
             Left err -> expectationFailure err
             Right stmt -> authorize service root testDatabase stmt `shouldReturn` Right ()
+
+-- 真存储夹具：一个用例一份数据目录，跑完关链路删干净
+
+-- | 本次用例的数据目录（用例串行跑，固定名够用）
+ipcDataDir :: IO FilePath
+ipcDataDir = do
+    tmp <- getTemporaryDirectory
+    pure (tmp </> "chusql-server-test-ipc")
+
+-- | 写一份只属于这次用例的存储配置：数据目录与日志级别都从文件走
+writeIpcConfig :: FilePath -> IO FilePath
+writeIpcConfig dir = do
+    let cfgPath = dir ++ ".toml"
+        -- TOML 的普通字符串会吃反斜杠，路径统一用正斜杠
+        slashed = map (\c -> if c == '\\' then '/' else c) dir
+    writeFile
+        cfgPath
+        ( unlines
+            [ "[storage]"
+            , "data_dir = \"" ++ slashed ++ "\""
+            , "[log]"
+            , "level = \"error\""
+            ]
+        )
+    pure cfgPath
+
+-- | 删掉这次用例的数据目录与配置，删不掉也不算错
+cleanIpc :: FilePath -> IO ()
+cleanIpc dir = do
+    _ <- try (removePathForcibly dir) :: IO (Either IOException ())
+    _ <- try (removePathForcibly (dir ++ ".toml")) :: IO (Either IOException ())
+    pure ()
+
+-- 事务用例：内存后端跑得快，真存储的提交再在 IPC 用例里验一遍
+
+-- | 起一个内存后端会话，当前库已切到 test
+withMemorySession :: (Session -> IO a) -> IO a
+withMemorySession body = do
+    db <- newMVar testDb
+    settings <- tempSettingsPath "transaction"
+    removeIfExists settings
+    session <- newSession (memoryBackend testDatabaseName db) (T.pack testDatabaseName) settings
+    _ <- runStatementCoded session "use test"
+    body session
+
+-- | 两个会话共用一份内存库，用来验会话隔离
+withTwoSessions :: (Session -> Session -> IO a) -> IO a
+withTwoSessions body = do
+    db <- newMVar testDb
+    settings <- tempSettingsPath "transaction-pair"
+    removeIfExists settings
+    let backend = memoryBackend testDatabaseName db
+    first <- newSession backend (T.pack testDatabaseName) settings
+    second <- newSession backend (T.pack testDatabaseName) settings
+    _ <- runStatementCoded first "use test"
+    _ <- runStatementCoded second "use test"
+    body first second
+
+-- | 跑一条语句；出错就算用例失败
+mustSql :: Session -> Text -> IO QueryResult
+mustSql session sql = runStatementCoded session sql >>= either failed pure
+  where
+    failed err = expectationFailure (T.unpack (sessMessage err)) >> pure (QueryResult [] [] 0 False Nothing)
+
+-- | 取 users 的 id 列
+sessionIds :: Session -> IO [Int]
+sessionIds session = do
+    result <- mustSql session "select * from users"
+    pure [n | row <- qrRows result, Just (VInt n) <- [nth 0 row]]
+
+-- | 取某个 id 的 age
+sessionAge :: Session -> Int -> IO (Maybe Int)
+sessionAge session wanted = do
+    result <- mustSql session "select * from users"
+    let ages = [(n, a) | row <- qrRows result, Just (VInt n) <- [nth 0 row], Just (VInt a) <- [nth 2 row]]
+    pure (lookup wanted ages)
+
+-- | 取失败里的文案
+failureMessage :: Either SessionError QueryResult -> Text
+failureMessage outcome = either sessMessage (const "") outcome
+
+-- | 取结果第一列的整数
+intValues :: [[Value]] -> [Int]
+intValues rows = [n | row <- rows, Just (VInt n) <- [nth 0 row]]
+
+-- | 显式事务用例
+transactionSpec :: Spec
+transactionSpec = describe "server transactions" $ do
+    it "keeps uncommitted rows invisible to other sessions until COMMIT" $ withTwoSessions $ \writer reader -> do
+        _ <- mustSql writer "begin"
+        _ <- mustSql writer "insert into users (id, name, age) values (6, 'six', 26)"
+        sessionIds writer `shouldReturn` [1, 2, 3, 4, 5, 6]
+        sessionIds reader `shouldReturn` [1, 2, 3, 4, 5]
+        _ <- mustSql writer "commit"
+        ids <- sessionIds writer
+        ids `shouldMatchList` [1, 2, 3, 4, 5, 6]
+        seen <- sessionIds reader
+        seen `shouldMatchList` [1, 2, 3, 4, 5, 6]
+
+    it "drops every change on ROLLBACK" $ withMemorySession $ \session -> do
+        _ <- mustSql session "begin"
+        _ <- mustSql session "insert into users (id, name, age) values (6, 'six', 26)"
+        _ <- mustSql session "update users set age = 99 where id = 1"
+        _ <- mustSql session "delete from users where id = 2"
+        rollback <- mustSql session "rollback"
+        qrRowCount rollback `shouldBe` 0
+        kept <- sessionIds session
+        kept `shouldMatchList` [1, 2, 3, 4, 5]
+
+    it "commits the whole write set at once" $ withMemorySession $ \session -> do
+        _ <- mustSql session "begin"
+        _ <- mustSql session "insert into users (id, name, age) values (6, 'six', 26)"
+        _ <- mustSql session "update users set age = 99 where id = 1"
+        _ <- mustSql session "delete from users where id = 2"
+        _ <- mustSql session "commit"
+        ids <- sessionIds session
+        ids `shouldMatchList` [1, 3, 4, 5, 6]
+        sessionAge session 1 `shouldReturn` Just 99
+
+    it "rejects DDL inside a transaction and takes it after ROLLBACK" $ withMemorySession $ \session -> do
+        _ <- mustSql session "begin"
+        denied <- runStatementCoded session "create table blocked (id int)"
+        failureMessage denied `shouldBe` "DDL is not allowed in a transaction"
+        _ <- mustSql session "rollback"
+        _ <- mustSql session "create table fresh (id int)"
+        _ <- mustSql session "insert into fresh (id) values (1)"
+        rows <- mustSql session "select * from fresh"
+        qrRowCount rows `shouldBe` 1
+
+    it "refuses nested BEGIN and COMMIT outside a transaction" $ withMemorySession $ \session -> do
+        _ <- mustSql session "begin"
+        nested <- runStatementCoded session "begin"
+        failureMessage nested `shouldBe` "already in a transaction"
+        _ <- mustSql session "rollback"
+        late <- runStatementCoded session "commit"
+        failureMessage late `shouldBe` "no transaction in progress"
+
+    it "does not switch database inside a transaction" $ withMemorySession $ \session -> do
+        _ <- mustSql session "begin"
+        denied <- runStatementCoded session "use other"
+        failureMessage denied `shouldBe` "cannot switch database inside a transaction"
+
+    it "needs a current database to start" $ do
+        db <- newMVar testDb
+        settings <- tempSettingsPath "transaction-bare"
+        removeIfExists settings
+        session <- newSession (memoryBackend testDatabaseName db) (T.pack testDatabaseName) settings
+        result <- runStatementCoded session "begin"
+        failureMessage result `shouldBe` "no database selected"
+
+-- | 起一份真存储并装成当前链路；动态库打不开就当用例待定
+withIpcStorage :: IO () -> IO ()
+withIpcStorage body = do
+    dir <- ipcDataDir
+    cleanIpc dir
+    createDirectoryIfMissing True dir
+    cfgPath <- writeIpcConfig dir
+    opened <- localStorageLink (Just cfgPath)
+    case opened of
+        Left err -> cleanIpc dir >> pendingWith ("cannot open the storage library: " ++ err)
+        Right link -> do
+            setStorageLink link
+            body `finally` (closeConnection >> cleanIpc dir)
+
+-- | 跑一条语句，出错就算用例失败
+mustRun :: IO (Either String StatementResult) -> IO ()
+mustRun action = action >>= either expectationFailure (const (pure ()))
+
+-- | 取结果行，出错就算用例失败
+rowsOf :: IO (Either String StatementResult) -> IO [Row]
+rowsOf action = action >>= either (\err -> expectationFailure err >> pure []) (pure . srRows)
+
+-- | 取结果里某一列的整数
+intColumn :: String -> [Row] -> [Int]
+intColumn name rows = [n | row <- rows, Just (VInt n) <- [lookup name row]]
+
+-- | 往 p 表连插一批行，结果放 MVar 交回主线程
+writeRows :: Backend -> [Int] -> MVar [Either String StatementResult] -> IO ()
+writeRows session ids done = do
+    outs <- mapM (\i -> beStatement session ("INSERT INTO p (id) VALUES (" ++ show i ++ ")")) ids
+    putMVar done outs
+
+-- | 同一进程里开两个库：会话之间不串数据，也不互相挡路
+ipcConcurrencySpec :: Spec
+ipcConcurrencySpec = describe "server backend on the real storage" $ do
+    it "keeps two databases apart" $ withIpcStorage $ do
+        base <- ipcBackend
+        mustRun (beStatement base "CREATE DATABASE alpha")
+        mustRun (beStatement base "CREATE DATABASE beta")
+        let alpha = beWithDatabase base "alpha"
+            beta = beWithDatabase base "beta"
+        mustRun (beStatement alpha "CREATE TABLE t (id int)")
+        mustRun (beStatement beta "CREATE TABLE t (id int)")
+        mustRun (beStatement alpha "INSERT INTO t (id) VALUES (1)")
+        mustRun (beStatement beta "INSERT INTO t (id) VALUES (2)")
+        rowsA <- rowsOf (beStatement alpha "SELECT id FROM t")
+        rowsB <- rowsOf (beStatement beta "SELECT id FROM t")
+        intColumn "id" rowsA `shouldBe` [1]
+        intColumn "id" rowsB `shouldBe` [2]
+
+    it "runs two sessions at once without mixing their rows" $ withIpcStorage $ do
+        base <- ipcBackend
+        mustRun (beStatement base "CREATE DATABASE alpha")
+        mustRun (beStatement base "CREATE DATABASE beta")
+        let alpha = beWithDatabase base "alpha"
+            beta = beWithDatabase base "beta"
+        mustRun (beStatement alpha "CREATE TABLE p (id int)")
+        mustRun (beStatement beta "CREATE TABLE p (id int)")
+        doneA <- newEmptyMVar
+        doneB <- newEmptyMVar
+        _ <- forkIO (writeRows alpha [1 .. 20] doneA)
+        _ <- forkIO (writeRows beta [101 .. 120] doneB)
+        outs <- sequence [takeMVar doneA, takeMVar doneB]
+        [err | Left err <- concat outs] `shouldBe` []
+        rowsA <- rowsOf (beStatement alpha "SELECT id FROM p")
+        rowsB <- rowsOf (beStatement beta "SELECT id FROM p")
+        intColumn "id" rowsA `shouldMatchList` [1 .. 20]
+        intColumn "id" rowsB `shouldMatchList` [101 .. 120]
+
+    it "commits an explicit transaction to the real storage" $ withIpcStorage $ do
+        base <- ipcBackend
+        mustRun (beStatement base "CREATE DATABASE alpha")
+        let alpha = beWithDatabase base "alpha"
+        settings <- tempSettingsPath "transaction-ipc"
+        removeIfExists settings
+        session <- newSession alpha (T.pack testDatabaseName) settings
+        _ <- mustSql session "use alpha"
+        _ <- mustSql session "create table t (id int)"
+        _ <- mustSql session "begin"
+        _ <- mustSql session "insert into t (id) values (1)"
+        inside <- mustSql session "select * from t"
+        intValues (qrRows inside) `shouldBe` [1]
+        _ <- mustSql session "commit"
+        rows <- rowsOf (beStatement alpha "SELECT id FROM t")
+        intColumn "id" rows `shouldBe` [1]
 

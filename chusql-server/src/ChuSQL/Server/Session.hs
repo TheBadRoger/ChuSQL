@@ -24,22 +24,24 @@ module ChuSQL.Server.Session
     , queryResultJson
     ) where
 
-import ChuSQL.Core.Model (Value (..))
-import ChuSQL.Core.Protocol (Account, QueryResult (..), queryResultJson)
+import ChuSQL.Core.Model (Database, Row, Table (..), Value (..))
+import ChuSQL.Core.Protocol (Account, QueryResult (..), TxnOp (..), queryResultJson)
 import ChuSQL.Core.Engine.Storage.IPC (TableInfo (..))
+import qualified ChuSQL.Core.Engine as Engine
 import qualified ChuSQL.Core.Engine.Error as E
 import ChuSQL.Core.Engine.Syntax.AST (Statement (..))
 import ChuSQL.Core.Engine.Syntax.Parser (parseStatement)
 import ChuSQL.Interface.AccountTable (systemTableInfo)
 import ChuSQL.Interface.Auth (defaultSessionPolicy, newSessionStore)
 import ChuSQL.Server.Accounts
-import ChuSQL.Server.Backend (Backend (..), StatementResult (..))
+import ChuSQL.Server.Backend (Backend (..), StatementResult (..), columnsFromStatement)
 import ChuSQL.Server.Policy (configurePasswordPolicy)
 import ChuSQL.Server.Privileges (PrivilegeCommand, PrivilegeError (..), Privileges, RoleView, authorize, filterTables, listRoleViews, newPrivileges, privilegeCommand, runPrivilegeCommand)
 import Control.Exception (IOException, try)
 import Data.Bifunctor (first)
 import Data.Char (isAlpha, isAlphaNum)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Time.Clock (getCurrentTime)
@@ -64,6 +66,13 @@ data Session = Session
     , ssCurrent :: IORef Text
     , ssPrincipal :: IORef (Maybe Principal)
     , ssSettingsFile :: FilePath
+    , ssTransaction :: IORef (Maybe Transaction)
+    }
+
+-- | 一条会话里的显式事务：开事务时的快照与事务内改到的状态
+data Transaction = Transaction
+    { txBase :: Database
+    , txStaged :: Database
     }
 
 -- | 开一个会话：账号与角色服务、配置策略都和 Web 端一致
@@ -76,7 +85,8 @@ newSession backend name settingsFile = do
     -- 服务启动后只有系统库：没 USE 之前不预设任何工作库
     current <- newIORef ""
     principal <- newIORef Nothing
-    pure (Session backend accountsService privileges current principal settingsFile)
+    transaction <- newIORef Nothing
+    pure (Session backend accountsService privileges current principal settingsFile transaction)
 
 -- | 当前生效的口令策略（只有管理员能看）
 policyOf :: Session -> IO (Either Text PasswordPolicy)
@@ -168,21 +178,182 @@ runStatement session sql = fmap (first sessMessage) (runStatementCoded session s
 runStatementCoded :: Session -> Text -> IO (Either SessionError QueryResult)
 runStatementCoded session sql = case parseStatement (T.unpack sql) of
     Right (UseDatabase name) -> do
-        switched <- switchDatabaseCoded session (T.pack name)
-        case switched of
-            Left err -> pure (Left err)
-            Right () -> do
-                current <- readIORef (ssCurrent session)
-                pure (Right (emptyResult (Just current)))
+        existing <- readIORef (ssTransaction session)
+        case existing of
+            Just _ -> pure (Left (SessionError "query_error" "cannot switch database inside a transaction"))
+            Nothing -> do
+                switched <- switchDatabaseCoded session (T.pack name)
+                case switched of
+                    Left err -> pure (Left err)
+                    Right () -> do
+                        current <- readIORef (ssCurrent session)
+                        pure (Right (emptyResult (Just current)))
+    Right BeginTransaction -> beginTransaction session
+    Right CommitTransaction -> commitTransaction session
+    Right RollbackTransaction -> rollbackTransaction session
     Right statement
         | Just command <- accountCommand statement -> runAccount session command
         | Just command <- privilegeCommand statement -> runPrivilege session command
         | otherwise -> do
-            allowed <- authorized session statement
-            case allowed of
-                Left err -> pure (Left err)
-                Right () -> runPlain session sql
+            transaction <- readIORef (ssTransaction session)
+            if isJust transaction && transactionDdl statement
+                then pure (Left (SessionError "query_error" "DDL is not allowed in a transaction"))
+                else do
+                    allowed <- authorized session statement
+                    case allowed of
+                        Left err -> pure (Left err)
+                        Right ()
+                            | isJust transaction && transactionData statement -> runInTransaction session statement
+                            | otherwise -> runPlain session sql
     Left _ -> runPlain session sql
+
+-- | 事务里不许改结构，会话层直接拦下
+transactionDdl :: Statement -> Bool
+transactionDdl statement = case statement of
+    CreateTable{} -> True
+    DropTable{} -> True
+    CreateIndex{} -> True
+    DropIndex{} -> True
+    DropColumn{} -> True
+    AddColumn{} -> True
+    RenameColumn{} -> True
+    AlterColumnType{} -> True
+    AlterColumnDefault{} -> True
+    AlterColumnNull{} -> True
+    CreateDatabase{} -> True
+    DropDatabase{} -> True
+    _ -> False
+
+-- | 事务里只有数据语句走快照
+transactionData :: Statement -> Bool
+transactionData statement = case statement of
+    Select{} -> True
+    SelectExpr{} -> True
+    Insert{} -> True
+    Update{} -> True
+    Delete{} -> True
+    _ -> False
+
+-- | 开事务：把当前库整库做一份快照当起点
+beginTransaction :: Session -> IO (Either SessionError QueryResult)
+beginTransaction session = do
+    current <- readIORef (ssCurrent session)
+    existing <- readIORef (ssTransaction session)
+    case existing of
+        Just _ -> pure (Left (SessionError "query_error" "already in a transaction"))
+        Nothing
+            | T.null current -> pure (Left (SessionError "no_database" "no database selected"))
+            | otherwise -> do
+                backend <- currentBackend session
+                snapshotResult <- beSnapshot backend
+                case snapshotResult of
+                    Left err -> pure (Left (engineErrorCode err))
+                    Right db -> do
+                        writeIORef (ssTransaction session) (Just (Transaction db db))
+                        pure (Right (emptyResult (Just current)))
+
+-- | 提交：把快照差分交给存储层应用，成功才结束事务
+commitTransaction :: Session -> IO (Either SessionError QueryResult)
+commitTransaction session = do
+    current <- readIORef (ssCurrent session)
+    existing <- readIORef (ssTransaction session)
+    case existing of
+        Nothing -> pure (Left (SessionError "query_error" "no transaction in progress"))
+        Just transaction -> do
+            backend <- currentBackend session
+            liveResult <- beSnapshot backend
+            case liveResult of
+                Left err -> pure (Left (engineErrorCode err))
+                Right live -> do
+                    applied <- beApplyTransaction backend (transactionOps (txBase transaction) (txStaged transaction) live)
+                    case applied of
+                        Left err -> pure (Left (engineErrorCode err))
+                        Right () -> do
+                            writeIORef (ssTransaction session) Nothing
+                            pure (Right (emptyResult (Just current)))
+
+-- | 回滚：快照丢掉，存储层没被改过
+rollbackTransaction :: Session -> IO (Either SessionError QueryResult)
+rollbackTransaction session = do
+    current <- readIORef (ssCurrent session)
+    existing <- readIORef (ssTransaction session)
+    case existing of
+        Nothing -> pure (Left (SessionError "query_error" "no transaction in progress"))
+        Just _ -> do
+            writeIORef (ssTransaction session) Nothing
+            pure (Right (emptyResult (Just current)))
+
+-- | 事务里跑一条数据语句：只动内存快照，不碰存储层
+runInTransaction :: Session -> Statement -> IO (Either SessionError QueryResult)
+runInTransaction session statement = do
+    existing <- readIORef (ssTransaction session)
+    case existing of
+        Nothing -> pure (Left (SessionError "query_error" "no transaction in progress"))
+        Just transaction -> case Engine.runStatement (txStaged transaction) statement of
+            Left err -> pure (Left (engineErrorCode err))
+            Right (staged, rows) -> do
+                writeIORef (ssTransaction session) (Just transaction {txStaged = staged})
+                pure (Right (resultOfStaged (txStaged transaction) statement rows))
+
+-- | 事务内的结果集：空结果回落到解析出来的列名
+resultOfStaged :: Database -> Statement -> [Row] -> QueryResult
+resultOfStaged db statement rows = resultOf (StatementResult cols rows)
+  where
+    cols = case rows of
+        [] -> columnsFromStatement db statement
+        (r : _) -> map fst r
+
+-- | 提交差分：相对快照列出要删、要写与要替换的行
+transactionOps :: Database -> Database -> Database -> [TxnOp]
+transactionOps base staged live =
+    concatMap opsFor names
+  where
+    -- | 事务里碰得着的表：数据语句不增删表
+    names = nubKeys (map fst base ++ map fst staged)
+
+    -- | 一张表的差分
+    opsFor name
+        | all (isJust . rowKey) (baseRows ++ stagedRows) = keyedOps
+        | stagedRows == baseRows = []
+        | otherwise = [TxnReplace name stagedRows]
+      where
+        baseRows = rowsOf name base
+        stagedRows = rowsOf name staged
+        liveRows = rowsOf name live
+
+        liveByKey = [(k, r) | r <- liveRows, Just k <- [rowKey r]]
+        stagedByKey = [(k, r) | r <- stagedRows, Just k <- [rowKey r]]
+        baseKeys = [k | r <- baseRows, Just k <- [rowKey r]]
+
+        -- 开事务时就存在、现在没了：删；内容变了的行也先删再写
+        gone = [k | (k, _) <- liveByKey, k `elem` baseKeys, not (any ((== k) . fst) stagedByKey)]
+        rewritten = [k | (k, r) <- stagedByKey, Just liveRow <- [lookup k liveByKey], liveRow /= r]
+        deleted = gone ++ rewritten
+
+        -- 新增的行，以及跟库里不一样的行；并发插进来的行不动
+        written =
+            [ r
+            | (k, r) <- stagedByKey
+            , case lookup k liveByKey of
+                Nothing -> True
+                Just liveRow -> liveRow /= r
+            ]
+
+        keyedOps =
+            [TxnDelete name deleted | not (null deleted)]
+                ++ [TxnUpsert name written | not (null written)]
+
+    -- | 表名去重但保持顺序
+    nubKeys = foldr (\name acc -> if name `elem` acc then acc else name : acc) []
+
+    -- | 库里某张表的行
+    rowsOf name db = maybe [] tableRows (lookup name db)
+
+-- | 行 id：只有整数 id 才认，跟存储层删行的口径一致
+rowKey :: Row -> Maybe Int
+rowKey row = case lookup "id" row of
+    Just (VInt k) -> Just k
+    _ -> Nothing
 
 -- | 普通身份跑语句前的权限判定；管理员与未登录放行
 authorized :: Session -> Statement -> IO (Either SessionError ())

@@ -53,6 +53,12 @@ data Statement
     | DropDatabase String
     | UseDatabase String
     | ShowDatabases
+    -- | 开事务：BEGIN / START TRANSACTION
+    | BeginTransaction
+    -- | 提交事务
+    | CommitTransaction
+    -- | 回滚事务
+    | RollbackTransaction
     deriving (Show, Eq)
 
 -- | 连接类型：内连接与左外连接

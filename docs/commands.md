@@ -38,6 +38,22 @@ csql -d sales -e "SELECT * FROM orders LIMIT 5"
 csql -f json -e "SELECT count(*) FROM orders"
 ```
 
+表名与列名的写法：
+
+- 选定数据库后语句里直接写表名即可，例如 `SELECT name FROM orders WHERE orders.id = 1`。
+- 表名可以带库前缀（`sales.orders`），列名可以带表限定符（`orders.id`）或库限定符（`sales.orders.id`），这几种写法指向同一张表和同一个列。
+- 只有候选唯一时才自动推导前缀；同名的表或列出现在多个候选上会以 `ambiguous table` / `ambiguous column` 报错，需要写全。
+- `FROM orders AS o` 之后只能用 `o.id`，不能再写 `orders.id`。
+
+事务：
+
+- `BEGIN`（或 `START TRANSACTION`）开始显式事务，`COMMIT` 提交，`ROLLBACK` 回滚。
+- 事务内只允许数据语句；DDL 与 `USE` 会被拒绝，`SHOW DATABASES` 这类不碰表数据的语句照常可用。
+- 事务里的读都看开事务那一刻的快照：别的连接在事务期间提交的改动不会出现在事务里，本会话未提交的改动别的连接也看不见。
+- 同一连接同时只能有一个事务，没有保存点与嵌套事务；开事务前要先选好数据库。
+- 提交时按行 `id` 写回本事务改动过的行，事务没碰过的行不受影响；没有整数 `id` 的表按整表替换提交。
+- 提交是持久的：整批改动与一条提交标记一次落盘，提交后进程被强杀也会在重启时重放；提交前崩溃则整批丢弃，不会只落一半。
+
 ### 交互模式
 
 SQL 语句以分号结束，可跨多行输入。

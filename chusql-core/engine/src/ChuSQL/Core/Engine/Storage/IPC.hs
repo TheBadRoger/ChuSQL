@@ -3,6 +3,10 @@
 
 module ChuSQL.Core.Engine.Storage.IPC (
     IPCStorage (..),
+    Env (..),
+    envForDatabase,
+    defaultEnv,
+    runIPCStorage,
     Request (..),
     Response (..),
     Account (..),
@@ -41,21 +45,38 @@ import System.IO.Unsafe (unsafePerformIO)
 
 -- IPC 存储实现：把 MonadStorage 的操作变成发给存储库的 JSON 请求。
 
-newtype IPCStorage a = IPCStorage
-    { runIPCStorage :: IO a
+-- | 一条会话的存储环境：当前库名随会话走，不共享
+data Env = Env
+    { envDatabase :: Maybe String
     }
 
+newtype IPCStorage a = IPCStorage
+    { runIPCStorageIn :: Env -> IO a
+    }
+
+-- | 按库名造一个会话环境
+envForDatabase :: Maybe String -> Env
+envForDatabase = Env
+
+-- | 进程默认环境：读全局库名，给测试与 CLI 用
+defaultEnv :: IO Env
+defaultEnv = Env <$> readMVar databaseRef
+
+-- | 用进程默认环境跑（兼容既有调用点）
+runIPCStorage :: IPCStorage a -> IO a
+runIPCStorage action = defaultEnv >>= runIPCStorageIn action
+
 instance Functor IPCStorage where
-    fmap f (IPCStorage m) = IPCStorage (fmap f m)
+    fmap f (IPCStorage m) = IPCStorage (fmap f . m)
 
 instance Applicative IPCStorage where
-    pure = IPCStorage . pure
-    IPCStorage mf <*> IPCStorage ma = IPCStorage (mf <*> ma)
+    pure = IPCStorage . const . pure
+    IPCStorage mf <*> IPCStorage ma = IPCStorage $ \env -> mf env <*> ma env
 
 instance Monad IPCStorage where
-    IPCStorage m >>= k = IPCStorage $ do
-        a <- m
-        runIPCStorage (k a)
+    IPCStorage m >>= k = IPCStorage $ \env -> do
+        a <- m env
+        runIPCStorageIn (k a) env
 
 -- | 一条到存储库的链路：管请求与关闭
 data StorageLink = StorageLink
@@ -147,10 +168,9 @@ globalRequest ReqPing = True
 globalRequest _ = False
 
 -- | 发请求并把响应翻成 Either
-ask :: String -> Request -> (Response -> Maybe a) -> IO (Either String a)
-ask what req recognize = do
-    current <- getDatabaseName
-    resp <- sendRequest (stampDatabase current req)
+ask :: Env -> String -> Request -> (Response -> Maybe a) -> IO (Either String a)
+ask env what req recognize = do
+    resp <- sendRequest (stampDatabase (envDatabase env) req)
     pure $ case resp of
         RespError e -> Left e
         other -> case recognize other of
@@ -163,99 +183,100 @@ okOnly RespOk = Just ()
 okOnly _ = Nothing
 
 -- | 发 Scan
-doScan :: String -> IO (Either String [Row])
-doScan t = ask "scan" (ReqScan t) $ \resp -> case resp of
+doScan :: Env -> String -> IO (Either String [Row])
+doScan env t = ask env "scan" (ReqScan t) $ \resp -> case resp of
     RespRows rows -> Just rows
     _ -> Nothing
 
 -- | 发带投影的 Scan
-doScanColumns :: String -> [String] -> IO (Either String [Row])
-doScanColumns t cols = ask "scan" (ReqScanColumns t cols) $ \resp -> case resp of
+doScanColumns :: Env -> String -> [String] -> IO (Either String [Row])
+doScanColumns env t cols = ask env "scan" (ReqScanColumns t cols) $ \resp -> case resp of
     RespRows rows -> Just [[(c, v) | c <- cols, Just v <- [lookup c row]] | row <- rows]
     _ -> Nothing
 
 -- | 发分片 Scan：只取第 shard 片
-doScanShard :: String -> Maybe [String] -> Int -> Int -> IO (Either String [Row])
-doScanShard t cols shard shards = ask "scan_shard" (ReqScanShard t cols shard shards) $ \resp -> case resp of
+doScanShard :: Env -> String -> Maybe [String] -> Int -> Int -> IO (Either String [Row])
+doScanShard env t cols shard shards = ask env "scan_shard" (ReqScanShard t cols shard shards) $ \resp -> case resp of
     RespRows rows -> Just rows
     _ -> Nothing
 
 -- | 发 Insert（索引由存储层维护）
-doInsert :: String -> Row -> IO (Either String ())
-doInsert t r = ask "insert" (ReqInsert t r) okOnly
+doInsert :: Env -> String -> Row -> IO (Either String ())
+doInsert env t r = ask env "insert" (ReqInsert t r) okOnly
 
 -- | 发 InsertBatch：一批行一次请求
-doInsertMany :: String -> [Row] -> IO (Either String ())
-doInsertMany t rs = ask "insert_batch" (ReqInsertBatch t rs) okOnly
+doInsertMany :: Env -> String -> [Row] -> IO (Either String ())
+doInsertMany env t rs = ask env "insert_batch" (ReqInsertBatch t rs) okOnly
 
 -- | 发 DeleteKeys
-doDeleteKeys :: String -> [Int] -> IO (Either String ())
-doDeleteKeys t ks = ask "delete_keys" (ReqDeleteKeys t ks) okOnly
+doDeleteKeys :: Env -> String -> [Int] -> IO (Either String ())
+doDeleteKeys env t ks = ask env "delete_keys" (ReqDeleteKeys t ks) okOnly
 
 -- | 发 ReplaceAll
-doReplaceAll :: String -> [Row] -> IO (Either String ())
-doReplaceAll t rs = ask "replace_all" (ReqReplaceAll t rs) okOnly
+doReplaceAll :: Env -> String -> [Row] -> IO (Either String ())
+doReplaceAll env t rs = ask env "replace_all" (ReqReplaceAll t rs) okOnly
 
 -- | 发 ListTables
-doListTables :: IO (Either String [String])
-doListTables = ask "list_tables" ReqListTables $ \resp -> case resp of
+doListTables :: Env -> IO (Either String [String])
+doListTables env = ask env "list_tables" ReqListTables $ \resp -> case resp of
     RespTables ts -> Just ts
     _ -> Nothing
 
 -- | 一次拿全库 schema
-doListCatalog :: IO (Either String [TableInfo])
-doListCatalog = ask "list_catalog" ReqListCatalog $ \resp -> case resp of
+doListCatalog :: Env -> IO (Either String [TableInfo])
+doListCatalog env = ask env "list_catalog" ReqListCatalog $ \resp -> case resp of
     RespCatalog xs -> Just xs
     _ -> Nothing
 
 -- | 按某一列的索引取一行（键可以是整数或字符串）
-doLookupByColumn :: String -> String -> Value -> IO (Either String IndexResult)
-doLookupByColumn t c k = ask "lookup_by_index" (ReqLookupByColumn t c k) $ \resp -> case resp of
+doLookupByColumn :: Env -> String -> String -> Value -> IO (Either String IndexResult)
+doLookupByColumn env t c k = ask env "lookup_by_index" (ReqLookupByColumn t c k) $ \resp -> case resp of
     RespRows rows -> Just (IndexRows rows)
     RespNoIndex -> Just NoIndex
     _ -> Nothing
 
 -- | 范围扫描：没有可用索引就回 Nothing，让上层退回扫描
 doScanRange ::
+    Env ->
     String ->
     String ->
     Maybe (Value, Bool) ->
     Maybe (Value, Bool) ->
     IO (Either String (Maybe [Row]))
-doScanRange t c lo hi = ask "range_by_index" (ReqRangeByIndex t c lo hi) $ \resp -> case resp of
+doScanRange env t c lo hi = ask env "range_by_index" (ReqRangeByIndex t c lo hi) $ \resp -> case resp of
     RespRows rows -> Just (Just rows)
     RespNoIndex -> Just Nothing
     _ -> Nothing
 
 -- | 发 DescribeTable
-doDescribeTable :: String -> IO (Either String TableInfo)
-doDescribeTable t = ask "describe_table" (ReqDescribeTable t) $ \resp -> case resp of
+doDescribeTable :: Env -> String -> IO (Either String TableInfo)
+doDescribeTable env t = ask env "describe_table" (ReqDescribeTable t) $ \resp -> case resp of
     RespSchema info -> Just info
     _ -> Nothing
 
 -- | 给某一列建索引
-doCreateIndex :: String -> String -> IO (Either String ())
-doCreateIndex t c = ask "create_index" (ReqCreateIndex t c) okOnly
+doCreateIndex :: Env -> String -> String -> IO (Either String ())
+doCreateIndex env t c = ask env "create_index" (ReqCreateIndex t c) okOnly
 
 -- | 去掉某一列的索引
-doDropIndex :: String -> String -> IO (Either String ())
-doDropIndex t c = ask "drop_index" (ReqDropIndex t c) okOnly
+doDropIndex :: Env -> String -> String -> IO (Either String ())
+doDropIndex env t c = ask env "drop_index" (ReqDropIndex t c) okOnly
 
 -- | 删一列（列定义、这一列上的索引、每行里的那一格一起没）
-doDropColumn :: String -> String -> IO (Either String ())
-doDropColumn t c = ask "drop_column" (ReqDropColumn t c) okOnly
+doDropColumn :: Env -> String -> String -> IO (Either String ())
+doDropColumn env t c = ask env "drop_column" (ReqDropColumn t c) okOnly
 
 -- | 发 ReplaceSchema（ALTER 用）
-doReplaceSchema :: String -> [SchemaColumn] -> [Row] -> IO (Either String ())
-doReplaceSchema t cols rs = ask "replace_schema" (ReqReplaceSchema t cols rs) okOnly
+doReplaceSchema :: Env -> String -> [SchemaColumn] -> [Row] -> IO (Either String ())
+doReplaceSchema env t cols rs = ask env "replace_schema" (ReqReplaceSchema t cols rs) okOnly
 
 -- | 发 CreateTable
-doCreateTable :: String -> [SchemaColumn] -> IO (Either String ())
-doCreateTable t cols = ask "create_table" (ReqCreateTable t cols) okOnly
+doCreateTable :: Env -> String -> [SchemaColumn] -> IO (Either String ())
+doCreateTable env t cols = ask env "create_table" (ReqCreateTable t cols) okOnly
 
 -- | 发 DropTable
-doDropTable :: String -> IO (Either String ())
-doDropTable t = ask "drop_table" (ReqDropTable t) okOnly
+doDropTable :: Env -> String -> IO (Either String ())
+doDropTable env t = ask env "drop_table" (ReqDropTable t) okOnly
 
 -- | 线上 schema 转本地列
 schemaToColumns :: [SchemaColumn] -> [(String, Column)]
@@ -292,92 +313,91 @@ toWire (n, c) =
 
 instance MonadStorage IPCStorage where
     -- \| 建一个库
-    createDatabase name = IPCStorage (ask "create_database" (ReqDatabase "create_database" name) okOnly)
+    createDatabase name = IPCStorage $ \env -> ask env "create_database" (ReqDatabase "create_database" name) okOnly
     -- \| 删一个库
-    dropDatabase name = IPCStorage (ask "drop_database" (ReqDatabase "drop_database" name) okOnly)
+    dropDatabase name = IPCStorage $ \env -> ask env "drop_database" (ReqDatabase "drop_database" name) okOnly
     -- \| 切当前库
-    useDatabase name = IPCStorage (ask "use_database" (ReqDatabase "use_database" name) okOnly)
+    useDatabase name = IPCStorage $ \env -> ask env "use_database" (ReqDatabase "use_database" name) okOnly
     -- \| 列出现有库
-    listDatabases = IPCStorage $ ask "list_databases" (ReqDatabase "list_databases" "") $ \resp -> case resp of
+    listDatabases = IPCStorage $ \env -> ask env "list_databases" (ReqDatabase "list_databases" "") $ \resp -> case resp of
         RespTables names -> Just names
         _ -> Nothing
     -- \| 发 Scan
-    scan t = IPCStorage (doScan t)
+    scan t = IPCStorage (\env -> doScan env t)
     -- \| 只取指定列
-    scanColumns t cols = IPCStorage (doScanColumns t cols)
+    scanColumns t cols = IPCStorage (\env -> doScanColumns env t cols)
 
     -- \| 并行分片数：按 RTS 能力数，封顶在 parallelShardLimit
-    parallelShards = IPCStorage $ do
+    parallelShards = IPCStorage $ \_ -> do
         caps <- getNumCapabilities
         pure (max 1 (min parallelShardLimit caps))
 
     -- \| 分片并行扫，再按分片序拼接
     scanShards width t cols
-        | width <= 1 = IPCStorage (maybe (doScan t) (doScanColumns t) cols)
-        | otherwise = IPCStorage $ do
+        | width <= 1 = IPCStorage (\env -> maybe (doScan env t) (doScanColumns env t) cols)
+        | otherwise = IPCStorage $ \env -> do
             pool <- workerPool width
-            parts <- poolRun pool [doScanShard t cols shard width | shard <- [0 .. width - 1]]
+            parts <- poolRun pool [doScanShard env t cols shard width | shard <- [0 .. width - 1]]
             pure (fmap concat (sequence parts))
 
     -- \| 发 Insert（索引由存储层自己维护）
-    insert t r = IPCStorage (doInsert t r)
+    insert t r = IPCStorage (\env -> doInsert env t r)
 
     -- \| 一批行一次请求：N 行只落一次盘
-    insertMany t rs = IPCStorage (doInsertMany t rs)
+    insertMany t rs = IPCStorage (\env -> doInsertMany env t rs)
 
     -- \| 按 id 批量删行
-    deleteKeys t ks = IPCStorage (doDeleteKeys t ks)
+    deleteKeys t ks = IPCStorage (\env -> doDeleteKeys env t ks)
 
     -- \| 发 ReplaceAll
-    replaceAll t rs = IPCStorage (doReplaceAll t rs)
+    replaceAll t rs = IPCStorage (\env -> doReplaceAll env t rs)
 
     -- \| 按某一列的索引取一行（没有索引就回 NoIndex）
-    lookupByColumn t c k = IPCStorage (doLookupByColumn t c k)
+    lookupByColumn t c k = IPCStorage (\env -> doLookupByColumn env t c k)
 
     -- \| 范围扫描（没有索引就回 Nothing）
-    scanRange t c lo hi = IPCStorage (doScanRange t c lo hi)
+    scanRange t c lo hi = IPCStorage (\env -> doScanRange env t c lo hi)
 
     -- \| 发 CreateTable
-    createTable name cols = IPCStorage (doCreateTable name (map toWire cols))
+    createTable name cols = IPCStorage (\env -> doCreateTable env name (map toWire cols))
 
     -- \| ALTER：整表换列定义与全部行
-    replaceSchema name cols rows = IPCStorage (doReplaceSchema name (map toWire cols) rows)
+    replaceSchema name cols rows = IPCStorage (\env -> doReplaceSchema env name (map toWire cols) rows)
 
     -- \| 发 DropTable
-    dropTable name = IPCStorage (doDropTable name)
+    dropTable name = IPCStorage (\env -> doDropTable env name)
 
     -- \| 建索引
-    createIndex t c = IPCStorage (doCreateIndex t c)
+    createIndex t c = IPCStorage (\env -> doCreateIndex env t c)
 
     -- \| 删索引
-    dropIndex t c = IPCStorage (doDropIndex t c)
+    dropIndex t c = IPCStorage (\env -> doDropIndex env t c)
 
     -- \| 删一列
-    dropColumn t c = IPCStorage (doDropColumn t c)
+    dropColumn t c = IPCStorage (\env -> doDropColumn env t c)
 
     -- \| 列表 + 逐表扫描拼库
-    snapshot = IPCStorage $ do
-        result <- doListCatalog
+    snapshot = IPCStorage $ \env -> do
+        result <- doListCatalog env
         case result of
             Left _ -> pure []
-            Right xs -> mapM loadEntry xs
+            Right xs -> mapM (loadEntry env) xs
       where
-        loadEntry info = do
-            rows <- doScan (tiTable info)
+        loadEntry env info = do
+            rows <- doScan env (tiTable info)
             pure
                 ( tiTable info
                 , Table (tiTable info) (schemaToColumns (tiColumns info)) (either (const []) id rows) (Just (metaOf info))
                 )
 
     -- \| 只问数据字典要结构，设了当前库只留它的表
-    schema = IPCStorage $ do
-        current <- getDatabaseName
-        result <- ask "all_catalogs" ReqAllCatalog $ \resp -> case resp of
+    schema = IPCStorage $ \env -> do
+        result <- ask env "all_catalogs" ReqAllCatalog $ \resp -> case resp of
             RespCatalog infos -> Just infos
             _ -> Nothing
         pure $ case result of
             Left _ -> []
-            Right xs -> concatMap (visibleTables current) xs
+            Right xs -> concatMap (visibleTables (envDatabase env)) xs
 
 -- | 线上表信息转引擎侧统计
 metaOf :: TableInfo -> TableMeta
