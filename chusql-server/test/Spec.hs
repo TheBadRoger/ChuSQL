@@ -652,6 +652,10 @@ sessionAge session wanted = do
 failureMessage :: Either SessionError QueryResult -> Text
 failureMessage outcome = either sessMessage (const "") outcome
 
+-- | 取失败里的错误码
+failureCode :: Either SessionError QueryResult -> Text
+failureCode outcome = either sessCode (const "") outcome
+
 -- | 取结果第一列的整数
 intValues :: [[Value]] -> [Int]
 intValues rows = [n | row <- rows, Just (VInt n) <- [nth 0 row]]
@@ -712,6 +716,77 @@ transactionSpec = describe "server transactions" $ do
         _ <- mustSql session "begin"
         denied <- runStatementCoded session "use other"
         failureMessage denied `shouldBe` "cannot switch database inside a transaction"
+
+    it "refuses COMMIT when another session changed the same row" $ withTwoSessions $ \first second -> do
+        _ <- mustSql first "begin"
+        _ <- mustSql second "begin"
+        _ <- mustSql first "update users set age = 31 where id = 1"
+        _ <- mustSql second "update users set age = 42 where id = 1"
+        _ <- mustSql first "commit"
+        denied <- runStatementCoded second "commit"
+        failureCode denied `shouldBe` "serialization_failure"
+        failureMessage denied `shouldBe` "write conflict on table users, id 1"
+        -- 事务保留：回滚之后看到的还是先提交的那个值
+        _ <- mustSql second "rollback"
+        sessionAge second 1 `shouldReturn` Just 31
+
+    it "refuses COMMIT when the row was deleted meanwhile" $ withTwoSessions $ \first second -> do
+        _ <- mustSql first "begin"
+        _ <- mustSql second "begin"
+        _ <- mustSql first "delete from users where id = 2"
+        _ <- mustSql second "update users set age = 42 where id = 2"
+        _ <- mustSql first "commit"
+        denied <- runStatementCoded second "commit"
+        failureMessage denied `shouldBe` "write conflict on table users, id 2"
+        _ <- mustSql second "rollback"
+        ids <- sessionIds second
+        ids `shouldMatchList` [1, 3, 4, 5]
+
+    it "refuses COMMIT when deleting a row that changed meanwhile" $ withTwoSessions $ \first second -> do
+        _ <- mustSql first "begin"
+        _ <- mustSql second "begin"
+        _ <- mustSql first "update users set age = 31 where id = 3"
+        _ <- mustSql second "delete from users where id = 3"
+        _ <- mustSql first "commit"
+        denied <- runStatementCoded second "commit"
+        failureMessage denied `shouldBe` "write conflict on table users, id 3"
+        _ <- mustSql second "rollback"
+        sessionAge second 3 `shouldReturn` Just 31
+
+    it "refuses COMMIT when another session inserted the same id" $ withTwoSessions $ \first second -> do
+        _ <- mustSql first "begin"
+        _ <- mustSql second "begin"
+        _ <- mustSql first "insert into users (id, name, age) values (7, 'seven', 27)"
+        _ <- mustSql second "insert into users (id, name, age) values (7, 'other', 70)"
+        _ <- mustSql first "commit"
+        denied <- runStatementCoded second "commit"
+        failureMessage denied `shouldBe` "write conflict on table users, id 7"
+        _ <- mustSql second "rollback"
+        ids <- sessionIds second
+        ids `shouldMatchList` [1, 2, 3, 4, 5, 7]
+
+    it "keeps other sessions' rows untouched when the write sets do not overlap" $ withTwoSessions $ \first second -> do
+        _ <- mustSql first "begin"
+        _ <- mustSql second "begin"
+        _ <- mustSql first "insert into users (id, name, age) values (6, 'six', 26)"
+        _ <- mustSql first "update users set age = 31 where id = 1"
+        _ <- mustSql second "update users set age = 42 where id = 2"
+        _ <- mustSql first "commit"
+        _ <- mustSql second "commit"
+        sessionAge second 1 `shouldReturn` Just 31
+        sessionAge second 2 `shouldReturn` Just 42
+        ids <- sessionIds second
+        ids `shouldMatchList` [1, 2, 3, 4, 5, 6]
+
+    it "lets both sessions delete the same row" $ withTwoSessions $ \first second -> do
+        _ <- mustSql first "begin"
+        _ <- mustSql second "begin"
+        _ <- mustSql first "delete from users where id = 4"
+        _ <- mustSql second "delete from users where id = 4"
+        _ <- mustSql first "commit"
+        _ <- mustSql second "commit"
+        ids <- sessionIds second
+        ids `shouldMatchList` [1, 2, 3, 5]
 
     it "needs a current database to start" $ do
         db <- newMVar testDb
@@ -806,4 +881,29 @@ ipcConcurrencySpec = describe "server backend on the real storage" $ do
         _ <- mustSql session "commit"
         rows <- rowsOf (beStatement alpha "SELECT id FROM t")
         intColumn "id" rows `shouldBe` [1]
+
+    it "refuses the second COMMIT on the real storage" $ withIpcStorage $ do
+        base <- ipcBackend
+        mustRun (beStatement base "CREATE DATABASE alpha")
+        let alpha = beWithDatabase base "alpha"
+        mustRun (beStatement alpha "CREATE TABLE users (id int, name text, age int)")
+        mustRun (beStatement alpha "INSERT INTO users (id, name, age) VALUES (1, 'a', 21)")
+        settings <- tempSettingsPath "transaction-ipc-conflict"
+        removeIfExists settings
+        first <- newSession alpha (T.pack testDatabaseName) settings
+        second <- newSession alpha (T.pack testDatabaseName) settings
+        _ <- mustSql first "use alpha"
+        _ <- mustSql second "use alpha"
+        _ <- mustSql first "begin"
+        _ <- mustSql second "begin"
+        _ <- mustSql first "update users set age = 31 where id = 1"
+        _ <- mustSql second "update users set age = 42 where id = 1"
+        _ <- mustSql first "commit"
+        denied <- runStatementCoded second "commit"
+        failureCode denied `shouldBe` "serialization_failure"
+        failureMessage denied `shouldBe` "write conflict on table users, id 1"
+        _ <- mustSql second "rollback"
+        rows <- rowsOf (beStatement alpha "SELECT id, age FROM users")
+        intColumn "id" rows `shouldBe` [1]
+        intColumn "age" rows `shouldBe` [31]
 

@@ -264,13 +264,15 @@ commitTransaction session = do
             liveResult <- beSnapshot backend
             case liveResult of
                 Left err -> pure (Left (engineErrorCode err))
-                Right live -> do
-                    applied <- beApplyTransaction backend (transactionOps (txBase transaction) (txStaged transaction) live)
-                    case applied of
-                        Left err -> pure (Left (engineErrorCode err))
-                        Right () -> do
-                            writeIORef (ssTransaction session) Nothing
-                            pure (Right (emptyResult (Just current)))
+                Right live -> case transactionConflict (txBase transaction) (txStaged transaction) live of
+                    Just msg -> pure (Left (SessionError "serialization_failure" (T.pack msg)))
+                    Nothing -> do
+                        applied <- beApplyTransaction backend (transactionOps (txBase transaction) (txStaged transaction) live)
+                        case applied of
+                            Left err -> pure (Left (engineErrorCode err))
+                            Right () -> do
+                                writeIORef (ssTransaction session) Nothing
+                                pure (Right (emptyResult (Just current)))
 
 -- | 回滚：快照丢掉，存储层没被改过
 rollbackTransaction :: Session -> IO (Either SessionError QueryResult)
@@ -303,45 +305,79 @@ resultOfStaged db statement rows = resultOf (StatementResult cols rows)
         [] -> columnsFromStatement db statement
         (r : _) -> map fst r
 
+-- | 一张表的提交差异与冲突
+data TableDiff = TableDiff
+    { tdDeletes :: [Int]
+    , tdWrites :: [Row]
+    , tdReplace :: Maybe [Row]
+    , tdConflict :: Maybe String
+    }
+
 -- | 提交差分：相对快照列出要删、要写与要替换的行
 transactionOps :: Database -> Database -> Database -> [TxnOp]
-transactionOps base staged live =
-    concatMap opsFor names
+transactionOps base staged live = concatMap opsOf (transactionDiffs base staged live)
+  where
+    -- | 一张表的请求：先删后写
+    opsOf (name, diff) =
+        [TxnDelete name (tdDeletes diff) | not (null (tdDeletes diff))]
+            ++ [TxnUpsert name (tdWrites diff) | not (null (tdWrites diff))]
+            ++ [TxnReplace name rows | Just rows <- [tdReplace diff]]
+
+-- | 提交前校验：本事务动过的行是否已被别人改掉
+transactionConflict :: Database -> Database -> Database -> Maybe String
+transactionConflict base staged live =
+    case [msg | (_, diff) <- transactionDiffs base staged live, Just msg <- [tdConflict diff]] of
+        (msg : _) -> Just msg
+        [] -> Nothing
+
+-- | 逐表算提交差异，顺带找出冲突
+transactionDiffs :: Database -> Database -> Database -> [(String, TableDiff)]
+transactionDiffs base staged live = [(name, diffFor name) | name <- names]
   where
     -- | 事务里碰得着的表：数据语句不增删表
     names = nubKeys (map fst base ++ map fst staged)
 
-    -- | 一张表的差分
-    opsFor name
-        | all (isJust . rowKey) (baseRows ++ stagedRows) = keyedOps
-        | stagedRows == baseRows = []
-        | otherwise = [TxnReplace name stagedRows]
+    -- | 一张表的差异
+    diffFor name
+        | all (isJust . rowKey) (baseRows ++ stagedRows) = keyedDiff
+        -- 没动过这张表：别人改成什么样都不关本事务
+        | stagedRows == baseRows = emptyDiff
+        -- 动过，库里还是基线：整表替换
+        | liveRows == baseRows = emptyDiff {tdReplace = Just stagedRows}
+        | otherwise = emptyDiff {tdConflict = Just ("write conflict on table " ++ name)}
       where
         baseRows = rowsOf name base
         stagedRows = rowsOf name staged
         liveRows = rowsOf name live
 
+        baseByKey = [(k, r) | r <- baseRows, Just k <- [rowKey r]]
         liveByKey = [(k, r) | r <- liveRows, Just k <- [rowKey r]]
         stagedByKey = [(k, r) | r <- stagedRows, Just k <- [rowKey r]]
-        baseKeys = [k | r <- baseRows, Just k <- [rowKey r]]
 
-        -- 开事务时就存在、现在没了：删；内容变了的行也先删再写
-        gone = [k | (k, _) <- liveByKey, k `elem` baseKeys, not (any ((== k) . fst) stagedByKey)]
-        rewritten = [k | (k, r) <- stagedByKey, Just liveRow <- [lookup k liveByKey], liveRow /= r]
-        deleted = gone ++ rewritten
+        -- 本事务动过的键：内容改过、新增，或者删掉
+        written = [k | (k, r) <- stagedByKey, lookup k baseByKey /= Just r]
+        removed = [k | (k, _) <- baseByKey, not (any ((== k) . fst) stagedByKey)]
+        touched = written ++ removed
 
-        -- 新增的行，以及跟库里不一样的行；并发插进来的行不动
-        written =
-            [ r
-            | (k, r) <- stagedByKey
-            , case lookup k liveByKey of
-                Nothing -> True
-                Just liveRow -> liveRow /= r
+        -- 两边都删了算一致；其余只要跟基线不一样就是冲突
+        victims =
+            [ k
+            | k <- touched
+            , lookup k liveByKey /= lookup k baseByKey
+            , not (k `elem` removed && lookup k liveByKey == Nothing)
             ]
 
-        keyedOps =
-            [TxnDelete name deleted | not (null deleted)]
-                ++ [TxnUpsert name written | not (null written)]
+        keyedDiff =
+            emptyDiff
+                { tdDeletes = [k | k <- touched, isJust (lookup k liveByKey)]
+                , tdWrites = [r | (k, r) <- stagedByKey, k `elem` written]
+                , tdConflict = case victims of
+                    (k : _) -> Just ("write conflict on table " ++ name ++ ", id " ++ show k)
+                    [] -> Nothing
+                }
+
+    -- | 没有差异的空结果
+    emptyDiff = TableDiff [] [] Nothing Nothing
 
     -- | 表名去重但保持顺序
     nubKeys = foldr (\name acc -> if name `elem` acc then acc else name : acc) []
