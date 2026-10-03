@@ -10,6 +10,7 @@ import ChuSQL.Core.Engine.Storage.IPC (
     localStorageLink,
     setStorageLink,
  )
+import ChuSQL.Core.Engine.Syntax.AST (Statement)
 import ChuSQL.Core.Engine.Syntax.Parser (parseStatement)
 import ChuSQL.Core.Model (Database, Row, Table (..), Value (..), pattern TInt, pattern TStr)
 import ChuSQL.Interface.Auth (hashPasswordWith)
@@ -480,6 +481,16 @@ withPrivileges body = do
     service <- newPrivileges (memoryBackend testDatabaseName db)
     body service (Root testRootName)
 
+-- | 解析一条 SQL，失败就丢掉用例
+parseOrFail :: String -> IO Statement
+parseOrFail sql = case parseStatement sql of
+    Left err -> expectationFailure err >> fail "statement did not parse"
+    Right stmt -> pure stmt
+
+-- | 用某个身份鉴权一条 SQL
+authorizeSql :: Privileges -> Principal -> String -> IO (Either PrivilegeError ())
+authorizeSql service principal sql = parseOrFail sql >>= authorize service principal testDatabase
+
 -- | 权限与目录 API 用例
 privilegeSpec :: Spec
 privilegeSpec = describe "server privileges" $ do
@@ -535,6 +546,49 @@ privilegeSpec = describe "server privileges" $ do
         views <- listRoleViews service
         views `shouldBe` Right []
 
+    it "inherits the grants of another role" $ withPrivileges $ \service root -> do
+        _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
+        _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "writer")
+        _ <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "reader")
+        _ <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "reader" ["writer"])
+        linked <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "writer" ["alice"])
+        linked `shouldBe` Right ()
+        -- 继承链上的授权跟着成员传上来
+        authorizeSql service (Ordinary testAccount) "SELECT * FROM users" `shouldReturn` Right ()
+        views <- listRoleViews service
+        case views of
+            Left err -> expectationFailure (show err)
+            Right known -> do
+                let membersOf name = concat [ms | view <- known, roleName view == name, ms <- [roleMembers view]]
+                membersOf "reader" `shouldMatchList` ["writer"]
+                membersOf "writer" `shouldMatchList` ["alice"]
+        revoked <- runPrivilegeCommand service root testDatabase (RevokeRoleCommand "reader" ["writer"])
+        revoked `shouldBe` Right ()
+        authorizeSql service (Ordinary testAccount) "SELECT * FROM users"
+            `shouldReturn` Left (PrivilegeError "forbidden" "permission denied: SELECT ON users")
+
+    it "refuses a role membership that would create a cycle" $ withPrivileges $ \service root -> do
+        _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
+        _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "writer")
+        _ <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "reader" ["writer"])
+        loop <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "writer" ["reader"])
+        loop `shouldBe` Left (PrivilegeError "conflict" "role membership would create a cycle: writer and reader")
+        self <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "reader" ["reader"])
+        self `shouldBe` Left (PrivilegeError "conflict" "role membership would create a cycle: reader and reader")
+
+    it "drops the inherited edge together with the role" $ withPrivileges $ \service root -> do
+        _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
+        _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "writer")
+        _ <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "reader")
+        _ <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "reader" ["writer"])
+        _ <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "writer" ["alice"])
+        dropped <- runPrivilegeCommand service root testDatabase (DropRoleCommand "reader")
+        dropped `shouldBe` Right ()
+        authorizeSql service (Ordinary testAccount) "SELECT * FROM users"
+            `shouldReturn` Left (PrivilegeError "forbidden" "permission denied: SELECT ON users")
+        views <- listRoleViews service
+        fmap (map roleMembers) views `shouldBe` Right [["alice"]]
+
     it "refuses a command on a role that does not exist" $ withPrivileges $ \service root -> do
         missing <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "ghost")
         missing `shouldBe` Left (PrivilegeError "not_found" "unknown role: ghost")
@@ -571,6 +625,17 @@ privilegeSpec = describe "server privileges" $ do
         case denied of
             Left _ -> pure ()
             Right result -> expectationFailure ("account table must stay hidden: " ++ show (srRows result))
+
+    it "inherits a role on the real storage" $ withIpcStorage $ do
+        base <- ipcBackend
+        service <- newPrivileges base
+        _ <- runPrivilegeCommand service (Root testRootName) testDatabase (CreateRoleCommand "reader")
+        _ <- runPrivilegeCommand service (Root testRootName) testDatabase (CreateRoleCommand "writer")
+        _ <- runPrivilegeCommand service (Root testRootName) testDatabase (GrantPrivilegesCommand ["select"] "users" "reader")
+        _ <- runPrivilegeCommand service (Root testRootName) testDatabase (GrantRoleCommand "reader" ["writer"])
+        linked <- runPrivilegeCommand service (Root testRootName) testDatabase (GrantRoleCommand "writer" ["alice"])
+        linked `shouldBe` Right ()
+        authorizeSql service (Ordinary testAccount) "SELECT * FROM users" `shouldReturn` Right ()
 
 -- 真存储夹具：一个用例一份数据目录，跑完关链路删干净
 

@@ -104,13 +104,14 @@ readRoleNames catalog = fmap (fmap (map (normalizeRole . cell "name"))) (readRow
 insertRole :: Catalog -> Text -> IO (Either String ())
 insertRole catalog role = exec catalog (insertSql rolesTable ["name"] [normalizeRole role])
 
--- | 删掉一个角色，连同它的授权与成员
+-- | 删掉一个角色，连同它的授权与成员边
 dropRole :: Catalog -> Text -> IO (Either String ())
 dropRole catalog role = do
     first <- exec catalog ("DELETE FROM " ++ rolesTable ++ " WHERE name = " ++ roleLiteral role)
     second <- exec catalog ("DELETE FROM " ++ grantsTable ++ " WHERE role = " ++ roleLiteral role)
     third <- exec catalog ("DELETE FROM " ++ membersTable ++ " WHERE role = " ++ roleLiteral role)
-    pure (sequence_ [first, second, third])
+    fourth <- exec catalog ("DELETE FROM " ++ membersTable ++ " WHERE member = " ++ roleLiteral role)
+    pure (sequence_ [first, second, third, fourth])
 
 -- | 全部授权
 readGrants :: Catalog -> IO (Either String [Grant])
