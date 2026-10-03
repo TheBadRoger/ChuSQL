@@ -177,6 +177,19 @@ inferExpr db place env (InList a es _) = do
     mapM_ (itemType place ta) ts
     Right (InferType CBool)
 inferExpr _ _ _ (ExistsSub _ _) = Right (InferType CBool)
+inferExpr db place env (QuantCmp _ a sq q) = do
+    ta <- inferExpr db place env a
+    cols <- inferSubqueryOutput db env sq
+    case cols of
+        [(_, t)]
+            | compatible ta t -> Right (InferType CBool)
+            | otherwise -> Left (place ++ ": " ++ quantLabel q ++ " subquery column has type " ++ renderType t ++ ", expected " ++ renderType ta)
+        _ -> Left (place ++ ": " ++ quantLabel q ++ " subquery must return exactly one column")
+
+-- | 量词在错误文本里的名字
+quantLabel :: Quantifier -> String
+quantLabel AnyQ = "ANY"
+quantLabel AllQ = "ALL"
 
 -- | IN 列表里的每一项都要跟左边的类型对得上
 itemType :: String -> InferredType -> InferredType -> Either String ()
@@ -617,6 +630,7 @@ resolveExpr db env outer f e = case e of
     InSub a sq negated -> InSub <$> resolveExpr db env outer f a <*> resolveSubquery db (env ++ outer) sq <*> pure negated
     InList a es negated -> InList <$> resolveExpr db env outer f a <*> mapM (resolveExpr db env outer f) es <*> pure negated
     ExistsSub sq negated -> ExistsSub <$> resolveSubquery db (env ++ outer) sq <*> pure negated
+    QuantCmp op a sq q -> QuantCmp op <$> resolveExpr db env outer f a <*> resolveSubquery db (env ++ outer) sq <*> pure q
     _ -> Right e
   where
     -- | 递归处理两个子表达式

@@ -1,8 +1,8 @@
-module ChuSQL.Core.Engine.Algebra.Expr (evalExpr, evalCondForRow, colsInExpr, aggregatesIn, hasAggregate, bareColumns, hasSubquery, hasDivision, inValues, threeValuedNot) where
+module ChuSQL.Core.Engine.Algebra.Expr (evalExpr, evalCondForRow, colsInExpr, aggregatesIn, hasAggregate, bareColumns, hasSubquery, hasDivision, inValues, threeValuedNot, quantifiedCompare) where
 
 import ChuSQL.Core.Model
 import ChuSQL.Core.Engine.Syntax.AST
-import ChuSQL.Core.Engine.Builtin (Operator (..), executeOperator, inValues, threeValuedNot)
+import ChuSQL.Core.Engine.Builtin (Operator (..), compareNode, executeOperator, inValues, threeValuedNot)
 
 -- 表达式求值：三值逻辑，NULL 参与运算结果仍是 NULL。
 
@@ -47,11 +47,18 @@ evalExpr (InList a es negated) row = do
 evalExpr (ScalarSub _) _ = Left subqueryNeedsDatabase
 evalExpr (InSub _ _ _) _ = Left subqueryNeedsDatabase
 evalExpr (ExistsSub _ _) _ = Left subqueryNeedsDatabase
+evalExpr (QuantCmp _ _ _ _) _ = Left subqueryNeedsDatabase
 evalExpr agg _ = Left ("aggregate functions are not allowed here: " ++ show agg)
 
 -- | 子查询要连上存储才能跑
 subqueryNeedsDatabase :: String
 subqueryNeedsDatabase = "subquery needs a database to run"
+
+-- | 量词比较摊成 AND / OR 链
+quantifiedCompare :: CompareOp -> Expr -> [Expr] -> Quantifier -> Expr
+quantifiedCompare op lhs vs q = case vs of
+    [] -> LitBool (q == AllQ)
+    _ -> foldr1 (if q == AllQ then And else Or) (map (compareNode op lhs) vs)
 
 -- | 表达式用到了哪些列
 colsInExpr :: Expr -> [String]
@@ -80,6 +87,7 @@ colsInExpr (ScalarSub sq) = subqueryRefs sq
 colsInExpr (InSub a sq _) = colsInExpr a ++ subqueryRefs sq
 colsInExpr (InList a es _) = colsInExpr a ++ concatMap colsInExpr es
 colsInExpr (ExistsSub sq _) = subqueryRefs sq
+colsInExpr (QuantCmp _ a sq _) = colsInExpr a ++ subqueryRefs sq
 colsInExpr _ = []
 
 -- | 表达式里有没有除法（除法可能报错，不能提前或延后求值）
@@ -98,6 +106,7 @@ hasDivision e = case e of
     NotEq a b -> both a b
     And a b -> both a b
     Or a b -> both a b
+    QuantCmp _ a _ _ -> hasDivision a
     _ -> False
   where
     -- | 两个子表达式里任意一个有除法
@@ -110,6 +119,7 @@ hasSubquery e = case e of
     InSub _ _ _ -> True
     InList a es _ -> any hasSubquery (a : es)
     ExistsSub _ _ -> True
+    QuantCmp _ _ _ _ -> True
     Add a b -> both a b
     Sub a b -> both a b
     Mul a b -> both a b
@@ -144,6 +154,7 @@ aggregatesIn e = case e of
     a@(AvgOf _) -> [a]
     a@(MinOf _) -> [a]
     a@(MaxOf _) -> [a]
+    QuantCmp _ a _ _ -> aggregatesIn a
     Add a b -> both a b
     Sub a b -> both a b
     Mul a b -> both a b
@@ -191,6 +202,7 @@ bareColumns e = case e of
     InSub a sq _ -> bareColumns a ++ subqueryRefs sq
     InList a es _ -> bareColumns a ++ concatMap bareColumns es
     ExistsSub sq _ -> subqueryRefs sq
+    QuantCmp _ a sq _ -> bareColumns a ++ subqueryRefs sq
     _ -> []
   where
     -- | 两个子表达式的裸列拼起来

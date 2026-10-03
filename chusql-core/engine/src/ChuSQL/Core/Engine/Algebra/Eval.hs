@@ -1,7 +1,7 @@
 module ChuSQL.Core.Engine.Algebra.Eval (evalRelOp, evalRelOpM, evalExprM, evalCondForRowM) where
 
 import ChuSQL.Core.Engine.Algebra.Cost (tableMetaOf)
-import ChuSQL.Core.Engine.Algebra.Expr (evalCondForRow, evalExpr)
+import ChuSQL.Core.Engine.Algebra.Expr (evalCondForRow, evalExpr, quantifiedCompare)
 import ChuSQL.Core.Engine.Algebra.Optimize (optimize)
 import ChuSQL.Core.Engine.Algebra.Op
 import ChuSQL.Core.Engine.Algebra.Planner (translate)
@@ -312,6 +312,14 @@ substSubqueries db e env = case e of
     ExistsSub sq negated -> do
         rows <- runSubqueryRows db sq env
         pure (fmap (\rs -> LitBool (if negated then null rs else not (null rs))) rows)
+    QuantCmp op a sq q -> do
+        lhs <- substSubqueries db a env
+        rows <- runSubqueryRows db sq env
+        pure (do
+            a' <- lhs
+            rs <- rows
+            vs <- mapM rowValue rs
+            Right (quantifiedCompare op a' (map valueLiteral vs) q))
     InList a es negated -> do
         lhs <- substSubqueries db a env
         es' <- mapM (\x -> substSubqueries db x env) es

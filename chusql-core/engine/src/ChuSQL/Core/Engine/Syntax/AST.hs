@@ -1,4 +1,4 @@
-module ChuSQL.Core.Engine.Syntax.AST (Statement (..), FromClause (..), JoinKind (..), Expr (..), Subquery (..), SortDir (..), makeSelect) where
+module ChuSQL.Core.Engine.Syntax.AST (Statement (..), FromClause (..), JoinKind (..), Expr (..), Subquery (..), Quantifier (..), CompareOp (..), SortDir (..), makeSelect) where
 
 import ChuSQL.Core.Model (Column (..), ColumnType, Value (..))
 
@@ -88,6 +88,22 @@ data Subquery = Subquery
     }
     deriving (Show, Eq)
 
+-- | 量词：ANY 至少一行成立，ALL 每一行都成立
+data Quantifier
+    = AnyQ
+    | AllQ
+    deriving (Show, Eq)
+
+-- | 量词比较里的比较运算符
+data CompareOp
+    = CmpEq
+    | CmpNe
+    | CmpGt
+    | CmpGtE
+    | CmpLt
+    | CmpLtE
+    deriving (Show, Eq)
+
 -- | 条件表达式：列、字面量、算术、比较、逻辑、聚合与子查询
 data Expr
     = Col String
@@ -124,6 +140,7 @@ data Expr
     | InSub Expr Subquery Bool
     | InList Expr [Expr] Bool
     | ExistsSub Subquery Bool
+    | QuantCmp CompareOp Expr Subquery Quantifier
     deriving (Show, Eq)
 
 -- | 排序方向：升序或降序

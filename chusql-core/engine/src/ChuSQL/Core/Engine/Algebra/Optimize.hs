@@ -147,6 +147,7 @@ foldConstants (Eq a b) = foldNode (Eq (foldConstants a) (foldConstants b))
 foldConstants (GtE a b) = foldNode (GtE (foldConstants a) (foldConstants b))
 foldConstants (LtE a b) = foldNode (LtE (foldConstants a) (foldConstants b))
 foldConstants (NotEq a b) = foldNode (NotEq (foldConstants a) (foldConstants b))
+foldConstants (QuantCmp op a sq q) = QuantCmp op (foldConstants a) sq q
 foldConstants (And a b) = foldNode (And (foldConstants a) (foldConstants b))
 foldConstants (Or a b) = foldNode (Or (foldConstants a) (foldConstants b))
 foldConstants e = e

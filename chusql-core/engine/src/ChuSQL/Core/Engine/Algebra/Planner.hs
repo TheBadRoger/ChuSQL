@@ -47,6 +47,7 @@ rewriteAggs aggs e = case [label | (label, agg) <- aggs, agg == e] of
         GtE a b -> GtE (go a) (go b)
         LtE a b -> LtE (go a) (go b)
         NotEq a b -> NotEq (go a) (go b)
+        QuantCmp op a sq q -> QuantCmp op (go a) sq q
         And a b -> And (go a) (go b)
         Or a b -> Or (go a) (go b)
         IsNull a -> IsNull (go a)

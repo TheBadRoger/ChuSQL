@@ -3,7 +3,7 @@
 module ChuSQL.Core.Engine.Syntax.Parser (parseStatement, parseExpression) where
 
 import ChuSQL.Core.Model (Column (..), ColumnType (..), Value (..), plainColumn)
-import ChuSQL.Core.Engine.Builtin (Builtin (..), builtinName, builtinNames, builtinNode)
+import ChuSQL.Core.Engine.Builtin (Builtin (..), builtinName, builtinNames, builtinNode, compareNode)
 import ChuSQL.Core.Engine.Syntax.AST
 import Control.Monad (void)
 import Control.Monad.Combinators.Expr (Operator (..), makeExprParser)
@@ -112,20 +112,46 @@ operatorTable =
     [ [Prefix (Neg <$ symbol "-")]
     , [InfixL (Mul <$ symbol "*"), InfixL (Div <$ symbol "/")]
     , [InfixL (Add <$ symbol "+"), InfixL (Sub <$ symbol "-")]
-    , [ InfixN (NotEq <$ try (symbol "<>" <|> symbol "!="))
-        , InfixN (GtE <$ try (symbol ">="))
-        , InfixN (LtE <$ try (symbol "<="))
-        , InfixN (Gt <$ symbol ">")
-        , InfixN (Lt <$ symbol "<")
-        , InfixN (Eq <$ symbol "=")
-        ]
+    , [ InfixN comparisonOp ]
     , [ Postfix inPredicate
+        , Postfix (try quantifiedCmp)
         , Postfix (IsNotNull <$ try (keyword "is" *> keyword "not" *> keyword "null"))
         , Postfix (IsNull <$ (keyword "is" *> keyword "null"))
         ]
     , [InfixL (And <$ keyword "AND")]
     , [InfixL (Or <$ keyword "OR")]
     ]
+
+-- | 普通比较：读最长的运算符，后面不能是 ANY / ALL
+comparisonOp :: Parser (Expr -> Expr -> Expr)
+comparisonOp = try $ do
+    op <- cmpOp
+    notFollowedBy quantifierKeyword
+    return (compareNode op)
+
+-- | 量词：ANY 或 ALL
+quantifierKeyword :: Parser Quantifier
+quantifierKeyword = (AnyQ <$ keyword "any") <|> (AllQ <$ keyword "all")
+
+-- | 比较运算符符号
+cmpOp :: Parser CompareOp
+cmpOp =
+    choice
+        [ CmpNe <$ try (symbol "<>" <|> symbol "!=")
+        , CmpGtE <$ try (symbol ">=")
+        , CmpLtE <$ try (symbol "<=")
+        , CmpGt <$ symbol ">"
+        , CmpLt <$ symbol "<"
+        , CmpEq <$ symbol "="
+        ]
+
+-- | 量词比较 ANY / ALL
+quantifiedCmp :: Parser (Expr -> Expr)
+quantifiedCmp = do
+    op <- cmpOp
+    q <- quantifierKeyword
+    sq <- between (symbol "(") (symbol ")") subquerySelect
+    return (\e -> QuantCmp op e sq q)
 
 -- | 最小的表达式单位
 atom :: Parser Expr
@@ -282,6 +308,8 @@ reservedWords =
     , "type"
     , "group"
     , "with"
+    , "any"
+    , "all"
     ]
 
 -- | 别名（不许用保留字）
@@ -715,6 +743,7 @@ expandExpr env e = case e of
     InSub x sq neg -> (\x' sq' -> InSub x' sq' neg) <$> go x <*> goSub sq
     InList x es neg -> (\x' es' -> InList x' es' neg) <$> go x <*> traverse go es
     ExistsSub sq neg -> (\sq' -> ExistsSub sq' neg) <$> goSub sq
+    QuantCmp op x sq q -> (\x' sq' -> QuantCmp op x' sq' q) <$> go x <*> goSub sq
     _ -> Right e
   where
     -- | 继续看子表达式
