@@ -1,7 +1,7 @@
 module ChuSQL.Core.Engine.Algebra.Eval (evalRelOp, evalRelOpM, evalExprM, evalCondForRowM) where
 
 import ChuSQL.Core.Engine.Algebra.Cost (tableMetaOf)
-import ChuSQL.Core.Engine.Algebra.Expr (evalCondForRow, evalExpr, quantifiedCompare)
+import ChuSQL.Core.Engine.Algebra.Expr (evalCondForRow, evalExpr, hasSubquery, quantifiedCompare, subqueryRefsIn)
 import ChuSQL.Core.Engine.Algebra.Optimize (optimize)
 import ChuSQL.Core.Engine.Algebra.Op
 import ChuSQL.Core.Engine.Algebra.Planner (translate)
@@ -12,6 +12,7 @@ import ChuSQL.Core.Engine.Storage (IndexResult (..), MonadStorage (..))
 import ChuSQL.Core.Engine.Storage.Memory (runMemoryStorage)
 import ChuSQL.Core.Engine.Syntax.AST (Expr (..), JoinKind (..), Subquery (..))
 import Control.Monad (filterM)
+import Data.List (nub)
 import qualified Data.HashMap.Strict as HM
 
 -- 执行：按算子树算出结果行，外层行供相关子查询引用。
@@ -246,6 +247,53 @@ evalAggregate outer keys aggs rows = do
     let top = if null keys && null groups then [([], [])] else groups
     mapM (oneGroup outer keys aggs) top
 
+-- | 绑定键：子查询引用的外层列在这一行上的取值
+bindingKey :: [String] -> Row -> String
+bindingKey refs env = show [(c, lookup c env) | c <- refs]
+
+-- | 每个绑定留第一行当样本，去掉重复绑定
+bindingSamples :: [String] -> Row -> [Row] -> [(String, Row)]
+bindingSamples refs outer rows = go rows HM.empty []
+  where
+    -- | 逐行按绑定键去重
+    go [] _ acc = reverse acc
+    go (r : rs) seen acc =
+        let env = r ++ outer
+            k = bindingKey refs env
+        in case HM.lookup k seen of
+            Just _ -> go rs seen acc
+            Nothing -> go rs (HM.insert k () seen) ((k, env) : acc)
+
+-- | 每个绑定只换一次子查询，得到绑定到表达式的表
+bindingsTableM ::
+    (MonadStorage m) =>
+    Database ->
+    Row ->
+    [Expr] ->
+    [Row] ->
+    m (Either String (HM.HashMap String [Expr]))
+bindingsTableM db outer exprs rows = do
+    built <- mapM swap (bindingSamples refs outer rows)
+    pure (fmap HM.fromList (sequence built))
+  where
+    refs = nub (concatMap subqueryRefsIn exprs)
+    -- | 一个绑定样本上把子查询全换成字面量
+    swap (key, env) = do
+        es <- mapM (\e -> substSubqueries db e env) exprs
+        pure (fmap (\xs -> (key, xs)) (sequence es))
+
+-- | 取这一行绑定换好的表达式；没有这个绑定就是内部错误
+boundExprs :: [String] -> Row -> HM.HashMap String [Expr] -> Either String [Expr]
+boundExprs refs env table = case HM.lookup (bindingKey refs env) table of
+    Just es -> Right es
+    Nothing -> Left "subquery binding is missing"
+
+-- | 取这一行绑定换好的唯一表达式
+boundExpr :: [String] -> Row -> HM.HashMap String [Expr] -> Either String Expr
+boundExpr refs env table = case boundExprs refs env table of
+    Right [x] -> Right x
+    _ -> Left "subquery binding is missing"
+
 -- | 单子过滤：条件本身是单子求值的
 filterRowsM :: (Monad m) => (Row -> m (Either String Bool)) -> [Row] -> m (Either String [Row])
 filterRowsM p = go []
@@ -385,9 +433,19 @@ evalRelOpIn db outer (Compute items op) = do
     rows <- evalRelOpIn db outer op
     case rows of
         Left e -> pure (Left e)
-        Right rs -> do
-            computed <- mapM (computeM db outer items) rs
-            pure (sequence computed)
+        Right rs
+            | not (any (hasSubquery . snd) items) -> do
+                computed <- mapM (computeM db outer items) rs
+                pure (sequence computed)
+            | otherwise -> do
+                table <- bindingsTableM db outer (map snd items) rs
+                pure (table >>= \t -> traverse (computeBound t) rs)
+  where
+    refs = nub (concatMap (subqueryRefsIn . snd) items)
+    -- | 用这一行绑定换好的表达式算出一行
+    computeBound table r = do
+        es <- boundExprs refs (r ++ outer) table
+        mapM (\(label, e) -> (,) label <$> evalExpr e (r ++ outer)) (zip (map fst items) es)
 evalRelOpIn db outer (Aggregate keys aggs op) = do
     rows <- evalRelOpIn db outer op
     pure (rows >>= evalAggregate outer keys aggs)
@@ -410,7 +468,17 @@ evalRelOpIn db outer (Filter e op) = do
     rows <- evalRelOpIn db outer op
     case rows of
         Left err -> pure (Left err)
-        Right rs -> filterRowsM (\r -> evalCondForRowM db e (r ++ outer)) rs
+        Right rs
+            | not (hasSubquery e) -> filterRowsM (\r -> evalCondForRowM db e (r ++ outer)) rs
+            | otherwise -> do
+                table <- bindingsTableM db outer [e] rs
+                pure (table >>= \t -> filterM (keepBound t) rs)
+  where
+    refs = nub (subqueryRefsIn e)
+    -- | 用这一行绑定换好的条件判定
+    keepBound table r = do
+        e' <- boundExpr refs (r ++ outer) table
+        evalCondForRow e' (r ++ outer)
 evalRelOpIn db outer (Project cols op) = do
     rows <- evalRelOpIn db outer op
     pure (fmap (map (project cols)) rows)

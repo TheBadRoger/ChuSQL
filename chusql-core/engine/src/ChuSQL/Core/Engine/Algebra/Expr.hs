@@ -1,4 +1,4 @@
-module ChuSQL.Core.Engine.Algebra.Expr (evalExpr, evalCondForRow, colsInExpr, aggregatesIn, hasAggregate, bareColumns, hasSubquery, hasDivision, inValues, threeValuedNot, quantifiedCompare) where
+module ChuSQL.Core.Engine.Algebra.Expr (evalExpr, evalCondForRow, colsInExpr, subqueryRefsIn, aggregatesIn, hasAggregate, bareColumns, hasSubquery, hasDivision, inValues, threeValuedNot, quantifiedCompare) where
 
 import ChuSQL.Core.Model
 import ChuSQL.Core.Engine.Syntax.AST
@@ -89,6 +89,39 @@ colsInExpr (InList a es _) = colsInExpr a ++ concatMap colsInExpr es
 colsInExpr (ExistsSub sq _) = subqueryRefs sq
 colsInExpr (QuantCmp _ a sq _) = colsInExpr a ++ subqueryRefs sq
 colsInExpr _ = []
+
+-- | 表达式里子查询引用的外层列
+subqueryRefsIn :: Expr -> [String]
+subqueryRefsIn e = case e of
+    ScalarSub sq -> subqueryRefs sq
+    InSub a sq _ -> subqueryRefsIn a ++ subqueryRefs sq
+    InList a es _ -> concatMap subqueryRefsIn (a : es)
+    ExistsSub sq _ -> subqueryRefs sq
+    QuantCmp _ a sq _ -> subqueryRefsIn a ++ subqueryRefs sq
+    Add a b -> both a b
+    Sub a b -> both a b
+    Mul a b -> both a b
+    Div a b -> both a b
+    Neg a -> subqueryRefsIn a
+    Gt a b -> both a b
+    Lt a b -> both a b
+    Eq a b -> both a b
+    GtE a b -> both a b
+    LtE a b -> both a b
+    NotEq a b -> both a b
+    And a b -> both a b
+    Or a b -> both a b
+    IsNull a -> subqueryRefsIn a
+    IsNotNull a -> subqueryRefsIn a
+    CountOf a -> subqueryRefsIn a
+    SumOf a -> subqueryRefsIn a
+    AvgOf a -> subqueryRefsIn a
+    MinOf a -> subqueryRefsIn a
+    MaxOf a -> subqueryRefsIn a
+    _ -> []
+  where
+    -- | 两个子表达式的外层列拼起来
+    both a b = subqueryRefsIn a ++ subqueryRefsIn b
 
 -- | 表达式里有没有除法（除法可能报错，不能提前或延后求值）
 hasDivision :: Expr -> Bool

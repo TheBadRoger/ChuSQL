@@ -16,6 +16,7 @@ import ChuSQL.Core.Engine.Parallel (poolRun, workerPool)
 import ChuSQL.Core.Model
 import ChuSQL.Core.Engine.Semantic (prepare)
 import ChuSQL.Core.Engine.Storage (IndexResult (..), MonadStorage (..))
+import ChuSQL.Core.Engine.Storage.Memory (MemoryStorage (runMemoryStorage))
 import ChuSQL.Core.Engine.Storage.IPC (IPCStorage (..), closeConnection, defaultEnv, doListTables, envForDatabase, getDatabaseName, localStorageLink, runIPCStorage, setDatabaseName, setStorageLink)
 import ChuSQL.Core.Engine.Syntax.AST
 import ChuSQL.Core.Engine.Syntax.Parser
@@ -1399,6 +1400,24 @@ main = hspec $ do
         it "keeps subquery results identical after optimization" $ do
             sameResultAsUnoptimized "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders)"
             sameResultAsUnoptimized "SELECT u.name FROM users u WHERE EXISTS (SELECT * FROM orders o WHERE o.user_id = u.id)"
+
+    describe "ChuSQL.Core.Engine (子查询去相关)" $ do
+        it "runs a non-correlated subquery only once" $ do
+            let (result, scans) = countedRun "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders)"
+            fmap (map (map snd)) result `shouldBe` Right [[VStr "Alice"], [VStr "Bob"]]
+            scanTimes "orders" scans `shouldBe` 1
+
+        it "runs a correlated subquery once per distinct binding" $ do
+            let (result, scans) =
+                    countedRun "SELECT o.product FROM orders o WHERE EXISTS (SELECT * FROM users u WHERE u.id = o.user_id)"
+            fmap (map (map snd)) result `shouldBe` Right [[VStr "Book"], [VStr "Pen"], [VStr "Cup"]]
+            scanTimes "users" scans `shouldBe` 2
+            scanTimes "orders" scans `shouldBe` 1
+
+        it "runs a non-correlated subquery in a computed column only once" $ do
+            let (result, scans) = countedRun "SELECT name, (SELECT COUNT(*) FROM orders) FROM users"
+            length (either (const []) id result) `shouldBe` 3
+            scanTimes "orders" scans `shouldBe` 1
 
     describe "ChuSQL.Core.Engine (聚合与 GROUP BY)" $ do
         -- sql：在默认库上跑 SQL 取结果行
@@ -2926,3 +2945,88 @@ leftSideFilters _ = Nothing
 planRoot :: RelOp -> RelOp
 planRoot (Project _ x) = planRoot x
 planRoot x = x
+
+-- | 记下扫过哪些表的存储：语义与内存实现一致，只是扫描多记一笔
+data Counting a = Counting {runCounting :: Database -> Either String (a, Database, [String])}
+
+instance Functor Counting where
+    fmap f (Counting m) = Counting $ \db -> fmap (\(a, db', log') -> (f a, db', log')) (m db)
+
+instance Applicative Counting where
+    pure a = Counting $ \db -> Right (a, db, [])
+    Counting mf <*> Counting ma = Counting $ \db -> do
+        (f, db1, l1) <- mf db
+        (a, db2, l2) <- ma db1
+        Right (f a, db2, l1 ++ l2)
+
+instance Monad Counting where
+    Counting m >>= k = Counting $ \db -> do
+        (a, db1, l1) <- m db
+        (b, db2, l2) <- runCounting (k a) db1
+        Right (b, db2, l1 ++ l2)
+
+-- | 内存实现的某个动作，转发给 Counting
+memory :: MemoryStorage a -> Counting a
+memory m = Counting $ \db -> case runMemoryStorage m db of
+    Left e -> Left e
+    Right (a, db') -> Right (a, db', [])
+
+-- | 内存实现的扫描
+memScan :: String -> MemoryStorage (Either String [Row])
+memScan = scan
+
+-- | 内存实现的插入
+memInsert :: String -> Row -> MemoryStorage (Either String ())
+memInsert = insert
+
+-- | 内存实现的整表替换
+memReplaceAll :: String -> [Row] -> MemoryStorage (Either String ())
+memReplaceAll = replaceAll
+
+-- | 内存实现的建表
+memCreateTable :: String -> [(String, Column)] -> MemoryStorage (Either String ())
+memCreateTable = createTable
+
+-- | 内存实现的删表
+memDropTable :: String -> MemoryStorage (Either String ())
+memDropTable = dropTable
+
+-- | 内存实现的删列
+memDropColumn :: String -> String -> MemoryStorage (Either String ())
+memDropColumn = dropColumn
+
+-- | 内存实现的换结构
+memReplaceSchema :: String -> [(String, Column)] -> [Row] -> MemoryStorage (Either String ())
+memReplaceSchema = replaceSchema
+
+instance MonadStorage Counting where
+    -- \| 扫描：记一笔表名，其余走内存实现
+    scan t = Counting $ \db -> case runMemoryStorage (memScan t) db of
+        Left e -> Left e
+        Right (r, db') -> Right (r, db', [t])
+    -- \| 插入：走内存实现
+    insert t r = memory (memInsert t r)
+    -- \| 整表替换：走内存实现
+    replaceAll t rs = memory (memReplaceAll t rs)
+    -- \| 建表：走内存实现
+    createTable name cols = memory (memCreateTable name cols)
+    -- \| 删表：走内存实现
+    dropTable name = memory (memDropTable name)
+    -- \| 删列：走内存实现
+    dropColumn name col = memory (memDropColumn name col)
+    -- \| 换结构：走内存实现
+    replaceSchema name cols rows = memory (memReplaceSchema name cols rows)
+    -- \| 快照：把当前库原样交出去
+    snapshot = Counting $ \db -> Right (db, db, [])
+
+-- | 解析一条 SQL 并在计数存储上跑，返回结果与扫描过的表
+countedRun :: String -> (Either String [Row], [String])
+countedRun input = case parseStatement input of
+    Left err -> (Left err, [])
+    Right stmt -> case runCounting (runStatementM stmt) testDB of
+        Left err -> (Left err, [])
+        Right (result, _, scans) -> (result, scans)
+
+-- | 结果里出现了几张表被扫过几次
+scanTimes :: String -> [String] -> Int
+scanTimes t scans = length [name | name <- scans, name == t]
