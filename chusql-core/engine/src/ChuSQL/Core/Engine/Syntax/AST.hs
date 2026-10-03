@@ -41,8 +41,8 @@ data Statement
     | CreateRole String
     -- | 删角色：连同它的授权与成员一起删
     | DropRole String
-    -- | GRANT 权限 ON 表 TO 角色
-    | GrantPrivileges [String] String String
+    -- | GRANT 权限 ON 表 TO 角色，末位表示带 WITH GRANT OPTION
+    | GrantPrivileges [String] String String Bool
     -- | REVOKE 权限 ON 表 FROM 角色
     | RevokePrivileges [String] String String
     -- | GRANT 角色 TO 用户：给用户加角色

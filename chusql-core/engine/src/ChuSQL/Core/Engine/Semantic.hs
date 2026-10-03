@@ -415,7 +415,7 @@ checkResolvedWith db outer q = case q of
     DropUser name -> checkUserName name
     CreateRole name -> checkRoleName name
     DropRole name -> checkRoleName name
-    GrantPrivileges privs obj role -> do
+    GrantPrivileges privs obj role _ -> do
         mapM_ checkPrivilege privs
         checkGrantObject obj
         checkRoleName role

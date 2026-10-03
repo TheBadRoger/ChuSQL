@@ -182,7 +182,9 @@ listRoles session = do
         , if null (roleMembers view) then "-" else T.intercalate ", " (roleMembers view)
         ]
     -- | 拼一条授权说明
-    grantText grant = grantPrivilege grant <> " on " <> grantObject grant
+    grantText grant = grantPrivilege grant <> " on " <> grantObject grant <> optionText grant
+    -- | 带转授权时补一段说明
+    optionText grant = if grantable grant then " with grant option" else ""
 
 -- | 用 show 转成 Text
 tshow :: Show a => a -> Text

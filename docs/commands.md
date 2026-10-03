@@ -91,6 +91,7 @@ DROP USER alice;
 CREATE ROLE analyst;
 CREATE ROLE reviewer;
 GRANT SELECT ON orders TO analyst;
+GRANT SELECT ON orders TO reviewer WITH GRANT OPTION;
 GRANT analyst TO reviewer;
 GRANT reviewer TO alice;
 REVOKE SELECT ON orders FROM analyst;
@@ -104,6 +105,8 @@ DROP ROLE analyst;
 角色可以互相继承：`GRANT analyst TO reviewer` 让 `reviewer` 拿到 `analyst` 的授权，并把 `analyst` 记为 `reviewer` 的成员；继承会沿成员关系传递，成环的授权被拒绝（报 `conflict`），自继承同样拒绝。删角色时它的两向成员关系一起清掉。被授权者是不是角色，看名字是否在 `__system_roles` 里；用户名与角色名同名时按角色算。
 
 管理员拥有完整权限；数据库、表、索引等结构管理操作仅允许管理员执行。
+
+`GRANT ... WITH GRANT OPTION` 让拿到的授权可以再转授：普通身份只有手里那条授权带 grant option 时才能执行 `GRANT`，报错是 `grant option required: <权限> ON <表>`；`REVOKE` 仍然只允许管理员，收回授权会连它的 grant option 一起收掉，且不会级联收回别人转授出去的授权。转授权随角色继承一起传递。
 
 系统数据库 `system` 仅允许管理员访问。
 

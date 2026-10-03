@@ -507,14 +507,14 @@ privilegeSpec = describe "server privileges" $ do
 
     it "grants a privilege on a table and shows it in the role view" $ withPrivileges $ \service root -> do
         _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
-        granted <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "reader")
+        granted <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "reader" False)
         granted `shouldBe` Right ()
         views <- listRoleViews service
-        fmap (map roleGrants) views `shouldBe` Right [[Grant "reader" "select" "test.users"]]
+        fmap (map roleGrants) views `shouldBe` Right [[Grant "reader" "select" "test.users" False]]
 
     it "expands ALL and keeps a star object as is" $ withPrivileges $ \service root -> do
         _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
-        _ <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["all"] "*" "reader")
+        _ <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["all"] "*" "reader" False)
         views <- listRoleViews service
         fmap (concatMap (map grantPrivilege) . map roleGrants) views
             `shouldBe` Right ["select", "insert", "update", "delete"]
@@ -522,10 +522,46 @@ privilegeSpec = describe "server privileges" $ do
 
     it "revokes a privilege again" $ withPrivileges $ \service root -> do
         _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
-        _ <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "reader")
+        _ <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "reader" False)
         _ <- runPrivilegeCommand service root testDatabase (RevokePrivilegesCommand ["select"] "users" "reader")
         views <- listRoleViews service
         fmap (map roleGrants) views `shouldBe` Right [[]]
+
+    it "marks a grant that carries the grant option" $ withPrivileges $ \service root -> do
+        _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
+        _ <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "reader" True)
+        views <- listRoleViews service
+        fmap (map roleGrants) views `shouldBe` Right [[Grant "reader" "select" "test.users" True]]
+
+    it "refuses a non-administrator without the grant option" $ withPrivileges $ \service root -> do
+        _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
+        _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "writer")
+        _ <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "reader" False)
+        _ <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "reader" ["alice"])
+        refused <- runPrivilegeCommand service (Ordinary testAccount) testDatabase (GrantPrivilegesCommand ["select"] "users" "writer" False)
+        refused `shouldBe` Left (PrivilegeError "forbidden" "grant option required: SELECT ON users")
+
+    it "lets a grant option holder pass the privilege on" $ withPrivileges $ \service root -> do
+        _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
+        _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "writer")
+        _ <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "reader" True)
+        _ <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "reader" ["alice"])
+        passed <- runPrivilegeCommand service (Ordinary testAccount) testDatabase (GrantPrivilegesCommand ["select"] "users" "writer" False)
+        passed `shouldBe` Right ()
+        _ <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "writer" ["bob"])
+        views <- listRoleViews service
+        fmap (map roleGrants) views `shouldBe` Right [[Grant "reader" "select" "test.users" True], [Grant "writer" "select" "test.users" False]]
+
+    it "stops the pass-on once the grant option is revoked" $ withPrivileges $ \service root -> do
+        _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
+        _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "writer")
+        _ <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "reader" True)
+        _ <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "reader" ["alice"])
+        _ <- runPrivilegeCommand service root testDatabase (RevokePrivilegesCommand ["select"] "users" "reader")
+        refused <- runPrivilegeCommand service (Ordinary testAccount) testDatabase (GrantPrivilegesCommand ["select"] "users" "writer" False)
+        refused `shouldBe` Left (PrivilegeError "forbidden" "grant option required: SELECT ON users")
+        views <- listRoleViews service
+        fmap (map roleGrants) views `shouldBe` Right [[], []]
 
     it "adds and removes members" $ withPrivileges $ \service root -> do
         _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
@@ -539,7 +575,7 @@ privilegeSpec = describe "server privileges" $ do
 
     it "drops a role together with its grants and members" $ withPrivileges $ \service root -> do
         _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
-        _ <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "reader")
+        _ <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "reader" False)
         _ <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "reader" ["alice"])
         dropped <- runPrivilegeCommand service root testDatabase (DropRoleCommand "reader")
         dropped `shouldBe` Right ()
@@ -549,7 +585,7 @@ privilegeSpec = describe "server privileges" $ do
     it "inherits the grants of another role" $ withPrivileges $ \service root -> do
         _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
         _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "writer")
-        _ <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "reader")
+        _ <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "reader" False)
         _ <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "reader" ["writer"])
         linked <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "writer" ["alice"])
         linked `shouldBe` Right ()
@@ -579,7 +615,7 @@ privilegeSpec = describe "server privileges" $ do
     it "drops the inherited edge together with the role" $ withPrivileges $ \service root -> do
         _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
         _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "writer")
-        _ <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "reader")
+        _ <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "reader" False)
         _ <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "reader" ["writer"])
         _ <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "writer" ["alice"])
         dropped <- runPrivilegeCommand service root testDatabase (DropRoleCommand "reader")
@@ -590,12 +626,12 @@ privilegeSpec = describe "server privileges" $ do
         fmap (map roleMembers) views `shouldBe` Right [["alice"]]
 
     it "refuses a command on a role that does not exist" $ withPrivileges $ \service root -> do
-        missing <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "ghost")
+        missing <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "ghost" False)
         missing `shouldBe` Left (PrivilegeError "not_found" "unknown role: ghost")
 
     it "refuses a table grant without a selected database" $ withPrivileges $ \service root -> do
         _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
-        refused <- runPrivilegeCommand service root "" (GrantPrivilegesCommand ["select"] "users" "reader")
+        refused <- runPrivilegeCommand service root "" (GrantPrivilegesCommand ["select"] "users" "reader" False)
         refused `shouldBe` Left (PrivilegeError "no_database" "no database selected")
 
     it "refuses a non-administrator" $ withPrivileges $ \service _ -> do
@@ -631,11 +667,25 @@ privilegeSpec = describe "server privileges" $ do
         service <- newPrivileges base
         _ <- runPrivilegeCommand service (Root testRootName) testDatabase (CreateRoleCommand "reader")
         _ <- runPrivilegeCommand service (Root testRootName) testDatabase (CreateRoleCommand "writer")
-        _ <- runPrivilegeCommand service (Root testRootName) testDatabase (GrantPrivilegesCommand ["select"] "users" "reader")
+        _ <- runPrivilegeCommand service (Root testRootName) testDatabase (GrantPrivilegesCommand ["select"] "users" "reader" False)
         _ <- runPrivilegeCommand service (Root testRootName) testDatabase (GrantRoleCommand "reader" ["writer"])
         linked <- runPrivilegeCommand service (Root testRootName) testDatabase (GrantRoleCommand "writer" ["alice"])
         linked `shouldBe` Right ()
         authorizeSql service (Ordinary testAccount) "SELECT * FROM users" `shouldReturn` Right ()
+
+    it "keeps a grant option on the real storage" $ withIpcStorage $ do
+        base <- ipcBackend
+        service <- newPrivileges base
+        _ <- runPrivilegeCommand service (Root testRootName) testDatabase (CreateRoleCommand "reader")
+        _ <- runPrivilegeCommand service (Root testRootName) testDatabase (CreateRoleCommand "writer")
+        _ <- runPrivilegeCommand service (Root testRootName) testDatabase (GrantPrivilegesCommand ["select"] "users" "reader" True)
+        _ <- runPrivilegeCommand service (Root testRootName) testDatabase (GrantRoleCommand "reader" ["alice"])
+        views <- listRoleViews service
+        fmap (map roleGrants) views `shouldBe` Right [[Grant "reader" "select" "test.users" True], []]
+        passed <- runPrivilegeCommand service (Ordinary testAccount) testDatabase (GrantPrivilegesCommand ["select"] "users" "writer" False)
+        passed `shouldBe` Right ()
+        after <- listRoleViews service
+        fmap (map roleGrants) after `shouldBe` Right [[Grant "reader" "select" "test.users" True], [Grant "writer" "select" "test.users" False]]
 
 -- 真存储夹具：一个用例一份数据目录，跑完关链路删干净
 

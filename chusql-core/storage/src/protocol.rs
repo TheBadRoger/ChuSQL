@@ -230,7 +230,12 @@ pub fn reserved_table(table: &str) -> bool {
 }
 
 /// 服务自己的角色与授权表名
-pub const PRIVILEGE_TABLES: [&str; 3] = ["__system_roles", "__system_grants", "__system_members"];
+pub const PRIVILEGE_TABLES: [&str; 4] = [
+    "__system_roles",
+    "__system_grants",
+    "__system_grant_options",
+    "__system_members",
+];
 
 /// 是不是服务自己经请求通道读写的系统表
 pub fn internal_table(table: &str) -> bool {

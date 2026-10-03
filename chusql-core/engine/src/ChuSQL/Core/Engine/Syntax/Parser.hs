@@ -464,6 +464,10 @@ privilegeName =
 grantObject :: Parser String
 grantObject = ("*" <$ symbol "*") <|> tableName
 
+-- | 可选的 WITH GRANT OPTION
+grantOption :: Parser Bool
+grantOption = (True <$ try (keyword "with" *> keyword "grant" *> keyword "option")) <|> pure False
+
 -- | 读 GRANT：带 ON 的授权限，不带的加角色
 grantStatement :: Parser Statement
 grantStatement = do
@@ -474,7 +478,7 @@ grantStatement = do
             keyword "on"
             obj <- grantObject
             keyword "to"
-            GrantPrivileges privs obj <$> userName
+            GrantPrivileges privs obj <$> userName <*> grantOption
         , GrantRole <$> userName <*> (keyword "to" *> sepBy1 userName (symbol ","))
         ]
 

@@ -1756,8 +1756,11 @@ fn privilege_tables_are_reachable_but_account_table_is_not() -> Result<(), Box<d
     let (_server, _data) = start_server();
     let mut c = connect()?;
     request_ok(&mut c, serde_json::json!({"method":"create_table","database":"system","table":"__system_roles","columns":[{"name":"id","ty":"int"},{"name":"name","ty":"str"}]}))?;
+    request_ok(&mut c, serde_json::json!({"method":"create_table","database":"system","table":"__system_grant_options","columns":[{"name":"id","ty":"int"},{"name":"role","ty":"str"}]}))?;
     let scanned: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"scan","database":"system","table":"__system_roles"}"#))?;
     assert_eq!(scanned["status"], "rows", "{scanned}");
+    let options: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"scan","database":"system","table":"__system_grant_options"}"#))?;
+    assert_eq!(options["status"], "rows", "{options}");
     let denied: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"scan","database":"system","table":"__system_users"}"#))?;
     assert_eq!(denied["status"], "error", "{denied}");
     assert!(
@@ -1772,6 +1775,7 @@ fn privilege_tables_are_reachable_but_account_table_is_not() -> Result<(), Box<d
         .map(|one| one.as_str().unwrap_or(""))
         .collect();
     assert!(tables.contains(&"__system_roles"), "授权表要在字典里: {listed}");
+    assert!(tables.contains(&"__system_grant_options"), "转授权表要在字典里: {listed}");
     assert!(!tables.contains(&"__system_users"), "账号表不能露面: {listed}");
     Ok(())
 }
