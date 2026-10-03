@@ -788,6 +788,66 @@ transactionSpec = describe "server transactions" $ do
         ids <- sessionIds second
         ids `shouldMatchList` [1, 2, 3, 5]
 
+    it "keeps the work before a savepoint and drops the work after it" $ withMemorySession $ \session -> do
+        _ <- mustSql session "begin"
+        _ <- mustSql session "update users set age = 31 where id = 1"
+        _ <- mustSql session "savepoint spot"
+        _ <- mustSql session "insert into users (id, name, age) values (6, 'six', 26)"
+        _ <- mustSql session "delete from users where id = 2"
+        _ <- mustSql session "rollback to spot"
+        inside <- sessionIds session
+        inside `shouldMatchList` [1, 2, 3, 4, 5]
+        sessionAge session 1 `shouldReturn` Just 31
+        _ <- mustSql session "commit"
+        ids <- sessionIds session
+        ids `shouldMatchList` [1, 2, 3, 4, 5]
+        sessionAge session 1 `shouldReturn` Just 31
+
+    it "lets a savepoint be used again after rolling back to it" $ withMemorySession $ \session -> do
+        _ <- mustSql session "begin"
+        _ <- mustSql session "insert into users (id, name, age) values (6, 'six', 26)"
+        _ <- mustSql session "savepoint spot"
+        _ <- mustSql session "insert into users (id, name, age) values (7, 'seven', 27)"
+        _ <- mustSql session "rollback to spot"
+        _ <- mustSql session "insert into users (id, name, age) values (8, 'eight', 28)"
+        ids <- sessionIds session
+        ids `shouldMatchList` [1, 2, 3, 4, 5, 6, 8]
+
+    it "drops the savepoints above the one rolled back to" $ withMemorySession $ \session -> do
+        _ <- mustSql session "begin"
+        _ <- mustSql session "savepoint one"
+        _ <- mustSql session "savepoint two"
+        _ <- mustSql session "rollback to one"
+        missing <- runStatementCoded session "rollback to two"
+        failureMessage missing `shouldBe` "no such savepoint: two"
+
+    it "drops a released savepoint and the ones after it" $ withMemorySession $ \session -> do
+        _ <- mustSql session "begin"
+        _ <- mustSql session "savepoint one"
+        _ <- mustSql session "savepoint two"
+        released <- mustSql session "release one"
+        qrRowCount released `shouldBe` 0
+        first <- runStatementCoded session "rollback to one"
+        failureMessage first `shouldBe` "no such savepoint: one"
+        second <- runStatementCoded session "rollback to two"
+        failureMessage second `shouldBe` "no such savepoint: two"
+
+    it "clears the savepoints on COMMIT" $ withMemorySession $ \session -> do
+        _ <- mustSql session "begin"
+        _ <- mustSql session "savepoint spot"
+        _ <- mustSql session "commit"
+        missing <- runStatementCoded session "rollback to spot"
+        failureMessage missing `shouldBe` "no transaction in progress"
+
+    it "needs a transaction and a known name for savepoints" $ withMemorySession $ \session -> do
+        outside <- runStatementCoded session "savepoint spot"
+        failureMessage outside `shouldBe` "no transaction in progress"
+        _ <- mustSql session "begin"
+        unknown <- runStatementCoded session "rollback to nowhere"
+        failureMessage unknown `shouldBe` "no such savepoint: nowhere"
+        gone <- runStatementCoded session "release nowhere"
+        failureMessage gone `shouldBe` "no such savepoint: nowhere"
+
     it "needs a current database to start" $ do
         db <- newMVar testDb
         settings <- tempSettingsPath "transaction-bare"
@@ -876,6 +936,26 @@ ipcConcurrencySpec = describe "server backend on the real storage" $ do
         _ <- mustSql session "create table t (id int)"
         _ <- mustSql session "begin"
         _ <- mustSql session "insert into t (id) values (1)"
+        inside <- mustSql session "select * from t"
+        intValues (qrRows inside) `shouldBe` [1]
+        _ <- mustSql session "commit"
+        rows <- rowsOf (beStatement alpha "SELECT id FROM t")
+        intColumn "id" rows `shouldBe` [1]
+
+    it "rolls back to a savepoint on the real storage" $ withIpcStorage $ do
+        base <- ipcBackend
+        mustRun (beStatement base "CREATE DATABASE alpha")
+        let alpha = beWithDatabase base "alpha"
+        settings <- tempSettingsPath "transaction-ipc-savepoint"
+        removeIfExists settings
+        session <- newSession alpha (T.pack testDatabaseName) settings
+        _ <- mustSql session "use alpha"
+        _ <- mustSql session "create table t (id int)"
+        _ <- mustSql session "begin"
+        _ <- mustSql session "insert into t (id) values (1)"
+        _ <- mustSql session "savepoint spot"
+        _ <- mustSql session "insert into t (id) values (2)"
+        _ <- mustSql session "rollback to spot"
         inside <- mustSql session "select * from t"
         intValues (qrRows inside) `shouldBe` [1]
         _ <- mustSql session "commit"

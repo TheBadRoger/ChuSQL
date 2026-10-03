@@ -437,6 +437,10 @@ checkResolvedWith db outer q = case q of
     BeginTransaction -> Right ()
     CommitTransaction -> Right ()
     RollbackTransaction -> Right ()
+    -- | 保存点名字只是会话层的记号，不做列检查
+    Savepoint _ -> Right ()
+    RollbackToSavepoint _ -> Right ()
+    ReleaseSavepoint _ -> Right ()
   where
     tableCols' = map fst . tableCols
 

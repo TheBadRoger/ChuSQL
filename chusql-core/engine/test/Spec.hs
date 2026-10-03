@@ -286,6 +286,17 @@ main = hspec $ do
             parseStatement "COMMIT TRANSACTION" `shouldBe` Right CommitTransaction
             parseStatement "ROLLBACK" `shouldBe` Right RollbackTransaction
             parseStatement "rollback transaction" `shouldBe` Right RollbackTransaction
+            parseStatement "SAVEPOINT spot" `shouldBe` Right (Savepoint "spot")
+            parseStatement "savepoint spot" `shouldBe` Right (Savepoint "spot")
+            parseStatement "ROLLBACK TO spot" `shouldBe` Right (RollbackToSavepoint "spot")
+            parseStatement "ROLLBACK TO SAVEPOINT spot" `shouldBe` Right (RollbackToSavepoint "spot")
+            parseStatement "RELEASE spot" `shouldBe` Right (ReleaseSavepoint "spot")
+            parseStatement "RELEASE SAVEPOINT spot" `shouldBe` Right (ReleaseSavepoint "spot")
+
+        it "requires a name on savepoint statements" $ do
+            parseStatement "SAVEPOINT" `shouldSatisfy` isLeft
+            parseStatement "ROLLBACK TO" `shouldSatisfy` isLeft
+            parseStatement "RELEASE" `shouldSatisfy` isLeft
 
         it "parses the bare words only as whole words" $ do
             parseStatement "BEGINNER" `shouldSatisfy` isLeft
@@ -297,7 +308,7 @@ main = hspec $ do
                     (runStatement [("users", users)] =<< parseStatement sql)
                         `shouldSatisfy` either (isInfixOf "executed by the session") (const False)
                 )
-                ["BEGIN", "COMMIT", "ROLLBACK"]
+                ["BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT spot", "ROLLBACK TO spot", "RELEASE spot"]
 
         it "puts transaction errors under the protocol category" $ do
             errorCode "BEGIN is executed by the session" `shouldBe` "query_error"

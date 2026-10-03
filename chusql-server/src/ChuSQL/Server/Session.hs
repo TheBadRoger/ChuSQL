@@ -69,10 +69,11 @@ data Session = Session
     , ssTransaction :: IORef (Maybe Transaction)
     }
 
--- | 一条会话里的显式事务：开事务时的快照与事务内改到的状态
+-- | 一条会话里的显式事务：开事务时的快照、事务内改到的状态与保存点栈
 data Transaction = Transaction
     { txBase :: Database
     , txStaged :: Database
+    , txSavepoints :: [(String, Database)]
     }
 
 -- | 开一个会话：账号与角色服务、配置策略都和 Web 端一致
@@ -191,6 +192,9 @@ runStatementCoded session sql = case parseStatement (T.unpack sql) of
     Right BeginTransaction -> beginTransaction session
     Right CommitTransaction -> commitTransaction session
     Right RollbackTransaction -> rollbackTransaction session
+    Right (Savepoint name) -> savepointTransaction session (T.pack name)
+    Right (RollbackToSavepoint name) -> rollbackToSavepoint session (T.pack name)
+    Right (ReleaseSavepoint name) -> releaseSavepoint session (T.pack name)
     Right statement
         | Just command <- accountCommand statement -> runAccount session command
         | Just command <- privilegeCommand statement -> runPrivilege session command
@@ -249,7 +253,7 @@ beginTransaction session = do
                 case snapshotResult of
                     Left err -> pure (Left (engineErrorCode err))
                     Right db -> do
-                        writeIORef (ssTransaction session) (Just (Transaction db db))
+                        writeIORef (ssTransaction session) (Just (Transaction db db []))
                         pure (Right (emptyResult (Just current)))
 
 -- | 提交：把快照差分交给存储层应用，成功才结束事务
@@ -284,6 +288,54 @@ rollbackTransaction session = do
         Just _ -> do
             writeIORef (ssTransaction session) Nothing
             pure (Right (emptyResult (Just current)))
+
+-- | 建保存点：把事务当前状态压进保存点栈
+savepointTransaction :: Session -> Text -> IO (Either SessionError QueryResult)
+savepointTransaction session name = do
+    current <- readIORef (ssCurrent session)
+    existing <- readIORef (ssTransaction session)
+    case existing of
+        Nothing -> pure (Left (SessionError "query_error" "no transaction in progress"))
+        Just transaction -> do
+            let stack = txSavepoints transaction ++ [(T.unpack name, txStaged transaction)]
+            writeIORef (ssTransaction session) (Just transaction {txSavepoints = stack})
+            pure (Right (emptyResult (Just current)))
+
+-- | 回滚到保存点：事务状态退回保存点，该保存点保留
+rollbackToSavepoint :: Session -> Text -> IO (Either SessionError QueryResult)
+rollbackToSavepoint session name = do
+    current <- readIORef (ssCurrent session)
+    existing <- readIORef (ssTransaction session)
+    case existing of
+        Nothing -> pure (Left (SessionError "query_error" "no transaction in progress"))
+        Just transaction -> case savepointIndex name (txSavepoints transaction) of
+            Nothing -> pure (Left (SessionError "query_error" ("no such savepoint: " <> name)))
+            Just index -> do
+                let (_, staged) = txSavepoints transaction !! index
+                writeIORef
+                    (ssTransaction session)
+                    (Just transaction {txStaged = staged, txSavepoints = take (index + 1) (txSavepoints transaction)})
+                pure (Right (emptyResult (Just current)))
+
+-- | 释放保存点：该保存点与它之后的保存点一起丢掉
+releaseSavepoint :: Session -> Text -> IO (Either SessionError QueryResult)
+releaseSavepoint session name = do
+    current <- readIORef (ssCurrent session)
+    existing <- readIORef (ssTransaction session)
+    case existing of
+        Nothing -> pure (Left (SessionError "query_error" "no transaction in progress"))
+        Just transaction -> case savepointIndex name (txSavepoints transaction) of
+            Nothing -> pure (Left (SessionError "query_error" ("no such savepoint: " <> name)))
+            Just index -> do
+                writeIORef (ssTransaction session) (Just transaction {txSavepoints = take index (txSavepoints transaction)})
+                pure (Right (emptyResult (Just current)))
+
+-- | 最近一次同名保存点的下标
+savepointIndex :: Text -> [(String, Database)] -> Maybe Int
+savepointIndex name entries =
+    case [index | (index, (label, _)) <- zip [0 ..] entries, T.pack label == name] of
+        [] -> Nothing
+        hits -> Just (last hits)
 
 -- | 事务里跑一条数据语句：只动内存快照，不碰存储层
 runInTransaction :: Session -> Statement -> IO (Either SessionError QueryResult)
