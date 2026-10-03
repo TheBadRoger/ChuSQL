@@ -216,6 +216,67 @@ fn concurrent_shard_reads_exclude_writers() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+/// 跨库并发互不串数据，目录查询不被写饿死
+#[test]
+fn concurrent_requests_across_databases_stay_isolated() -> Result<(), Box<dyn std::error::Error>> {
+    let (_srv, _data) = start_server();
+    let mut c = connect()?;
+    let request = |c: &mut Conn, value: serde_json::Value| -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::from_str(&send(c, &value.to_string()))
+    };
+    let databases = ["alpha", "beta"];
+    for database in databases {
+        assert_eq!(request(&mut c, serde_json::json!({"method":"create_database","database":database}))?["status"], "ok");
+        assert_eq!(
+            request(&mut c, serde_json::json!({"method":"create_table","database":database,"table":"items","columns":[{"name":"id","ty":"int"}]}))?["status"],
+            "ok"
+        );
+    }
+
+    let storage = CURRENT.with(|slot| slot.borrow().as_ref().cloned().expect("storage opened"));
+    let written = 40;
+    std::thread::scope(|scope| {
+        let writers: Vec<_> = databases
+            .iter()
+            .map(|database| {
+                let storage = Arc::clone(&storage);
+                let database = database.to_string();
+                scope.spawn(move || {
+                    for i in 1..=written {
+                        let line = format!(
+                            r#"{{"method":"insert","database":"{database}","table":"items","row":{{"id":{i}}}}}"#
+                        );
+                        let value: serde_json::Value = serde_json::from_str(&storage.request_line(&line)).expect("json");
+                        assert_eq!(value["status"], "ok", "{database}: {value}");
+                    }
+                    database
+                })
+            })
+            .collect();
+        let catalog = {
+            let storage = Arc::clone(&storage);
+            scope.spawn(move || {
+                for _ in 0..40 {
+                    for line in [r#"{"method":"list_databases"}"#, r#"{"method":"all_catalogs"}"#] {
+                        let value: serde_json::Value = serde_json::from_str(&storage.request_line(line)).expect("json");
+                        assert_ne!(value["status"], "error", "{line}: {value}");
+                    }
+                }
+            })
+        };
+        for writer in writers {
+            writer.join().expect("writer thread");
+        }
+        catalog.join().expect("catalog thread");
+    });
+
+    for database in databases {
+        let rows = request(&mut c, serde_json::json!({"method":"scan","database":database,"table":"items"}))?["rows"].clone();
+        assert_eq!(rows.as_array().expect("rows").len(), written, "{database} 行数不对");
+    }
+    Ok(())
+}
+
 /// 删列不改堆字节，重启后不再暴露该列
 #[test]
 fn drop_column_keeps_heap_bytes_and_hides_values_after_restart() -> Result<(), Box<dyn std::error::Error>> {
@@ -744,6 +805,12 @@ fn account_failure_preserves_wal_and_blocks_writes() -> Result<(), Box<dyn std::
     let mut c = connect()?;
     let recovered = send(&mut c, r#"{"method":"accounts_list"}"#);
     assert!(recovered.contains("hash-one"), "{recovered}");
+    let status: serde_json::Value =
+        serde_json::from_str(&send(&mut c, r#"{"method":"system_status"}"#))?;
+    assert!(
+        status["last_lsn"].as_u64().unwrap_or(0) >= 1,
+        "重放后检查点要推进: {status}"
+    );
     Ok(())
 }
 
@@ -1013,6 +1080,125 @@ fn delete_keys_removes_row_and_index_entry() {
 
     let r = send(&mut c, r#"{"method":"insert","table":"del_t","row":{"id":2,"name":"Bob2"}}"#);
     assert!(r.contains(r#""status":"ok""#), "id 2 should be insertable again: {}", r);
+}
+
+/// 事务提交：一批写操作在同一个请求里落地
+#[test]
+fn apply_transaction_lands_upserts_and_deletes_together() {
+    let (_srv, _data) = start_server();
+    let mut c = connect().unwrap();
+
+    for (id, name) in [(1, "Alice"), (2, "Bob")] {
+        let req = format!(
+            r#"{{"method":"insert","table":"txn_t","row":{{"id":{},"name":"{}"}}}}"#,
+            id, name
+        );
+        send(&mut c, &req);
+    }
+
+    let batch = r#"{"method":"apply_transaction","ops":[
+        {"op":"delete","table":"txn_t","ids":[1]},
+        {"op":"upsert","table":"txn_t","rows":[{"id":3,"name":"Carol"}]}
+    ]}"#;
+    let r = send(&mut c, batch);
+    assert!(r.contains(r#""status":"ok""#), "batch: {}", r);
+
+    let r = send(&mut c, r#"{"method":"scan","table":"txn_t"}"#);
+    assert!(!r.contains("Alice"), "deleted row should be gone: {}", r);
+    assert!(r.contains("Bob") && r.contains("Carol"), "kept and added rows: {}", r);
+
+    for line in [
+        r#"{"method":"apply_transaction","ops":[{"op":"upsert","table":"__system_users","rows":[{"id":1}]}]}"#,
+        r#"{"method":"apply_transaction","ops":[{"op":"delete","table":"../evil","ids":[1]}]}"#,
+    ] {
+        let r = send(&mut c, line);
+        assert!(r.contains(r#""status":"error""#), "bad op rejected: {} -> {}", line, r);
+    }
+
+    // 没有整数 id 的表用整表替换提交
+    let r = send(&mut c, r#"{"method":"insert","table":"txn_no_id","row":{"name":"old"}}"#);
+    assert!(r.contains(r#""status":"ok""#), "insert: {}", r);
+    let replace = r#"{"method":"apply_transaction","ops":[{"op":"replace","table":"txn_no_id","rows":[{"name":"only"}]}]}"#;
+    let r = send(&mut c, replace);
+    assert!(r.contains(r#""status":"ok""#), "replace: {}", r);
+    let r = send(&mut c, r#"{"method":"scan","table":"txn_no_id"}"#);
+    assert!(r.contains("only") && !r.contains("old"), "replaced rows: {}", r);
+}
+
+/// 标记已落盘、数据未改的崩溃现场：重启重放并推进检查点
+#[test]
+fn committed_group_replays_after_restart() -> Result<(), Box<dyn std::error::Error>> {
+    use chusql_core_storage::wal::{Wal, WalOp};
+    let (server, data) = start_server();
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"insert","table":"items","row":{"id":1,"secret":"old"}}))?;
+    drop(c);
+    drop(server);
+
+    let mut added = std::collections::HashMap::new();
+    added.insert("id".to_string(), serde_json::json!(2));
+    added.insert("secret".to_string(), serde_json::json!("new"));
+    let group = vec![
+        WalOp::InsertBatch {
+            table: "items".into(),
+            rows: vec![added.clone()],
+        },
+        WalOp::DeleteKeys {
+            table: "items".into(),
+            keys: vec![1],
+        },
+    ];
+    let wal = Wal::new(data.path().join("databases/main/wal.log"));
+    let commit_lsn = wal.append_group(&group)?;
+    drop(wal);
+
+    let _server = start_server_in(data.path());
+    let mut c = connect()?;
+    let rows: serde_json::Value =
+        serde_json::from_str(&send(&mut c, r#"{"method":"scan","table":"items"}"#))?;
+    assert_eq!(rows["rows"], serde_json::json!([{"id":2,"secret":"new"}]));
+    assert_eq!(std::fs::metadata(data.path().join("databases/main/wal.log"))?.len(), 0);
+    let checkpoint = std::fs::read(data.path().join("databases/main/wal.checkpoint"))?;
+    assert_eq!(checkpoint.len(), 8, "检查点要落盘");
+    assert_eq!(
+        u64::from_le_bytes(checkpoint[..8].try_into()?),
+        commit_lsn,
+        "检查点记到提交 LSN"
+    );
+    Ok(())
+}
+
+/// 没有提交标记的记录组在重启时整组丢掉
+#[test]
+fn uncommitted_group_is_discarded_on_restart() -> Result<(), Box<dyn std::error::Error>> {
+    use chusql_core_storage::wal::{Wal, WalOp};
+    let (server, data) = start_server();
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"insert","table":"items","row":{"id":1,"secret":"old"}}))?;
+    drop(c);
+    drop(server);
+
+    let mut lost = std::collections::HashMap::new();
+    lost.insert("id".to_string(), serde_json::json!(2));
+    lost.insert("secret".to_string(), serde_json::json!("lost"));
+    let wal = Wal::new(data.path().join("databases/main/wal.log"));
+    wal.append(&WalOp::InsertBatch {
+        table: "items".into(),
+        rows: vec![lost.clone()],
+    })?;
+    wal.append(&WalOp::InsertBatch {
+        table: "items".into(),
+        rows: vec![lost],
+    })?;
+    drop(wal);
+
+    let _server = start_server_in(data.path());
+    let mut c = connect()?;
+    let rows: serde_json::Value =
+        serde_json::from_str(&send(&mut c, r#"{"method":"scan","table":"items"}"#))?;
+    assert_eq!(rows["rows"], serde_json::json!([{"id":1,"secret":"old"}]));
+    assert_eq!(std::fs::metadata(data.path().join("databases/main/wal.log"))?.len(), 0);
+    Ok(())
 }
 
 /// 给第二列建索引后能按那一列查

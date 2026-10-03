@@ -51,6 +51,8 @@ errorRules =
     , ErrorRule "storage" StorageError "query_error"
     , ErrorRule "storage library call failed" StorageError "query_error"
     , ErrorRule "unsupported protocol" ProtocolError "query_error"
+    , ErrorRule "executed by the session" ProtocolError "query_error"
+    , ErrorRule "transaction" ProtocolError "query_error"
     ]
 
 -- | 命中的第一条规则

@@ -38,16 +38,16 @@ scopeAt place scope c
             | "ambiguous column:" `isInfixOf` err -> Left err
             | otherwise -> columnAt place (scopeOuter scope) c
 
--- | 收集 FROM 能提供的列，含外层作用域
+-- | 收集 FROM 的列，列前缀由表名推导
 checkFrom :: Database -> [(String, Column)] -> FromClause -> Either String [(String, Column)]
 checkFrom _ _ FromUnit = Right []
 checkFrom db _ (FromTable mAlias tbl) = do
-    t <- lookupTable db tbl
-    Right (prefixColumns (Just (fromMaybe tbl mAlias)) (tableCols t))
+    (key, t) <- resolveTable db tbl
+    Right (prefixColumns (Just (deriveQualifier mAlias key)) (tableCols t))
 checkFrom db outer (FromJoin _ left mAlias tbl cond) = do
     lcols <- checkFrom db outer left
-    t <- lookupTable db tbl
-    let env = lcols ++ prefixColumns (Just (fromMaybe tbl mAlias)) (tableCols t)
+    (key, t) <- resolveTable db tbl
+    let env = lcols ++ prefixColumns (Just (deriveQualifier mAlias key)) (tableCols t)
     checkBool db "ON" (Scope env outer) cond
     Right env
 
@@ -433,6 +433,10 @@ checkResolvedWith db outer q = case q of
     DropDatabase name -> checkDatabaseName name
     UseDatabase name -> checkDatabaseName name
     ShowDatabases -> Right ()
+    -- | 事务控制由会话层执行，语义层不做列检查
+    BeginTransaction -> Right ()
+    CommitTransaction -> Right ()
+    RollbackTransaction -> Right ()
   where
     tableCols' = map fst . tableCols
 
@@ -650,21 +654,21 @@ resolveStatement db q = case q of
     Select{} -> resolveSelect db q
     SelectExpr{} -> resolveSelect db q
     Update tbl assigns mWhere -> do
-        t <- lookupTable db tbl
+        (key, t) <- resolveTable db tbl
         let env = tableCols t
             name = nameIn env "UPDATE"
         assigns' <- mapM (\(c, e) -> (\e' -> (c, e')) <$> resolveExpr db env [] name e) assigns
         w <- mapM (resolveExpr db env [] (nameIn env "WHERE")) mWhere
-        pure (Update tbl assigns' w)
+        pure (Update key assigns' w)
     Delete tbl mWhere -> do
-        t <- lookupTable db tbl
+        (key, t) <- resolveTable db tbl
         w <- mapM (resolveExpr db (tableCols t) [] (nameIn (tableCols t) "WHERE")) mWhere
-        pure (Delete tbl w)
+        pure (Delete key w)
     Insert tbl cols rows -> do
-        t <- lookupTable db tbl
+        (key, t) <- resolveTable db tbl
         let env = tableCols t
         rows' <- mapM (mapM (resolveExpr db env [] (nameIn env "INSERT"))) rows
-        pure (Insert tbl cols rows')
+        pure (Insert key cols rows')
     other -> Right other
 
 -- | 查一列的物理名
@@ -685,9 +689,9 @@ resolveSelect _ q = Right q
 resolveQuery :: Database -> [(String, Column)] -> Statement -> [(String, Expr)] -> Either String Statement
 resolveQuery db outer q items = do
     env <- checkFrom db outer (selectFrom q)
-    -- | 单表查询里把裸列名换成物理列名
+    -- | 单表无别名时把裸列名换成物理列名；带别名时表头保留别名限定名
     let physical c = case selectFrom q of
-            FromTable Nothing tbl -> unqualify (Just tbl) c
+            FromTable Nothing tbl -> unqualify (Just (deriveQualifier Nothing tbl)) c
             _ -> c
         -- | 查一列并换算成物理名
         name place c = physical . fst <$> scopedColumnAt place env outer c
@@ -707,18 +711,23 @@ resolveQuery db outer q items = do
     grouping <- mapM (name "GROUP BY") (selectGroupBy q)
     ordering <- mapM (\(c, d) -> (\k -> (k, d)) <$> name "ORDER BY" c) (selectOrderBy q)
     source <- case selectFrom q of
-        single@FromTable{} -> Right single
+        FromTable mAlias tbl -> do
+            (key, _) <- resolveTable db tbl
+            Right (FromTable mAlias key)
         other -> resolveFrom db outer other
     pure $ case q of
         Select{} -> Select (map fst projected) source condition grouping ordering (selectLimit q)
         _ -> SelectExpr projected source condition grouping ordering (selectLimit q)
 
--- | 连接两侧默认取表名作别名；ON 里的子查询也能引用外层列
+-- | 连接两侧取表名末段作别名；ON 可引用外层列
 resolveFrom :: Database -> [(String, Column)] -> FromClause -> Either String FromClause
 resolveFrom _ _ FromUnit = Right FromUnit
-resolveFrom _ _ (FromTable alias tbl) = Right (FromTable (Just (fromMaybe tbl alias)) tbl)
+resolveFrom db _ (FromTable alias tbl) = do
+    (key, _) <- resolveTable db tbl
+    Right (FromTable (Just (deriveQualifier alias key)) key)
 resolveFrom db outer fromC@(FromJoin kind left alias tbl cond) = do
     env <- checkFrom db outer fromC
     l <- resolveFrom db outer left
+    (key, _) <- resolveTable db tbl
     c <- resolveExpr db env outer (fmap fst . columnAt "ON" env) cond
-    pure (FromJoin kind l (Just (fromMaybe tbl alias)) tbl c)
+    pure (FromJoin kind l (Just (deriveQualifier alias key)) key c)

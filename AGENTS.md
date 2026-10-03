@@ -28,5 +28,5 @@
 - 改动说明只在交流中记录。
 
 ## 当前重点
-- 完善 WAL 重放幂等。
-- 完整事务路线见 project-plan.txt 阶段 12。
+- 主线已完成：高级优化器 → 并行查询 → M1 会话隔离 → M2 快照事务 → M3 WAL 与崩溃恢复。
+- 进度与计数见 `agent_credientials/project-plan.txt`，限制与风险见 `agent_credientials/known-issues.txt`。

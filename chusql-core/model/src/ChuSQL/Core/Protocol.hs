@@ -3,6 +3,7 @@
 module ChuSQL.Core.Protocol (
     SchemaColumn (..),
     Request (..),
+    TxnOp (..),
     Response (..),
     TableInfo (..),
     Account (..),
@@ -96,6 +97,35 @@ data Request
     | ReqDropColumn String String
     | ReqReplaceSchema String [SchemaColumn] [Row]
     | ReqListCatalog
+    | ReqApplyTransaction [TxnOp]
+
+-- | 事务提交里的一条写操作
+data TxnOp
+    = TxnUpsert String [Row]
+    | TxnDelete String [Int]
+    | TxnReplace String [Row]
+    deriving (Show, Eq)
+
+-- | 事务操作编码成 JSON
+instance ToJSON TxnOp where
+    toJSON (TxnUpsert t rs) =
+        object
+            [ "op" .= ("upsert" :: T.Text)
+            , "table" .= t
+            , "rows" .= map rowToJSON rs
+            ]
+    toJSON (TxnDelete t ks) =
+        object
+            [ "op" .= ("delete" :: T.Text)
+            , "table" .= t
+            , "ids" .= ks
+            ]
+    toJSON (TxnReplace t rs) =
+        object
+            [ "op" .= ("replace" :: T.Text)
+            , "table" .= t
+            , "rows" .= map rowToJSON rs
+            ]
 
 -- | 请求编码成 JSON
 instance ToJSON Request where
@@ -201,6 +231,11 @@ instance ToJSON Request where
             , "rows" .= map rowToJSON rs
             ]
     toJSON ReqListCatalog = object ["method" .= ("list_catalog" :: T.Text)]
+    toJSON (ReqApplyTransaction ops) =
+        object
+            [ "method" .= ("apply_transaction" :: T.Text)
+            , "ops" .= ops
+            ]
 
 -- | 一张表的梗概：列、行数、索引与列统计
 data TableInfo = TableInfo

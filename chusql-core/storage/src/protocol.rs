@@ -171,6 +171,22 @@ pub enum Request {
         columns: Vec<SchemaColumn>,
         rows: Vec<Row>,
     },
+    /// 事务提交：把一批写操作当成一个请求原子应用
+    ApplyTransaction {
+        ops: Vec<StorageOp>,
+    },
+}
+
+/// 事务提交里的一条写操作
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum StorageOp {
+    /// 追加写入的行（提交端已先删掉要覆盖的行）
+    Upsert { table: String, rows: Vec<Row> },
+    /// 按行 id 删除
+    Delete { table: String, ids: Vec<i64> },
+    /// 整表替换（没有整数 id 的表只能这么提交）
+    Replace { table: String, rows: Vec<Row> },
 }
 
 impl Request {
@@ -202,7 +218,8 @@ impl Request {
             | Self::ReplaceSchema { table, .. } => Some(table),
             Self::Ping | Self::ListTables | Self::ListCatalog | Self::AccountsList
             | Self::AccountCreate { .. } | Self::AccountReset { .. } | Self::AccountLogin { .. }
-            | Self::AccountDrop { .. } | Self::BootstrapSystem { .. } | Self::SystemStatus => None,
+            | Self::AccountDrop { .. } | Self::BootstrapSystem { .. } | Self::SystemStatus
+            | Self::ApplyTransaction { .. } => None,
         }
     }
 }
@@ -237,7 +254,11 @@ pub enum Response {
     NoIndex,
     Ok,
     /// 系统目录状态
-    System { initialized: bool },
+    System {
+        initialized: bool,
+        #[serde(default)]
+        last_lsn: u64,
+    },
     Error { message: String },
     Catalog { schemas: Vec<TableSchemaWire> },
 }

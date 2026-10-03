@@ -15,7 +15,7 @@ import ChuSQL.Core.Engine.Parallel (poolRun, workerPool)
 import ChuSQL.Core.Model
 import ChuSQL.Core.Engine.Semantic (prepare)
 import ChuSQL.Core.Engine.Storage (IndexResult (..), MonadStorage (..))
-import ChuSQL.Core.Engine.Storage.IPC (IPCStorage (runIPCStorage), closeConnection, doListTables, getDatabaseName, localStorageLink, setDatabaseName, setStorageLink)
+import ChuSQL.Core.Engine.Storage.IPC (IPCStorage (..), closeConnection, defaultEnv, doListTables, envForDatabase, getDatabaseName, localStorageLink, runIPCStorage, setDatabaseName, setStorageLink)
 import ChuSQL.Core.Engine.Syntax.AST
 import ChuSQL.Core.Engine.Syntax.Parser
 import Control.Concurrent (threadDelay)
@@ -112,6 +112,40 @@ main = hspec $ do
                 `shouldBe` Right [[("name", VStr "Alice")]]
             rowsOf (parseStatement "SELECT sales.users.name FROM sales.users WHERE sales.users.id = 1" >>= runStatement db)
                 `shouldBe` Right [[("name", VStr "Alice")]]
+
+        it "derives the column prefix when the session schema is scoped to one database" $ do
+            let scoped = [("users", users)]
+            rowsOf (parseStatement "SELECT sales.users.name FROM sales.users WHERE sales.users.id = 1" >>= runStatement scoped)
+                `shouldBe` Right [[("name", VStr "Alice")]]
+            rowsOf (parseStatement "SELECT users.name FROM users WHERE users.id = 1" >>= runStatement scoped)
+                `shouldBe` Right [[("name", VStr "Alice")]]
+
+        it "derives the database prefix for a bare table name" $ do
+            let catalog = [("sales.users", users)]
+            rowsOf (parseStatement "SELECT name FROM users WHERE users.id = 1" >>= runStatement catalog)
+                `shouldBe` Right [[("name", VStr "Alice")]]
+            rowsOf (parseStatement "SELECT users.name FROM sales.users WHERE users.id = 1" >>= runStatement catalog)
+                `shouldBe` Right [[("name", VStr "Alice")]]
+
+        it "keeps derived prefixes short in joins" $ do
+            let catalog = [("sales.users", users), ("sales.orders", orders)]
+            fmap
+                (map (map snd))
+                (parseStatement "SELECT users.name, orders.product FROM sales.users JOIN sales.orders ON users.id = orders.user_id" >>= rowsOf . runStatement catalog)
+                `shouldBe` Right [[VStr "Alice", VStr "Book"], [VStr "Alice", VStr "Cup"], [VStr "Bob", VStr "Pen"]]
+
+        it "writes through the derived table key" $ do
+            let scoped = [("users", users)]
+            case parseStatement "UPDATE sales.users SET age = 26 WHERE id = 1" >>= runStatement scoped of
+                Left err -> expectationFailure err
+                Right (db', _) ->
+                    rowsOf (runStatement db' (makeSelect ["age"] "users" (Just (Eq (Col "id") (LitInt 1)))))
+                        `shouldBe` Right [[("age", VInt 26)]]
+
+        it "rejects an ambiguous derived table name" $ do
+            let catalog = [("sales.users", users), ("other.users", users)]
+            (parseStatement "SELECT name FROM users" >>= rowsOf . runStatement catalog)
+                `shouldSatisfy` either (isInfixOf "ambiguous table") (const False)
 
         it "parses database lifecycle statements" $ do
             map (fmap show . parseStatement) ["CREATE DATABASE sales", "DROP DATABASE sales", "USE sales", "SHOW DATABASES"]
@@ -241,6 +275,33 @@ main = hspec $ do
         it "returns Left on missing table name" $ do
             parseStatement "SELECT name FROM"
                 `shouldSatisfy` isLeft
+
+    describe "ChuSQL.Core.Engine (事务)" $ do
+        it "parses transaction control statements" $ do
+            parseStatement "BEGIN" `shouldBe` Right BeginTransaction
+            parseStatement "BEGIN TRANSACTION" `shouldBe` Right BeginTransaction
+            parseStatement "START TRANSACTION" `shouldBe` Right BeginTransaction
+            parseStatement "begin transaction" `shouldBe` Right BeginTransaction
+            parseStatement "COMMIT" `shouldBe` Right CommitTransaction
+            parseStatement "COMMIT TRANSACTION" `shouldBe` Right CommitTransaction
+            parseStatement "ROLLBACK" `shouldBe` Right RollbackTransaction
+            parseStatement "rollback transaction" `shouldBe` Right RollbackTransaction
+
+        it "parses the bare words only as whole words" $ do
+            parseStatement "BEGINNER" `shouldSatisfy` isLeft
+            parseStatement "COMMITTED" `shouldSatisfy` isLeft
+
+        it "reports transaction control as session work" $ do
+            mapM_
+                ( \sql ->
+                    (runStatement [("users", users)] =<< parseStatement sql)
+                        `shouldSatisfy` either (isInfixOf "executed by the session") (const False)
+                )
+                ["BEGIN", "COMMIT", "ROLLBACK"]
+
+        it "puts transaction errors under the protocol category" $ do
+            errorCode "BEGIN is executed by the session" `shouldBe` "query_error"
+            errorCategory "BEGIN is executed by the session" `shouldBe` ProtocolError
 
     describe "ChuSQL.Core.Engine.Syntax.Parser (JOIN)" $ do
         it "parses a simple JOIN without aliases" $ do
@@ -1613,7 +1674,19 @@ main = hspec $ do
             withTestSession $ \srv -> withServerEnv srv $ do
                 runIPCStorage (insert "t1" [("id", VInt 1)]) `shouldReturn` Right ()
                 runIPCStorage (insert "t2" [("id", VInt 2)]) `shouldReturn` Right ()
-                doListTables `shouldReturn` Right ["t1", "t2"]
+                env <- defaultEnv
+                doListTables env `shouldReturn` Right ["t1", "t2"]
+
+        it "two sessions keep their own database" $ do
+            withTestSession $ \_ -> do
+                let alpha = envForDatabase (Just "alpha")
+                    beta = envForDatabase (Just "beta")
+                runIPCStorageIn (createDatabase "alpha") alpha `shouldReturn` Right ()
+                runIPCStorageIn (createDatabase "beta") beta `shouldReturn` Right ()
+                runIPCStorageIn (insert "iso" [("id", VInt 1)]) alpha `shouldReturn` Right ()
+                runIPCStorageIn (insert "iso" [("id", VInt 2)]) beta `shouldReturn` Right ()
+                runIPCStorageIn (scan "iso") alpha `shouldReturn` Right [[("id", VInt 1)]]
+                runIPCStorageIn (scan "iso") beta `shouldReturn` Right [[("id", VInt 2)]]
 
         it "rows survive a restart on the same data directory" $ do
             withTestSession $ \srv -> do

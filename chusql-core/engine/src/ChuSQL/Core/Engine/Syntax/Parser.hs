@@ -613,6 +613,14 @@ updateStatement = do
     mWhere <- optional (keyword "where" *> expr)
     return (Update tbl assigns mWhere)
 
+-- | 事务控制语句
+transactionStatement :: Parser Statement
+transactionStatement =
+    try (BeginTransaction <$ (keyword "start" *> keyword "transaction"))
+        <|> (BeginTransaction <$ (keyword "begin" *> optional (keyword "transaction")))
+        <|> (CommitTransaction <$ (keyword "commit" *> optional (keyword "transaction")))
+        <|> (RollbackTransaction <$ (keyword "rollback" *> optional (keyword "transaction")))
+
 -- | 解析总入口
 parseStatement :: String -> Either String Statement
 parseStatement input =
@@ -622,7 +630,8 @@ parseStatement input =
   where
     -- | 按关键字分派到各语句解析器
     statementP =
-        selectStatement
+        transactionStatement
+            <|> selectStatement
             <|> try (CreateDatabase <$> (keyword "create" *> keyword "database" *> identifier))
             <|> try (DropDatabase <$> (keyword "drop" *> keyword "database" *> identifier))
             <|> (UseDatabase <$> (keyword "use" *> identifier))
