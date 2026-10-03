@@ -1,5 +1,5 @@
 use chusql_core_storage::protocol::Row;
-use chusql_core_storage::wal::{committed_ops, Wal, WalOp};
+use chusql_core_storage::wal::{committed_ops, records_after, Wal, WalOp};
 use serde_json::json;
 
 // WAL 测试：追加、读取、清空、截断尾巴、LSN 与提交标记。
@@ -216,5 +216,83 @@ fn checkpoint_round_trips() {
     assert_eq!(wal.read_checkpoint().unwrap(), None);
     wal.write_checkpoint(7).unwrap();
     assert_eq!(wal.read_checkpoint().unwrap(), Some(7));
+}
+
+/// 按 LSN 截断只丢边界以内的帧
+#[test]
+fn truncate_before_keeps_newer_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wal.log");
+    let wal = Wal::new(&path);
+
+    let second_op = WalOp::Insert {
+        table: "t".into(),
+        row: row(&[("id", json!(2))]),
+    };
+    let first = wal
+        .append_group(&[WalOp::Insert {
+            table: "t".into(),
+            row: row(&[("id", json!(1))]),
+        }])
+        .unwrap();
+    let second = wal.append_group(std::slice::from_ref(&second_op)).unwrap();
+    assert!(second > first);
+
+    // 提交号是第一组的最后一条；边界以内的操作与提交标记都该丢掉
+    wal.truncate_before(first).unwrap();
+    let kept = wal.read_all().unwrap();
+    assert!(kept.records.iter().all(|(lsn, _)| *lsn > first));
+    let ops: Vec<&WalOp> = kept
+        .records
+        .iter()
+        .map(|(_, op)| op)
+        .filter(|op| **op != WalOp::Commit)
+        .collect();
+    assert_eq!(ops, vec![&second_op], "只剩第二组的操作");
+
+    // 边界划到最后一条之后，日志就空了
+    wal.truncate_before(second).unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    assert!(wal.read_all().unwrap().records.is_empty());
+}
+
+/// 日志被截断后 LSN 也不回头
+#[test]
+fn lsn_continues_from_the_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wal.log");
+    let op = WalOp::Insert {
+        table: "t".into(),
+        row: row(&[("id", json!(1))]),
+    };
+
+    let first = {
+        let wal = Wal::new(&path);
+        let lsn = wal.append_group(std::slice::from_ref(&op)).unwrap();
+        wal.write_checkpoint(lsn).unwrap();
+        wal.truncate_before(lsn).unwrap();
+        lsn
+    };
+
+    // 重新打开：号从检查点续
+    let wal = Wal::new(&path);
+    let next = wal.append_group(std::slice::from_ref(&op)).unwrap();
+    assert!(next > first, "重启后 LSN 要接着检查点走: {next} vs {first}");
+}
+
+/// 过滤只留下检查点之后的记录
+#[test]
+fn records_after_keeps_only_the_tail() {
+    let records = vec![
+        (1u64, WalOp::Insert { table: "t".into(), row: row(&[("id", json!(1))]) }),
+        (2, WalOp::Commit),
+        (3, WalOp::Insert { table: "t".into(), row: row(&[("id", json!(2))]) }),
+        (4, WalOp::Commit),
+    ];
+    let kept = records_after(&records, 2);
+    let lsn: Vec<u64> = kept.iter().map(|(lsn, _)| *lsn).collect();
+    assert_eq!(lsn, vec![3, 4]);
+    assert_eq!(records_after(&records, 4).len(), 0);
+    assert_eq!(records_after(&records, 0).len(), 4);
 }
 

@@ -1394,6 +1394,43 @@ fn already_applied_create_table_is_skipped_on_restart() -> Result<(), Box<dyn st
     Ok(())
 }
 
+/// 检查点跟着每组提交走，LSN 跨重启不回头
+#[test]
+fn checkpoint_advances_and_lsn_survives_restart() -> Result<(), Box<dyn std::error::Error>> {
+    let checkpoint = |data: &tempfile::TempDir| -> Result<u64, Box<dyn std::error::Error>> {
+        let bytes = std::fs::read(data.path().join("databases/main/wal.checkpoint"))?;
+        Ok(u64::from_le_bytes(bytes[..8].try_into()?))
+    };
+
+    let (server, data) = start_server();
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"create_table","table":"m6_seq","columns":[{"name":"id","ty":"int"}]}))?;
+    request_ok(&mut c, serde_json::json!({"method":"insert","table":"m6_seq","row":{"id":1}}))?;
+    drop(c);
+    let first = checkpoint(&data)?;
+    assert!(first > 0, "提交后检查点要前进: {first}");
+    drop(server);
+
+    // 重启后接着写，新的 LSN 必须落在检查点之后
+    let _server = start_server_in(data.path());
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"insert","table":"m6_seq","row":{"id":2}}))?;
+    drop(c);
+    let second = checkpoint(&data)?;
+    assert!(second > first, "重启后 LSN 要接着检查点走: {second} vs {first}");
+
+    // 数据都在，日志本身是空的：每组提交后就按边界截掉了
+    let mut c = connect()?;
+    let rows: serde_json::Value =
+        serde_json::from_str(&send(&mut c, r#"{"method":"scan","table":"m6_seq"}"#))?;
+    assert_eq!(rows["rows"].as_array().map(Vec::len), Some(2), "{rows}");
+    assert_eq!(
+        std::fs::metadata(data.path().join("databases/main/wal.log"))?.len(),
+        0
+    );
+    Ok(())
+}
+
 /// 给第二列建索引后能按那一列查
 #[test]
 fn create_index_on_secondary_column() {
