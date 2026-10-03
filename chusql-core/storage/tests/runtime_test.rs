@@ -1201,6 +1201,199 @@ fn uncommitted_group_is_discarded_on_restart() -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+/// 直接删表后文件不留，重建同名表是空表
+#[test]
+fn drop_table_removes_files() -> Result<(), Box<dyn std::error::Error>> {
+    let (_srv, data) = start_server();
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"create_table","table":"m4_gone","columns":[{"name":"id","ty":"int"},{"name":"note","ty":"text"}]}))?;
+    request_ok(&mut c, serde_json::json!({"method":"create_index","table":"m4_gone","column":"note"}))?;
+    request_ok(&mut c, serde_json::json!({"method":"insert","table":"m4_gone","row":{"id":1,"note":"a"}}))?;
+    assert!(data.path().join("databases/main/m4_gone.db").exists(), "建表要落数据文件");
+
+    request_ok(&mut c, serde_json::json!({"method":"drop_table","table":"m4_gone"}))?;
+    assert!(!data.path().join("databases/main/m4_gone.db").exists(), "数据文件要删掉");
+    assert!(!data.path().join("databases/main/m4_gone.idx").exists(), "id 索引要删掉");
+    assert!(!data.path().join("databases/main/m4_gone.note.idx").exists(), "二级索引要删掉");
+
+    request_ok(&mut c, serde_json::json!({"method":"create_table","table":"m4_gone","columns":[{"name":"id","ty":"int"},{"name":"note","ty":"text"}]}))?;
+    let rows: serde_json::Value =
+        serde_json::from_str(&send(&mut c, r#"{"method":"scan","table":"m4_gone"}"#))?;
+    assert_eq!(rows["rows"], serde_json::json!([]), "旧数据不能复活");
+    Ok(())
+}
+
+/// 建表操作进了 WAL 后，重启按提交组把表重建出来
+#[test]
+fn create_table_replays_after_restart() -> Result<(), Box<dyn std::error::Error>> {
+    use chusql_core_storage::protocol::SchemaColumn;
+    use chusql_core_storage::wal::{Wal, WalOp};
+    let (server, data) = start_server();
+    drop(server);
+
+    let group = vec![WalOp::CreateTable {
+        table: "m4_create".into(),
+        columns: vec![
+            SchemaColumn {
+                name: "id".into(),
+                ty: "int".into(),
+                ..Default::default()
+            },
+            SchemaColumn {
+                name: "note".into(),
+                ty: "text".into(),
+                ..Default::default()
+            },
+        ],
+    }];
+    let wal = Wal::new(data.path().join("databases/main/wal.log"));
+    let commit_lsn = wal.append_group(&group)?;
+    drop(wal);
+
+    let _server = start_server_in(data.path());
+    let mut c = connect()?;
+    let schema: serde_json::Value =
+        serde_json::from_str(&send(&mut c, r#"{"method":"describe_table","table":"m4_create"}"#))?;
+    assert_eq!(schema["status"], "schema", "{schema}");
+    assert_eq!(schema["columns"][1]["name"], "note", "{schema}");
+    assert!(data.path().join("databases/main/m4_create.db").exists(), "建表要落数据文件");
+    let checkpoint = std::fs::read(data.path().join("databases/main/wal.checkpoint"))?;
+    assert_eq!(u64::from_le_bytes(checkpoint[..8].try_into()?), commit_lsn);
+    Ok(())
+}
+
+/// 删表操作进了 WAL 后，重启把表和数据文件一起清掉
+#[test]
+fn drop_table_replays_after_restart() -> Result<(), Box<dyn std::error::Error>> {
+    use chusql_core_storage::wal::{Wal, WalOp};
+    let (server, data) = start_server();
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"create_table","table":"m4_drop","columns":[{"name":"id","ty":"int"}]}))?;
+    request_ok(&mut c, serde_json::json!({"method":"insert","table":"m4_drop","row":{"id":1}}))?;
+    drop(c);
+    drop(server);
+
+    let wal = Wal::new(data.path().join("databases/main/wal.log"));
+    wal.append_group(&[WalOp::DropTable {
+        table: "m4_drop".into(),
+    }])?;
+    drop(wal);
+
+    let _server = start_server_in(data.path());
+    let mut c = connect()?;
+    let schema: serde_json::Value =
+        serde_json::from_str(&send(&mut c, r#"{"method":"describe_table","table":"m4_drop"}"#))?;
+    assert_eq!(schema["status"], "error", "{schema}");
+    let left: Vec<String> = std::fs::read_dir(data.path().join("databases/main"))?
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(!data.path().join("databases/main/m4_drop.db").exists(), "数据文件要删掉，现存 {left:?}");
+    assert!(!data.path().join("databases/main/m4_drop.idx").exists(), "id 索引要删掉，现存 {left:?}");
+    Ok(())
+}
+
+/// 建索引操作进了 WAL 后，重启补建索引文件
+#[test]
+fn create_index_replays_after_restart() -> Result<(), Box<dyn std::error::Error>> {
+    use chusql_core_storage::wal::{Wal, WalOp};
+    let (server, data) = start_server();
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"create_table","table":"m4_idx","columns":[{"name":"id","ty":"int"},{"name":"note","ty":"text"}]}))?;
+    request_ok(&mut c, serde_json::json!({"method":"insert","table":"m4_idx","row":{"id":1,"note":"a"}}))?;
+    drop(c);
+    drop(server);
+
+    let wal = Wal::new(data.path().join("databases/main/wal.log"));
+    wal.append_group(&[WalOp::CreateIndex {
+        table: "m4_idx".into(),
+        column: "note".into(),
+    }])?;
+    drop(wal);
+
+    let _server = start_server_in(data.path());
+    let mut c = connect()?;
+    let schema: serde_json::Value =
+        serde_json::from_str(&send(&mut c, r#"{"method":"describe_table","table":"m4_idx"}"#))?;
+    assert_eq!(schema["status"], "schema", "{schema}");
+    let indexed = |schema: &serde_json::Value, column: &str| {
+        schema["indexes"]
+            .as_array()
+            .map(|list| list.iter().any(|i| i["column"] == column))
+            .unwrap_or(false)
+    };
+    assert!(indexed(&schema, "note"), "{schema}");
+    assert!(data.path().join("databases/main/m4_idx.note.idx").exists(), "索引文件要建出来");
+    let found: serde_json::Value = serde_json::from_str(&send(
+        &mut c,
+        r#"{"method":"lookup_by_index","table":"m4_idx","column":"note","key":"a"}"#,
+    ))?;
+    assert_eq!(found["rows"], serde_json::json!([{"id":1,"note":"a"}]), "{found}");
+    Ok(())
+}
+
+/// 删索引操作进了 WAL 后，重启清掉索引定义和文件
+#[test]
+fn drop_index_replays_after_restart() -> Result<(), Box<dyn std::error::Error>> {
+    use chusql_core_storage::wal::{Wal, WalOp};
+    let (server, data) = start_server();
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"create_table","table":"m4_didx","columns":[{"name":"id","ty":"int"},{"name":"note","ty":"text"}]}))?;
+    request_ok(&mut c, serde_json::json!({"method":"create_index","table":"m4_didx","column":"note"}))?;
+    drop(c);
+    drop(server);
+
+    let wal = Wal::new(data.path().join("databases/main/wal.log"));
+    wal.append_group(&[WalOp::DropIndex {
+        table: "m4_didx".into(),
+        column: "note".into(),
+    }])?;
+    drop(wal);
+
+    let _server = start_server_in(data.path());
+    let mut c = connect()?;
+    let schema: serde_json::Value =
+        serde_json::from_str(&send(&mut c, r#"{"method":"describe_table","table":"m4_didx"}"#))?;
+    assert_eq!(schema["status"], "schema", "{schema}");
+    let columns: Vec<&str> = schema["indexes"]
+        .as_array()
+        .map(|list| list.iter().filter_map(|i| i["column"].as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(columns, vec!["id"], "{schema}");
+    assert!(!data.path().join("databases/main/m4_didx.note.idx").exists(), "索引文件要删掉");
+    Ok(())
+}
+
+/// 已生效的建表记录重启时被跳过，不报恢复失败
+#[test]
+fn already_applied_create_table_is_skipped_on_restart() -> Result<(), Box<dyn std::error::Error>> {
+    use chusql_core_storage::protocol::SchemaColumn;
+    use chusql_core_storage::wal::{Wal, WalOp};
+    let (server, data) = start_server();
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"create_table","table":"m4_done","columns":[{"name":"id","ty":"int"}]}))?;
+    drop(c);
+    drop(server);
+
+    let wal = Wal::new(data.path().join("databases/main/wal.log"));
+    wal.append_group(&[WalOp::CreateTable {
+        table: "m4_done".into(),
+        columns: vec![SchemaColumn {
+            name: "id".into(),
+            ty: "int".into(),
+            ..Default::default()
+        }],
+    }])?;
+    drop(wal);
+
+    let _server = start_server_in(data.path());
+    let mut c = connect()?;
+    let schema: serde_json::Value =
+        serde_json::from_str(&send(&mut c, r#"{"method":"describe_table","table":"m4_done"}"#))?;
+    assert_eq!(schema["status"], "schema", "{schema}");
+    assert_eq!(std::fs::metadata(data.path().join("databases/main/wal.log"))?.len(), 0);
+    Ok(())
+}
+
 /// 给第二列建索引后能按那一列查
 #[test]
 fn create_index_on_secondary_column() {

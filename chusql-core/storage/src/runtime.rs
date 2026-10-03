@@ -280,6 +280,35 @@ impl Server {
                 let _ = std::fs::remove_file(self.index_path(table, column));
                 Ok(())
             }
+            WalOp::CreateTable { table, columns } => {
+                self.with_table(table, |_t| Ok(()))?;
+                let mut c = self.catalog.lock().map_err(|_| std::io::Error::other("catalog lock poisoned"))?;
+                c.create_table(table, columns.clone())?;
+                c.save(self.catalog_path())
+            }
+            WalOp::DropTable { table } => {
+                let dropped_indexes: Vec<String> = {
+                    let mut c = self.catalog.lock().map_err(|_| std::io::Error::other("catalog lock poisoned"))?;
+                    let idx = c
+                        .describe(table)
+                        .map(|s| s.indexes.iter().map(|i| i.column.clone()).collect())
+                        .unwrap_or_default();
+                    if c.describe(table).is_some() {
+                        c.drop_table(table)?;
+                        c.save(self.catalog_path())?;
+                    }
+                    idx
+                };
+                self.tables.lock().map_err(|_| std::io::Error::other("table lock poisoned"))?.remove(table);
+                let _ = std::fs::remove_file(self.table_path(table));
+                let _ = std::fs::remove_file(self.index_path(table, "id"));
+                for col in dropped_indexes {
+                    let _ = std::fs::remove_file(self.index_path(table, &col));
+                }
+                Ok(())
+            }
+            WalOp::CreateIndex { table, column } => self.apply_create_index(table, column),
+            WalOp::DropIndex { table, column } => self.apply_drop_index(table, column),
             WalOp::ReplaceSchema { table, columns, rows } => {
                 let old_indexes: Vec<String> = {
                     let c = self.catalog.lock().map_err(|_| std::io::Error::other("catalog lock poisoned"))?;
@@ -426,6 +455,8 @@ impl Server {
         let table = match op {
             WalOp::HideColumn { .. } => return Ok(()),
             WalOp::Commit => return Ok(()),
+            // 删表后不需要写回
+            WalOp::DropTable { .. } => return Ok(()),
             WalOp::Accounts { .. } => USERS_TABLE,
             WalOp::Insert { table, .. }
             | WalOp::InsertBatch { table, .. }
@@ -433,6 +464,9 @@ impl Server {
             | WalOp::ReplaceAll { table, .. }
             | WalOp::DropColumn { table, .. }
             | WalOp::Compact { table, .. }
+            | WalOp::CreateTable { table, .. }
+            | WalOp::CreateIndex { table, .. }
+            | WalOp::DropIndex { table, .. }
             | WalOp::ReplaceSchema { table, .. } => table,
         };
         self.with_table(table, |t| t.flush())
@@ -515,8 +549,25 @@ impl Server {
                 let c = self.catalog.lock().unwrap();
                 Ok(c.describe(table).is_some_and(|s| !s.columns.iter().any(|col| &col.name == column)))
             }
+            WalOp::CreateTable { table, .. } => self.table_exists(table),
+            WalOp::DropTable { table } => Ok(!self.table_exists(table)?
+                && !self.table_path(table).exists()
+                && !self.index_path(table, "id").exists()),
+            WalOp::CreateIndex { table, column } => Ok(self.index_exists(table, column)),
+            WalOp::DropIndex { table, column } => {
+                Ok(!self.index_exists(table, column) && !self.index_path(table, column).exists())
+            }
             _ => Ok(false),
         }
+    }
+
+    /// 这个列有索引吗
+    fn index_exists(&self, table: &str, column: &str) -> bool {
+        self.catalog
+            .lock()
+            .unwrap()
+            .describe(table)
+            .is_some_and(|s| s.indexes.iter().any(|i| i.column == column))
     }
 
     /// 这些行是不是都已经在表里
@@ -598,35 +649,38 @@ impl Server {
         Ok(())
     }
 
-    /// 给一列建索引
-    fn create_index(&self, table: &str, column: &str) -> std::io::Result<()> {        if column == "id" {
+    /// 建索引前的检查：内置列、未知表列、重复索引
+    fn check_create_index(&self, table: &str, column: &str) -> std::io::Result<()> {
+        if column == "id" {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 "id is the built-in index and cannot be created twice",
             ));
         }
-        {
-            let c = self.catalog.lock().unwrap();
-            let Some(schema) = c.describe(table) else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("unknown table: {}", table),
-                ));
-            };
-            if !schema.columns.iter().any(|c| c.name == column) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("unknown column: {}", column),
-                ));
-            }
-            if schema.indexes.iter().any(|i| i.column == column) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    format!("index on column \"{}\" already exists", column),
-                ));
-            }
+        let c = self.catalog.lock().map_err(|_| std::io::Error::other("catalog lock poisoned"))?;
+        let Some(schema) = c.describe(table) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("unknown table: {}", table),
+            ));
+        };
+        if !schema.columns.iter().any(|c| c.name == column) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("unknown column: {}", column),
+            ));
         }
+        if schema.indexes.iter().any(|i| i.column == column) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("index on column \"{}\" already exists", column),
+            ));
+        }
+        Ok(())
+    }
 
+    /// 建索引文件并登记到 catalog
+    fn apply_create_index(&self, table: &str, column: &str) -> std::io::Result<()> {
         let path = self.index_path(table, column);
         let (page_size, order, pool) = (self.cfg.page_size, self.cfg.btree_order, self.cfg.pool_size);
         self.with_table(table, |t| {
@@ -639,33 +693,43 @@ impl Server {
         c.save(self.catalog_path())
     }
 
-    /// 去掉一列的索引（连文件一起删）
-    fn drop_index(&self, table: &str, column: &str) -> std::io::Result<()> {
+    /// 去索引前的检查：内置列、未知表、索引不存在
+    fn check_drop_index(&self, table: &str, column: &str) -> std::io::Result<()> {
         if column == "id" {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "id is the built-in index and cannot be dropped",
             ));
         }
-        {
-            let c = self.catalog.lock().unwrap();
-            if c.describe(table).is_none() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("unknown table: {}", table),
-                ));
+        let c = self.catalog.lock().map_err(|_| std::io::Error::other("catalog lock poisoned"))?;
+        let Some(schema) = c.describe(table) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("unknown table: {}", table),
+            ));
+        };
+        if !schema.indexes.iter().any(|i| i.column == column) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no index on column \"{}\"", column),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 摘掉索引定义并删文件；重放时容忍 catalog 里已没有它
+    fn apply_drop_index(&self, table: &str, column: &str) -> std::io::Result<()> {
+        if self.table_exists(table)? {
+            self.with_table(table, |t| {
+                t.detach_index(column);
+                Ok(())
+            })?;
+            let mut c = self.catalog.lock().map_err(|_| std::io::Error::other("catalog lock poisoned"))?;
+            if c.describe(table).is_some_and(|s| s.indexes.iter().any(|i| i.column == column)) {
+                c.remove_index(table, column)?;
+                c.save(self.catalog_path())?;
             }
         }
-        self.with_table(table, |t| {
-            t.detach_index(column);
-            Ok(())
-        })?;
-
-        let mut c = self.catalog.lock().unwrap();
-        c.remove_index(table, column)?;
-        c.save(self.catalog_path())?;
-        drop(c);
-
         let _ = std::fs::remove_file(self.index_path(table, column));
         Ok(())
     }
@@ -892,13 +956,6 @@ impl Server {
 
     /// 持门后分发一条请求
     fn dispatch(&self, req: Request) -> Response {
-        let _ddl_guard = if matches!(req, Request::CreateTable { .. } | Request::DropTable { .. }
-            | Request::CreateIndex { .. } | Request::DropIndex { .. }) {
-            match self.write_lock.lock() {
-                Ok(guard) => Some(guard),
-                Err(_) => return Response::Error { message: "write lock poisoned".into() },
-            }
-        } else { None };
         if self.recovery_required.load(Ordering::Acquire) && !matches!(req, Request::Ping) {
             return Response::Error { message: "storage recovery required".into() };
         }
@@ -1168,76 +1225,76 @@ impl Server {
 
             Request::CreateTable { table, columns } => {
                 log_debug!(request, "create_table table={} cols={}", table, columns.len());
-
-                {
-                    let c = self.catalog.lock().unwrap();
-                    if c.describe(&table).is_some() {
+                let exists = match self.table_exists(&table) {
+                    Ok(exists) => exists,
+                    Err(e) => {
                         return Response::Error {
-                            message: format!("create_table {}: table already exists", table),
-                        };
+                            message: format!("create_table {}: {}", table, e),
+                        }
+                    }
+                };
+                if exists {
+                    return Response::Error {
+                        message: format!("create_table {}: table already exists", table),
+                    };
+                }
+                let tname = table.clone();
+                let op = WalOp::CreateTable { table, columns };
+                match self.write_via_wal(&op) {
+                    Ok(()) => Response::Ok,
+                    Err(e) => {
+                        log_warn!(request, "create_table {}: {}", tname, e);
+                        Response::Error {
+                            message: format!("create_table {}: {}", tname, e),
+                        }
                     }
                 }
-
-                if let Err(e) = self.with_table(&table, |_t| Ok(())) {
-                    return Response::Error {
-                        message: format!("create_table {}: {}", table, e),
-                    };
-                }
-
-                let mut c = self.catalog.lock().unwrap();
-                if let Err(e) = c.create_table(&table, columns) {
-                    return Response::Error {
-                        message: format!("create_table {}: {}", table, e),
-                    };
-                }
-                if let Err(e) = c.save(self.catalog_path()) {
-                    return Response::Error {
-                        message: format!("create_table {}: catalog save: {}", table, e),
-                    };
-                }
-                Response::Ok
             }
 
             Request::DropTable { table } => {
                 log_debug!(request, "drop_table table={}", table);
-
-                let dropped_indexes: Vec<String> = {
-                    let mut c = self.catalog.lock().unwrap();
-                    let idx = c
-                        .describe(&table)
-                        .map(|s| s.indexes.iter().map(|i| i.column.clone()).collect())
-                        .unwrap_or_default();
-                    if let Err(e) = c.drop_table(&table) {
+                let exists = match self.table_exists(&table) {
+                    Ok(exists) => exists,
+                    Err(e) => {
                         return Response::Error {
                             message: format!("drop_table {}: {}", table, e),
-                        };
+                        }
                     }
-                    if let Err(e) = c.save(self.catalog_path()) {
-                        return Response::Error {
-                            message: format!("drop_table {}: catalog save: {}", table, e),
-                        };
-                    }
-                    idx
                 };
-
-                self.tables.lock().unwrap().remove(&table);
-                let _ = std::fs::remove_file(self.table_path(&table));
-                let _ = std::fs::remove_file(self.index_path(&table, "id"));
-                for col in dropped_indexes {
-                    let _ = std::fs::remove_file(self.index_path(&table, &col));
+                if !exists {
+                    return Response::Error {
+                        message: format!("drop_table {}: unknown table: {}", table, table),
+                    };
                 }
-
-                Response::Ok
+                let tname = table.clone();
+                let op = WalOp::DropTable { table };
+                match self.write_via_wal(&op) {
+                    Ok(()) => Response::Ok,
+                    Err(e) => {
+                        log_warn!(request, "drop_table {}: {}", tname, e);
+                        Response::Error {
+                            message: format!("drop_table {}: {}", tname, e),
+                        }
+                    }
+                }
             }
 
             Request::CreateIndex { table, column } => {
                 log_debug!(request, "create_index table={} column={}", table, column);
-                match self.create_index(&table, &column) {
+                if let Err(e) = self.check_create_index(&table, &column) {
+                    log_warn!(request, "create_index {}({}): {}", table, column, e);
+                    return Response::Error {
+                        message: format!("create_index {}({}): {}", table, column, e),
+                    };
+                }
+                let tname = table.clone();
+                let op = WalOp::CreateIndex { table, column };
+                match self.write_via_wal(&op) {
                     Ok(()) => Response::Ok,
                     Err(e) => {
-                        log_warn!(request, "create_index {}({}): {}", table, column, e);
+                        log_warn!(request, "create_index {}: {}", tname, e);
                         Response::Error {
-                            message: format!("create_index {}({}): {}", table, column, e),
+                            message: format!("create_index {}: {}", tname, e),
                         }
                     }
                 }
@@ -1245,12 +1302,20 @@ impl Server {
 
             Request::DropIndex { table, column } => {
                 log_debug!(request, "drop_index table={} column={}", table, column);
-                match self.drop_index(&table, &column) {
+                if let Err(e) = self.check_drop_index(&table, &column) {
+                    log_warn!(request, "drop_index {}({}): {}", table, column, e);
+                    return Response::Error {
+                        message: format!("drop_index {}({}): {}", table, column, e),
+                    };
+                }
+                let tname = table.clone();
+                let op = WalOp::DropIndex { table, column };
+                match self.write_via_wal(&op) {
                     Ok(()) => Response::Ok,
                     Err(e) => {
-                        log_warn!(request, "drop_index {}({}): {}", table, column, e);
+                        log_warn!(request, "drop_index {}: {}", tname, e);
                         Response::Error {
-                            message: format!("drop_index {}({}): {}", table, column, e),
+                            message: format!("drop_index {}: {}", tname, e),
                         }
                     }
                 }
