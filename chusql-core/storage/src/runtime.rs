@@ -1602,6 +1602,9 @@ fn stat_wires(schema: &crate::catalog::TableSchema) -> Vec<ColumnStatWire> {
             name: name.clone(),
             distinct: s.distinct,
             capped: s.capped,
+            lo: s.lo,
+            hi: s.hi,
+            hist: s.hist.clone(),
         })
         .collect()
 }

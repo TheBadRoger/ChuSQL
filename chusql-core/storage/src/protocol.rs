@@ -58,12 +58,18 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ColumnStatWire {
     pub name: String,
     pub distinct: u64,
     #[serde(default)]
     pub capped: bool,
+    #[serde(default)]
+    pub lo: Option<f64>,
+    #[serde(default)]
+    pub hi: Option<f64>,
+    #[serde(default)]
+    pub hist: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

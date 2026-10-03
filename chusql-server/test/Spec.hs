@@ -6,13 +6,14 @@ module Main (main) where
 import ChuSQL.Core.Engine.Storage.IPC (
     Account (..),
     Request (ReqAccountReset),
+    TableInfo (..),
     closeConnection,
     localStorageLink,
     setStorageLink,
  )
 import ChuSQL.Core.Engine.Syntax.AST (Statement)
 import ChuSQL.Core.Engine.Syntax.Parser (parseStatement)
-import ChuSQL.Core.Model (Database, Row, Table (..), Value (..), pattern TInt, pattern TStr)
+import ChuSQL.Core.Model (Database, Histogram (..), Row, Table (..), Value (..), pattern TInt, pattern TStr)
 import ChuSQL.Interface.Auth (hashPasswordWith)
 import ChuSQL.Interface.Protocol (ClientRequest (..), Grant (..), RoleView (..), ServerResponse (..), decodeRequest, encodeResponse)
 import ChuSQL.Interface.RateLimit (newRateLimiter)
@@ -306,6 +307,21 @@ tcpSpec = do
             asInt (at "rowCount" value) `shouldBe` 1
             asBool (at "truncated" value) `shouldBe` False
             asText (at "database" value) `shouldBe` "test"
+
+    describe "memory backend: catalog statistics" $ do
+        it "reports a histogram for a numeric column" $ do
+            db <- newMVar testDb
+            let backend = memoryBackend testDatabaseName db
+            infos <- beCatalog backend
+            case infos of
+                Left err -> expectationFailure err
+                Right tables -> case [i | i <- tables, tiTable i == "users"] of
+                    [] -> expectationFailure "the catalog is missing the users table"
+                    (info : _) -> do
+                        fmap histLow (lookup "id" (tiHistograms info)) `shouldBe` Just 1
+                        fmap histHigh (lookup "id" (tiHistograms info)) `shouldBe` Just 5
+                        fmap (sum . histBuckets) (lookup "id" (tiHistograms info)) `shouldBe` Just 5
+                        lookup "name" (tiHistograms info) `shouldBe` Nothing
 
     describe "server config ([server] in chusql.toml)" $ do
         it "falls back to the defaults when the file has no server section" $ do

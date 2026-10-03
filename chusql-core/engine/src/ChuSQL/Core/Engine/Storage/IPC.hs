@@ -401,7 +401,7 @@ instance MonadStorage IPCStorage where
 
 -- | 线上表信息转引擎侧统计
 metaOf :: TableInfo -> TableMeta
-metaOf info = TableMeta (tiRows info) (tiStats info) (tiIndexes info)
+metaOf info = TableMeta (tiRows info) (tiStats info) (tiHistograms info) (tiIndexes info)
 
 -- | 没设库名就照单全收；设了库名只收这个库的表，键名去掉库名前缀
 visibleTables :: Maybe String -> TableInfo -> [(String, Table)]

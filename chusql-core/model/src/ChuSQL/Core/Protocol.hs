@@ -15,7 +15,7 @@ module ChuSQL.Core.Protocol (
     queryResultJson,
 ) where
 
-import ChuSQL.Core.Model (Row, Value (..))
+import ChuSQL.Core.Model (Histogram (..), Row, Value (..))
 import Data.Aeson (FromJSON (..), ToJSON (..), object, withObject, (.:), (.:?), (.!=), (.=))
 import qualified Data.Aeson as A
 import qualified Data.Aeson.Key as K
@@ -244,6 +244,7 @@ data TableInfo = TableInfo
     , tiRows :: Int
     , tiIndexes :: [String]
     , tiStats :: [(String, Int, Bool)]
+    , tiHistograms :: [(String, Histogram)]
     }
     deriving (Show, Eq)
 
@@ -255,11 +256,21 @@ instance ToJSON TableInfo where
             , "columns" .= tiColumns info
             , "row_count" .= tiRows info
             , "indexes" .= map (\name -> object ["column" .= name]) (tiIndexes info)
-            , "stats" .= map statJson (tiStats info)
+            , "stats" .= map (statJson (tiHistograms info)) (tiStats info)
             ]
       where
-        statJson (name, distinct, capped) =
-            object ["name" .= name, "distinct" .= distinct, "capped" .= capped]
+        statJson hists (name, distinct, capped) =
+            object (statFields ++ histFields (lookup name hists))
+          where
+            statFields = ["name" .= name, "distinct" .= distinct, "capped" .= capped]
+            histFields Nothing = []
+            histFields (Just h) = ["lo" .= histLow h, "hi" .= histHigh h, "hist" .= histBuckets h]
+
+-- | 线上直方图还原；区间或桶缺了就当作没有
+histogramFromWire :: Maybe Double -> Maybe Double -> [Int] -> Maybe Histogram
+histogramFromWire (Just low) (Just high) counts
+    | not (null counts) = Just (Histogram low high counts)
+histogramFromWire _ _ _ = Nothing
 
 -- | JSON 解回表信息
 instance FromJSON TableInfo where
@@ -270,14 +281,19 @@ instance FromJSON TableInfo where
         indexes <- o .:? "indexes" .!= []
         stats <- o .:? "stats" .!= []
         indexColumns <- mapM (\v -> withObject "IndexWire" (.: "column") v) (indexes :: [A.Value])
-        parsedStats <- mapM parseStat (stats :: [A.Value])
-        pure (TableInfo table columns count indexColumns parsedStats)
+        parsed <- mapM parseStat (stats :: [A.Value])
+        let parsedStats = [(name, distinct, capped) | (name, distinct, capped, _) <- parsed]
+            parsedHistograms = [(name, h) | (name, _, _, Just h) <- parsed]
+        pure (TableInfo table columns count indexColumns parsedStats parsedHistograms)
       where
         parseStat = withObject "ColumnStat" $ \o -> do
             name <- o .: "name"
             distinct <- o .: "distinct"
             capped <- o .:? "capped" .!= False
-            pure (name, distinct, capped)
+            low <- o .:? "lo"
+            high <- o .:? "hi"
+            counts <- o .:? "hist" .!= []
+            pure (name, distinct, capped, histogramFromWire low high counts)
 
 -- | 一条账号记录
 data Account = Account

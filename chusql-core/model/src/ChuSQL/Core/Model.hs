@@ -10,8 +10,11 @@ module ChuSQL.Core.Model
     , Value (..)
     , Row
     , TableMeta (..)
+    , Histogram (..)
     , Table (..)
     , Database
+    , histogramOf
+    , histogramFor
     , colNames
     , colType
     , lookupTable
@@ -42,7 +45,7 @@ module ChuSQL.Core.Model
 import Data.Char (isDigit, isSpace, toLower)
 import Data.Hashable (Hashable (..))
 import Data.List (isSuffixOf, stripPrefix)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
 
 -- 数据模型：列类型、列约束、值、行、表、数据库，外加查表小工具。
 
@@ -441,10 +444,19 @@ instance Hashable Value where
 -- | 一行数据
 type Row = [(String, Value)]
 
--- | 一张表的统计：行数、各列不同值数（capped 表示只数到上限）、有索引的列
+-- | 一列的等宽直方图：区间下界、上界与每桶计数
+data Histogram = Histogram
+    { histLow :: Double
+    , histHigh :: Double
+    , histBuckets :: [Int]
+    }
+    deriving (Show, Eq)
+
+-- | 一张表的统计：行数、各列不同值数、列直方图与索引
 data TableMeta = TableMeta
     { metaRowCount :: Int
     , metaDistinct :: [(String, Int, Bool)]
+    , metaHistograms :: [(String, Histogram)]
     , metaIndexes :: [String]
     }
     deriving (Show)
@@ -460,6 +472,36 @@ data Table = Table
 
 -- | 库：库名到表的映射
 type Database = [(String, Table)]
+
+-- | 这一列的直方图
+histogramFor :: TableMeta -> String -> Maybe Histogram
+histogramFor m col = lookup col (metaHistograms m)
+
+-- | 数值列按 16 个等宽桶统计，无数值给 Nothing
+histogramOf :: [Value] -> Maybe Histogram
+histogramOf values = case mapMaybe numericOf values of
+    [] -> Nothing
+    vs -> let lo = minimum vs; hi = maximum vs in Just (Histogram lo hi (bucketCounts lo hi vs))
+
+-- | 值转成用于分桶的数；非数值给 Nothing
+numericOf :: Value -> Maybe Double
+numericOf (VInt n) = Just (fromIntegral n)
+numericOf (VFloat d) = Just d
+numericOf _ = Nothing
+
+-- | 每个桶里落了多少个值
+bucketCounts :: Double -> Double -> [Double] -> [Int]
+bucketCounts lo hi vs = [length [v | v <- vs, bucketIndexOf lo hi v == i] | i <- [0 .. bucketTotal - 1]]
+
+-- | 值落在第几个桶；区间退化时都算第 0 桶
+bucketIndexOf :: Double -> Double -> Double -> Int
+bucketIndexOf lo hi v
+    | hi <= lo = 0
+    | otherwise = max 0 (min (bucketTotal - 1) (floor ((v - lo) / (hi - lo) * fromIntegral bucketTotal) :: Int))
+
+-- | 直方图的桶数
+bucketTotal :: Int
+bucketTotal = 16
 
 -- | 取表的列名
 colNames :: Table -> [String]

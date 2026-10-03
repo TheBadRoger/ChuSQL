@@ -43,4 +43,4 @@ accountColumnSpec name ty nullable autoIncrement primary unique =
 
 -- | 账号表的结构（排序校验用）
 systemTableInfo :: TableInfo
-systemTableInfo = TableInfo accountTableName accountColumns 0 [] []
+systemTableInfo = TableInfo accountTableName accountColumns 0 [] [] []
