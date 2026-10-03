@@ -817,8 +817,22 @@ impl Server {
         self.write_via_wal(&op)
     }
 
-    /// 整理一张表：按当前列定义重写堆页，回收隐藏列占的空间
+    /// 整理一张表：原地回收页内碎片，有隐藏列时重写堆页
     fn compact_table(&self, table: &str) -> std::io::Result<()> {
+        let rewrite = {
+            let c = self.catalog.lock().map_err(|_| std::io::Error::other("catalog lock poisoned"))?;
+            c.has_dropped_columns(table)
+        };
+        if !rewrite {
+            let reclaimed = self.with_existing_table(table, |t| {
+                let n = t.compact_pages()?;
+                t.flush()?;
+                Ok(n)
+            })?;
+            log_info!(core, "compact {} reclaimed {} bytes", table, reclaimed);
+            return Ok(());
+        }
+
         let rows = self.with_existing_table(table, |t| t.scan())?;
         let op = WalOp::Compact {
             table: table.to_string(),

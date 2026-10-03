@@ -294,6 +294,11 @@ impl Catalog {
         Ok(())
     }
 
+    /// 这张表还有隐藏列字节吗
+    pub fn has_dropped_columns(&self, table: &str) -> bool {
+        self.tables.get(table).is_some_and(|e| !e.dropped_columns.is_empty())
+    }
+
     /// 还有隐藏列字节待整理的表
     pub fn dropped_tables(&self) -> Vec<String> {
         self.tables
