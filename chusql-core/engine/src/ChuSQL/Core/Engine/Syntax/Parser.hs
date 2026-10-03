@@ -619,7 +619,14 @@ transactionStatement =
     try (BeginTransaction <$ (keyword "start" *> keyword "transaction"))
         <|> (BeginTransaction <$ (keyword "begin" *> optional (keyword "transaction")))
         <|> (CommitTransaction <$ (keyword "commit" *> optional (keyword "transaction")))
+        <|> try (RollbackToSavepoint <$> rollbackToName)
         <|> (RollbackTransaction <$ (keyword "rollback" *> optional (keyword "transaction")))
+        <|> (Savepoint <$> (keyword "savepoint" *> identifier))
+        <|> (ReleaseSavepoint <$> (keyword "release" *> optional (keyword "savepoint") *> identifier))
+  where
+    -- | ROLLBACK TO [SAVEPOINT] 名字
+    rollbackToName =
+        keyword "rollback" *> keyword "to" *> optional (keyword "savepoint") *> identifier
 
 -- | 解析总入口
 parseStatement :: String -> Either String Statement

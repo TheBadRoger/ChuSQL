@@ -137,6 +137,9 @@ runStatementUncheckedM _ ShowDatabases = runStatementM ShowDatabases
 runStatementUncheckedM _ BeginTransaction = pure (Left "BEGIN is executed by the session")
 runStatementUncheckedM _ CommitTransaction = pure (Left "COMMIT is executed by the session")
 runStatementUncheckedM _ RollbackTransaction = pure (Left "ROLLBACK is executed by the session")
+runStatementUncheckedM _ Savepoint{} = pure (Left "SAVEPOINT is executed by the session")
+runStatementUncheckedM _ RollbackToSavepoint{} = pure (Left "ROLLBACK TO is executed by the session")
+runStatementUncheckedM _ ReleaseSavepoint{} = pure (Left "RELEASE is executed by the session")
 
 -- | 只有需要读全表才能判断约束时才扫表
 existingRows :: (MonadStorage m) => String -> Table -> m (Either String [Row])

@@ -59,6 +59,12 @@ data Statement
     | CommitTransaction
     -- | 回滚事务
     | RollbackTransaction
+    -- | 建保存点：SAVEPOINT 名字
+    | Savepoint String
+    -- | 回滚到保存点：ROLLBACK TO [SAVEPOINT] 名字
+    | RollbackToSavepoint String
+    -- | 释放保存点：RELEASE [SAVEPOINT] 名字
+    | ReleaseSavepoint String
     deriving (Show, Eq)
 
 -- | 连接类型：内连接与左外连接
