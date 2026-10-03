@@ -652,6 +652,15 @@ privilegeSpec = describe "server privileges" $ do
         authorizeSql service (Ordinary testAccount) "SELECT d.name FROM (SELECT product FROM orders) d"
             `shouldReturn` Left (PrivilegeError "forbidden" "permission denied: SELECT ON orders")
 
+    it "requires the privilege on the table inside a CTE" $ withPrivileges $ \service root -> do
+        _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
+        _ <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "reader" False)
+        _ <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "reader" ["alice"])
+        authorizeSql service (Ordinary testAccount) "WITH d AS (SELECT name FROM users) SELECT d.name FROM d"
+            `shouldReturn` Right ()
+        authorizeSql service (Ordinary testAccount) "WITH d AS (SELECT product FROM orders) SELECT d.product FROM d"
+            `shouldReturn` Left (PrivilegeError "forbidden" "permission denied: SELECT ON orders")
+
     it "keeps the role tables on the real storage" $ withIpcStorage $ do
         base <- ipcBackend
         service <- newPrivileges base

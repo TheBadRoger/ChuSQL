@@ -171,7 +171,7 @@ inPredicate = do
 
 -- | 括号里的子查询；对外层列的引用留给语义检查填
 subquerySelect :: Parser Subquery
-subquerySelect = Subquery <$> selectStatement <*> pure []
+subquerySelect = Subquery <$> queryStatement <*> pure []
 
 -- | 聚合调用：名称与节点都由内置函数表给出
 aggregateCall :: Parser Expr
@@ -278,6 +278,7 @@ reservedWords =
     , "auto_increment"
     , "type"
     , "group"
+    , "with"
     ]
 
 -- | 别名（不许用保留字）
@@ -307,7 +308,7 @@ fromSource = fromSubquerySource <|> (uncurry FromTable <$> tableRef)
 -- | 派生表：括号里的一条 SELECT，必须有别名
 fromSubquerySource :: Parser FromClause
 fromSubquerySource = do
-    stmt <- between (symbol "(") (symbol ")") selectStatement
+    stmt <- between (symbol "(") (symbol ")") queryStatement
     mAlias <- optional ((keyword "as" *> aliasName) <|> aliasName)
     case mAlias of
         Nothing -> fail "FROM subquery needs an alias"
@@ -598,6 +599,123 @@ selectStatement = do
         then Select (map fst cols) fromC mWhere groupBy orderBy mLimit
         else SelectExpr cols fromC mWhere groupBy orderBy mLimit
 
+-- | 读 WITH：展开每个 CTE 再读主查询
+withStatement :: Parser Statement
+withStatement = do
+    keyword "with"
+    defs <- sepBy1 cteDef (symbol ",")
+    main <- selectStatement
+    either fail return (expandWith defs main)
+
+-- | 一个 CTE：名字、可选列清单与查询
+cteDef :: Parser (String, [String], Statement)
+cteDef = do
+    name <- identifier
+    cols <- fromMaybe [] <$> optional (between (symbol "(") (symbol ")") (sepBy1 identifier (symbol ",")))
+    keyword "as"
+    body <- between (symbol "(") (symbol ")") queryStatement
+    return (name, cols, body)
+
+-- | 查询：允许 WITH 开头
+queryStatement :: Parser Statement
+queryStatement = withStatement <|> selectStatement
+
+-- | 按顺序把每个 CTE 展开成派生表
+expandWith :: [(String, [String], Statement)] -> Statement -> Either String Statement
+expandWith defs main = go [] defs
+  where
+    -- | 前面的 CTE 已进环境，接着展开本体
+    go env [] = expandStatement env main
+    go env ((name, cols, body) : rest) = do
+        body' <- expandStatement env body
+        named <- renameColumns name cols body'
+        go (env ++ [(cteKey name, named)]) rest
+
+-- | CTE 名不分大小写
+cteKey :: String -> String
+cteKey = map toLower
+
+-- | CTE 带列清单时改本体的输出名
+renameColumns :: String -> [String] -> Statement -> Either String Statement
+renameColumns _ [] q = Right q
+renameColumns name cols q@Select { selectCols = names } = do
+    checkCteArity name cols names
+    Right
+        ( SelectExpr
+            [(c, Col n) | (c, n) <- zip cols names]
+            (selectFrom q)
+            (selectWhere q)
+            (selectGroupBy q)
+            (selectOrderBy q)
+            (selectLimit q)
+        )
+renameColumns name cols q@SelectExpr { selectItems = items } = do
+    checkCteArity name cols (map snd items)
+    Right q { selectItems = zip cols (map snd items) }
+renameColumns _ _ _ = Left "WITH: a CTE must be a SELECT"
+
+-- | 列清单个数必须和本体输出一致
+checkCteArity :: String -> [String] -> [a] -> Either String ()
+checkCteArity name cols out
+    | length cols == length out = Right ()
+    | otherwise = Left ("WITH: column list of " ++ name ++ " does not match its query")
+
+-- | 把语句里对 CTE 的引用换成派生表
+expandStatement :: [(String, Statement)] -> Statement -> Either String Statement
+expandStatement env q = case q of
+    q@Select { selectFrom = fromC, selectWhere = mWhere } -> do
+        fromC' <- expandClause env fromC
+        w <- traverse (expandExpr env) mWhere
+        Right q { selectFrom = fromC', selectWhere = w }
+    q@SelectExpr { selectFrom = fromC, selectItems = items, selectWhere = mWhere } -> do
+        fromC' <- expandClause env fromC
+        items' <- traverse (\(label, e) -> fmap ((,) label) (expandExpr env e)) items
+        w <- traverse (expandExpr env) mWhere
+        Right q { selectFrom = fromC', selectItems = items', selectWhere = w }
+    _ -> Right q
+
+-- | 来源树里的 CTE 引用换成派生表
+expandClause :: [(String, Statement)] -> FromClause -> Either String FromClause
+expandClause env fromC = case fromC of
+    FromTable mAlias tbl
+        | Just body <- lookup (cteKey tbl) env -> Right (FromSubquery (Just (fromMaybe tbl mAlias)) body)
+        | otherwise -> Right fromC
+    FromSubquery mAlias stmt -> FromSubquery mAlias <$> expandStatement env stmt
+    FromJoin kind left right cond ->
+        FromJoin kind <$> expandClause env left <*> expandClause env right <*> expandExpr env cond
+    FromUnit -> Right FromUnit
+
+-- | 表达式里的子查询也要展开
+expandExpr :: [(String, Statement)] -> Expr -> Either String Expr
+expandExpr env e = case e of
+    Add a b -> Add <$> go a <*> go b
+    Sub a b -> Sub <$> go a <*> go b
+    Mul a b -> Mul <$> go a <*> go b
+    Div a b -> Div <$> go a <*> go b
+    Gt a b -> Gt <$> go a <*> go b
+    Lt a b -> Lt <$> go a <*> go b
+    Eq a b -> Eq <$> go a <*> go b
+    And a b -> And <$> go a <*> go b
+    Or a b -> Or <$> go a <*> go b
+    Neg a -> Neg <$> go a
+    IsNull a -> IsNull <$> go a
+    IsNotNull a -> IsNotNull <$> go a
+    CountOf a -> CountOf <$> go a
+    SumOf a -> SumOf <$> go a
+    AvgOf a -> AvgOf <$> go a
+    MinOf a -> MinOf <$> go a
+    MaxOf a -> MaxOf <$> go a
+    ScalarSub sq -> ScalarSub <$> goSub sq
+    InSub x sq neg -> (\x' sq' -> InSub x' sq' neg) <$> go x <*> goSub sq
+    InList x es neg -> (\x' es' -> InList x' es' neg) <$> go x <*> traverse go es
+    ExistsSub sq neg -> (\sq' -> ExistsSub sq' neg) <$> goSub sq
+    _ -> Right e
+  where
+    -- | 继续看子表达式
+    go = expandExpr env
+    -- | 继续看子查询里的语句
+    goSub sq = (\stmt -> sq { subqueryStatement = stmt }) <$> expandStatement env (subqueryStatement sq)
+
 -- | 读 INSERT，可一次插多行
 insertStatement :: Parser Statement
 insertStatement = do
@@ -660,7 +778,8 @@ parseStatement input =
   where
     -- | 按关键字分派到各语句解析器
     statementP =
-        transactionStatement
+        withStatement
+            <|> transactionStatement
             <|> selectStatement
             <|> try (CreateDatabase <$> (keyword "create" *> keyword "database" *> identifier))
             <|> try (DropDatabase <$> (keyword "drop" *> keyword "database" *> identifier))
