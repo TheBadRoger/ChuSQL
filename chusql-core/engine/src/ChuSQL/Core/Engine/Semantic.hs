@@ -44,12 +44,20 @@ checkFrom _ _ FromUnit = Right []
 checkFrom db _ (FromTable mAlias tbl) = do
     (key, t) <- resolveTable db tbl
     Right (prefixColumns (Just (deriveQualifier mAlias key)) (tableCols t))
-checkFrom db outer (FromJoin _ left mAlias tbl cond) = do
+checkFrom db _ (FromSubquery mAlias stmt) = do
+    out <- inferSubqueryOutput db (Scope [] []) (Subquery stmt [])
+    Right (prefixColumns mAlias [(name, plainColumn (derivedType t)) | (name, t) <- out])
+checkFrom db outer (FromJoin _ left right cond) = do
     lcols <- checkFrom db outer left
-    (key, t) <- resolveTable db tbl
-    let env = lcols ++ prefixColumns (Just (deriveQualifier mAlias key)) (tableCols t)
+    rcols <- checkFrom db outer right
+    let env = lcols ++ rcols
     checkBool db "ON" (Scope env outer) cond
     Right env
+
+-- | 派生表里 NULL 字面量列没有具体类型，按字符串处理
+derivedType :: InferredType -> ColumnType
+derivedType (InferType t) = t
+derivedType InferNull = CStr
 
 -- | 合并两层列，本层优先且不重复
 scopedEnv :: [(String, Column)] -> [(String, Column)] -> [(String, Column)]
@@ -638,7 +646,8 @@ statementColumns stmt = case stmt of
     -- | 取 FROM 里出现的列
     fromColumns FromUnit = []
     fromColumns (FromTable _ _) = []
-    fromColumns (FromJoin _ l _ _ c) = fromColumns l ++ colsInExpr c
+    fromColumns (FromSubquery _ _) = []
+    fromColumns (FromJoin _ l r c) = fromColumns l ++ fromColumns r ++ colsInExpr c
 
 -- | 取语句的 FROM 子句，没有就是 FromUnit
 statementFrom :: Statement -> FromClause
@@ -692,17 +701,18 @@ resolveSelect _ q = Right q
 -- | 解析投影、条件、排序与连接引用
 resolveQuery :: Database -> [(String, Column)] -> Statement -> [(String, Expr)] -> Either String Statement
 resolveQuery db outer q items = do
-    env <- checkFrom db outer (selectFrom q)
+    source <- resolveSource db outer (selectFrom q)
+    env <- checkFrom db outer source
     -- | 单表无别名时把裸列名换成物理列名；带别名时表头保留别名限定名
     let physical c = case selectFrom q of
             FromTable Nothing tbl -> unqualify (Just (deriveQualifier Nothing tbl)) c
             _ -> c
         -- | 查一列并换算成物理名
         name place c = physical . fst <$> scopedColumnAt place env outer c
-        -- | 换算一个投影项
-        output (_, Col c) = do
+        -- | 换算一个投影项：带别名时保留别名做输出列名
+        output (label, Col c) = do
             k <- name "SELECT" c
-            pure (k, Col k)
+            pure (if label == c then (k, Col k) else (label, Col k))
         output (label, e) = do
             e' <- resolveExpr db env outer (name "SELECT") e
             pure (label, e')
@@ -714,24 +724,68 @@ resolveQuery db outer q items = do
     condition <- mapM (resolveExpr db env outer (name "WHERE")) (selectWhere q)
     grouping <- mapM (name "GROUP BY") (selectGroupBy q)
     ordering <- mapM (\(c, d) -> (\k -> (k, d)) <$> name "ORDER BY" c) (selectOrderBy q)
-    source <- case selectFrom q of
-        FromTable mAlias tbl -> do
-            (key, _) <- resolveTable db tbl
-            Right (FromTable mAlias key)
-        other -> resolveFrom db outer other
     pure $ case q of
         Select{} -> Select (map fst projected) source condition grouping ordering (selectLimit q)
         _ -> SelectExpr projected source condition grouping ordering (selectLimit q)
 
--- | 连接两侧取表名末段作别名；ON 可引用外层列
+-- | 单表不加限定名，其余来源交给 resolveFrom
+resolveSource :: Database -> [(String, Column)] -> FromClause -> Either String FromClause
+resolveSource db outer fromC = case fromC of
+    FromTable mAlias tbl -> do
+        (key, _) <- resolveTable db tbl
+        Right (FromTable mAlias key)
+    other -> resolveFrom db outer other
+
+-- | 连接两侧与派生表都要先解析，再取环境解析 ON
 resolveFrom :: Database -> [(String, Column)] -> FromClause -> Either String FromClause
 resolveFrom _ _ FromUnit = Right FromUnit
 resolveFrom db _ (FromTable alias tbl) = do
     (key, _) <- resolveTable db tbl
     Right (FromTable (Just (deriveQualifier alias key)) key)
-resolveFrom db outer fromC@(FromJoin kind left alias tbl cond) = do
-    env <- checkFrom db outer fromC
+resolveFrom db _ (FromSubquery mAlias stmt) = do
+    inner <- resolveSubqueryStatement db [] stmt
+    named <- nameDerivedColumns inner
+    Right (FromSubquery mAlias named)
+resolveFrom db outer fromC@(FromJoin kind left right cond) = do
     l <- resolveFrom db outer left
-    (key, _) <- resolveTable db tbl
+    r <- resolveFrom db outer right
+    env <- checkFrom db outer (FromJoin kind l r cond)
     c <- resolveExpr db env outer (fmap fst . columnAt "ON" env) cond
-    pure (FromJoin kind l (Just (deriveQualifier alias key)) key c)
+    pure (FromJoin kind l r c)
+
+-- | 派生表的输出列名：列取裸名，表达式保留原标签
+nameDerivedColumns :: Statement -> Either String Statement
+nameDerivedColumns q@Select { selectCols = cols, selectFrom = fromC } = do
+    let names = map lastTablePart cols
+    checkDerivedNames names
+    Right
+        ( SelectExpr
+            [(n, Col c) | (n, c) <- zip names cols]
+            fromC
+            (selectWhere q)
+            (selectGroupBy q)
+            (selectOrderBy q)
+            (selectLimit q)
+        )
+nameDerivedColumns q@SelectExpr { selectItems = items } = do
+    let names = map derivedItemName items
+    checkDerivedNames names
+    Right q { selectItems = zip names (map snd items) }
+nameDerivedColumns _ = Left "FROM: subquery must be a SELECT"
+
+-- | 派生表里一个投影项的输出名：没写别名的列取裸名
+derivedItemName :: (String, Expr) -> String
+derivedItemName (label, Col c)
+    | label == c = lastTablePart c
+    | otherwise = label
+derivedItemName (label, _) = label
+
+-- | 派生表列名不能重复
+checkDerivedNames :: [String] -> Either String ()
+checkDerivedNames = go []
+  where
+    -- | 逐个查有没有见过
+    go _ [] = Right ()
+    go seen (n : ns)
+        | n `elem` seen = Left ("FROM: duplicate column name in subquery: " ++ n)
+        | otherwise = go (n : seen) ns

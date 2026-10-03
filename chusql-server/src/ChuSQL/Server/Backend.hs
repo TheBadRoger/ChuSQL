@@ -283,7 +283,8 @@ statementNeedsDatabase stmt = any (not . T.any (== '.')) (statementTables stmt)
 tableRefsOf :: FromClause -> [Text]
 tableRefsOf FromUnit = []
 tableRefsOf (FromTable _ name) = [T.pack name]
-tableRefsOf (FromJoin _ left _ name cond) = tableRefsOf left ++ [T.pack name] ++ exprTables cond
+tableRefsOf (FromSubquery _ stmt) = statementTables stmt
+tableRefsOf (FromJoin _ left right cond) = tableRefsOf left ++ tableRefsOf right ++ exprTables cond
 
 -- | 表达式里出现的表（子查询是唯一的来路）
 exprTables :: Expr -> [Text]

@@ -6,18 +6,19 @@ import ChuSQL.Core.Engine.Syntax.AST
 
 -- 计划生成：把语句翻译成算子树。
 
--- | 把 FROM 子句翻成 Scan / Join
-fromToRelOp :: FromClause -> RelOp
-fromToRelOp FromUnit = Unit
-fromToRelOp (FromTable mAlias tbl) = Scan mAlias tbl Nothing
-fromToRelOp (FromJoin kind left mAlias tbl cond) =
-    Join kind (fromToRelOp left) (Scan mAlias tbl Nothing) cond
+-- | FROM 子句翻成关系算子
+fromToRelOp :: FromClause -> Either String RelOp
+fromToRelOp FromUnit = Right Unit
+fromToRelOp (FromTable mAlias tbl) = Right (Scan mAlias tbl Nothing)
+fromToRelOp (FromSubquery mAlias stmt) = Derived mAlias <$> translate stmt
+fromToRelOp (FromJoin kind left right cond) =
+    Join kind <$> fromToRelOp left <*> fromToRelOp right <*> pure cond
 
 -- | 带上 WHERE 的来源
-source :: FromClause -> Maybe Expr -> RelOp
-source fromC mWhere = case mWhere of
-    Nothing -> fromToRelOp fromC
-    Just w -> Filter w (fromToRelOp fromC)
+source :: FromClause -> Maybe Expr -> Either String RelOp
+source fromC mWhere = do
+    op <- fromToRelOp fromC
+    Right (maybe op (`Filter` op) mWhere)
 
 -- | 给用到的聚合起内部列名，同一个聚合只算一次
 nameAggs :: [(String, Expr)] -> [(String, Expr)]
@@ -80,9 +81,11 @@ translate q = case q of
         , selectOrderBy = orderBy
         , selectLimit = mLimit
         } -> do
-            let (plan, _) = grouped groupBy [] (source fromC mWhere)
+            plan0 <- source fromC mWhere
+            let (plan, _) = grouped groupBy [] plan0
             Right (Project cols (limited orderBy mLimit plan))
     SelectExpr items fromC mWhere groupBy orderBy mLimit -> do
-        let (plan, items') = grouped groupBy items (source fromC mWhere)
+        plan0 <- source fromC mWhere
+        let (plan, items') = grouped groupBy items plan0
         Right (Compute items' (limited orderBy mLimit plan))
     _ -> Left "only SELECT is supported by translate"

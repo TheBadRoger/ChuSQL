@@ -73,10 +73,11 @@ data JoinKind
     | LeftJoin
     deriving (Show, Eq)
 
--- | 数据来源：单表、带连接的来源，或空
+-- | 数据来源：单表、派生表（子查询，输出列已改成裸列名）、带连接的来源，或空
 data FromClause
     = FromTable (Maybe String) String
-    | FromJoin JoinKind FromClause (Maybe String) String Expr
+    | FromSubquery (Maybe String) Statement
+    | FromJoin JoinKind FromClause FromClause Expr
     | FromUnit
     deriving (Show, Eq)
 

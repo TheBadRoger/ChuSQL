@@ -17,6 +17,7 @@ data RelOp
     | Sort [(String, SortDir)] RelOp
     | Limit Int RelOp
     | Join JoinKind RelOp RelOp Expr
+    | Derived (Maybe String) RelOp
     deriving (Show, Eq)
 
 -- | 算子会产出哪些列
@@ -39,6 +40,7 @@ relOpCols _ (Project cols _) = cols
 relOpCols db (Sort _ x) = relOpCols db x
 relOpCols db (Limit _ x) = relOpCols db x
 relOpCols db (Join _ l r _) = relOpCols db l ++ relOpCols db r
+relOpCols db (Derived mAlias x) = map (qualify mAlias) (relOpCols db x)
 
 -- | 连接的显示名
 kindLabel :: JoinKind -> String
@@ -69,5 +71,6 @@ renderPlan = go 0
         Sort s x -> pad ++ "Sort " ++ show s ++ "\n" ++ go (ind + 1) x
         Limit n x -> pad ++ "Limit " ++ show n ++ "\n" ++ go (ind + 1) x
         Join k l r c -> pad ++ kindLabel k ++ " on " ++ show c ++ "\n" ++ go (ind + 1) l ++ "\n" ++ go (ind + 1) r
+        Derived a x -> pad ++ "Derived " ++ show a ++ "\n" ++ go (ind + 1) x
       where
         pad = replicate (ind * 2) ' '

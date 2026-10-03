@@ -79,6 +79,7 @@ planHasDivision (Compute items x) = any (hasDivision . snd) items || planHasDivi
 planHasDivision (Project _ x) = planHasDivision x
 planHasDivision (Sort _ x) = planHasDivision x
 planHasDivision (Limit _ x) = planHasDivision x
+planHasDivision (Derived _ x) = planHasDivision x
 planHasDivision _ = False
 
 -- | 是否要全部列
@@ -117,6 +118,7 @@ pushProject db need leaf@(Scan a t _)
     | needsAll need = leaf
     | all (`elem` need) (relOpCols db leaf) = leaf
     | otherwise = Scan a t (Just (nub (map (unqualify a) need)))
+pushProject _ _ (Derived a x) = Derived a x
 pushProject db need leaf@(Lookup _ _ _ _) = pushProjectLeaf db need leaf
 pushProject db need leaf@(Range _ _ _ _ _) = pushProjectLeaf db need leaf
 
@@ -202,6 +204,7 @@ optimizeRelOp db = rewriteNode db . descend
     descend (Sort spec x) = Sort spec (optimizeRelOp db x)
     descend (Limit n x) = Limit n (optimizeRelOp db x)
     descend (Join kind l r c) = Join kind (optimizeRelOp db l) (optimizeRelOp db r) c
+    descend (Derived a x) = Derived a (optimizeRelOp db x)
     descend x = x
 
 -- | 反复跑到不动点

@@ -324,8 +324,7 @@ main = hspec $ do
                             FromJoin
                                 InnerJoin
                                 (FromTable Nothing "users")
-                                Nothing
-                                "orders"
+                                (FromTable Nothing "orders")
                                 (Eq (Col "id") (Col "user_id"))
                         , selectWhere = Nothing
                         , selectGroupBy = []
@@ -343,8 +342,7 @@ main = hspec $ do
                             FromJoin
                                 InnerJoin
                                 (FromTable (Just "u") "users")
-                                (Just "o")
-                                "orders"
+                                (FromTable (Just "o") "orders")
                                 (Eq (Col "u.id") (Col "o.user_id"))
                         , selectWhere = Nothing
                         , selectGroupBy = []
@@ -362,8 +360,7 @@ main = hspec $ do
                             FromJoin
                                 LeftJoin
                                 (FromTable (Just "u") "users")
-                                (Just "o")
-                                "orders"
+                                (FromTable (Just "o") "orders")
                                 (Eq (Col "u.id") (Col "o.user_id"))
                         , selectWhere = Nothing
                         , selectGroupBy = []
@@ -378,10 +375,89 @@ main = hspec $ do
                     ( FromJoin
                         LeftJoin
                         (FromTable (Just "u") "users")
-                        (Just "o")
-                        "orders"
+                        (FromTable (Just "o") "orders")
                         (Eq (Col "u.id") (Col "o.user_id"))
                     )
+
+    describe "ChuSQL.Core.Engine (派生表)" $ do
+        -- sql：在默认库上跑 SQL 取结果行
+        let sql input = parseStatement input >>= rowsOf . runStatement testDB
+            -- values：只取结果里的值
+            values input = fmap (map (map snd)) (sql input)
+        it "parses a derived table with an alias" $ do
+            parseStatement "SELECT d.name FROM (SELECT name FROM users) d"
+                `shouldBe` Right
+                    ( Select
+                        { selectCols = ["d.name"]
+                        , selectFrom =
+                            FromSubquery
+                                (Just "d")
+                                (Select ["name"] (FromTable Nothing "users") Nothing [] [] Nothing)
+                        , selectWhere = Nothing
+                        , selectGroupBy = []
+                        , selectOrderBy = []
+                        , selectLimit = Nothing
+                        }
+                    )
+
+        it "requires an alias for a derived table" $ do
+            parseStatement "SELECT name FROM (SELECT name FROM users)" `shouldSatisfy` isLeft
+
+        it "parses a derived table on the right of a JOIN" $ do
+            fmap selectFrom (parseStatement "SELECT d.name FROM users u JOIN (SELECT name FROM users) d ON u.name = d.name")
+                `shouldBe` Right
+                    ( FromJoin
+                        InnerJoin
+                        (FromTable (Just "u") "users")
+                        (FromSubquery (Just "d") (Select ["name"] (FromTable Nothing "users") Nothing [] [] Nothing))
+                        (Eq (Col "u.name") (Col "d.name"))
+                    )
+
+        it "parses a projection alias" $ do
+            parseStatement "SELECT count(*) AS total FROM orders"
+                `shouldBe` Right
+                    ( SelectExpr
+                        [("total", CountAll)]
+                        (FromTable Nothing "orders")
+                        Nothing
+                        []
+                        []
+                        Nothing
+                    )
+
+        it "runs a derived table as a source" $ do
+            values "SELECT d.name FROM (SELECT name FROM users) d"
+                `shouldBe` Right [[VStr "Alice"], [VStr "Bob"], [VStr "Carol"]]
+
+        it "expands the star of a derived table" $ do
+            sql "SELECT * FROM (SELECT id, name FROM users) d"
+                `shouldBe` Right
+                    [ [("d.id", VInt 1), ("d.name", VStr "Alice")]
+                    , [("d.id", VInt 2), ("d.name", VStr "Bob")]
+                    , [("d.id", VInt 3), ("d.name", VStr "Carol")]
+                    ]
+
+        it "joins a derived table with a table" $ do
+            values "SELECT o.id FROM (SELECT id FROM users WHERE age > 20) d JOIN orders o ON o.user_id = d.id ORDER BY o.id"
+                `shouldBe` Right [[VInt 1], [VInt 3]]
+
+        it "runs an aggregate inside a derived table" $ do
+            values "SELECT d.total FROM (SELECT user_id, count(*) AS total FROM orders GROUP BY user_id) d ORDER BY d.total"
+                `shouldBe` Right [[VInt 1], [VInt 2]]
+
+        it "runs a derived table inside a derived table" $ do
+            values "SELECT inner_d.name FROM (SELECT d.name FROM (SELECT name FROM users) d WHERE d.name = 'Bob') inner_d"
+                `shouldBe` Right [[VStr "Bob"]]
+
+        it "keeps a projection alias outside a derived table" $ do
+            sql "SELECT count(*) AS total FROM orders" `shouldBe` Right [[("total", VInt 3)]]
+
+        it "rejects duplicate column names in a derived table" $ do
+            sql "SELECT d.name FROM (SELECT name, name FROM users) d" `shouldSatisfy` isLeft
+
+        it "does not let a derived table see outer columns" $ do
+            sql "SELECT d.name FROM users u JOIN (SELECT name FROM users WHERE id = u.id) d ON u.name = d.name"
+                `shouldSatisfy` isLeft
 
     describe "ChuSQL.Core.Engine (SELECT)" $ do
         -- sql：在默认库上跑 SQL 取结果行
@@ -991,8 +1067,7 @@ main = hspec $ do
                         FromJoin
                             InnerJoin
                             (FromTable (Just "u") "users")
-                            (Just "x")
-                            "nonexistent"
+                            (FromTable (Just "x") "nonexistent")
                             (Eq (Col "u.id") (Col "x.id"))
                     , selectWhere = Nothing
                     , selectGroupBy = []

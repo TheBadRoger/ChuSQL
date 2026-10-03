@@ -300,21 +300,34 @@ joinKind =
         <|> try (keyword "inner" *> keyword "join" *> return InnerJoin)
         <|> (keyword "join" *> return InnerJoin)
 
+-- | FROM 里的一个来源：表或派生表
+fromSource :: Parser FromClause
+fromSource = fromSubquerySource <|> (uncurry FromTable <$> tableRef)
+
+-- | 派生表：括号里的一条 SELECT，必须有别名
+fromSubquerySource :: Parser FromClause
+fromSubquerySource = do
+    stmt <- between (symbol "(") (symbol ")") selectStatement
+    mAlias <- optional ((keyword "as" *> aliasName) <|> aliasName)
+    case mAlias of
+        Nothing -> fail "FROM subquery needs an alias"
+        Just name -> return (FromSubquery (Just name) stmt)
+
 -- | 一个 JOIN ... ON
-joinClause :: Parser (JoinKind, Maybe String, String, Expr)
+joinClause :: Parser (JoinKind, FromClause, Expr)
 joinClause = do
     kind <- joinKind
-    (mAlias, tbl) <- tableRef
+    src <- fromSource
     keyword "on"
     cond <- expr
-    return (kind, mAlias, tbl, cond)
+    return (kind, src, cond)
 
 -- | FROM 子句（可含多个 JOIN）
 fromClause :: Parser FromClause
 fromClause = do
-    (mAlias, tbl) <- tableRef
+    src <- fromSource
     joins <- many joinClause
-    return (foldl (\acc (k, a, t, c) -> FromJoin k acc a t c) (FromTable mAlias tbl) joins)
+    return (foldl (\acc (k, s, c) -> FromJoin k acc s c) src joins)
 
 -- | SELECT 的列清单
 selectList :: Parser [(String, Expr)]
@@ -324,11 +337,17 @@ selectList =
         , sepBy1 selectItem (symbol ",")
         ]
 
--- | 投影标签保留表达式原文
+-- | 投影项：列名或表达式，可带 AS 别名
 selectItem :: Parser (String, Expr)
 selectItem = do
     (source, e) <- match expr
-    pure (case e of Col c -> (c, e); _ -> (reverse (dropWhile isSpace (reverse source)), e))
+    mAlias <- optional (try (keyword "as" *> aliasName))
+    pure (fromMaybe (selectItemLabel source e) mAlias, e)
+
+-- | 投影项的默认标签：列用列名，表达式用原文
+selectItemLabel :: String -> Expr -> String
+selectItemLabel _ (Col c) = c
+selectItemLabel source _ = reverse (dropWhile isSpace (reverse source))
 
 -- | 读 CREATE TABLE
 createTableStatement :: Parser Statement
