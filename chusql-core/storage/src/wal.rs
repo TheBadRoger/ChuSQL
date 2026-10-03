@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::protocol::{Account, Row, SchemaColumn, USERS_TABLE};
 
+/// 一帧的位置：LSN、操作、起止字节偏移
+type Frame = (u64, WalOp, usize, usize);
+
 // 预写日志：先记操作并 fsync，再改数据；重启按 LSN 重放已提交的组。
 
 const OP_INSERT: u8 = 1;
@@ -170,6 +173,51 @@ impl Wal {
         })
     }
 
+    /// 丢掉 LSN 不大于边界的帧，其余记录原样留下
+    ///
+    /// 边界以内的记录代表「已经落盘」，所以整段前缀可以丢弃；做法是把尾巴
+    /// 写进同目录的临时文件再改名，崩在中间也不会留下半新半旧的文件。
+    pub fn truncate_before(&self, lsn: u64) -> io::Result<()> {
+        let (frames, good_len) = self.parse()?;
+        let keep = frames
+            .iter()
+            .find(|(frame_lsn, _, _, _)| *frame_lsn > lsn)
+            .map(|(_, _, start, _)| *start);
+        match keep {
+            None => self.clear(),
+            Some(0) => Ok(()),
+            Some(start) => self.rewrite_tail(start, good_len),
+        }
+    }
+
+    /// 丢掉 LSN 大于边界的帧（未提交的尾巴），前缀原样留下
+    pub fn truncate_after(&self, lsn: u64) -> io::Result<()> {
+        let (frames, good_len) = self.parse()?;
+        let keep = frames
+            .iter()
+            .find(|(frame_lsn, _, _, _)| *frame_lsn > lsn)
+            .map(|(_, _, start, _)| *start)
+            .unwrap_or(good_len);
+        self.truncate_to(keep.min(good_len))
+    }
+
+    /// 把 [start, end) 一段写到文件头
+    fn rewrite_tail(&self, start: usize, end: usize) -> io::Result<()> {
+        // 常驻句柄认的是旧文件，改名后必须重新打开
+        *self.handle.lock().unwrap() = None;
+        let bytes = std::fs::read(&self.path)?;
+        let tail = bytes.get(start..end).unwrap_or(&[]);
+        let mut temp = self.path.clone().into_os_string();
+        temp.push(".tmp");
+        let temp = PathBuf::from(temp);
+        {
+            let mut f = File::create(&temp)?;
+            f.write_all(tail)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&temp, &self.path)
+    }
+
     /// 追加一条并 fsync
     pub fn append(&self, op: &WalOp) -> io::Result<()> {
         let bytes = self.encode_next(op)?;
@@ -202,16 +250,25 @@ impl Wal {
 
     /// 读全部记录，撕裂或损坏的尾巴按长度截断
     pub fn read_all(&self) -> io::Result<WalScan> {
+        let (frames, good_len) = self.parse()?;
+        Ok(WalScan {
+            records: frames
+                .into_iter()
+                .map(|(lsn, op, _, _)| (lsn, op))
+                .collect(),
+            good_len,
+        })
+    }
+
+    /// 解析整个文件：每帧的 LSN、操作与字节范围，外加完好长度
+    fn parse(&self) -> io::Result<(Vec<Frame>, usize)> {
         if !self.path.exists() {
-            return Ok(WalScan {
-                records: Vec::new(),
-                good_len: 0,
-            });
+            return Ok((Vec::new(), 0));
         }
         let mut f = File::open(&self.path)?;
         let mut buf = Vec::new();
         f.read_to_end(&mut buf)?;
-        let mut records = Vec::new();
+        let mut frames = Vec::new();
         let mut offset = 0usize;
         while offset + 4 <= buf.len() {
             let body_len =
@@ -222,17 +279,14 @@ impl Wal {
                 break;
             }
             match decode_body(&buf[offset + 4..end]) {
-                Ok(record) => {
-                    records.push(record);
+                Ok((lsn, op)) => {
+                    frames.push((lsn, op, offset, end));
                     offset = end;
                 }
                 Err(_) => break,
             }
         }
-        Ok(WalScan {
-            records,
-            good_len: offset,
-        })
+        Ok((frames, offset))
     }
 
     /// 记录检查点：到此为止的 LSN 都已落盘
@@ -258,11 +312,17 @@ impl Wal {
     }
 
     /// 取下一条 LSN
+    ///
+    /// 号从检查点与文件尾里较大的那个续，因此日志被按边界截断之后 LSN 也不回头。
     fn take_lsn(&self) -> io::Result<u64> {
         let mut slot = self.next_lsn.lock().unwrap();
         if *slot == 0 {
-            let last = self.read_all()?.records.last().map(|(lsn, _)| *lsn).unwrap_or(0);
-            *slot = last + 1;
+            let mut base = self.read_checkpoint()?.unwrap_or(0);
+            let (frames, _) = self.parse()?;
+            if let Some((lsn, _, _, _)) = frames.last() {
+                base = base.max(*lsn);
+            }
+            *slot = base + 1;
         }
         let lsn = *slot;
         *slot += 1;
@@ -291,6 +351,15 @@ pub fn committed_ops(records: &[(u64, WalOp)]) -> Vec<(u64, WalOp)> {
         out.append(&mut pending);
     }
     out
+}
+
+/// 只留下检查点之后的记录：边界以内的已经落盘，不必重放
+pub fn records_after(records: &[(u64, WalOp)], checkpoint: u64) -> Vec<(u64, WalOp)> {
+    records
+        .iter()
+        .filter(|(lsn, _)| *lsn > checkpoint)
+        .cloned()
+        .collect()
 }
 
 /// 清空文件并把读写位置归零

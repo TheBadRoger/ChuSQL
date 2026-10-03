@@ -11,7 +11,7 @@ use crate::protocol::{
     blocked_table, reserved_table, Account, ColumnStatWire, IndexWire, Request, Response, Row,
     SchemaColumn, StorageOp, TableSchemaWire, USERS_TABLE,
 };
-use crate::wal::{committed_ops, Wal, WalOp};
+use crate::wal::{committed_ops, records_after, Wal, WalOp};
 use crate::{log_debug, log_error, log_info, log_warn};
 
 // 进程内存储运行时：Haskell 侧经 ffi.rs 调进来。
@@ -412,11 +412,13 @@ impl Server {
         self.group_via_wal(&wal_ops)
     }
 
-    /// 一组操作加提交标记落盘，成功后清空日志
+    /// 一组操作加提交标记落盘，成功后把检查点推到这条提交
+    ///
+    /// 检查点写在这组数据和字典都刷盘之后，含义是「LSN 到此为止的改动都已落盘」；
+    /// 写完再按这个边界丢掉日志前缀，中途崩掉只会留下更长的日志，不会少数据。
     fn group_via_wal(&self, ops: &[WalOp]) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.cfg.data_dir)?;
         let wal = &self.wal;
-        wal.truncate()?;
         let commit_lsn = wal.append_group(ops)?;
         for op in ops {
             let result = self.apply_op(op);
@@ -430,7 +432,8 @@ impl Server {
             self.flush_op_tables(op)?;
         }
         self.flush_all_tables()?;
-        wal.clear()?;
+        wal.write_checkpoint(commit_lsn)?;
+        wal.truncate_before(commit_lsn)?;
         log_debug!(core, "WAL committed group at LSN {}", commit_lsn);
         Ok(())
     }
@@ -472,7 +475,7 @@ impl Server {
         self.with_table(table, |t| t.flush())
     }
 
-    /// 重放残留 WAL：已提交组重放，未提交组丢弃
+    /// 重放残留 WAL：检查点之后的已提交组重放，未提交组丢弃
     fn recover_wal(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.cfg.data_dir)?;
         let wal = &self.wal;
@@ -483,14 +486,17 @@ impl Server {
             }
             return Ok(());
         }
-        let records = committed_ops(&scan.records);
+        // 检查点以内的记录已经落盘，直接按边界截掉
+        let checkpoint = wal.read_checkpoint()?.unwrap_or(0);
+        let pending = records_after(&scan.records, checkpoint);
+        let records = committed_ops(&pending);
         if records.is_empty() {
             log_warn!(core, "discarding uncommitted WAL records");
-            wal.clear()?;
+            // 边界之后的都是没提交的尾巴，直接丢
+            wal.truncate_after(checkpoint)?;
             return Ok(());
         }
-        let max_lsn = scan
-            .records
+        let max_lsn = pending
             .iter()
             .rev()
             .find(|(_, op)| *op == WalOp::Commit)
@@ -504,7 +510,7 @@ impl Server {
         }
         self.flush_all_tables()?;
         wal.write_checkpoint(max_lsn)?;
-        wal.clear()?;
+        wal.truncate_before(max_lsn)?;
         log_info!(core, "WAL replay complete");
         Ok(())
     }
