@@ -304,3 +304,77 @@ fn secondary_index_is_maintained() {
     );
 }
 
+
+/// 整表整理要收回删行留下的页内空洞
+#[test]
+fn compact_pages_reclaims_dead_space() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.db");
+    let mut t = HeapTable::open(&path, DEFAULT_PAGE_SIZE, DEFAULT_POOL_SIZE).unwrap();
+
+    let pad = "x".repeat(200);
+    for i in 0..10 {
+        t.insert_row(&row(&[("id", json!(i)), ("pad", json!(pad))])).unwrap();
+    }
+    let pages = t.num_pages().unwrap();
+
+    t.delete_by_keys(&[3]).unwrap();
+    assert_eq!(t.num_pages().unwrap(), pages, "删一行不该动页数");
+    let reclaimed = t.compact_pages().unwrap();
+    assert!(reclaimed > 0, "整理要回收删掉的 {} 字节", 200);
+    assert_eq!(t.compact_pages().unwrap(), 0, "整理过就没有空洞了");
+
+    let rows = t.scan().unwrap();
+    assert_eq!(rows.len(), 9);
+    assert!(!rows.iter().any(|r| r["id"] == json!(3)));
+    assert_eq!(rows[0]["pad"], json!(pad));
+}
+
+/// 删行的页内空间要能被后续插入复用
+#[test]
+fn deletes_compact_pages_so_space_is_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.db");
+    let mut t = HeapTable::open(&path, DEFAULT_PAGE_SIZE, DEFAULT_POOL_SIZE).unwrap();
+
+    let pad = "y".repeat(80);
+    for i in 0..30 {
+        t.insert_row(&row(&[("id", json!(i)), ("pad", json!(pad))])).unwrap();
+    }
+    assert_eq!(t.num_pages().unwrap(), 1, "30 行要先塞进一页");
+
+    // 删掉中间的行，只留最靠页尾的那一行
+    let keys: Vec<i64> = (10..29).collect();
+    t.delete_by_keys(&keys).unwrap();
+
+    for i in 100..119 {
+        t.insert_row(&row(&[("id", json!(i)), ("pad", json!(pad))])).unwrap();
+    }
+    assert_eq!(t.num_pages().unwrap(), 1, "删掉的空间要能被复用");
+    assert_eq!(t.scan().unwrap().len(), 30);
+}
+
+/// 页内整理之后索引里的位置仍然指向原来的行
+#[test]
+fn compact_pages_keeps_index_positions_valid() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("t.db");
+    let index = dir.path().join("t.idx");
+    let mut t = HeapTable::open_indexed(&data, &index, DEFAULT_PAGE_SIZE, 4, DEFAULT_POOL_SIZE).unwrap();
+
+    let pad = "z".repeat(80);
+    for i in 0..30 {
+        t.insert_row(&row(&[("id", json!(i)), ("pad", json!(pad))])).unwrap();
+    }
+    let keys: Vec<i64> = (5..25).collect();
+    t.delete_by_keys(&keys).unwrap();
+    t.compact_pages().unwrap();
+
+    for i in [0, 1, 2, 3, 4, 25, 26, 27, 28, 29] {
+        let found = t.get_by_column_key("id", i).unwrap();
+        assert_eq!(found.as_ref().map(|r| r["pad"].clone()), Some(json!(pad)), "整理后 id={} 仍要能点查", i);
+    }
+    for i in 5..25 {
+        assert!(t.get_by_column_key("id", i).unwrap().is_none(), "删掉的行不该再查出来");
+    }
+}

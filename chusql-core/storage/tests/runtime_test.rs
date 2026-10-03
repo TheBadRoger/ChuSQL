@@ -480,6 +480,38 @@ fn startup_compaction_reclaims_dropped_columns() -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+/// 没有隐藏列时整理表只原地回收页内空间
+#[test]
+fn compact_defragments_pages_without_dropped_columns() -> Result<(), Box<dyn std::error::Error>> {
+    let (_srv, data) = start_server();
+    let mut c = connect()?;
+    let pad = "p".repeat(200);
+    for id in 1..=5 {
+        request_ok(&mut c, serde_json::json!({"method":"insert","table":"items","row":{"id":id,"note":pad}}))?;
+    }
+    request_ok(&mut c, serde_json::json!({"method":"insert","table":"items","row":{"id":6,"note":"doomed-row-marker"}}))?;
+    for id in 7..=11 {
+        request_ok(&mut c, serde_json::json!({"method":"insert","table":"items","row":{"id":id,"note":pad}}))?;
+    }
+    request_ok(&mut c, serde_json::json!({"method":"delete_keys","table":"items","keys":[6]}))?;
+
+    let heap = data.path().join("databases/main/items.db");
+    assert!(
+        std::fs::read(&heap)?.windows(17).any(|w| w == &b"doomed-row-marker"[..]),
+        "删行只留墓碑，字节还在页里"
+    );
+    request_ok(&mut c, serde_json::json!({"method":"compact","table":"items"}))?;
+    assert!(
+        !std::fs::read(&heap)?.windows(17).any(|w| w == &b"doomed-row-marker"[..]),
+        "原地整理要把墓碑字节收掉"
+    );
+    assert_eq!(std::fs::metadata(data.path().join("databases/main/wal.log"))?.len(), 0);
+
+    let rows: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"scan","table":"items"}"#))?;
+    assert_eq!(rows["rows"].as_array().map(Vec::len), Some(10), "rows survive compaction: {}", rows);
+    Ok(())
+}
+
 /// 非法库名被拒；system 是唯一保留库
 #[test]
 fn databases_reject_unsafe_names_and_keep_only_system_reserved() -> Result<(), Box<dyn std::error::Error>> {

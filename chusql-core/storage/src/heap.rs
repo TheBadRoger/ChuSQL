@@ -199,6 +199,55 @@ impl HeapPage {
     pub fn iter_slots(page: &Page) -> Vec<u16> {
         (0..Self::slot_count(page)).collect()
     }
+
+    /// 页内死空间字节数：行区里除活行以外的部分
+    pub fn dead_bytes(page: &Page) -> usize {
+        let n = Self::slot_count(page);
+        let mut live = 0;
+        for i in 0..n as usize {
+            let slot_off = SLOT_DIR_START + i * SLOT_SIZE;
+            live += read_u32(&page.data, slot_off + 4) as usize;
+        }
+        (page.data.len() - Self::free_end(page)).saturating_sub(live)
+    }
+
+    /// 页内整理：活行挪到页尾，槽位号不动，返回回收字节数
+    pub fn compact_page(page: &mut Page) -> usize {
+        let reclaimed = Self::dead_bytes(page);
+        if reclaimed == 0 {
+            return 0;
+        }
+
+        let n = Self::slot_count(page);
+        let mut live: Vec<(usize, Vec<u8>)> = Vec::new();
+        for i in 0..n as usize {
+            let slot_off = SLOT_DIR_START + i * SLOT_SIZE;
+            let off = read_u32(&page.data, slot_off) as usize;
+            let len = read_u32(&page.data, slot_off + 4) as usize;
+            if len > 0 {
+                live.push((i, page.data[off..off + len].to_vec()));
+            } else {
+                write_u32(&mut page.data, slot_off, 0);
+            }
+        }
+
+        let mut end = page.data.len();
+        for (i, bytes) in live {
+            end -= bytes.len();
+            page.data[end..end + bytes.len()].copy_from_slice(&bytes);
+            write_u32(&mut page.data, SLOT_DIR_START + i * SLOT_SIZE, end as u32);
+        }
+        reclaimed
+    }
+
+    /// 死空间超过四分之一就整理这一页
+    pub fn compact_if_fragmented(page: &mut Page) -> usize {
+        if Self::dead_bytes(page) * 4 >= page.data.len() {
+            Self::compact_page(page)
+        } else {
+            0
+        }
+    }
 }
 
 struct NamedIndex {
@@ -442,6 +491,7 @@ impl HeapTable {
             let last_id = n - 1;
             let mut slot = None;
             self.file.update_page(last_id, |p| {
+                HeapPage::compact_page(p);
                 slot = HeapPage::insert_tuple(p, &tuple);
             })?;
             if let Some(s) = slot {
@@ -556,7 +606,13 @@ impl HeapTable {
     /// 按位置删一行并返回它
     pub fn delete_at(&mut self, page_id: PageId, slot: u16) -> io::Result<Option<Row>> {
         let row = self.read_at(page_id, slot)?;
-        let existed = self.file.update_page(page_id, |p| HeapPage::delete_tuple(p, slot))?;
+        let existed = self.file.update_page(page_id, |p| {
+            let ok = HeapPage::delete_tuple(p, slot);
+            if ok {
+                HeapPage::compact_if_fragmented(p);
+            }
+            ok
+        })?;
         if !existed {
             return Ok(None);
         }
@@ -700,6 +756,19 @@ impl HeapTable {
             idx.tree.flush()?;
         }
         self.file.flush()
+    }
+
+    /// 整理整张表的页内碎片，返回回收字节数
+    pub fn compact_pages(&mut self) -> io::Result<usize> {
+        let n = self.file.num_pages()?;
+        let mut reclaimed = 0;
+        for i in 0..n {
+            if self.file.with_page(i, HeapPage::dead_bytes)? == 0 {
+                continue;
+            }
+            reclaimed += self.file.update_page(i, HeapPage::compact_page)?;
+        }
+        Ok(reclaimed)
     }
 
     /// 当前缓存页数
