@@ -36,6 +36,8 @@ errorRules =
     [ ErrorRule "no database selected" NoDatabaseError "no_database"
     , ErrorRule "administrator required" PermissionError "forbidden"
     , ErrorRule "unknown table" CatalogError "not_found"
+    , ErrorRule "unknown domain" CatalogError "not_found"
+    , ErrorRule "domain is still used" CatalogError "query_error"
     , ErrorRule "unknown column" CatalogError "query_error"
     , ErrorRule "unknown database" CatalogError "not_found"
     , ErrorRule "unknown role" CatalogError "not_found"
@@ -72,5 +74,7 @@ errorCode message = maybe "query_error" ruleCode (errorLike message)
 -- | 账号服务对外的错误码
 accountErrorCode :: String -> String
 accountErrorCode "account already exists" = "conflict"
+accountErrorCode "identity already exists" = "conflict"
+accountErrorCode "the last enabled login superuser cannot be removed" = "bad_request"
 accountErrorCode "unknown account" = "not_found"
 accountErrorCode _ = "storage_error"

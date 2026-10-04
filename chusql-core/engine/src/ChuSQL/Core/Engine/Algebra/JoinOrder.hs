@@ -1,7 +1,7 @@
 module ChuSQL.Core.Engine.Algebra.JoinOrder (reorderJoins) where
 
 import ChuSQL.Core.Engine.Algebra.Cost (pointRows, rangeRows, selectivityOf, tableMetaOf)
-import ChuSQL.Core.Engine.Algebra.Expr (colsInExpr, hasDivision)
+import ChuSQL.Core.Engine.Algebra.Expr (colsInExpr, hasDivision, hasSubquery)
 import ChuSQL.Core.Engine.Algebra.Op (RelOp (..), relOpCols)
 import ChuSQL.Core.Engine.Syntax.AST (Expr (..), JoinKind (..))
 import ChuSQL.Core.Model
@@ -46,8 +46,13 @@ leafRows db op = case op of
     Scan _ t _ -> rowCountOf db t
     Lookup _ t c _ -> pointRows <$> tableMetaOf db t <*> pure c
     Range _ t c lo hi -> (\m -> rangeRows m c lo hi) <$> tableMetaOf db t
-    Filter p x -> scaleRows db p x <$> leafRows db x
+    Filter p x | not (hasDivision p || hasSubquery p) -> scaleRows db p x <$> leafRows db x
     Project _ x -> leafRows db x
+    Compute items x | all (\(_, e) -> not (hasDivision e || hasSubquery e)) items -> leafRows db x
+    Sort _ x -> leafRows db x
+    Limit n x -> min (max 0 n) <$> leafRows db x
+    Derived _ x -> leafRows db x
+    Unit -> Just 1
     _ -> Nothing
 
 -- | 表统计里的行数

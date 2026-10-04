@@ -7,8 +7,9 @@ module Repl
     ) where
 
 import ChuSQL.CLI.Format (OutputFormat, formatName, renderResult, renderRows)
+import ChuSQL.CLI.History (historySettings, rememberStatement)
 import ChuSQL.CLI.Script (Meta (..), errorHint, metaHelp, parseMeta, takeStatement)
-import ChuSQL.CLI.Session (Session, catalog, databases, roleViews, runStatement, sessionDatabase, switchDatabase)
+import ChuSQL.Interface.Session (Session, catalog, databases, roleViews, runStatement, sessionDatabase, switchDatabase)
 import ChuSQL.Core.Protocol (SchemaColumn (..), TableInfo (..))
 import ChuSQL.Interface.Protocol (Grant (..), RoleView (..))
 import Control.Monad (forM_, when)
@@ -25,7 +26,7 @@ import System.IO (hIsTerminalDevice, stderr, stdin)
 -- | 交互循环，没有历史文件就不落盘
 runRepl :: Session -> IORef OutputFormat -> Maybe FilePath -> IO ()
 runRepl session formatRef historyPath =
-    runInputT (defaultSettings{historyFile = historyPath}) (loop session formatRef T.empty)
+    runInputT (historySettings historyPath) (loop session formatRef T.empty)
 
 -- | 入口处直接报错（-e 与启动阶段用）
 reportError :: Text -> IO ()
@@ -56,6 +57,7 @@ loop session formatRef buffer = do
                 then loop session formatRef buffer
                 else case (T.null buffer, parseMeta line) of
                     (True, Just meta) -> do
+                        rememberStatement line
                         again <- runMeta session formatRef meta
                         when again (loop session formatRef T.empty)
                     _ -> do
@@ -81,7 +83,9 @@ drain :: Session -> IORef OutputFormat -> Text -> InputT IO Text
 drain session formatRef buffer = case takeStatement buffer of
     Nothing -> pure (T.strip buffer)
     Just (statement, rest) -> do
-        when (not (T.null statement)) (runOne session formatRef statement)
+        when (not (T.null statement)) $ do
+            rememberStatement (statement <> ";")
+            runOne session formatRef statement
         drain session formatRef rest
 
 -- | 执行一条语句并打印结果

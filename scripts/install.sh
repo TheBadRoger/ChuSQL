@@ -30,7 +30,7 @@ usage: ./install.sh [--component web|cli|both] [options]
                             web front end (browser UI)?   default no  [y/N]
                           it then asks whether to give the administrator account a
                           password (default no); that password goes straight into the
-                          system catalog and is never written to chusql.toml
+                          system catalog and is never written to settings.toml
 
   --interactive           ask even when there is no terminal; the answers are
                           read from stdin (one per line)
@@ -129,7 +129,8 @@ case "$self" in
 esac
 
 [ -n "$install_dir" ] || install_dir="$HOME/.local/share/chusql"
-[ -n "$data_dir" ] || data_dir="$install_dir/data"
+[ -n "$data_dir" ] || data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/chusql/data"
+log_dir="${XDG_STATE_HOME:-$HOME/.local/state}/chusql/logs"
 
 # ---- 交互：先确定答案从哪来 ----
 # 管道安装（curl ... | sh -s --）时 stdin 是脚本本身，所以优先开 /dev/tty；
@@ -203,7 +204,7 @@ if [ "$component" = '' ] && [ "$list_versions" = 'no' ]; then
 fi
 
 # 管理员口令是装机必答项：交互时当场设，非交互时给 --password 或
-# CHUSQL_ADMIN_PASSWORD。口令只经 stdin 传给 csql-bootstrap，不落 chusql.toml。
+# CHUSQL_ADMIN_PASSWORD。口令只经 stdin 传给 csql-bootstrap，不落 settings.toml。
 admin_password="${CHUSQL_ADMIN_PASSWORD:-}"
 if [ "$list_versions" = 'no' ]; then
     if [ -n "$password_arg" ]; then
@@ -491,7 +492,7 @@ if [ "$from_source" = 'yes' ]; then
         note "source     $src"
     fi
     [ -f "$src/chusql-core/storage/Cargo.toml" ] || fail "not a ChuSQL checkout (chusql-core/storage/Cargo.toml missing): $src"
-    [ -f "$src/scripts/chusql.toml" ] || fail "not a ChuSQL checkout (scripts/chusql.toml missing): $src"
+    [ -f "$src/resources/settings.toml.linux" ] || fail "not a ChuSQL checkout (resources/settings.toml.linux missing): $src"
 
     if command -v pkg-config >/dev/null 2>&1 && ! pkg-config --exists zlib 2>/dev/null; then
         note 'hint       the Haskell zlib binding needs the C library: apt-get install zlib1g-dev (or dnf install zlib-devel)'
@@ -504,9 +505,9 @@ if [ "$from_source" = 'yes' ]; then
 
     step 'Staging the package'
     pack="$tmp/stage"
-    mkdir -p "$pack/bin" "$pack/scripts"
+    mkdir -p "$pack/bin" "$pack/resources"
     cp "$storage_lib" "$pack/bin/"
-    cp "$src/scripts/chusql.toml" "$pack/scripts/"
+    cp "$src/resources/settings.toml.linux" "$pack/resources/"
     cp "$src/scripts/install.sh" "$pack/"
     for comp in $wanted; do
         if [ "$comp" = 'web' ]; then
@@ -605,19 +606,19 @@ fi
 if [ "$want_cli" = 'yes' ]; then
     [ -f "$pack/bin/csql" ] || fail 'package is incomplete: bin/csql not found'
 fi
-[ -f "$pack/scripts/chusql.toml" ] || fail 'package is incomplete: scripts/chusql.toml not found'
+[ -f "$pack/resources/settings.toml.linux" ] || fail 'package is incomplete: resources/settings.toml.linux not found'
 
 echo 'ChuSQL installer'
 echo "  version    $version"
 echo "  components $component_label"
 echo "  install to $install_dir"
 echo "  data dir   $data_dir"
-echo "  root user  $root_user (password asked above, kept out of chusql.toml)"
+echo "  root user  $root_user (password asked above, kept out of settings.toml)"
 
 # ---- 释放文件 ----
 # 包是合在一起的（web 和 cli 都在），这里按这次的选择逐个释放：没选的组件不落地
 step 'Installing files'
-mkdir -p "$install_dir/bin" "$install_dir/logs" "$data_dir"
+mkdir -p "$install_dir/bin" "$log_dir" "$data_dir"
 cp "$pack/bin/chusql-server" "$install_dir/bin/"
 cp "$pack/bin/csql-bootstrap" "$install_dir/bin/"
 for lib in "$pack/bin/"libchusql_core_storage.*; do
@@ -641,22 +642,22 @@ fi
 chmod +x "$install_dir/bin/"* 2>/dev/null || true
 
 # ---- 写全局配置 ----
-step 'Writing chusql.toml'
+step 'Writing settings.toml'
 config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ChuSQL"
-config_file="$config_dir/chusql.toml"
+config_file="$config_dir/settings.toml"
 mkdir -p "$config_dir"
-sed -e "s|^\(user[[:space:]]*=[[:space:]]*\).*|\1\"$root_user\"|" \
-    -e "s|^\(data_dir[[:space:]]*=[[:space:]]*\).*|\1\"$data_dir\"|" \
-    "$pack/scripts/chusql.toml" > "$config_file"
+sed -e "s|@DATA_DIR@|$(printf '%s' "$data_dir" | sed 's/[\&|]/\\&/g')|g" \
+    -e "s|@LOG_DIR@|$(printf '%s' "$log_dir" | sed 's/[\&|]/\\&/g')|g" \
+    "$pack/resources/settings.toml.linux" > "$config_file"
 echo "  config file  $config_file"
 
 # ---- 引导系统目录 ----
-# csql-bootstrap 建 system 数据库和 __system_users 表；口令只走 stdin，不进 chusql.toml
-step 'Creating the system catalog'
+# 引导身份目录、root 与预装类型，口令通过标准输入传递
+step 'Initializing the administrator identity and preinstalled types'
 bootstrap="$install_dir/bin/csql-bootstrap"
 [ -n "$admin_password" ] || fail 'the administrator password is required'
 printf '%s\n' "$admin_password" | "$bootstrap" --config "$config_file" --user "$root_user" --password-stdin ||
-    fail 'the bootstrap program failed; the system catalog is not ready'
+    fail 'the bootstrap program failed; identities or preinstalled types are not ready'
 
 # ---- 命令入口 ----
 step 'Creating commands'
@@ -717,19 +718,19 @@ if [ "$no_start" = 'yes' ]; then
     note '--no-start: the server was not started'
 else
     step 'Starting the server'
-    mkdir -p "$install_dir/logs"
-    nohup "$server_bin" --config "$config_file" > "$install_dir/logs/server.log" 2> "$install_dir/logs/server.err.log" &
+    mkdir -p "$log_dir"
+    nohup "$server_bin" --config "$config_file" --user "$root_user" > "$log_dir/server.log" 2> "$log_dir/server.err.log" &
     server_pid=$!
     sleep 1
     if ! kill -0 "$server_pid" 2>/dev/null; then
-        fail "the server stopped right away; look at $install_dir/logs/server.err.log"
+        fail "the server stopped right away; look at $log_dir/server.err.log"
     fi
     note "server running, pid $server_pid"
-    note "log            $install_dir/logs/server.err.log"
+    note "log            $log_dir/server.err.log"
 fi
 
 step 'Done'
-echo "  chusql.toml  $config_file"
+echo "  settings.toml  $config_file"
 echo "  data         $data_dir"
 start_with=''
 if [ "$want_web" = 'yes' ]; then start_with='csql-web'; fi
@@ -737,9 +738,9 @@ if [ "$want_cli" = 'yes' ]; then
     if [ -n "$start_with" ]; then start_with="$start_with, csql"; else start_with='csql'; fi
 fi
 echo "  start with   $start_with"
-echo "  tcp server   $server_bin (listens on [server] host/port, defaults 127.0.0.1:7777)"
+echo "  tcp server   $server_bin (listens on [server] listen_host/port, defaults 127.0.0.1:7777)"
 if [ -n "$server_pid" ]; then
     echo "  running      pid $server_pid (stop it with: kill $server_pid)"
 else
-    echo "  start it     $server_bin --config \"$config_file\""
+    echo "  start it     $server_bin --config \"$config_file\" --user $root_user"
 fi

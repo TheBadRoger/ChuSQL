@@ -1,5 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::io::Write;
@@ -51,9 +51,11 @@ pub struct TableSchema {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Catalog {
+    #[serde(default)]
+    pub identity_high_water: i64,
     tables: BTreeMap<String, TableSchema>,
     #[serde(skip)]
-    seen: BTreeMap<String, HashSet<u64>>,
+    seen: BTreeMap<String, HashMap<u64, u64>>,
 }
 
 impl Catalog {
@@ -153,17 +155,25 @@ impl Catalog {
         for r in rows {
             for (name, v) in r {
                 let stat = entry.stats.entry(name.clone()).or_default();
+                hist_remove(stat, v);
                 if stat.capped {
                     continue;
                 }
-                if seen.remove(&fold(name, value_hash(v))) {
-                    stat.distinct = stat.distinct.saturating_sub(1);
+                let key = fold(name, value_hash(v));
+                if let Some(count) = seen.get_mut(&key) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        seen.remove(&key);
+                        stat.distinct = stat.distinct.saturating_sub(1);
+                    }
                 }
-                hist_remove(stat, v);
             }
         }
         if entry.row_count == 0 {
+            seen.clear();
             for stat in entry.stats.values_mut() {
+                stat.distinct = 0;
+                stat.capped = false;
                 stat.lo = None;
                 stat.hi = None;
                 stat.hist.clear();
@@ -192,17 +202,18 @@ impl Catalog {
         let seen = self.seen.entry(table.to_string()).or_default();
         for (name, v) in row {
             let stat = entry.stats.entry(name.clone()).or_default();
+            hist_add(stat, v);
             if stat.capped {
                 continue;
             }
-            if seen.insert(fold(name, value_hash(v))) {
+            let count = seen.entry(fold(name, value_hash(v))).or_insert(0);
+            *count += 1;
+            if *count == 1 {
                 stat.distinct += 1;
                 if stat.distinct >= STATS_DISTINCT_CAP {
                     stat.capped = true;
-                    seen.clear();
                 }
             }
-            hist_add(stat, v);
         }
     }
 
@@ -476,5 +487,7 @@ fn hist_remove(stat: &mut ColumnStat, v: &serde_json::Value) {
         return;
     }
     let index = hist_index(lo, hi, x);
-    stat.hist[index] = stat.hist[index].saturating_sub(1);
+    if let Some(bucket) = (0..stat.hist.len()).filter(|&i| stat.hist[i] > 0).min_by_key(|&i| i.abs_diff(index)) {
+        stat.hist[bucket] -= 1;
+    }
 }

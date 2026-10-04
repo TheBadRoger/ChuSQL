@@ -2,11 +2,11 @@ cabal-version: 2.4
 
 name:           chusql-server
 version:        1.0.0
-synopsis:       ChuSQL 数据库服务器：TCP 端点 + 自家协议 + SQL 会话
-description:    ChuSQL 的数据库服务器。负责监听 TCP、一行一条 JSON 的自家协议、
-                登录与限流，并把用户 SQL 转交给 chusql-core-engine（存储则由进程内
-                的 chusql_core_storage 动态库承担）。Web 管理端与命令行客户端都只
-                通过这条 TCP 连接访问数据库。
+synopsis:       ChuSQL database server with TCP endpoints and SQL sessions
+description:    Provides the ChuSQL TCP server and newline-delimited JSON protocol,
+                authentication, rate limiting, and SQL sessions. SQL is executed by
+                chusql-core-engine with the in-process chusql_core_storage library.
+                Web and command-line clients access the database through TCP.
 build-type:     Simple
 
 library

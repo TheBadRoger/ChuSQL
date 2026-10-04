@@ -25,6 +25,9 @@ data Statement
     | Delete String (Maybe Expr)
     | Update String [(String, Expr)] (Maybe Expr)
     | CreateTable String [(String, Column)]
+    | CreateDomain String ColumnType
+    | DropDomain String
+    | ShowDomains
     | DropTable String
     | CreateIndex String String
     | DropIndex String String
@@ -36,6 +39,8 @@ data Statement
     | AlterColumnNull String String Bool
     | CreateUser String String
     | AlterUser String String
+    | AlterIdentity String [(String, Bool)]
+    | ShowRoles
     | DropUser String
     -- | 新角色：权限的载体，用户靠成员资格继承它的权限
     | CreateRole String

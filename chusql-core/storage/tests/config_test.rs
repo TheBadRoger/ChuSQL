@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use chusql_core_storage::config::{self, Config, DEFAULT_BTREE_ORDER, DEFAULT_PAGE_SIZE, Origin};
+use chusql_core_storage::config::{
+    self, Config, DEFAULT_BTREE_ORDER, DEFAULT_LOG_FILES, DEFAULT_PAGE_SIZE, Origin,
+};
 use chusql_core_storage::log::Level;
 
 // 配置测试：默认值、文件覆盖、环境变量彻底无效、非法值报错。
@@ -25,6 +27,7 @@ fn defaults_without_file() {
     assert_eq!(loaded.config.page_size, DEFAULT_PAGE_SIZE);
     assert_eq!(loaded.config.btree_order, DEFAULT_BTREE_ORDER);
     assert_eq!(loaded.config.data_dir, config::default_data_dir());
+    assert_eq!(loaded.config.log_files, PathBuf::from(DEFAULT_LOG_FILES));
     assert_eq!(loaded.config.log_level, Level::Info);
 }
 
@@ -39,6 +42,7 @@ fn file_overrides_only_written_keys() {
     assert_eq!(loaded.config.page_size, 8192);
     assert_eq!(loaded.config.btree_order, DEFAULT_BTREE_ORDER);
     assert_eq!(loaded.config.data_dir, config::default_data_dir());
+    assert_eq!(loaded.config.log_files, PathBuf::from(DEFAULT_LOG_FILES));
     assert_eq!(loaded.config_path, Some(path.clone()));
 
     let page = loaded.origins.iter().find(|(n, _, _)| *n == "page.size").unwrap();
@@ -47,11 +51,11 @@ fn file_overrides_only_written_keys() {
     assert_eq!(order.2, Origin::Default);
 }
 
-/// 五项全写都生效
+/// 全部配置项及其来源生效
 #[test]
 fn file_all_keys() {
     let _guard = env_guard();
-    let text = "[page]\nsize = 8192\n[btree]\norder = 32\n[buffer]\npool_size = 128\n[storage]\ndata_dir = \"mydata\"\n[log]\nlevel = \"debug\"\n";
+    let text = "[page]\nsize = 8192\n[btree]\norder = 32\n[buffer]\npool_size = 128\n[storage]\ndata_dir = \"mydata\"\nlog_files = \"mylogs\"\n[log]\nlevel = \"debug\"\n";
     let path = PathBuf::from("t.toml");
     let loaded = config::resolve(Some(text), Some(path.clone())).unwrap();
 
@@ -59,6 +63,7 @@ fn file_all_keys() {
     assert_eq!(loaded.config.btree_order, 32);
     assert_eq!(loaded.config.pool_size, 128);
     assert_eq!(loaded.config.data_dir, PathBuf::from("mydata"));
+    assert_eq!(loaded.config.log_files, PathBuf::from("mylogs"));
     assert_eq!(loaded.config.log_level, Level::Debug);
     assert!(
         loaded
@@ -103,16 +108,16 @@ fn env_vars_are_ignored_entirely() {
 fn default_config_path_follows_system_convention() {
     let _guard = env_guard();
     let path = config::default_config_path();
-    assert_eq!(path.file_name().unwrap(), "chusql.toml");
+    assert_eq!(path.file_name().unwrap(), "settings.toml");
     assert_eq!(path.parent().unwrap().file_name().unwrap(), "ChuSQL");
-    assert!(path.ends_with(format!("ChuSQL{}chusql.toml", std::path::MAIN_SEPARATOR)), "got {}", path.display());
+    assert!(path.ends_with(format!("ChuSQL{}settings.toml", std::path::MAIN_SEPARATOR)), "got {}", path.display());
 
-    // 本机 APPDATA 存在时必须是 %APPDATA%\ChuSQL\chusql.toml
+    // 本机 APPDATA 存在时必须是 %APPDATA%\ChuSQL\settings.toml
     #[cfg(windows)]
     if let Some(appdata) = std::env::var_os("APPDATA") {
         assert_eq!(
             path,
-            PathBuf::from(appdata).join("ChuSQL").join("chusql.toml")
+            PathBuf::from(appdata).join("ChuSQL").join("settings.toml")
         );
     }
 }
@@ -186,7 +191,7 @@ fn load_without_explicit_path_uses_builtin_defaults() {
 #[test]
 fn server_section_belongs_to_another_layer() {
     let _guard = env_guard();
-    let db_server = "[server]\nhost = \"0.0.0.0\"\nport = 7778\nmax_rows = 10\n";
+    let db_server = "[server]\nlisten_host = \"0.0.0.0\"\nport = 7778\nmax_rows = 10\n";
     let loaded = config::resolve(Some(db_server), None).unwrap();
     assert_eq!(loaded.config.data_dir, config::default_data_dir());
 
@@ -224,6 +229,14 @@ fn rejects_unknown_key() {
     let _guard = env_guard();
     let err = config::resolve(Some("[page]\nsizes = 4096\n"), None).unwrap_err();
     assert!(err.contains("bad config"), "got {}", err);
+}
+
+/// 空的日志目录要报错（否则日志会落到当前目录）
+#[test]
+fn rejects_empty_log_files() {
+    let _guard = env_guard();
+    let err = config::resolve(Some("[storage]\nlog_files = \"   \"\n"), None).unwrap_err();
+    assert!(err.contains("storage.log_files"), "got {}", err);
 }
 
 /// 坏的页面尺寸只能来自文件

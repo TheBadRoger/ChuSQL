@@ -9,6 +9,7 @@ module ChuSQL.Server.Catalog
     , ensureCatalog
     , eachAction
     , readRoleNames
+    , readIdentities
     , insertRole
     , dropRole
     , readGrants
@@ -23,6 +24,7 @@ module ChuSQL.Server.Catalog
     ) where
 
 import ChuSQL.Core.Model (Row, Value (..))
+import ChuSQL.Core.Protocol (Account (..), Request (..))
 import ChuSQL.Interface.Actions (sqlLiteral)
 import ChuSQL.Interface.Protocol (Grant (..))
 import ChuSQL.Server.Backend (Backend (..), StatementResult (..), grantsTable, membersTable, optionsTable, rolesTable)
@@ -102,21 +104,19 @@ readRows catalog table = fmap (fmap srRows) (beStatement (catBackend catalog) ("
 
 -- | 角色名清单
 readRoleNames :: Catalog -> IO (Either String [Text])
-readRoleNames catalog = fmap (fmap (map (normalizeRole . cell "name"))) (readRows catalog rolesTable)
+readRoleNames catalog = fmap (fmap (map accountUser)) (readIdentities catalog)
+
+-- | 读取统一身份目录
+readIdentities :: Catalog -> IO (Either String [Account])
+readIdentities catalog = beAccounts (catBackend catalog) ReqAccountsList
 
 -- | 新建一个角色
 insertRole :: Catalog -> Text -> IO (Either String ())
-insertRole catalog role = exec catalog (insertSql rolesTable ["name"] [normalizeRole role])
+insertRole catalog role = fmap (fmap (const ())) (beAccounts (catBackend catalog) (ReqRoleCreate (normalizeRole role)))
 
 -- | 删掉一个角色，连同它的授权与成员边
 dropRole :: Catalog -> Text -> IO (Either String ())
-dropRole catalog role = do
-    first <- exec catalog ("DELETE FROM " ++ rolesTable ++ " WHERE name = " ++ roleLiteral role)
-    second <- exec catalog ("DELETE FROM " ++ grantsTable ++ " WHERE role = " ++ roleLiteral role)
-    third <- exec catalog ("DELETE FROM " ++ membersTable ++ " WHERE role = " ++ roleLiteral role)
-    fourth <- exec catalog ("DELETE FROM " ++ membersTable ++ " WHERE member = " ++ roleLiteral role)
-    fifth <- exec catalog ("DELETE FROM " ++ optionsTable ++ " WHERE role = " ++ roleLiteral role)
-    pure (sequence_ [first, second, third, fourth, fifth])
+dropRole catalog role = fmap (fmap (const ())) (beAccounts (catBackend catalog) (ReqAccountDrop (normalizeRole role)))
 
 -- | 全部授权，都不带 grant option
 readGrants :: Catalog -> IO (Either String [Grant])

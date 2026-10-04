@@ -93,7 +93,7 @@ check_stage() {
     [ -f "$stage/bin/csql-bootstrap" ] || Fail 'bin/csql-bootstrap is missing from the package'
     [ -f "$stage/static/index.html" ] || Fail 'static/index.html is missing from the package'
     [ -f "$stage/csql-web.sh" ] || Fail 'csql-web.sh is missing from the package'
-    [ -f "$stage/scripts/chusql.toml" ] || Fail 'scripts/chusql.toml is missing from the package'
+    [ -f "$stage/resources/settings.toml.linux" ] || Fail 'resources/settings.toml.linux is missing from the package'
     [ -f "$stage/install.sh" ] || Fail 'install.sh is missing from the package'
     [ -f "$stage/install.ps1" ] || Fail 'install.ps1 is missing from the package'
     [ -f "$stage/uninstall.sh" ] || Fail 'uninstall.sh is missing from the package'
@@ -133,8 +133,11 @@ verify_package() {
         [ -f "$vtmp/opt/bin/chusql-server" ] || ok=no
         [ -f "$vtmp/opt/bin/csql-bootstrap" ] || ok=no
         [ -f "$vtmp/data/system/catalog.json" ] || ok=no
-        [ -f "$vtmp/home/.config/ChuSQL/chusql.toml" ] || ok=no
-        grep -q "data_dir = \"$vtmp/data\"" "$vtmp/home/.config/ChuSQL/chusql.toml" || ok=no
+        [ -f "$vtmp/data/system/__system_identities.db" ] || ok=no
+        [ -f "$vtmp/data/system/__system_users.db" ] || ok=no
+        [ -f "$vtmp/data/system/__system_types.db" ] || ok=no
+        [ -f "$vtmp/home/.config/ChuSQL/settings.toml" ] || ok=no
+        grep -q "data_dir = \"$vtmp/data\"" "$vtmp/home/.config/ChuSQL/settings.toml" || ok=no
         if [ "$comp" = web ]; then
             [ -f "$vtmp/opt/bin/chusql-web" ] || ok=no
             [ -f "$vtmp/opt/static/index.html" ] || ok=no
@@ -183,7 +186,7 @@ trap 'rm -rf "$out_dir/.stage"' EXIT INT TERM
 
 Step "Packing $name"
 rm -rf "$out_dir/.stage"
-mkdir -p "$stage/bin" "$stage/scripts"
+mkdir -p "$stage/bin" "$stage/resources"
 
 cp "$repo_root/chusql-core/storage/target/release/"libchusql_core_storage.* "$stage/bin/" \
     || Fail "chusql-core/storage/target/release/libchusql_core_storage.* is not built (run without --no-build)"
@@ -217,7 +220,7 @@ for lib in "$repo_root"/chusql-core/storage/target/release/*.so "$repo_root"/chu
     cp "$lib" "$stage/bin/"
 done
 
-cp "$repo_root/scripts/chusql.toml" "$stage/scripts/"
+cp "$repo_root/resources/settings.toml.linux" "$stage/resources/"
 cp "$repo_root/scripts/install.sh" "$repo_root/scripts/install.ps1" "$repo_root/scripts/uninstall.sh" "$repo_root/scripts/uninstall.ps1" "$stage/"
 mkdir -p "$stage/static"
 cp -R "$repo_root"/chusql-web/static/. "$stage/static/"

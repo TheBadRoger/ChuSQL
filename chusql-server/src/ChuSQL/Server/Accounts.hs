@@ -3,7 +3,7 @@
 module ChuSQL.Server.Accounts (
     Accounts, AccountError (..), Principal (..), PasswordPolicy (..), defaultPasswordPolicy,
     newAccounts, accountsPolicy, setAccountsPolicy, passwordAllowed,
-    ensureRootAccount, administratorPasswordless, rootUserName, principalName, principalIsRoot,
+    ensureRootAccount, administratorPasswordless, rootUserName, principalName, principalIsRoot, principalIsCatalogManager,
     authenticate, currentPrincipal,
     listAccounts, findAccount, AccountCommand (..), accountCommand, runAccountCommand,
 ) where
@@ -17,14 +17,15 @@ import ChuSQL.Server.Backend (Backend (..), currentStamp)
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Data.Char (isAlphaNum, isAscii, isAsciiLower, isAsciiUpper, isDigit)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.List (nub)
 import Data.Text (Text)
 import qualified Data.Text as T
 
--- 账号服务：管理员是系统表里名字固定的那一行，口令哈希存在表里，普通账号由管理员用 CREATE/ALTER/DROP USER 管理。
+-- 身份服务：按登录、最高权限和启用属性认证，管理身份与口令。
 
 data AccountError = AccountError Text Text deriving (Show, Eq)
 
--- | 当前身份：名字固定的管理员，或系统表里的一个普通账号
+-- | 当前认证身份与最高权限标志
 data Principal
     = Root Text
     | Ordinary Account
@@ -40,10 +41,16 @@ principalName :: Principal -> Text
 principalName (Root name) = name
 principalName (Ordinary a) = accountUser a
 
--- | 是不是名字固定的管理员
+-- | 判断身份是否具备最高权限
 principalIsRoot :: Principal -> Bool
 principalIsRoot (Root _) = True
-principalIsRoot (Ordinary _) = False
+principalIsRoot (Ordinary a) = accountIsSuperuser a && accountEnabled a && accountCanLogin a
+
+-- | 判断身份是否可管理系统目录
+principalIsCatalogManager :: Principal -> Bool
+principalIsCatalogManager principal = principalIsRoot principal || case principal of
+    Ordinary a -> accountSystemCatalogManager a && accountEnabled a && accountCanLogin a
+    Root _ -> True
 
 data Accounts = Accounts
     { acBackend :: Backend
@@ -110,13 +117,9 @@ validateUserName name
     -- | 该字符是否允许使用
     allowed c = isAscii c && (isAlphaNum c || c `elem` ("_.-" :: String))
 
--- | 校验新账号名，并挡掉管理员保留名
+-- | 校验新身份的名称
 validateNewName :: Accounts -> Text -> Either AccountError ()
-validateNewName service name = do
-    validateUserName name
-    if normalize name == rootName service
-        then Left (AccountError "bad_request" "the administrator name is reserved")
-        else Right ()
+validateNewName _ name = validateUserName name
 
 storageFailure :: AccountError
 storageFailure = AccountError "storage_error" "account storage unavailable"
@@ -141,24 +144,25 @@ readAccounts backend = fmap (either (const (Left storageFailure)) Right) (beAcco
 -- | 表里没有管理员那一行就补一行空哈希，表示还没设口令
 ensureRootAccount :: Backend -> Text -> IO (Either AccountError ())
 ensureRootAccount backend name = do
-    stored <- readAccounts backend
+    initialized <- beAccounts backend (ReqIdentityInitialize (normalize name))
+    let stored = either (const (Left storageFailure)) Right initialized
     case stored of
         Left err -> pure (Left err)
         Right accounts
             | any ((== normalize name) . accountUser) accounts -> pure (Right ())
             | otherwise -> do
                 created <- beAccounts backend (ReqAccountCreate (normalize name) "")
-                pure $ case created of
-                    Right _ -> Right ()
-                    Left "account already exists" -> Right ()
-                    Left _ -> Left storageFailure
+                case created of
+                    Right _ -> storageResult <$> beAccounts backend (ReqIdentityAlter (normalize name) Nothing (Just True) Nothing Nothing)
+                    Left "account already exists" -> pure (Right ())
+                    Left _ -> pure (Left storageFailure)
 
 -- | 管理员是不是还没设口令
 administratorPasswordless :: Backend -> Text -> IO Bool
 administratorPasswordless backend name = do
     stored <- readAccounts backend
     pure $ case stored of
-        Right accounts -> any (\a -> accountUser a == normalize name && T.null (accountHash a)) accounts
+        Right accounts -> any (\a -> accountUser a == normalize name && accountIsSuperuser a && accountEnabled a && accountCanLogin a && T.null (accountHash a)) accounts
         Left _ -> False
 
 -- | 按令牌解析当前身份，版本对不上即失效
@@ -174,8 +178,8 @@ currentUnlocked service token = do
                 account <- case filter ((== user) . accountUser) accounts of
                     [a] -> Right a
                     _ -> Left unauthorized
-                if revision == Just (accountRevision account)
-                    then Right (if user == rootName service then Root user else Ordinary account)
+                if revision == Just (accountRevision account) && accountEnabled account && accountCanLogin account
+                    then Right (if accountIsSuperuser account then Root user else Ordinary account)
                     else Left unauthorized
 
 -- | 加锁解析当前身份
@@ -185,28 +189,27 @@ currentPrincipal service token = withMVar (acLock service) $ \_ -> currentUnlock
 -- | 登录：比哈希，管理员未设口令时只收空口令
 authenticate :: Accounts -> Text -> Text -> IO (Either AccountError Text)
 authenticate service user password = withMVar (acLock service) $ \_ -> do
-    stored <- readAccounts (acBackend service)
+    initialized <- beAccounts (acBackend service) (ReqIdentityInitialize (rootName service))
+    let stored = either (const (Left storageFailure)) Right initialized
     case stored of
         Left err -> pure (Left err)
         Right accounts
-            | name == rootName service -> signInRoot accounts
+            | any (\a -> accountUser a == name && accountIsSuperuser a && accountEnabled a && accountCanLogin a) accounts -> signInRoot accounts
             | unset accounts -> pure (Left ordinaryRefused)
             | otherwise -> signInOrdinary accounts
   where
     name = normalize user
     ordinaryRefused = AccountError "forbidden" "this server only accepts the administrator"
-    -- | 管理员那一行还没设口令（或压根不在表里）
-    unset accounts = case filter ((== rootName service) . accountUser) accounts of
-        [a] -> T.null (accountHash a)
-        _ -> True
+    -- | 判断是否有已设置口令的登录管理员
+    unset accounts = not (any (\a -> accountIsSuperuser a && accountEnabled a && accountCanLogin a && not (T.null (accountHash a))) accounts)
     -- | 管理员登录
-    signInRoot accounts = case filter ((== rootName service) . accountUser) accounts of
+    signInRoot accounts = case filter ((== name) . accountUser) accounts of
         [a] | T.null (accountHash a) && T.null password -> issue a
-        [a] | not (T.null (accountHash a)) && verifyPassword (accountHash a) password -> issue a
+        [a] | accountCanLogin a && accountEnabled a && not (T.null (accountHash a)) && verifyPassword (accountHash a) password -> issue a
         _ -> pure (Left unauthorized)
     -- | 普通账号登录
     signInOrdinary accounts = case filter ((== name) . accountUser) accounts of
-        [a] | not (T.null (accountHash a)) && verifyPassword (accountHash a) password -> issue a
+        [a] | accountCanLogin a && accountEnabled a && not (T.null (accountHash a)) && verifyPassword (accountHash a) password -> issue a
         _ -> pure (Left unauthorized)
     -- | 记一次登录再发会话
     issue a = do
@@ -218,7 +221,7 @@ authenticate service user password = withMVar (acLock service) $ \_ -> do
 
 -- | 系统表里的账号清单（含管理员）
 listAccounts :: Accounts -> IO (Either AccountError [Account])
-listAccounts service = withMVar (acLock service) $ \_ -> readAccounts (acBackend service)
+listAccounts service = withMVar (acLock service) $ \_ -> fmap (fmap (filter (\a -> accountCanLogin a || not (T.null (accountHash a))))) (readAccounts (acBackend service))
 
 -- | 按用户名找一个账号
 findAccount :: Accounts -> Text -> IO (Either AccountError Account)
@@ -233,7 +236,7 @@ findAccount service name = withMVar (acLock service) $ \_ -> do
 
 -- | 建一个普通账号
 createUser :: Accounts -> Text -> Text -> IO (Either AccountError ())
-createUser service name password = withMVar (acLock service) $ \_ -> do
+createUser service name password = do
     policy <- accountsPolicy service
     case validateNewName service name >> passwordAllowed policy password of
         Left err -> pure (Left err)
@@ -243,22 +246,24 @@ createUser service name password = withMVar (acLock service) $ \_ -> do
 
 -- | 设账号口令；管理员不受口令策略约束，空口令即免密
 resetPassword :: Accounts -> Text -> Text -> IO (Either AccountError ())
-resetPassword service name password = withMVar (acLock service) $ \_ -> do
+resetPassword service name password = do
     policy <- accountsPolicy service
-    let admin = normalize name == rootName service
-        checked = if admin then validateUserName name else validateNewName service name >> passwordAllowed policy password
-    case checked of
+    stored <- readAccounts (acBackend service)
+    case stored of
         Left err -> pure (Left err)
-        Right () -> do
-            encoded <- if admin && T.null password then pure "" else hashPassword password
-            storageResult <$> beAccounts (acBackend service) (ReqAccountReset (normalize name) encoded)
+        Right identities -> do
+            let admin = any (\a -> accountUser a == normalize name && accountIsSuperuser a) identities
+                checked = if admin then validateUserName name else validateUserName name >> passwordAllowed policy password
+            case checked of
+                Left err -> pure (Left err)
+                Right () -> do
+                    encoded <- if admin && T.null password then pure "" else hashPassword password
+                    storageResult <$> beAccounts (acBackend service) (ReqAccountReset (normalize name) encoded)
 
 -- | 删一个普通账号
 dropUser :: Accounts -> Text -> IO (Either AccountError ())
-dropUser service name = withMVar (acLock service) $ \_ ->
-    if normalize name == rootName service
-        then pure (Left (AccountError "bad_request" "the administrator cannot be dropped"))
-        else case validateUserName name of
+dropUser service name =
+    case validateUserName name of
             Left err -> pure (Left err)
             Right () -> storageResult <$> beAccounts (acBackend service) (ReqAccountDrop (normalize name))
 
@@ -267,6 +272,7 @@ data AccountCommand
     = CreateAccount Text Text
     | ResetAccountPassword Text Text
     | DropAccount Text
+    | AlterAccountAttributes Text [(String, Bool)]
     deriving (Show, Eq)
 
 -- | 一条语句是不是账号管理语句
@@ -274,12 +280,42 @@ accountCommand :: Statement -> Maybe AccountCommand
 accountCommand (CreateUser name password) = Just (CreateAccount (T.pack name) (T.pack password))
 accountCommand (AlterUser name password) = Just (ResetAccountPassword (T.pack name) (T.pack password))
 accountCommand (DropUser name) = Just (DropAccount (T.pack name))
+accountCommand (AlterIdentity name attributes) = Just (AlterAccountAttributes (T.pack name) attributes)
 accountCommand _ = Nothing
 
--- | 执行一条账号管理命令；普通账号一律拒绝
+-- | 按目录管理权限执行账号命令
 runAccountCommand :: Accounts -> Principal -> AccountCommand -> IO (Either AccountError ())
-runAccountCommand _ (Ordinary _) _ = pure (Left (AccountError "forbidden" "administrator required"))
-runAccountCommand service (Root _) command = case command of
-    CreateAccount name password -> createUser service name password
-    ResetAccountPassword name password -> resetPassword service name password
-    DropAccount name -> dropUser service name
+runAccountCommand service principal command = withMVar (acLock service) $ \_ -> run
+  where
+    -- | 校验并执行身份管理权限
+    run
+        | not (principalIsCatalogManager principal) = pure (Left (AccountError "forbidden" "catalog manager required"))
+        | not (principalIsRoot principal) = do
+            identities <- readAccounts (acBackend service)
+            case identities of
+                Left err -> pure (Left err)
+                Right accounts
+                    | any (\a -> accountUser a == normalize (target command) && (accountIsSuperuser a || accountSystemCatalogManager a)) accounts
+                        || privilegedChange command -> pure (Left (AccountError "forbidden" "superuser required to manage privileged identities"))
+                    | otherwise -> execute
+        | otherwise = execute
+    -- | 获取身份管理的目标
+    target (CreateAccount name _) = name
+    target (ResetAccountPassword name _) = name
+    target (DropAccount name) = name
+    target (AlterAccountAttributes name _) = name
+    -- | 判断是否修改特权属性
+    privilegedChange (AlterAccountAttributes _ attributes) = any (\(key, _) -> key `elem` ["superuser", "system_catalog_manager"]) attributes
+    privilegedChange _ = False
+    -- | 执行已授权的身份命令
+    execute = executeWith (if principalIsRoot principal then service else service{acBackend = (acBackend service){beAccounts = \request -> beAccounts (acBackend service) (ReqCatalogManage request)}})
+    -- | 通过受限存储请求执行管理操作
+    executeWith managed = case command of
+        CreateAccount name password -> createUser managed name password
+        ResetAccountPassword name password -> resetPassword managed name password
+        DropAccount name -> dropUser managed name
+        AlterAccountAttributes name attributes
+            | length (nub (map fst attributes)) /= length attributes -> pure (Left (AccountError "bad_request" "duplicate identity attribute"))
+            | otherwise ->
+                storageResult <$> beAccounts (acBackend managed) (ReqIdentityAlter (normalize name)
+                    (lookup "login" attributes) (lookup "superuser" attributes) (lookup "enabled" attributes) (lookup "system_catalog_manager" attributes))

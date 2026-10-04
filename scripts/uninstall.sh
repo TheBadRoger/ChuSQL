@@ -19,7 +19,7 @@ Usage: uninstall.sh [options]
   --install-dir DIR   program directory (default: $HOME/.local/share/chusql)
   --data-dir DIR      data directory (default: <install-dir>/data)
   --keep-data         keep the data directory, remove programs only
-  --keep-config       keep chusql.toml
+  --keep-config       keep settings.toml
   --yes               do not ask (required when there is no terminal)
   -h, --help          show this help
 EOF
@@ -73,9 +73,9 @@ while [ $# -gt 0 ]; do
 done
 
 install_dir=${install_dir:-$HOME/.local/share/chusql}
-data_dir=${data_dir:-$install_dir/data}
+data_dir=${data_dir:-${XDG_DATA_HOME:-$HOME/.local/share}/chusql/data}
 config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ChuSQL"
-config_file="$config_dir/chusql.toml"
+config_file="$config_dir/settings.toml"
 profile="$HOME/.profile"
 
 if [ "$assume_yes" = 'no' ]; then
@@ -119,7 +119,7 @@ else
     note "removed $install_dir"
 fi
 
-step 'Removing chusql.toml'
+step 'Removing settings.toml'
 if [ "$keep_config" = 'yes' ]; then
     note "kept config: $config_file"
 else

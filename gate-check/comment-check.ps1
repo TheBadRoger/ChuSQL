@@ -2,7 +2,7 @@
 # 有问题的文件不静默：问题数大于 0 时退出码为 1
 param([string]$Root = (Split-Path -Parent $PSScriptRoot), [string[]]$Only)
 
-$codeDirs = @('chusql-core','chusql-server','chusql-web','chusql-cli','chusql-bootstrap','chusql-interface','chusql-benchmark','scripts','gate-check')
+$codeDirs = @('chusql-core','chusql-server','chusql-web','chusql-cli','chusql-bootstrap','chusql-interface','benchmark','scripts','gate-check')
 $files = @()
 foreach ($d in $codeDirs) {
     $p = Join-Path $Root $d
@@ -13,7 +13,6 @@ foreach ($d in $codeDirs) {
 }
 if ($Only) { $files = $files | Where-Object { $n = $_.Name; ($Only | Where-Object { $n -like $_ }).Count -gt 0 } }
 $files = $files | Sort-Object FullName
-$files = $files | Where-Object { $_.FullName -notmatch '\\localdata\\' }
 
 $problems = @()
 $scanned = 0

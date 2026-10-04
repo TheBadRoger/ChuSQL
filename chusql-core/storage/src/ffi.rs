@@ -71,6 +71,33 @@ pub unsafe extern "C" fn chusql_storage_close(handle: *mut Storage) {
     let _ = catch_unwind(AssertUnwindSafe(|| unsafe { drop(Box::from_raw(handle)) }));
 }
 
+/// 离线维护系统目录并返回 JSON
+///
+/// # Safety
+/// 输入为有效字符串；输出指针可写，响应使用 free 释放。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn chusql_storage_maintenance(
+    config_path: *const c_char, request: *const u8, request_len: usize,
+    out: *mut *mut u8, out_len: *mut usize,
+) -> i32 {
+    if request.is_null() || out.is_null() || out_len.is_null() { set_error("invalid maintenance argument"); return ERR; }
+    unsafe { *out = ptr::null_mut(); *out_len = 0; }
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let path = if config_path.is_null() { None } else { Some(unsafe { CStr::from_ptr(config_path) }.to_str().map_err(|e| e.to_string())?) };
+        let text = std::str::from_utf8(unsafe { slice::from_raw_parts(request, request_len) }).map_err(|e| e.to_string())?;
+        Storage::maintenance(path, text)
+    }));
+    let response = match result {
+        Ok(Ok(response)) => response,
+        Ok(Err(err)) => { set_error(err); return ERR; }
+        Err(_) => { set_error("panic in system maintenance"); return ERR; }
+    };
+    let mut buffer = response.into_bytes().into_boxed_slice();
+    unsafe { *out = buffer.as_mut_ptr(); *out_len = buffer.len(); }
+    std::mem::forget(buffer);
+    OK
+}
+
 /// 处理一条请求，响应缓冲须归还
 ///
 /// # Safety

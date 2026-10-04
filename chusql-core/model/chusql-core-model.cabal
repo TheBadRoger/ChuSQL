@@ -2,10 +2,11 @@ cabal-version: 2.4
 
 name:           chusql-core-model
 version:        1.0.0
-synopsis:       ChuSQL 共用数据模型与线上协议类型
-description:    ChuSQL 各进程共用的纯数据类型：列与值的模型、存储层线上协议
-                （请求/响应/表结构与账号）以及查询结果集。这里不放任何执行
-                逻辑，前端只依赖这个包就不会把引擎链进自己的二进制。
+synopsis:       Shared ChuSQL data models and wire protocol types
+description:    Defines shared column and value models, storage protocol requests
+                and responses, table schemas, accounts, and query results.
+                Contains data types without execution logic, allowing clients to
+                use the models without linking the query engine.
 build-type:     Simple
 
 library

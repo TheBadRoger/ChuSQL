@@ -99,6 +99,15 @@ runStatementUncheckedM db (Update tbl assigns mWhere) =
 runStatementUncheckedM _ (CreateTable name cols) = do
     result <- createTable name cols
     pure (result >> Right [])
+runStatementUncheckedM _ (CreateDomain name base) = do
+    result <- createTable (domainTableName name) [("base", plainColumn base)]
+    pure (result >> Right [])
+runStatementUncheckedM _ (DropDomain name) = do
+    result <- dropTable (domainTableName name)
+    pure (result >> Right [])
+runStatementUncheckedM db ShowDomains = pure (Right
+    [[("domain", VStr (drop (length (domainTableName "")) name)), ("base_type", VStr (typeName (columnType base)))]
+    | (name, table) <- db, isDomainTable name, Just base <- [lookup "base" (tableCols table)]])
 runStatementUncheckedM _ (DropTable name) = do
     result <- dropTable name
     pure (result >> Right [])
@@ -123,6 +132,8 @@ runStatementUncheckedM db (AlterColumnNull tbl col nullable) =
     alterTable db tbl (\table -> setColumnNullable col nullable (tableCols table) (tableRows table))
 runStatementUncheckedM _ CreateUser{} = pure (Left "CREATE USER is executed by the account service")
 runStatementUncheckedM _ AlterUser{} = pure (Left "ALTER USER is executed by the account service")
+runStatementUncheckedM _ AlterIdentity{} = pure (Left "ALTER ROLE is executed by the account service")
+runStatementUncheckedM _ ShowRoles = pure (Left "SHOW ROLES is executed by the account service")
 runStatementUncheckedM _ DropUser{} = pure (Left "DROP USER is executed by the account service")
 runStatementUncheckedM _ CreateRole{} = pure (Left "CREATE ROLE is executed by the privilege service")
 runStatementUncheckedM _ DropRole{} = pure (Left "DROP ROLE is executed by the privilege service")

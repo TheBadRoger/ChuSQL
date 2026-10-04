@@ -7,6 +7,7 @@ module ChuSQL.Core.Engine.Storage.FFI (
     openStorage,
     closeStorage,
     storageRequest,
+    maintainStorage,
 ) where
 
 import Control.Exception (SomeException, try)
@@ -39,6 +40,21 @@ foreign import ccall unsafe "chusql_storage_free"
 
 foreign import ccall unsafe "chusql_storage_last_error"
     cStorageLastError :: Ptr CSize -> IO (Ptr CChar)
+
+foreign import ccall safe "chusql_storage_maintenance"
+    cStorageMaintenance :: CString -> Ptr CChar -> CSize -> Ptr (Ptr CChar) -> Ptr CSize -> IO CInt
+
+-- | 离线修复系统目录并返回结果
+maintainStorage :: FilePath -> BS.ByteString -> IO (Either String BS.ByteString)
+maintainStorage path payload = withCString path $ \config ->
+    BS.useAsCStringLen payload $ \(input, size) -> alloca $ \outRef -> alloca $ \lenRef -> do
+        code <- cStorageMaintenance config input (fromIntegral size) outRef lenRef
+        if code /= 0 then Left <$> lastError else do
+            output <- peek outRef
+            len <- peek lenRef
+            bytes <- BS.packCStringLen (output, fromIntegral len)
+            cStorageFree output len
+            pure (Right bytes)
 
 -- | 库版本（Rust 侧的 CARGO_PKG_VERSION）
 storageVersion :: IO String

@@ -2,6 +2,7 @@ module ChuSQL.Core.Engine.Storage.Memory (MemoryStorage (runMemoryStorage)) wher
 
 import ChuSQL.Core.Model
 import ChuSQL.Core.Engine.Storage
+import qualified Data.HashSet as HS
 
 -- 内存实现：Database 上的状态，错误通道是 Either String。
 
@@ -74,10 +75,31 @@ instance MonadStorage MemoryStorage where
     -- \| 原样返回当前库
     snapshot = MemoryStorage $ \db -> Right (db, db)
 
+    -- \| 返回实时行数与去重统计的无数据结构
+    schema = MemoryStorage $ \db -> Right (map describe db, db)
+      where
+        -- | 将存储数据汇总为结构统计
+        describe (name, table) =
+            (name, table {tableRows = [], tableMeta = Just metadata})
+          where
+            metadata = TableMeta (length (tableRows table)) distinct [] []
+            distinct = [columnStatistics column (tableRows table) | (column, _) <- tableCols table]
+
     -- \| 改表结构：列定义与行一起换
     replaceSchema name cols rows = MemoryStorage $ \db -> case lookup name db of
         Nothing -> Right (Left ("unknown table: " ++ name), db)
         Just tbl -> Right (Right (), replaceTable name tbl{tableCols = cols, tableRows = rows} db)
+
+-- | 对列值去重并限制统计内存
+columnStatistics :: String -> [Row] -> (String, Int, Bool)
+columnStatistics column rows = go rows HS.empty
+  where
+    -- | 累积规范化值，达到上限后停止
+    go remaining values
+        | HS.size values >= 4096 = (column, 4096, True)
+        | otherwise = case remaining of
+            [] -> (column, HS.size values, False)
+            row : rest -> go rest (maybe values (\v -> HS.insert (canonicalValue v) values) (lookup column row))
 
 -- | 用给定表替换同名表
 replaceTable :: String -> Table -> Database -> Database

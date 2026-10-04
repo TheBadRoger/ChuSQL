@@ -1,0 +1,11 @@
+# 门禁状态：仅由所有者手动触发全量入口。
+name: gate
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  gate:
+    uses: ./.github/workflows/linux.yml
+    with:
+      phase: gate

@@ -15,14 +15,14 @@ module ChuSQL.Interface.Settings (
     effectiveSettings,
 ) where
 
-import ChuSQL.Interface.Config (WebConfig (..), canonicalSettingKeys, defaultUser)
+import ChuSQL.Interface.Config (WebConfig (..), canonicalSettingKeys)
 import ChuSQL.Interface.TOML (readSection, writeSection)
 import Data.List (nub)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
 
--- 设置目录，以及全局 chusql.toml 的读、写与校验。
+-- 设置目录，以及全局 settings.toml 的读、写与校验。
 
 -- | 一个可配置项
 data SettingItem = SettingItem
@@ -42,8 +42,7 @@ data SettingItem = SettingItem
 settingCatalogue :: [SettingItem]
 settingCatalogue =
     [ item "port" "HTTP port" "server" "int" "7778" True True
-    , item "host" "Listen address" "server" "text" "127.0.0.1" True True
-    , item "static-dir" "Static directory" "server" "text" "static" True True
+    , withTomlKey "listen_host" (item "listen-host" "Listen address" "server" "text" "127.0.0.1" True True)
     , item "cookie-secure" "Secure cookie (behind TLS)" "server" "bool" "0" True False
     , item "body-limit" "Max request body (bytes)" "limits" "int" "65536" False False
     , item "session-idle" "Session idle timeout (s)" "limits" "int" "28800" False False
@@ -54,16 +53,16 @@ settingCatalogue =
     , item "max-page-size" "Rows per page ceiling" "limits" "int" "500" False False
     , item "max-rows" "Rows per query" "limits" "int" "1000" False False
     , item "max-sql-length" "Max SQL characters" "limits" "int" "20000" False False
-    , item "user" "管理员账号（设置文件）" "auth" "text" "root" True True
     , item "password-min-length" "口令最短长度" "auth" "int" "12" True False
     , item "password-classes" "口令字符类别数" "auth" "int" "2" True False
     , owned "data-dir" "Data directory" "storage" "text" "" "storage" "data_dir"
+    , owned "log-files" "Log directory" "storage" "text" "./logs" "storage" "log_files"
     , owned "storage-page-size" "Storage page size" "storage" "int" "4096" "page" "size"
     , owned "storage-btree-order" "Storage B+tree order" "storage" "int" "4" "btree" "order"
     , owned "storage-buffer-pool" "Storage buffer pool pages" "storage" "int" "1024" "buffer" "pool_size"
     , owned "storage-log" "Storage log level" "storage" "text" "info" "log" "level"
     , item "seed" "Seed demo data on start" "storage" "bool" "1" True True
-    , owned "tcp-host" "TCP listen address" "network" "text" "127.0.0.1" "server" "host"
+    , owned "tcp-listen-host" "TCP listen address" "network" "text" "127.0.0.1" "server" "listen_host"
     , owned "tcp-port" "TCP port" "network" "int" "7777" "server" "port"
     , owned "tcp-max-message" "TCP max request line (bytes)" "network" "int" "1048576" "server" "max_message"
     , owned "tcp-max-rows" "TCP rows per result" "network" "int" "1000" "server" "max_rows"
@@ -96,6 +95,9 @@ settingCatalogue =
             , siTomlKey = tomlKey
             }
 
+    -- | 换掉落盘用的键名：界面键与 TOML 键不同名时用
+    withTomlKey key spec = spec{siTomlKey = key}
+
 -- | web 自己的分区名
 webSection :: Text
 webSection = "web"
@@ -114,9 +116,9 @@ findItem key = case [i | i <- settingCatalogue, siKey i == key] of
 isRootOnly :: Text -> Bool
 isRootOnly key = maybe False siRootOnly (findItem key)
 
--- | 网页端不能改的键
+-- | 网页端不能改的键（当前没有）
 lockedKeys :: [Text]
-lockedKeys = ["user"]
+lockedKeys = []
 
 -- | 这项在界面上是不是只读
 isLockedSetting :: Text -> Bool
@@ -218,8 +220,7 @@ effectiveSettings :: WebConfig -> Map.Map Text Text
 effectiveSettings cfg =
     Map.fromList
         [ ("port", tshow (wcPort cfg))
-        , ("host", T.pack (wcHost cfg))
-        , ("static-dir", T.pack (wcStaticDir cfg))
+        , ("listen-host", T.pack (wcHost cfg))
         , ("cookie-secure", boolText (wcCookieSecure cfg))
         , ("body-limit", tshow (wcBodyLimit cfg))
         , ("session-idle", tshow (wcSessionIdle cfg))
@@ -230,9 +231,9 @@ effectiveSettings cfg =
         , ("max-page-size", tshow (wcMaxPageSize cfg))
         , ("max-rows", tshow (wcMaxRows cfg))
         , ("max-sql-length", tshow (wcMaxSqlLength cfg))
-        , ("user", if T.null (T.strip (wcUser cfg)) then defaultUser else T.strip (wcUser cfg))
         , ("seed", boolText (wcSeedDemo cfg))
         , ("data-dir", maybe "" T.pack (wcDataDir cfg))
+        , ("log-files", T.pack (wcLogFiles cfg))
         ]
   where
     -- | 数值转文本

@@ -24,7 +24,8 @@ import qualified Data.Text as T
 import System.Directory (doesDirectoryExist)
 import Text.Read (readMaybe)
 
--- Web 与 server 的运行参数：命令行 > chusql.toml 分区 > 内置默认。
+-- Web 与 server 的运行参数：命令行 > settings.toml 分区 > 默认。
+-- 监听地址用 listen_host；静态目录与管理员名写死，不认配置键。
 
 -- | 默认账号名
 defaultUser :: Text
@@ -37,6 +38,7 @@ data WebConfig = WebConfig
     , wcStaticDir :: FilePath
     , wcUser :: Text
     , wcDataDir :: Maybe FilePath
+    , wcLogFiles :: FilePath
     , wcCookieSecure :: Bool
     , wcBodyLimit :: Int
     , wcSessionIdle :: Int
@@ -60,6 +62,7 @@ defaultWebConfig =
         , wcStaticDir = "static"
         , wcUser = ""
         , wcDataDir = Nothing
+        , wcLogFiles = "./logs"
         , wcCookieSecure = False
         , wcBodyLimit = 65536
         , wcSessionIdle = 8 * 3600
@@ -81,11 +84,10 @@ canonicalSettingKeys saved =
     -- | 取一个键的规范名
     canonicalKey key = fromMaybe key (lookup key keyAliases)
 
--- | 下划线写法到连字符写法的别名
+-- | 设置键别名：非权威写法到权威写法（多数写连字符）
 keyAliases :: [(Text, Text)]
 keyAliases =
-    [ ("static_dir", "static-dir")
-    , ("session_idle", "session-idle")
+    [ ("session_idle", "session-idle")
     , ("session_max", "session-max")
     , ("login_max_attempts", "login-max-attempts")
     , ("login_window", "login-window")
@@ -96,6 +98,7 @@ keyAliases =
     , ("max_sql_length", "max-sql-length")
     , ("password_min_length", "password-min-length")
     , ("password_classes", "password-classes")
+    , ("listen-host", "listen_host")
     ]
 
 -- | 配置文件的 [web] 分节里是否还留着明文口令键
@@ -108,11 +111,11 @@ nonEmptyValue key saved = case T.strip <$> Map.lookup key saved of
     Just value | not (T.null value) -> Just value
     _ -> Nothing
 
--- | 管理员名字：命令行 > 设置文件 > 内置默认
-rootUserName :: WebConfig -> Map.Map Text Text -> Text
-rootUserName cfg saved
+-- | 管理员名字：命令行 > 内置默认（超级用户由内部自举）
+rootUserName :: WebConfig -> Text
+rootUserName cfg
     | not (T.null (T.strip (wcUser cfg))) = T.strip (wcUser cfg)
-    | otherwise = fromMaybe defaultUser (nonEmptyValue "user" saved)
+    | otherwise = defaultUser
 
 -- | 读配置：默认叠上 [web] 与 [storage]
 loadWebConfigAt :: FilePath -> IO WebConfig
@@ -121,18 +124,20 @@ loadWebConfigAt path = do
     storage <- readSection path "storage"
     pure (withStorage storage (webConfigFromSection (canonicalSettingKeys raw)))
 
--- | 数据目录取自 [storage] 段
+-- | 数据与日志目录取自 [storage] 段
 withStorage :: Map.Map Text Text -> WebConfig -> WebConfig
 withStorage storage cfg =
-    cfg{wcDataDir = T.unpack <$> nonEmptyValue "data_dir" storage}
+    cfg
+        { wcDataDir = T.unpack <$> nonEmptyValue "data_dir" storage
+        , wcLogFiles = maybe (wcLogFiles cfg) T.unpack (nonEmptyValue "log_files" storage)
+        }
 
 -- | [web] 分区里的启动参数，缺失或坏值一律回到内置默认
 webConfigFromSection :: Map.Map Text Text -> WebConfig
 webConfigFromSection saved =
     defaultWebConfig
-        { wcHost = T.unpack (sectionText "host" saved (T.pack (wcHost defaultWebConfig)))
+        { wcHost = T.unpack (sectionText "listen_host" saved (T.pack (wcHost defaultWebConfig)))
         , wcPort = sectionInt "port" saved (wcPort defaultWebConfig)
-        , wcStaticDir = T.unpack (sectionText "static-dir" saved (T.pack (wcStaticDir defaultWebConfig)))
         , wcCookieSecure = sectionBool "cookie-secure" saved (wcCookieSecure defaultWebConfig)
         , wcBodyLimit = sectionInt "body-limit" saved (wcBodyLimit defaultWebConfig)
         , wcSessionIdle = sectionInt "session-idle" saved (wcSessionIdle defaultWebConfig)
@@ -202,7 +207,7 @@ loadServerConfigAt path = do
             Nothing -> fallback
     pure
         defaultServerConfig
-            { scHost = textOf "host" (scHost defaultServerConfig)
+            { scHost = textOf "listen_host" (scHost defaultServerConfig)
             , scPort = intOf "port" (scPort defaultServerConfig)
             , scMaxMessage = intOf "max_message" (scMaxMessage defaultServerConfig)
             , scMaxRows = intOf "max_rows" (scMaxRows defaultServerConfig)

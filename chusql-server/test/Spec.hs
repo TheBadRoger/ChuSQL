@@ -5,7 +5,7 @@ module Main (main) where
 
 import ChuSQL.Core.Engine.Storage.IPC (
     Account (..),
-    Request (ReqAccountReset),
+    Request (ReqAccountReset, ReqAccountsList),
     TableInfo (..),
     closeConnection,
     localStorageLink,
@@ -82,7 +82,7 @@ import System.IO (
     noNewlineTranslation,
  )
 import System.Timeout (timeout)
-import Test.Hspec
+import Test.Hspec hiding (after, before)
 
 -- TCP 服务器测试：协议编解码、配置读取与真连服务器的端到端用例。
 
@@ -98,6 +98,149 @@ spec = do
     privilegeSpec
     transactionSpec
     ipcConcurrencySpec
+    identitySpec
+
+-- | 身份属性与权限边界的端到端测试
+identitySpec :: Spec
+identitySpec = describe "unified identities" $ do
+    it "lets catalog managers manage ordinary identities without gaining superuser" $ withTcpServer defaultServerConfig $ \_ handle ->
+        withConnection handle $ \admin -> withConnection handle $ \manager -> do
+            _ <- tcpLogin admin "admin" "s3cret"
+            _ <- tcpQuery admin "create user manager identified by 'Worker-Pass123!'"
+            changed <- tcpQuery admin "alter user manager system_catalog_manager"
+            asText (at "status" changed) `shouldBe` "result"
+            signed <- tcpLogin manager "manager" "Worker-Pass123!"
+            asBool (at "admin" signed) `shouldBe` False
+            created <- tcpQuery manager "create user managed identified by 'Worker-Pass123!'"
+            asText (at "status" created) `shouldBe` "result"
+            shown <- tcpQuery manager "show roles"
+            asText (at "status" shown) `shouldBe` "result"
+            switched <- tcpQuery manager "use system"
+            asText (at "status" switched) `shouldBe` "result"
+            mapM_ (\sql -> tcpQuery manager sql >>= \reply -> asText (at "code" reply) `shouldBe` "forbidden")
+                ["alter user manager superuser", "alter user managed system_catalog_manager", "alter user admin identified by 'Another-Pass123!'", "create database forbidden"]
+    it "does not inherit catalog management through role membership" $ withTcpServer defaultServerConfig $ \_ handle ->
+        withConnection handle $ \admin -> withConnection handle $ \worker -> do
+            _ <- tcpLogin admin "admin" "s3cret"
+            _ <- tcpQuery admin "create user worker identified by 'Worker-Pass123!'"
+            _ <- tcpQuery admin "create role catalog_admin"
+            _ <- tcpQuery admin "alter role catalog_admin system_catalog_manager"
+            _ <- tcpQuery admin "grant catalog_admin to worker"
+            _ <- tcpLogin worker "worker" "Worker-Pass123!"
+            denied <- tcpQuery worker "create user elevated identified by 'Worker-Pass123!'"
+            asText (at "code" denied) `shouldBe` "forbidden"
+    it "shares names and shows safe identity attributes" $ withTcpServer defaultServerConfig $ \_ handle ->
+        withConnection handle $ \h -> do
+            _ <- tcpLogin h "admin" "s3cret"
+            _ <- tcpQuery h "create role reader"
+            conflict <- tcpQuery h "create user reader identified by 'Worker-Pass123!'"
+            asText (at "code" conflict) `shouldBe` "conflict"
+            _ <- tcpQuery h "create user alice identified by 'Worker-Pass123!'"
+            other <- tcpQuery h "create role alice"
+            asText (at "code" other) `shouldBe` "conflict"
+            shown <- tcpQuery h "show roles"
+            map asText (items (at "columns" shown)) `shouldBe` ["id", "name", "can_login", "is_superuser", "enabled", "system_catalog_manager", "created_at"]
+            asInt (at "rowCount" shown) `shouldBe` 3
+            reader <- tcpQuery h "alter role reader login nologin"
+            asText (at "code" reader) `shouldBe` "bad_request"
+    it "turns a role into a login identity and promotes by attribute" $ withTcpServer defaultServerConfig $ \_ handle ->
+        withConnection handle $ \admin -> withConnection handle $ \worker -> do
+            _ <- tcpLogin admin "admin" "s3cret"
+            _ <- tcpQuery admin "create role worker"
+            _ <- tcpQuery admin "alter role worker identified by 'Worker-Pass123!'"
+            denied <- tcpLogin worker "worker" "Worker-Pass123!"
+            asText (at "status" denied) `shouldBe` "error"
+            changed <- tcpQuery admin "alter role worker login superuser"
+            asText (at "status" changed) `shouldBe` "result"
+            allowed <- tcpLogin worker "worker" "Worker-Pass123!"
+            asBool (at "admin" allowed) `shouldBe` True
+            created <- tcpQuery worker "create role managed"
+            asText (at "status" created) `shouldBe` "result"
+    it "does not inherit the superuser attribute through membership" $ withTcpServer defaultServerConfig $ \_ handle ->
+        withConnection handle $ \admin -> withConnection handle $ \alice -> do
+            _ <- tcpLogin admin "admin" "s3cret"
+            _ <- tcpQuery admin "create user alice identified by 'Worker-Pass123!'"
+            _ <- tcpQuery admin "create role powerful"
+            _ <- tcpQuery admin "alter role powerful superuser"
+            _ <- tcpQuery admin "grant powerful to alice"
+            signed <- tcpLogin alice "alice" "Worker-Pass123!"
+            asBool (at "admin" signed) `shouldBe` False
+            denied <- tcpQuery alice "create role elevated"
+            asText (at "code" denied) `shouldBe` "forbidden"
+    it "treats a demoted configured administrator as ordinary" $ withTcpServer defaultServerConfig $ \_ handle ->
+        withConnection handle $ \admin -> do
+            _ <- tcpLogin admin "admin" "s3cret"
+            _ <- tcpQuery admin "create user owner identified by 'Worker-Pass123!'"
+            _ <- tcpQuery admin "alter user owner superuser"
+            demoted <- tcpQuery admin "alter user admin nosuperuser"
+            asText (at "status" demoted) `shouldBe` "result"
+            withConnection handle $ \fresh -> do
+                signed <- tcpLogin fresh "admin" "s3cret"
+                asBool (at "admin" signed) `shouldBe` False
+                denied <- tcpQuery fresh "show roles"
+                asText (at "code" denied) `shouldBe` "forbidden"
+    it "protects the last enabled login superuser" $ withTcpServer defaultServerConfig $ \_ handle ->
+        withConnection handle $ \h -> do
+            _ <- tcpLogin h "admin" "s3cret"
+            mapM_ (\sql -> tcpQuery h sql >>= \reply -> asText (at "code" reply) `shouldBe` "bad_request")
+                ["alter user admin disabled", "alter role admin nologin", "alter user admin nosuperuser", "drop user admin", "drop role admin"]
+            shown <- tcpQuery h "show roles"
+            asText (at "status" shown) `shouldBe` "result"
+    it "stops disabled role inheritance and disconnects its members" $ withTcpServer defaultServerConfig $ \_ handle ->
+        withConnection handle $ \admin -> withConnection handle $ \alice -> do
+            _ <- tcpLogin admin "admin" "s3cret"
+            _ <- tcpQuery admin "use test"
+            _ <- tcpQuery admin "create user alice identified by 'Worker-Pass123!'"
+            _ <- tcpQuery admin "create role reader"
+            _ <- tcpQuery admin "grant select on users to reader"
+            _ <- tcpQuery admin "grant reader to alice"
+            _ <- tcpLogin alice "alice" "Worker-Pass123!"
+            _ <- tcpQuery alice "use test"
+            before <- tcpQuery alice "select * from users"
+            asText (at "status" before) `shouldBe` "result"
+            changed <- tcpQuery admin "alter role reader disabled"
+            asText (at "status" changed) `shouldBe` "result"
+            refused <- tcpQuery alice "use test"
+            asText (at "code" refused) `shouldBe` "unauthorized"
+            tcpClosed alice
+            withConnection handle $ \fresh -> do
+                _ <- tcpLogin fresh "alice" "Worker-Pass123!"
+                _ <- tcpQuery fresh "use test"
+                after <- tcpQuery fresh "select * from users"
+                asText (at "code" after) `shouldBe` "forbidden"
+                escalation <- tcpQuery fresh "alter user alice superuser"
+                asText (at "code" escalation) `shouldBe` "forbidden"
+    it "disables login identities and invalidates their connections" $ withTcpServer defaultServerConfig $ \_ handle ->
+        withConnection handle $ \admin -> withConnection handle $ \alice -> do
+            _ <- tcpLogin admin "admin" "s3cret"
+            _ <- tcpQuery admin "create user alice identified by 'Worker-Pass123!'"
+            _ <- tcpLogin alice "alice" "Worker-Pass123!"
+            _ <- tcpQuery admin "alter user alice disabled"
+            refused <- tcpQuery alice "use test"
+            asText (at "code" refused) `shouldBe` "unauthorized"
+            tcpClosed alice
+            withConnection handle $ \fresh -> do
+                denied <- tcpLogin fresh "alice" "Worker-Pass123!"
+                asText (at "status" denied) `shouldBe` "error"
+                _ <- tcpQuery admin "alter user alice enabled"
+                allowed <- tcpLogin fresh "alice" "Worker-Pass123!"
+                asText (at "status" allowed) `shouldBe` "ok"
+    it "does not reuse dropped identity ids or permissions" $ withTcpServer defaultServerConfig $ \_ handle ->
+        withConnection handle $ \admin -> do
+            _ <- tcpLogin admin "admin" "s3cret"
+            _ <- tcpQuery admin "use test"
+            _ <- tcpQuery admin "create user alice identified by 'Worker-Pass123!'"
+            _ <- tcpQuery admin "grant select on users to alice"
+            before <- tcpQuery admin "show roles"
+            _ <- tcpQuery admin "drop user alice"
+            _ <- tcpQuery admin "create user alice identified by 'Worker-Pass123!'"
+            after <- tcpQuery admin "show roles"
+            at "rows" after `shouldNotBe` at "rows" before
+            withConnection handle $ \alice -> do
+                _ <- tcpLogin alice "alice" "Worker-Pass123!"
+                _ <- tcpQuery alice "use test"
+                denied <- tcpQuery alice "select * from users"
+                asText (at "code" denied) `shouldBe` "forbidden"
 
 -- 夹具：内存后端装在 MVar 里，跟 Web 测试同一套表
 
@@ -324,14 +467,14 @@ tcpSpec = do
                         fmap (sum . histBuckets) (lookup "id" (tiHistograms info)) `shouldBe` Just 5
                         lookup "name" (tiHistograms info) `shouldBe` Nothing
 
-    describe "server config ([server] in chusql.toml)" $ do
+    describe "server config ([server] in settings.toml)" $ do
         it "falls back to the defaults when the file has no server section" $ do
             path <- tcpConfigPath "server-default"
             removeIfExists path
             loadServerConfigAt path `shouldReturn` defaultServerConfig
-        it "reads host, port, max_message and max_rows" $ do
+        it "reads listen_host, port, max_message and max_rows" $ do
             path <- tcpConfigPath "server-keys"
-            BS.writeFile path "[server]\nhost = \"0.0.0.0\"\nport = 7777\nmax_message = 4096\nmax_rows = 7\n"
+            BS.writeFile path "[server]\nlisten_host = \"0.0.0.0\"\nport = 7777\nmax_message = 4096\nmax_rows = 7\n"
             config <- loadServerConfigAt path
             scHost config `shouldBe` "0.0.0.0"
             scPort config `shouldBe` 7777
@@ -554,7 +697,7 @@ tcpServerSpec = do
 
 -- | 一个普通账号
 testAccount :: Account
-testAccount = Account 0 "alice" "" 0 "" Nothing
+testAccount = Account 0 "alice" "" 0 "" Nothing True False True False
 
 -- | 权限用例传的当前库名
 testDatabase :: Text
@@ -724,6 +867,11 @@ privilegeSpec = describe "server privileges" $ do
         refused <- runPrivilegeCommand service (Ordinary testAccount) testDatabase (CreateRoleCommand "reader")
         refused `shouldBe` Left (PrivilegeError "forbidden" "administrator required")
 
+    it "requires administrator privileges for domain commands" $ withPrivileges $ \service root -> do
+        authorizeSql service root "CREATE DOMAIN code AS INT" `shouldReturn` Right ()
+        authorizeSql service (Ordinary testAccount) "CREATE DOMAIN code AS INT"
+            `shouldReturn` Left (PrivilegeError "forbidden" "administrator required")
+
     it "authorizes the administrator on any statement" $ withPrivileges $ \service root ->
         case parseStatement "SELECT * FROM users" of
             Left err -> expectationFailure err
@@ -785,12 +933,9 @@ privilegeSpec = describe "server privileges" $ do
         created `shouldBe` Right ()
         views <- listRoleViews service
         fmap (map roleName) views `shouldBe` Right ["reader"]
-        -- 改名后真存储上仍要读得到角色表
+        stored <- beAccounts base ReqAccountsList
+        fmap (map (\a -> (accountUser a, accountCanLogin a))) stored `shouldBe` Right [("root", True), ("reader", False)]
         let system = beWithDatabase base "system"
-        stored <- beStatement system "SELECT * FROM __system_roles"
-        case stored of
-            Left err -> expectationFailure ("select __system_roles: " ++ err)
-            Right result -> concatMap (map snd) (srRows result) `shouldContain` [VStr "reader"]
         -- 账号表不给语句通道看到
         denied <- beStatement system "SELECT * FROM __system_users"
         case denied of
@@ -913,6 +1058,57 @@ intValues rows = [n | row <- rows, Just (VInt n) <- [nth 0 row]]
 -- | 显式事务用例
 transactionSpec :: Spec
 transactionSpec = describe "server transactions" $ do
+    it "filters qualified memory tables and preserves other databases on writes" $ do
+        let local = Table "users" [("id", TInt)] [[("id", VInt 1)]] Nothing
+            otherTable = Table "users" [("id", TInt)] [[("id", VInt 2)]] Nothing
+        ref <- newMVar [("test.users", local), ("other.users", otherTable)]
+        let backend = memoryBackend "test" ref
+        selected <- beStatement backend "SELECT id FROM users"
+        fmap srRows selected `shouldBe` Right [[("id", VInt 1)]]
+        tables <- beCatalog backend
+        fmap (map tiTable) tables `shouldBe` Right ["users"]
+        updated <- beStatement backend "UPDATE users SET id = 3"
+        fmap (const ()) updated `shouldBe` Right ()
+        snapshot <- beSnapshot (memoryBackend "other" ref)
+        fmap (map (tableRows . snd)) snapshot `shouldBe` Right [[[ ("id", VInt 2) ]]]
+    it "rejects cross-database reads and writes including nested queries" $ withMemorySession $ \session -> do
+        mapM_ (\query -> do
+            result <- runStatementCoded session query
+            failureMessage result `shouldSatisfy` T.isInfixOf "outside the current database")
+            [ "SELECT * FROM other.users"
+            , "UPDATE other.users SET age = 1"
+            , "DELETE FROM other.users"
+            , "INSERT INTO other.users (id) VALUES (99)"
+            , "SELECT * FROM users WHERE id IN (SELECT id FROM other.users)"
+            , "SELECT other.users.id FROM users"
+            ]
+        void (mustSql session "BEGIN")
+        result <- runStatementCoded session "SELECT * FROM other.users"
+        failureMessage result `shouldSatisfy` T.isInfixOf "outside the current database"
+        void (mustSql session "ROLLBACK")
+    it "redacts malformed password statements through the session" $ withMemorySession $ \session -> do
+        result <- runStatementCoded session "ALTER USER alice IDENTIFIED BY 'private-secret' trailing"
+        failureMessage result `shouldSatisfy` T.isInfixOf "syntax"
+        failureMessage result `shouldSatisfy` (not . T.isInfixOf "private-secret")
+    it "resolves current database qualifiers for memory DDL" $ withMemorySession $ \session -> do
+        _ <- mustSql session "CREATE TABLE test.qualified (id INT)"
+        _ <- mustSql session "ALTER TABLE test.qualified ADD COLUMN value INT DEFAULT 8"
+        _ <- mustSql session "INSERT INTO qualified (id) VALUES (1)"
+        rows <- mustSql session "SELECT value FROM test.qualified"
+        intValues (qrRows rows) `shouldBe` [8]
+        void (mustSql session "DROP TABLE test.qualified")
+
+    it "uses domain columns in snapshot transactions and rejects domain DDL" $ withMemorySession $ \session -> do
+        _ <- mustSql session "create domain code as int"
+        _ <- mustSql session "create table typed (id code)"
+        _ <- mustSql session "begin"
+        denied <- runStatementCoded session "drop domain code"
+        failureMessage denied `shouldBe` "DDL is not allowed in a transaction"
+        _ <- mustSql session "insert into typed (id) values (7)"
+        _ <- mustSql session "commit"
+        rows <- mustSql session "select id from typed"
+        intValues (qrRows rows) `shouldBe` [7]
+
     it "keeps uncommitted rows invisible to other sessions until COMMIT" $ withTwoSessions $ \writer reader -> do
         _ <- mustSql writer "begin"
         _ <- mustSql writer "insert into users (id, name, age) values (6, 'six', 26)"
@@ -1118,6 +1314,13 @@ withIpcStorage body = do
         Left err -> cleanIpc dir >> pendingWith ("cannot open the storage library: " ++ err)
         Right link -> do
             setStorageLink link
+            base <- ipcBackend
+            seeded <- beStorage base (A.object ["method" A..= ("bootstrap_system" :: Text), "user" A..= ("root" :: Text), "password_hash" A..= ("hash" :: Text)])
+            case seeded of
+                Left err -> expectationFailure err
+                Right value -> case value of
+                    A.Object fields -> KM.lookup "initialized" fields `shouldBe` Just (A.Bool True)
+                    _ -> expectationFailure "invalid bootstrap response"
             body `finally` (closeConnection >> cleanIpc dir)
 
 -- | 跑一条语句，出错就算用例失败
@@ -1141,6 +1344,70 @@ writeRows session ids done = do
 -- | 同一进程里开两个库：会话之间不串数据，也不互相挡路
 ipcConcurrencySpec :: Spec
 ipcConcurrencySpec = describe "server backend on the real storage" $ do
+    it "resolves DDL qualifiers without crossing database boundaries" $ withIpcStorage $ do
+        base <- ipcBackend
+        mustRun (beStatement base "CREATE DATABASE alpha")
+        mustRun (beStatement base "CREATE DATABASE beta")
+        let alpha = beWithDatabase base "alpha"
+            beta = beWithDatabase base "beta"
+        unselected <- beStatement base "CREATE TABLE alpha.t (id INT)"
+        fmap (const ()) unselected `shouldBe` Left "no database selected"
+        mustRun (beStatement alpha "CREATE TABLE alpha.t (id INT, value INT)")
+        duplicate <- beStatement alpha "CREATE TABLE t (id INT)"
+        fmap (const ()) duplicate `shouldSatisfy` either (const True) (const False)
+        mustRun (beStatement alpha "INSERT INTO t (id, value) VALUES (1, 7)")
+        mustRun (beStatement alpha "CREATE INDEX ON alpha.t (value)")
+        mustRun (beStatement alpha "DROP INDEX ON alpha.t (value)")
+        mustRun (beStatement alpha "ALTER TABLE alpha.t RENAME COLUMN value TO score")
+        mustRun (beStatement alpha "ALTER TABLE alpha.t ALTER COLUMN score TYPE BIGINT")
+        mustRun (beStatement alpha "ALTER TABLE alpha.t ALTER COLUMN score SET DEFAULT 9")
+        mustRun (beStatement alpha "ALTER TABLE alpha.t ALTER COLUMN score SET NOT NULL")
+        rows <- rowsOf (beStatement alpha "SELECT score FROM t")
+        intColumn "score" rows `shouldBe` [7]
+        crossed <- beStatement beta "DROP TABLE alpha.t"
+        fmap (const ()) crossed `shouldBe` Left "DDL target is outside the current database: alpha.t"
+        mustRun (beStatement alpha "ALTER TABLE alpha.t DROP COLUMN score")
+        mustRun (beStatement alpha "DROP TABLE alpha.t")
+        catalog <- beCatalog alpha >>= either fail pure
+        map tiTable catalog `shouldBe` []
+
+    it "isolates domain catalogs by database and hides them from table lists" $ withIpcStorage $ do
+        base <- ipcBackend
+        unselected <- beStatement base "SHOW DOMAINS"
+        fmap (const ()) unselected `shouldBe` Left "no database selected"
+        mustRun (beStatement base "CREATE DATABASE alpha")
+        mustRun (beStatement base "CREATE DATABASE beta")
+        let alpha = beWithDatabase base "alpha"
+            beta = beWithDatabase base "beta"
+        mustRun (beStatement alpha "CREATE DOMAIN code AS INT")
+        mustRun (beStatement beta "CREATE DOMAIN code AS VARCHAR(3)")
+        mustRun (beStatement alpha "CREATE TABLE typed (id code)")
+        mustRun (beStatement beta "CREATE TABLE typed (id code)")
+        mustRun (beStatement alpha "INSERT INTO typed (id) VALUES (1)")
+        mustRun (beStatement beta "INSERT INTO typed (id) VALUES ('abc')")
+        catalog <- beCatalog alpha >>= either fail pure
+        map tiTable catalog `shouldBe` ["typed"]
+        domains <- rowsOf (beStatement beta "SHOW DOMAINS")
+        domains `shouldBe` [[("domain", VStr "code"), ("base_type", VStr "varchar(3)")]]
+        refused <- beStatement beta "INSERT INTO typed (id) VALUES (1)"
+        fmap (const ()) refused `shouldSatisfy` either (const True) (const False)
+
+    it "resolves nested domains only inside their own database" $ withIpcStorage $ do
+        base <- ipcBackend
+        mustRun (beStatement base "CREATE DATABASE alpha")
+        mustRun (beStatement base "CREATE DATABASE beta")
+        let alpha = beWithDatabase base "alpha"
+            beta = beWithDatabase base "beta"
+        mustRun (beStatement alpha "CREATE DOMAIN label AS VARCHAR(3)")
+        mustRun (beStatement alpha "CREATE DOMAIN product_label AS label")
+        absent <- beStatement beta "CREATE DOMAIN product_label AS label"
+        fmap (const ()) absent `shouldBe` Left "unknown domain: label"
+        mustRun (beStatement alpha "CREATE TABLE products (name product_label)")
+        mustRun (beStatement alpha "INSERT INTO products (name) VALUES ('abc')")
+        rowsOf (beStatement alpha "SELECT name FROM products") `shouldReturn` [[("name", VStr "abc")]]
+        dependency <- beStatement alpha "DROP DOMAIN label"
+        fmap (const ()) dependency `shouldSatisfy` either (const True) (const False)
+
     it "keeps two databases apart" $ withIpcStorage $ do
         base <- ipcBackend
         mustRun (beStatement base "CREATE DATABASE alpha")

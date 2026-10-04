@@ -3,22 +3,22 @@
 module Main (main) where
 
 import ChuSQL.Core.Engine.Storage.IPC (closeConnection, localStorageLink, sendRawRequest, setStorageLink)
+import ChuSQL.Bootstrap (preinstalledTypes, runBootstrap)
+import ChuSQL.Core.Engine.Storage.FFI (maintainStorage)
 import ChuSQL.Interface.Auth (hashPassword)
 import ChuSQL.Interface.Config (loadWebConfigAt, rootUserName)
-import ChuSQL.Interface.Settings (readSettingsFile)
 import ChuSQL.Interface.TOML (resolveConfigPath)
 import qualified Data.Aeson as A
-import qualified Data.Aeson.KeyMap as KM
-import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy.Char8 as BL
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
+import Control.Exception (finally)
 import System.Environment (getArgs)
 import System.Exit (exitFailure)
 import System.IO (BufferMode (LineBuffering), hSetBuffering, stdout)
 
--- 引导程序：建系统库与管理员账号，装完即退，留在 bin 里备用。
+-- 引导程序：初始化系统库、管理员身份与内置类型目录。
 
 data Options = Options
     { optConfig :: Maybe FilePath
@@ -26,6 +26,7 @@ data Options = Options
     , optPasswordStdin :: Bool
     , optPasswordless :: Bool
     , optHelp :: Bool
+    , optMode :: Maybe String
     }
 
 -- | 全部选项都取默认值
@@ -37,6 +38,7 @@ emptyOptions =
         , optPasswordStdin = False
         , optPasswordless = False
         , optHelp = False
+        , optMode = Nothing
         }
 
 -- | 解析参数
@@ -45,6 +47,10 @@ parseArgs = go emptyOptions
   where
     -- | 逐条消费参数列表
     go opts [] = Right opts
+    go opts (command : rest)
+        | command `elem` ["repair", "recover", "recovery", "reset"] = case optMode opts of
+            Nothing -> go opts{optMode = Just (if command == "recovery" then "recover" else command)} rest
+            Just _ -> Left "only one maintenance command is allowed"
     go opts ("--help" : rest) = go opts{optHelp = True} rest
     go opts ("-h" : rest) = go opts{optHelp = True} rest
     go opts ("--config" : v : rest) = go opts{optConfig = Just v} rest
@@ -56,19 +62,23 @@ parseArgs = go emptyOptions
 -- | 打印用法说明
 usage :: IO ()
 usage = do
-    putStrLn "usage: csql-bootstrap [options]"
+    putStrLn "usage: csql-bootstrap [repair|recover|recovery|reset] [options]"
+    putStrLn "  repair    repair structures; abort if data recovery or initialization is needed"
+    putStrLn "  recover   replay WAL and recover system metadata; recovery is an alias"
+    putStrLn "  reset     replace system identities and grants with initial defaults"
+    putStrLn "Stop all database processes first. Maintenance preserves the old system directory."
     putStrLn ""
-    putStrLn "config: chusql.toml sits at a fixed place (Windows: %APPDATA%\\ChuSQL\\chusql.toml;"
-    putStrLn "        other: $XDG_CONFIG_HOME/ChuSQL/chusql.toml), the same file the server reads"
+    putStrLn "config: settings.toml sits at a fixed place (Windows: %APPDATA%\\ChuSQL\\settings.toml;"
+    putStrLn "        other: $XDG_CONFIG_HOME/ChuSQL/settings.toml), the same file the server reads"
     putStrLn ""
     putStrLn "  --config FILE          read that config file instead"
-    putStrLn "  --user NAME            administrator name          ([web] user, default root)"
+    putStrLn "  --user NAME            administrator name          (default root)"
     putStrLn "  --password-stdin       read the administrator password from one line of stdin"
     putStrLn "  --passwordless         leave the administrator without a password"
     putStrLn ""
-    putStrLn "what it does: creates the system database, the __system_users table and the"
-    putStrLn "  administrator row, then exits. It never changes an existing account, and it"
-    putStrLn "  never deletes data, so the installer and later repairs can run it again."
+    putStrLn "what it does: initializes the system database, an enabled login superuser and"
+    putStrLn "  the preinstalled builtin type directory, then exits. Existing passwords and"
+    putStrLn "  matching type definitions are preserved; conflicting definitions fail."
 
 -- | 入口
 main :: IO ()
@@ -84,13 +94,13 @@ main = do
             | optHelp opts -> usage
             | otherwise -> run opts
 
--- | 读配置、算口令哈希、发一条引导请求
+-- | 读取配置和口令并完成安装引导
 run :: Options -> IO ()
+run opts | Just mode <- optMode opts = runMaintenance opts mode
 run opts = do
     configPath <- resolveConfigPath (optConfig opts)
     base <- loadWebConfigAt configPath
-    saved <- readSettingsFile configPath
-    let name = maybe (rootUserName base saved) T.pack (optUser opts)
+    let name = maybe (rootUserName base) T.pack (optUser opts)
     chosen <- readPassword opts
     case chosen of
         Left err -> do
@@ -112,35 +122,34 @@ run opts = do
                 Left err -> failWith ("cannot open the storage library: " ++ err)
                 Right link -> do
                     setStorageLink link
-                    reply <- sendRawRequest (BL.toStrict (A.encode (bootstrapRequest name encoded)))
-                    closeConnection
-                    report reply
+                    result <- runBootstrap send name encoded `finally` closeConnection
+                    case result of
+                        Left err -> failWith ("bootstrap failed: " ++ err)
+                        Right count -> do
+                            putStrLn "system catalog: ready"
+                            putStrLn "administrator identity: LOGIN SUPERUSER ENABLED"
+                            putStrLn ("preinstalled types: ready (" ++ show count ++ " definitions)")
 
--- | 引导请求：建表、插管理员行
-bootstrapRequest :: Text -> Text -> A.Value
-bootstrapRequest name encoded =
-    A.object
-        [ "method" A..= ("bootstrap_system" :: Text)
-        , "user" A..= name
-        , "password_hash" A..= encoded
-        ]
+-- | 在离线维护入口执行所选策略
+runMaintenance :: Options -> String -> IO ()
+runMaintenance opts mode = do
+    path <- resolveConfigPath (optConfig opts)
+    chosen <- if mode == "reset" || optPasswordStdin opts || optPasswordless opts then readPassword opts else pure (Right "")
+    case chosen of
+        Left err -> failWith err
+        Right plain -> do
+            encoded <- if T.null plain then pure "" else hashPassword plain
+            let request = A.object ["mode" A..= mode, "user" A..= maybe "root" id (optUser opts), "password_hash" A..= encoded, "types" A..= preinstalledTypes]
+            reply <- maintainStorage path (BL.toStrict (A.encode request))
+            case reply of
+                Left err -> failWith err
+                Right value -> BL.putStrLn (BL.fromStrict value)
 
--- | 看应答：system 就是成功，其余按错误处理
-report :: Either String BS.ByteString -> IO ()
-report (Left err) = failWith ("cannot talk to the storage library: " ++ err)
-report (Right raw) = case A.eitherDecodeStrict raw of
-    Right (A.Object fields)
-        | KM.lookup "status" fields == Just (A.String "system") ->
-            putStrLn "system catalog: ready"
-        | otherwise ->
-            failWith ("bootstrap failed: " ++ message fields)
-    Right _ -> failWith ("unexpected reply from the storage library: " ++ show raw)
-    Left err -> failWith ("the storage library answered something that is not JSON: " ++ err)
-  where
-    -- | 取错误文本
-    message fields = case KM.lookup "message" fields of
-        Just (A.String text) -> T.unpack text
-        _ -> show raw
+-- | 通过存储链路发送引导请求
+send :: A.Value -> IO (Either String A.Value)
+send request = do
+    reply <- sendRawRequest (BL.toStrict (A.encode request))
+    pure (reply >>= A.eitherDecodeStrict)
 
 -- | 读口令：stdin 一行，空行等于不设口令
 readPassword :: Options -> IO (Either String Text)

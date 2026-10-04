@@ -8,5 +8,6 @@ packages:
     - ../chusql-core/engine
     - ../chusql-server
     - ../chusql-web
+    - ../chusql-bootstrap
     - ../chusql-core/model
     - ../chusql-interface

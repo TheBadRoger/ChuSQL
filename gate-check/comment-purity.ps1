@@ -3,13 +3,13 @@
 param([string]$Root = (Split-Path -Parent $PSScriptRoot))
 
 Set-Location $Root
-$dirs = @('chusql-core','chusql-server','chusql-web','chusql-cli','chusql-bootstrap','chusql-interface','chusql-benchmark','scripts','gate-check')
+$dirs = @('chusql-core','chusql-server','chusql-web','chusql-cli','chusql-bootstrap','chusql-interface','benchmark','scripts','gate-check')
 $files = @()
 foreach ($d in $dirs) {
     $p = Join-Path $Root $d
     if (Test-Path -LiteralPath $p) {
         $files += Get-ChildItem -LiteralPath $p -Recurse -File -Include *.hs,*.rs,*.js,*.css,*.html,*.ps1,*.sh |
-            Where-Object { $_.FullName -notmatch '\\\.stack-work\\|\\dist-newstyle\\|\\target\\|\\node_modules\\|\\localdata\\|\\logs\\|\\tmp\\' }
+            Where-Object { $_.FullName -notmatch '\\\.stack-work\\|\\dist-newstyle\\|\\target\\|\\node_modules\\|\\logs\\|\\tmp\\' }
     }
 }
 $files = $files | Sort-Object FullName

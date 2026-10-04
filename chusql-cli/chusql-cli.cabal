@@ -2,21 +2,25 @@ cabal-version: 2.4
 
 name:           chusql-cli
 version:        1.0.0
-synopsis:       ChuSQL 命令行客户端：直连数据库服务，与 Web 管理端共用账号
-description:    ChuSQL 的命令行前端。自己不开存储、不链引擎，所有 SQL 与会话
-                 都走 chusql-server 的 TCP 端点；账号表与权限服务与 Web 管理端完全共用。
+synopsis:       ChuSQL command-line client for the database server
+description:    Provides a command-line interface for SQL and database sessions
+                through the chusql-server TCP endpoint. Shares accounts and
+                permissions with the web interface while keeping query execution
+                and storage in the database server process.
 build-type:     Simple
 
 library
     hs-source-dirs:   src
     exposed-modules:  ChuSQL.CLI.Format
+                      ChuSQL.CLI.History
+                      ChuSQL.CLI.Password
                       ChuSQL.CLI.Script
-                      ChuSQL.CLI.Session
     build-depends:    base >= 4.14 && < 5
                     , aeson
                     , bytestring
                     , chusql-core-model
                     , chusql-interface
+                    , haskeline
                     , text
     default-language: Haskell2010
     ghc-options:      -Wall
@@ -48,11 +52,13 @@ test-suite chusql-cli-test
     main-is:          Spec.hs
     hs-source-dirs:   test
     build-depends:    base
+                    , directory
                     , aeson
                     , bytestring
                     , chusql-cli
                     , chusql-core-model
                     , hspec
+                    , haskeline
                     , text
     default-language: Haskell2010
     ghc-options:      -Wall

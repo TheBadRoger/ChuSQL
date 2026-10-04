@@ -135,27 +135,33 @@ filterPairsM ::
     [Row] ->
     [Row] ->
     m (Either String [Row])
-filterPairsM db outer kind ncols cond lrows rrows = go lrows []
+filterPairsM db outer kind ncols cond lrows rrows = go lrows [] HM.empty
   where
+    refs = subqueryRefsIn cond
     -- | 逐左行配对，左连接没配上就补 NULL
-    go [] acc = pure (Right (reverse acc))
-    go (l : ls) acc = do
-        hits <- keep l rrows []
+    go [] acc _ = pure (Right (reverse acc))
+    go (l : ls) acc cache = do
+        hits <- keep l rrows [] cache
         case hits of
             Left e -> pure (Left e)
-            Right hs -> do
+            Right (hs, nextCache) -> do
                 let hs' = case (kind, hs) of
                         (LeftJoin, []) -> [l ++ nullRow]
                         _ -> hs
-                go ls (reverse hs' ++ acc)
+                go ls (reverse hs' ++ acc) nextCache
     -- | 拿一行右行去比条件
-    keep _ [] acc = pure (Right (reverse acc))
-    keep l (r : rs) acc = do
-        ok <- evalCondForRowM db cond (l ++ r ++ outer)
-        case ok of
+    keep _ [] acc cache = pure (Right (reverse acc, cache))
+    keep l (r : rs) acc cache = do
+        let env = l ++ r ++ outer
+            key = bindingKey refs env
+        resolved <- case HM.lookup key cache of
+            Just expression -> pure (Right expression)
+            Nothing -> substSubqueries db cond env
+        case resolved of
             Left e -> pure (Left e)
-            Right True -> keep l rs ((l ++ r) : acc)
-            Right False -> keep l rs acc
+            Right expression -> case evalCondForRow expression env of
+                Left e -> pure (Left e)
+                Right matches -> keep l rs (if matches then (l ++ r) : acc else acc) (HM.insert key expression cache)
     nullRow = [(c, VNull) | c <- ncols]
 
 -- | 索引连接：右表是裸 Scan 时逐左行点查
@@ -197,6 +203,7 @@ floatType :: ColumnType -> Bool
 floatType CFloat = True
 floatType CDouble = True
 floatType (CDecimal _ _) = True
+floatType (CDomain _ base) = floatType base
 floatType _ = False
 
 -- | 是不是浮点值
@@ -249,7 +256,14 @@ evalAggregate outer keys aggs rows = do
 
 -- | 绑定键：子查询引用的外层列在这一行上的取值
 bindingKey :: [String] -> Row -> String
-bindingKey refs env = show [(c, lookup c env) | c <- refs]
+bindingKey refs env = show [(c, bindingValue c env) | c <- refs]
+
+-- | 查已解析外层引用对应的物理列值
+bindingValue :: String -> Row -> Maybe Value
+bindingValue column env = case lookup column env of
+    Just value -> Just value
+    Nothing | '.' `elem` column -> lookup (reverse (takeWhile (/= '.') (reverse column))) [(key, value) | (key, value) <- env, '.' `notElem` key]
+    Nothing -> Nothing
 
 -- | 每个绑定留第一行当样本，去掉重复绑定
 bindingSamples :: [String] -> Row -> [Row] -> [(String, Row)]
@@ -414,7 +428,14 @@ substSubqueries db e env = case e of
 runSubqueryRows :: (MonadStorage m) => Database -> Subquery -> Row -> m (Either String [Row])
 runSubqueryRows db sq outer = case translate (subqueryStatement sq) of
     Left e -> pure (Left e)
-    Right op -> evalRelOpIn db outer (optimize db op)
+    Right op -> case mapM bind (subqueryRefs sq) of
+        Left err -> pure (Left err)
+        Right bindings -> evalRelOpIn db (bindings ++ outer) (optimize db op)
+  where
+    -- | 给外层物理列补回已解析的限定名
+    bind column = case bindingValue column outer of
+        Just value -> Right (column, value)
+        Nothing -> Left ("unknown outer column: " ++ column)
 
 -- | 单子求值：Scan/点查/范围查都问存储
 evalRelOpM :: (MonadStorage m) => Database -> RelOp -> m (Either String [Row])

@@ -3,8 +3,9 @@
 module Main (main) where
 
 import ChuSQL.CLI.Format (OutputFormat (..), formatName, parseFormat)
+import ChuSQL.CLI.Password (readPasswordInput)
 import ChuSQL.CLI.Script (stripTerminator)
-import ChuSQL.CLI.Session (
+import ChuSQL.Interface.Session (
     Session,
     authenticateSession,
     isPlainIdentifier,
@@ -13,7 +14,6 @@ import ChuSQL.CLI.Session (
  )
 import ChuSQL.Interface.Config (ServerConfig (..), loadServerConfigAt, loadWebConfigAt, rootUserName)
 import ChuSQL.Interface.Link (Client, closeClient, connectClient)
-import ChuSQL.Interface.Settings (readSettingsFile)
 import ChuSQL.Interface.TOML (resolveConfigPath)
 import Control.Exception (finally)
 import Control.Monad (unless)
@@ -27,7 +27,7 @@ import System.Console.Haskeline (defaultSettings, getPassword, runInputT)
 import System.Directory (getHomeDirectory)
 import System.Exit (exitFailure)
 import System.FilePath ((</>))
-import System.IO (hSetEncoding, stderr, stdout, utf8)
+import System.IO (hFlush, hIsTerminalDevice, hPutStr, hSetEncoding, stderr, stdin, stdout, utf8)
 
 -- chusql-cli：与 Web 管理端并列的前端，接到拥有存储的 server 上跑 SQL，账号与 Web 共用。
 
@@ -44,7 +44,7 @@ data Options = Options
 optionsParser :: Parser Options
 optionsParser =
     Options
-        <$> optional (T.pack <$> strOption (long "user" <> short 'u' <> metavar "USER" <> help "Sign in as this account (default: the configured administrator)"))
+        <$> optional (T.pack <$> strOption (long "user" <> short 'u' <> metavar "USER" <> help "Sign in as this account (default: root)"))
         <*> ( T.pack
                 <$> strOption
                     ( long "database"
@@ -65,7 +65,7 @@ optionsParser =
             )
         <*> optional (T.pack <$> strOption (long "execute" <> short 'e' <> metavar "SQL" <> help "Run one statement and exit"))
         <*> optional (strOption (long "history" <> metavar "FILE" <> help "SQL history file (default ~/.chusql_history)"))
-        <*> optional (strOption (long "config" <> metavar "FILE" <> help "Config file to read (default: the fixed chusql.toml under the system config directory)"))
+        <*> optional (strOption (long "config" <> metavar "FILE" <> help "Config file to read (default: the fixed settings.toml under the system config directory)"))
 
 -- | 把 --format 的取值解析成格式
 formatReader :: String -> Either String OutputFormat
@@ -89,9 +89,8 @@ main = do
     options <- execParser parserInfo
     configPath <- resolveConfigPath (optConfig options)
     base <- loadWebConfigAt configPath
-    saved <- readSettingsFile configPath
     config <- loadServerConfigAt configPath
-    let rootName = rootUserName base saved
+    let rootName = rootUserName base
         userName = fromMaybe rootName (optUser options)
     password <- promptPassword userName
     connected <- connectClient (T.pack (scHost config)) (scPort config)
@@ -139,8 +138,15 @@ selectDatabase session wanted
 -- | 交互式读取口令；直接回车表示空口令
 promptPassword :: Text -> IO Text
 promptPassword user = do
-    entered <- runInputT defaultSettings (getPassword (Just '*') (T.unpack user <> "'s password: "))
-    pure (maybe "" T.pack entered)
+    terminal <- hIsTerminalDevice stdin
+    if terminal
+        then do
+            entered <- runInputT defaultSettings (getPassword (Just '*') (T.unpack user <> "'s password: "))
+            pure (maybe "" T.pack entered)
+        else do
+            hPutStr stderr (T.unpack user <> "'s password: ")
+            hFlush stderr
+            readPasswordInput stdin
 
 -- | 取历史文件路径，没给就用默认
 resolveHistory :: Maybe FilePath -> IO (Maybe FilePath)

@@ -10,6 +10,433 @@ thread_local! {
     static CURRENT: RefCell<Option<Arc<Storage>>> = const { RefCell::new(None) };
 }
 
+/// 定点写入检查舍入和整批原子拒绝
+#[test]
+fn decimal_writes_enforce_precision_before_wal() -> Result<(), Box<dyn std::error::Error>> {
+    let (_server, data) = start_server();
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"create_table","table":"amounts","columns":[{"name":"id","ty":"int"},{"name":"value","ty":"decimal(4,2)"}]}))?;
+    request_ok(&mut c, serde_json::json!({"method":"insert","table":"amounts","row":{"id":1,"value":99.994}}))?;
+    let snapshot = send(&mut c, r#"{"method":"scan","table":"amounts"}"#);
+    let rows: serde_json::Value = serde_json::from_str(&snapshot)?;
+    assert_eq!(rows["rows"][0]["value"], serde_json::json!(99.99));
+    let checkpoint = std::fs::read(data.path().join("databases/main/wal.checkpoint"))?;
+    for value in [99.995, -99.995, 100.0] {
+        let response = send(&mut c, &serde_json::json!({"method":"insert_batch","table":"amounts","rows":[{"id":2,"value":1.2},{"id":3,"value":value}]}).to_string());
+        assert!(response.contains("exceeds precision"), "{response}");
+        let remaining: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"scan","table":"amounts"}"#))?;
+        assert_eq!(remaining, rows);
+        assert_eq!(std::fs::read(data.path().join("databases/main/wal.checkpoint"))?, checkpoint);
+    }
+    let invalid = send(&mut c, &serde_json::json!({"method":"create_table","table":"invalid","columns":[{"name":"value","ty":"decimal(2,3)"}]}).to_string());
+    assert!(invalid.contains("invalid decimal"), "{invalid}");
+    Ok(())
+}
+
+/// 检查点失败封闭请求并在重启恢复
+#[test]
+fn checkpoint_failure_requires_recovery_and_preserves_committed_rows() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, data) = start_server();
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"create_table","table":"checkpointed","columns":[{"name":"id","ty":"int"}]}))?;
+    let pending = data.path().join("databases/main/wal.checkpoint.pending");
+    std::fs::create_dir(&pending)?;
+    let failed = send(&mut c, r#"{"method":"insert","table":"checkpointed","row":{"id":1}}"#);
+    assert!(failed.contains("error"), "{failed}");
+    assert!(send(&mut c, r#"{"method":"scan","table":"checkpointed"}"#).contains("recovery required"));
+    assert!(std::fs::metadata(data.path().join("databases/main/wal.log"))?.len() > 0);
+    drop(c);
+    drop(server);
+    std::fs::remove_dir(pending)?;
+    let _restarted = restart_at(data.path())?;
+    let mut c = connect()?;
+    let rows: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"scan","table":"checkpointed"}"#))?;
+    assert_eq!(rows["rows"], serde_json::json!([{"id":1}]));
+    Ok(())
+}
+
+/// 应用失败封闭读写并重放完整提交组
+#[test]
+fn committed_apply_failures_require_recovery() -> Result<(), Box<dyn std::error::Error>> {
+    for operation in [
+        serde_json::json!({"method":"create_table","table":"created","columns":[{"name":"id","ty":"int"}]}),
+        serde_json::json!({"method":"replace_all","table":"items","rows":[{"id":2}]}),
+        serde_json::json!({"method":"apply_transaction","ops":[{"op":"delete","table":"items","ids":[1]},{"op":"replace","table":"items","rows":[{"id":2}]}]}),
+    ] {
+        let (server, data) = start_server();
+        let mut c = connect()?;
+        request_ok(&mut c, serde_json::json!({"method":"create_table","table":"items","columns":[{"name":"id","ty":"int"}]}))?;
+        request_ok(&mut c, serde_json::json!({"method":"insert","table":"items","row":{"id":1}}))?;
+        let directory = data.path().join("databases/main");
+        let checkpoint = std::fs::read(directory.join("wal.checkpoint"))?;
+        let pending = directory.join("catalog.json.pending");
+        std::fs::create_dir(&pending)?;
+        let failed = send(&mut c, &operation.to_string());
+        assert!(failed.contains("error"), "{operation}: {failed}");
+        for request in [
+            r#"{"method":"scan","table":"items"}"#,
+            r#"{"method":"insert","table":"items","row":{"id":3}}"#,
+        ] {
+            let blocked = send(&mut c, request);
+            assert!(blocked.contains("recovery required"), "{blocked}");
+        }
+        assert_eq!(std::fs::read(directory.join("wal.checkpoint"))?, checkpoint);
+        assert!(std::fs::metadata(directory.join("wal.log"))?.len() > 0);
+        drop(c);
+        drop(server);
+        std::fs::remove_dir(pending)?;
+        let restarted = restart_at(data.path())?;
+        let mut c = connect()?;
+        let table = if operation["method"] == "create_table" { "created" } else { "items" };
+        let result: serde_json::Value = serde_json::from_str(&send(&mut c, &serde_json::json!({"method":"scan","table":table}).to_string()))?;
+        let expected = if table == "created" { serde_json::json!([]) } else { serde_json::json!([{"id":2}]) };
+        assert_eq!(result["rows"], expected, "{operation}");
+        assert_eq!(std::fs::metadata(directory.join("wal.log"))?.len(), 0);
+        drop(c);
+        drop(restarted);
+    }
+    Ok(())
+}
+
+/// 首帧撕裂恢复后新日志仍可重放
+#[test]
+fn torn_first_frame_is_removed_before_new_writes() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, data) = start_server();
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"create_table","table":"torn","columns":[{"name":"id","ty":"int"}]}))?;
+    drop(c);
+    drop(server);
+    std::fs::write(data.path().join("databases/main/wal.log"), [20, 0, 0, 0, 1])?;
+    let restarted = restart_at(data.path())?;
+    assert_eq!(std::fs::metadata(data.path().join("databases/main/wal.log"))?.len(), 0);
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"insert","table":"torn","row":{"id":1}}))?;
+    drop(c);
+    drop(restarted);
+    let _again = restart_at(data.path())?;
+    let mut c = connect()?;
+    let rows: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"scan","table":"torn"}"#))?;
+    assert_eq!(rows["rows"], serde_json::json!([{"id":1}]));
+    Ok(())
+}
+
+/// 校验预装类型幂等与冲突保护
+#[test]
+fn preinstalled_types_are_idempotent_hidden_and_conflict_safe() -> Result<(), Box<dyn std::error::Error>> {
+    let (_server, data) = start_server();
+    let mut c = connect()?;
+    let premature = send(&mut c, &type_seed_request().to_string());
+    assert!(premature.contains("login superuser"), "{premature}");
+    send(&mut c, r#"{"method":"bootstrap_system","user":"root","password_hash":"original-hash"}"#);
+    let accounts = send(&mut c, r#"{"method":"accounts_list"}"#);
+    let request = type_seed_request();
+    let seeded: serde_json::Value = serde_json::from_str(&send(&mut c, &request.to_string()))?;
+    assert_eq!(seeded["status"], "rows", "{seeded}");
+    assert_eq!(seeded["rows"].as_array().map(Vec::len), Some(2));
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&send(&mut c, &request.to_string()))?, seeded);
+    let mut conflict = request;
+    conflict["types"][1]["base_type"] = "int".into();
+    let rejected = send(&mut c, &conflict.to_string());
+    assert!(rejected.contains("definition conflict: text"), "{rejected}");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&send(&mut c, &type_seed_request().to_string()))?, seeded);
+    assert_eq!(send(&mut c, r#"{"method":"accounts_list"}"#), accounts);
+    let catalog: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(data.path().join("system/catalog.json"))?)?;
+    assert_eq!(catalog["tables"]["__system_types"]["system"], true);
+    assert_eq!(catalog["tables"]["__system_types"]["row_count"], 2);
+    let denied = send(&mut c, r#"{"method":"scan","database":"system","table":"__system_types"}"#);
+    assert!(denied.contains("reserved system table"), "{denied}");
+    Ok(())
+}
+
+/// 类型预装失败保留日志并在重启后恢复
+#[test]
+fn preinstalled_types_recover_after_catalog_write_failure() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, data) = start_server();
+    let mut c = connect()?;
+    send(&mut c, r#"{"method":"bootstrap_system","user":"root","password_hash":"hash"}"#);
+    std::fs::create_dir(data.path().join("system/catalog.json.pending"))?;
+    let failed = send(&mut c, &type_seed_request().to_string());
+    assert!(failed.contains("error"), "{failed}");
+    assert!(std::fs::metadata(data.path().join("system/wal.log"))?.len() > 0);
+    assert!(send(&mut c, &type_seed_request().to_string()).contains("recovery required"));
+    drop(c);
+    drop(server);
+    std::fs::remove_dir(data.path().join("system/catalog.json.pending"))?;
+    let _restarted = restart_at(data.path())?;
+    let mut c = connect()?;
+    let restored: serde_json::Value = serde_json::from_str(&send(&mut c, &type_seed_request().to_string()))?;
+    assert_eq!(restored["rows"].as_array().map(Vec::len), Some(2), "{restored}");
+    Ok(())
+}
+
+/// 类型目录不覆盖未登记的现有文件
+#[test]
+fn preinstalled_types_reject_reserved_file_collision() -> Result<(), Box<dyn std::error::Error>> {
+    let (_server, data) = start_server();
+    let mut c = connect()?;
+    send(&mut c, r#"{"method":"bootstrap_system","user":"root","password_hash":"hash"}"#);
+    let path = data.path().join("system/__system_types.db");
+    std::fs::write(&path, b"preserved")?;
+    let rejected = send(&mut c, &type_seed_request().to_string());
+    assert!(rejected.contains("reserved type file collision"), "{rejected}");
+    assert_eq!(std::fs::read(path)?, b"preserved");
+    Ok(())
+}
+
+/// 生成两项预装类型定义
+fn type_seed_request() -> serde_json::Value {
+    serde_json::json!({"method":"bootstrap_types","types":[
+        {"name":"int","base_type":"int","parameterized":false},
+        {"name":"text","base_type":"str","parameterized":false}
+    ]})
+}
+
+/// 引导保留已用身份编号
+#[test]
+fn bootstrap_respects_previous_identity_ids() -> Result<(), Box<dyn std::error::Error>> {
+    let (_server, _data) = start_server();
+    let mut c = connect()?;
+    send(&mut c, r#"{"method":"account_create","user":"alice","password_hash":"hash"}"#);
+    let deleted: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"account_drop","user":"alice"}"#))?;
+    assert_eq!(deleted["accounts"], serde_json::json!([]));
+    send(&mut c, r#"{"method":"bootstrap_system","user":"root","password_hash":"hash"}"#);
+    let seeded: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"accounts_list"}"#))?;
+    assert_eq!(seeded["accounts"][0]["id"], 2);
+    Ok(())
+}
+
+/// 旧账号日志迁移只提升初始管理员
+#[test]
+fn legacy_account_wal_migrates_without_promoting_other_names() -> Result<(), Box<dyn std::error::Error>> {
+    use chusql_core_storage::wal::Wal;
+    let (server, data) = start_server();
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"create_table","database":"system","table":"__system_roles","columns":[{"name":"name","ty":"str"}]}))?;
+    request_ok(&mut c, serde_json::json!({"method":"insert","database":"system","table":"__system_roles","row":{"name":"reader"}}))?;
+    drop(c);
+    drop(server);
+    let path = data.path().join("system/wal.log");
+    let lsn = Wal::new(&path).read_checkpoint()?.unwrap_or(0) + 1;
+    let legacy = serde_json::json!([
+        {"id":7,"user":"owner","password_hash":"owner-hash","revision":3,"registered_at":"2020-01-01 00:00:00","last_login_at":null},
+        {"id":9,"user":"alice","password_hash":"alice-hash","revision":2,"registered_at":"2020-01-02 00:00:00","last_login_at":null}
+    ]);
+    let table = b"__system_users";
+    let mut body = lsn.to_le_bytes().to_vec();
+    body.push(6);
+    body.extend_from_slice(&(table.len() as u16).to_le_bytes());
+    body.extend_from_slice(table);
+    body.extend_from_slice(&serde_json::to_vec(&legacy)?);
+    let mut frame = (body.len() as u32).to_le_bytes().to_vec();
+    frame.extend_from_slice(&body);
+    std::fs::write(&path, frame)?;
+    let _restarted = restart_at(data.path())?;
+    let mut c = connect()?;
+    let wrong = send(&mut c, r#"{"method":"identity_initialize","administrator":"missing"}"#);
+    assert!(wrong.contains("last enabled login superuser"), "{wrong}");
+    let migrated: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"identity_initialize","administrator":"owner"}"#))?;
+    assert_eq!(migrated["status"], "accounts", "{migrated}");
+    assert_eq!(migrated["accounts"][0]["id"], 7);
+    assert_eq!(migrated["accounts"][0]["is_superuser"], true);
+    assert_eq!(migrated["accounts"][0]["password_hash"], "owner-hash");
+    assert_eq!(migrated["accounts"][1]["is_superuser"], false);
+    assert_eq!(migrated["accounts"][2]["user"], "reader");
+    assert_eq!(migrated["accounts"][2]["id"], 10);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&send(&mut c, r#"{"method":"identity_initialize","administrator":"alice"}"#))?, migrated);
+    Ok(())
+}
+
+/// 身份属性重启保留且禁止删除最后管理员
+#[test]
+fn identity_attributes_survive_restart_and_protect_superuser() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, data) = start_server();
+    let mut c = connect()?;
+    send(&mut c, r#"{"method":"bootstrap_system","user":"root","password_hash":"hash"}"#);
+    let created: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"role_create","user":"Reader"}"#))?;
+    assert_eq!(created["status"], "accounts", "{created}");
+    assert_eq!(created["accounts"][1]["can_login"], false);
+    assert_eq!(created["accounts"][1]["enabled"], true);
+    for change in [serde_json::json!({"enabled":false}), serde_json::json!({"can_login":false}), serde_json::json!({"is_superuser":false})] {
+        let mut request = change;
+        request["method"] = "identity_alter".into();
+        request["user"] = "root".into();
+        let denied = send(&mut c, &request.to_string());
+        assert!(denied.contains("last enabled login superuser"), "{denied}");
+    }
+    let collision = send(&mut c, r#"{"method":"account_create","user":"READER","password_hash":"hash"}"#);
+    assert!(collision.contains("already exists"), "{collision}");
+    let changed: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"identity_alter","user":"reader","can_login":true,"is_superuser":true}"#))?;
+    assert_eq!(changed["accounts"][1]["revision"], 2);
+    drop(c);
+    drop(server);
+    let _restarted = restart_at(data.path())?;
+    let mut c = connect()?;
+    let restored: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"accounts_list"}"#))?;
+    assert_eq!(restored, changed);
+    let denied = send(&mut c, r#"{"method":"scan","database":"system","table":"__system_identities"}"#);
+    assert!(denied.contains("reserved system table"), "{denied}");
+    Ok(())
+}
+
+/// 旧角色迁移与重名拒绝不破坏原数据
+#[test]
+fn identity_migration_preserves_roles_and_rejects_collisions() -> Result<(), Box<dyn std::error::Error>> {
+    let (_server, _data) = start_server();
+    let mut c = connect()?;
+    send(&mut c, r#"{"method":"bootstrap_system","user":"root","password_hash":"hash"}"#);
+    request_ok(&mut c, serde_json::json!({"method":"create_table","database":"system","table":"__system_roles","columns":[{"name":"name","ty":"str"}]}))?;
+    request_ok(&mut c, serde_json::json!({"method":"insert","database":"system","table":"__system_roles","row":{"name":"root"}}))?;
+    let before = send(&mut c, r#"{"method":"accounts_list"}"#);
+    let rejected = send(&mut c, r#"{"method":"identity_initialize","administrator":"root"}"#);
+    assert!(rejected.contains("identity name collision: root"), "{rejected}");
+    assert_eq!(send(&mut c, r#"{"method":"accounts_list"}"#), before);
+    request_ok(&mut c, serde_json::json!({"method":"replace_all","database":"system","table":"__system_roles","rows":[{"name":"reader"}]}))?;
+    let migrated: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"identity_initialize","administrator":"root"}"#))?;
+    assert_eq!(migrated["accounts"][1]["user"], "reader");
+    assert_eq!(migrated["accounts"][1]["can_login"], false);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&send(&mut c, r#"{"method":"identity_initialize","administrator":"reader"}"#))?, migrated);
+    Ok(())
+}
+
+/// 删除身份清理授权并在恢复后保留编号上界
+#[test]
+fn identity_drop_cleanup_replays_without_reusing_ids() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, data) = start_server();
+    let mut c = connect()?;
+    send(&mut c, r#"{"method":"bootstrap_system","user":"root","password_hash":"hash"}"#);
+    send(&mut c, r#"{"method":"role_create","user":"reader"}"#);
+    for table in ["__system_grants", "__system_grant_options", "__system_members"] {
+        request_ok(&mut c, serde_json::json!({"method":"create_table","database":"system","table":table,"columns":[{"name":"role","ty":"str"},{"name":"member","ty":"str"}]}))?;
+        request_ok(&mut c, serde_json::json!({"method":"insert","database":"system","table":table,"row":{"role":"reader","member":"root"}}))?;
+    }
+    std::fs::create_dir(data.path().join("system/catalog.json.pending"))?;
+    let failed = send(&mut c, r#"{"method":"account_drop","user":"reader"}"#);
+    assert!(failed.contains("error"), "{failed}");
+    drop(c);
+    drop(server);
+    std::fs::remove_dir(data.path().join("system/catalog.json.pending"))?;
+    let _restarted = restart_at(data.path())?;
+    let mut c = connect()?;
+    for table in ["__system_grants", "__system_grant_options", "__system_members"] {
+        let rows: serde_json::Value = serde_json::from_str(&send(&mut c, &serde_json::json!({"method":"scan","database":"system","table":table}).to_string()))?;
+        assert_eq!(rows["rows"], serde_json::json!([]));
+    }
+    let recreated: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"role_create","user":"reader"}"#))?;
+    assert_eq!(recreated["accounts"][1]["id"], 3);
+    Ok(())
+}
+
+/// 命名类型引用与删除依赖在写入时校验
+#[test]
+fn domain_dependencies_are_checked_before_wal() -> Result<(), Box<dyn std::error::Error>> {
+    let (_srv, _data) = start_server();
+    let mut connection = connect()?;
+    let columns = serde_json::json!([{"name":"code","ty":"domain(code,int)"}]);
+    let missing = serde_json::json!({"method":"create_table","table":"typed","columns":columns});
+    let response: serde_json::Value = serde_json::from_str(&send(&mut connection, &missing.to_string()))?;
+    assert_eq!(response["status"], "error");
+    request_ok(&mut connection, serde_json::json!({"method":"create_table","table":"__system_domain_code","columns":[{"name":"base","ty":"int"}]}))?;
+    let forged = serde_json::json!({"method":"create_table","table":"forged","columns":[{"name":"code","ty":"domain(code,str)"}]});
+    let response: serde_json::Value = serde_json::from_str(&send(&mut connection, &forged.to_string()))?;
+    assert_eq!(response["status"], "error");
+    request_ok(&mut connection, missing)?;
+    let response: serde_json::Value = serde_json::from_str(&send(&mut connection, r#"{"method":"drop_table","table":"__system_domain_code"}"#))?;
+    assert_eq!(response["status"], "error");
+    request_ok(&mut connection, serde_json::json!({"method":"drop_table","table":"typed"}))?;
+    request_ok(&mut connection, serde_json::json!({"method":"drop_table","table":"__system_domain_code"}))?;
+    let response: serde_json::Value = serde_json::from_str(&send(&mut connection, r#"{"method":"create_table","table":"stale","columns":[{"name":"code","ty":"domain(code,int)"}]}"#))?;
+    assert_eq!(response["status"], "error");
+    Ok(())
+}
+
+/// 嵌套类型依赖与重启持久化
+#[test]
+fn nested_domains_preserve_dependencies_across_restart() -> Result<(), Box<dyn std::error::Error>> {
+    let (_srv, data) = start_server();
+    let mut connection = connect()?;
+    request_ok(&mut connection, serde_json::json!({"method":"create_table","table":"__system_domain_root","columns":[{"name":"base","ty":"int"}]}))?;
+    request_ok(&mut connection, serde_json::json!({"method":"create_table","table":"__system_domain_child","columns":[{"name":"base","ty":"domain(root,int)"}]}))?;
+    let rejected: serde_json::Value = serde_json::from_str(&send(&mut connection, r#"{"method":"drop_table","table":"__system_domain_root"}"#))?;
+    assert_eq!(rejected["status"], "error");
+    request_ok(&mut connection, serde_json::json!({"method":"create_table","table":"typed","columns":[{"name":"id","ty":"domain(child,domain(root,int))"}]}))?;
+    let forged: serde_json::Value = serde_json::from_str(&send(&mut connection, r#"{"method":"create_table","table":"forged","columns":[{"name":"id","ty":"domain(child,domain(root,str))"}]}"#))?;
+    assert_eq!(forged["status"], "error");
+    drop(connection);
+    CURRENT.with(|c| *c.borrow_mut() = None);
+    drop(_srv);
+    let _reopened = start_server_in(data.path());
+    let mut connection = connect()?;
+    let schema: serde_json::Value = serde_json::from_str(&send(&mut connection, r#"{"method":"describe_table","table":"typed"}"#))?;
+    assert_eq!(schema["status"], "schema");
+    assert_eq!(schema["columns"][0]["ty"], "domain(child,domain(root,int))");
+    request_ok(&mut connection, serde_json::json!({"method":"drop_table","table":"typed"}))?;
+    request_ok(&mut connection, serde_json::json!({"method":"drop_table","table":"__system_domain_child"}))?;
+    request_ok(&mut connection, serde_json::json!({"method":"drop_table","table":"__system_domain_root"}))?;
+    Ok(())
+}
+
+/// 重置与结构修复保留业务文件及系统数据
+#[test]
+fn offline_maintenance_preserves_data_and_rejects_live_storage() -> Result<(), Box<dyn std::error::Error>> {
+    let data = tempfile::tempdir()?;
+    let config = write_config(data.path());
+    let business = data.path().join("databases/business");
+    std::fs::create_dir_all(&business)?;
+    std::fs::write(business.join("sentinel"), b"business data")?;
+    let types = type_seed_request()["types"].clone();
+    let request = serde_json::json!({"mode":"reset","user":"root","password_hash":"original-hash","types":types});
+    Storage::maintenance(config.to_str(), &request.to_string())?;
+    let system = data.path().join("system");
+    let credentials = std::fs::read(system.join("__system_users.db"))?;
+    let mut catalog: serde_json::Value = serde_json::from_slice(&std::fs::read(system.join("catalog.json"))?)?;
+    catalog["tables"]["__system_identities"]["columns"] = serde_json::json!([]);
+    std::fs::write(system.join("catalog.json"), serde_json::to_vec(&catalog)?)?;
+    let repair = serde_json::json!({"mode":"repair","types":types});
+    Storage::maintenance(config.to_str(), &repair.to_string())?;
+    assert_eq!(std::fs::read(system.join("__system_users.db"))?, credentials);
+    assert_eq!(std::fs::read(business.join("sentinel"))?, b"business data");
+    let opened = Storage::open(config.to_str())?;
+    assert!(Storage::maintenance(config.to_str(), &request.to_string()).unwrap_err().contains("data directory is in use"));
+    drop(opened);
+    std::fs::remove_file(system.join("__system_users.db"))?;
+    let before = std::fs::read(system.join("catalog.json"))?;
+    let failure = Storage::maintenance(config.to_str(), &repair.to_string()).unwrap_err();
+    assert!(failure.contains("repair would require"));
+    assert_eq!(std::fs::read(system.join("catalog.json"))?, before);
+    assert!(!system.join("__system_users.db").exists());
+    Ok(())
+}
+
+/// 从账号 WAL 恢复缺失凭据文件
+#[test]
+fn offline_recovery_replays_account_wal() -> Result<(), Box<dyn std::error::Error>> {
+    let data = tempfile::tempdir()?;
+    let config = write_config(data.path());
+    let types = type_seed_request()["types"].clone();
+    Storage::maintenance(config.to_str(), &serde_json::json!({"mode":"reset","user":"root","password_hash":"original-hash","types":types}).to_string())?;
+    let storage = Storage::open(config.to_str())?;
+    let accounts: serde_json::Value = serde_json::from_str(&storage.request_line(r#"{"method":"accounts_list"}"#))?;
+    let saved = serde_json::from_value(accounts["accounts"].clone())?;
+    drop(storage);
+    let system = data.path().join("system");
+    let wal = chusql_core_storage::wal::Wal::new(system.join("wal.log"));
+    wal.append(&chusql_core_storage::wal::WalOp::Accounts { accounts: saved, removed: Vec::new(), migrate_roles: false })?;
+    wal.append(&chusql_core_storage::wal::WalOp::Commit)?;
+    drop(wal);
+    std::fs::remove_file(system.join("__system_users.db"))?;
+    Storage::maintenance(config.to_str(), &serde_json::json!({"mode":"recover","types":types}).to_string())?;
+    let storage = Storage::open(config.to_str())?;
+    let restored: serde_json::Value = serde_json::from_str(&storage.request_line(r#"{"method":"accounts_list"}"#))?;
+    assert_eq!(restored["accounts"], accounts["accounts"]);
+    drop(storage);
+    std::fs::write(system.join("catalog.json"), b"corrupted catalog")?;
+    Storage::maintenance(config.to_str(), &serde_json::json!({"mode":"recover","types":types}).to_string())?;
+    let storage = Storage::open(config.to_str())?;
+    let reconstructed: serde_json::Value = serde_json::from_str(&storage.request_line(r#"{"method":"accounts_list"}"#))?;
+    assert_eq!(reconstructed["accounts"], accounts["accounts"]);
+    Ok(())
+}
+
 /// 一次会话就是当前线程的存储句柄
 struct Conn(Arc<Storage>);
 
@@ -800,7 +1227,7 @@ fn account_snapshot_replays_twice_without_duplicating_accounts() -> Result<(), B
     for _ in 0..2 {
         let wal = Wal::new(data.path().join("system/wal.log"));
         wal.truncate()?;
-        wal.append(&WalOp::Accounts { accounts: accounts.clone() })?;
+        wal.append(&WalOp::Accounts { accounts: accounts.clone(), removed: Vec::new(), migrate_roles: false })?;
         drop(wal);
         std::fs::write(data.path().join("system/__system_users.idx"), b"torn index")?;
         std::fs::write(data.path().join("system/__system_users.db"), b"torn heap")?;
@@ -1595,7 +2022,7 @@ fn stats_report_distinct_values() {
     send(&mut c, r#"{"method":"delete_keys","table":"stat_t","keys":[1]}"#);
     let r = send(&mut c, r#"{"method":"describe_table","table":"stat_t"}"#);
     assert!(r.contains(r#""row_count":2"#), "after delete: {}", r);
-    assert!(r.contains(r#""name":"age","distinct":1"#), "after delete: {}", r);
+    assert!(r.contains(r#""name":"age","distinct":2"#), "remaining ages are still 30 and 41: {}", r);
 }
 
 /// 重开服务后索引仍在
@@ -1832,12 +2259,14 @@ fn account_table_uses_typed_columns_and_stamps_login() -> Result<(), Box<dyn std
     assert!(account["last_login_at"].is_null(), "还没登录过: {}", account);
 
     let catalog: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(data.path().join("system/catalog.json"))?)?;
-    let entry = &catalog["tables"]["__system_users"];
+    let credential_columns = &catalog["tables"]["__system_users"]["columns"];
+    assert_eq!(credential_columns.as_array().ok_or("missing credentials")?.iter().map(|c| c["name"].as_str().unwrap_or("")).collect::<Vec<_>>(), vec!["id", "password_hash"]);
+    let entry = &catalog["tables"]["__system_identities"];
     let columns = entry["columns"].as_array().ok_or("missing columns")?;
     let names: Vec<&str> = columns.iter().map(|col| col["name"].as_str().unwrap_or("")).collect();
-    assert_eq!(names, vec!["id", "user", "password_hash", "registered_at", "last_login_at", "revision"]);
+    assert_eq!(names, vec!["id", "user", "can_login", "is_superuser", "system_catalog_manager", "enabled", "identity_version", "registered_at", "last_login_at", "revision"]);
     let types: Vec<&str> = columns.iter().map(|col| col["ty"].as_str().unwrap_or("")).collect();
-    assert_eq!(types, vec!["int", "varchar(64)", "varchar(256)", "timestamp", "timestamp", "int"]);
+    assert_eq!(types, vec!["int", "varchar(64)", "bool", "bool", "bool", "bool", "int", "timestamp", "timestamp", "int"]);
     assert_eq!(columns[0]["primary_key"], true, "id 是主键");
     assert_eq!(columns[0]["nullable"], false);
     assert_eq!(columns[1]["unique"], true, "用户名唯一");

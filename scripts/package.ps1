@@ -57,7 +57,7 @@ function Assert-Stage([string]$stage) {
         'bin\csql-bootstrap.exe',
         'static\index.html',
         'csql-web.ps1',
-        'scripts\chusql.toml',
+        'resources\settings.toml.windows',
         'install.ps1',
         'install.sh',
         'uninstall.ps1',
@@ -110,7 +110,10 @@ function Test-Installed([string]$name, [string]$comp) {
             (Join-Path $opt 'bin\chusql-server.exe'),
             (Join-Path $opt 'bin\csql-bootstrap.exe'),
             (Join-Path $data 'system\catalog.json'),
-            (Join-Path $appdata 'ChuSQL\chusql.toml')
+            (Join-Path $data 'system\__system_identities.db'),
+            (Join-Path $data 'system\__system_users.db'),
+            (Join-Path $data 'system\__system_types.db'),
+            (Join-Path $appdata 'ChuSQL\settings.toml')
         )
         $forbidden = @()
         if ($comp -eq 'web') {
@@ -130,7 +133,11 @@ function Test-Installed([string]$name, [string]$comp) {
         }
         foreach ($f in $checks) { if (-not (Test-Path $f)) { $ok = $false; Write-Host "  missing: $f" } }
         foreach ($f in $forbidden) { if (Test-Path $f) { $ok = $false; Write-Host "  should not be there: $f" } }
-        $config = Join-Path $appdata 'ChuSQL\chusql.toml'
+        $systemCatalog = Get-Content -LiteralPath (Join-Path $data 'system\catalog.json') -Raw | ConvertFrom-Json
+        if (-not $systemCatalog.tables.__system_types.system -or $systemCatalog.tables.__system_types.row_count -lt 18) {
+            Fail "$name`: preinstalled types were not initialized during installation"
+        }
+        $config = Join-Path $appdata 'ChuSQL\settings.toml'
         $expectDataDir = $data -replace '\\', '/'
         if (-not (Test-Path $config) -or -not (Select-String -Path $config -SimpleMatch "data_dir = ""$expectDataDir""" -Quiet)) {
             $ok = $false
@@ -190,7 +197,7 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 try {
     Step "Packing $name"
     if (Test-Path $stageRoot) { Remove-Item -Recurse -Force $stageRoot }
-    New-Item -ItemType Directory -Force -Path (Join-Path $stage 'bin'), (Join-Path $stage 'scripts') | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $stage 'bin'), (Join-Path $stage 'resources') | Out-Null
 
     $storage = Join-Path $repoRoot 'chusql-core\storage\target\release\chusql_core_storage.dll'
     if (-not (Test-Path $storage)) { Fail 'chusql-core\storage\target\release\chusql_core_storage.dll is not built (run without -NoBuild)' }
@@ -227,7 +234,7 @@ try {
         Where-Object { $_.Name -notlike 'chusql*' } |
         ForEach-Object { Copy-Item $_.FullName (Join-Path $stage 'bin') }
 
-    Copy-Item (Join-Path $repoRoot 'scripts\chusql.toml') (Join-Path $stage 'scripts')
+    Copy-Item (Join-Path $repoRoot 'resources\settings.toml.windows') (Join-Path $stage 'resources')
     Copy-Item (Join-Path $repoRoot 'scripts\install.ps1'), (Join-Path $repoRoot 'scripts\install.sh') $stage
     Copy-Item (Join-Path $repoRoot 'scripts\uninstall.ps1'), (Join-Path $repoRoot 'scripts\uninstall.sh') $stage
     New-Item -ItemType Directory -Force -Path (Join-Path $stage 'static') | Out-Null

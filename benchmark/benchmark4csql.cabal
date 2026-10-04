@@ -1,0 +1,25 @@
+cabal-version: 2.4
+
+name:           benchmark4csql
+version:        1.0.0
+synopsis:       End-to-end ChuSQL benchmarks over TCP
+description:    Starts a chusql-server process and benchmarks authentication,
+                ping, catalog access, and queries through the newline-delimited
+                JSON TCP protocol. Uses the TCP client and shared protocol models;
+                query execution and storage remain in the server process.
+build-type:     Simple
+
+executable benchmark4csql
+    main-is:          Main.hs
+    hs-source-dirs:   src
+    build-tool-depends: chusql-server:chusql-server
+                      , chusql-bootstrap:csql-bootstrap
+    build-depends:    base >= 4.14 && < 5
+                    , chusql-core-model
+                    , chusql-interface
+                    , directory
+                    , filepath
+                    , process
+                    , text
+    default-language: Haskell2010
+    ghc-options:      -O2 -Wall

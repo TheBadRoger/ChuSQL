@@ -1,19 +1,22 @@
-# Linux 流水线：Rust 存储 + Haskell 引擎/Web/CLI 的构建与测试。
-#
-# 这里每条命令都在 WSL Debian（cargo 1.98 / GHC 9.10.3 / stack 3.11.1）上跑通过，
-# 见仓库根 README 的「构建与测试」段。Haskell 这边链接并装入 libchusql_core_storage.so，
-# 所以 Rust 先构建，LD_LIBRARY_PATH 指向它的输出目录，Haskell 用例才能真跑而不是 pending。
-# 打包和发版资源走 .github/workflows/release.yml（tag 触发，也可手动 dispatch）。
-name: linux
+# Linux CI：构建 Rust 与 Haskell，运行各组件测试。
+name: tests
 
 on:
   push:
-    branches: [main]
   pull_request:
+  merge_group:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      phase:
+        type: string
+        default: tests
+
+permissions:
+  contents: read
 
 concurrency:
-  group: linux-${{ github.ref }}
+  group: linux-${{ inputs.phase || 'tests' }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -22,7 +25,7 @@ env:
 
 jobs:
   linux:
-    name: build + test
+    name: ${{ inputs.phase || 'tests' }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -49,10 +52,12 @@ jobs:
         run: cargo build --release
 
       - name: cargo test
+        if: inputs.phase != 'build' && inputs.phase != 'gate'
         working-directory: chusql-core/storage
         run: cargo test --release
 
       - name: cargo clippy (-D warnings)
+        if: inputs.phase != 'build' && inputs.phase != 'gate'
         working-directory: chusql-core/storage
         run: cargo clippy --all-targets -- -D warnings
 
@@ -78,6 +83,7 @@ jobs:
             chusql-server/.stack-work
             chusql-web/.stack-work
             chusql-cli/.stack-work
+            benchmark/.stack-work
           key: ${{ runner.os }}-stack-${{ hashFiles('**/stack.yaml', '**/stack.yaml.lock') }}
           restore-keys: ${{ runner.os }}-stack-
 
@@ -89,19 +95,37 @@ jobs:
         working-directory: chusql-bootstrap
         run: stack build --fast
 
+      - name: benchmark4csql build
+        working-directory: benchmark
+        run: stack build benchmark4csql --fast
+
+      - name: owner-triggered gate
+        if: inputs.phase == 'gate'
+        shell: pwsh
+        run: ./gate-check/run-gate.ps1
+
       - name: engine tests
+        if: inputs.phase != 'build' && inputs.phase != 'gate'
         working-directory: chusql-core/engine
         run: stack test --fast
 
       - name: server tests
+        if: inputs.phase != 'build' && inputs.phase != 'gate'
         working-directory: chusql-server
         run: stack test --fast
 
       - name: web tests
+        if: inputs.phase != 'build' && inputs.phase != 'gate'
         working-directory: chusql-web
         run: stack test --fast
 
       - name: cli tests
+        if: inputs.phase != 'build' && inputs.phase != 'gate'
         working-directory: chusql-cli
         run: stack test chusql-cli --fast
 
+
+      - name: bootstrap tests
+        if: inputs.phase != 'build' && inputs.phase != 'gate'
+        working-directory: chusql-bootstrap
+        run: stack test chusql-bootstrap --fast

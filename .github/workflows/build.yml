@@ -1,0 +1,14 @@
+# 构建状态：调用共用 Linux 构建流程。
+name: build
+on:
+  push:
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    uses: ./.github/workflows/linux.yml
+    with:
+      phase: build

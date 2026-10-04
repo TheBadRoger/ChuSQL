@@ -20,11 +20,11 @@ function Say([string]$msg) { Write-Host $msg }
 function Fail([string]$msg) { Write-Host "!! $msg" -ForegroundColor Red; exit 1 }
 
 if (-not $InstallDir) { $InstallDir = Join-Path $env:LOCALAPPDATA 'ChuSQL' }
-if (-not $DataDir) { $DataDir = Join-Path $InstallDir 'data' }
+if (-not $DataDir) { $DataDir = Join-Path (Join-Path $env:LOCALAPPDATA 'ChuSQL') 'data' }
 $InstallDir = [System.IO.Path]::GetFullPath($InstallDir)
 $DataDir = [System.IO.Path]::GetFullPath($DataDir)
 $configDir = if ($env:APPDATA) { Join-Path $env:APPDATA 'ChuSQL' } else { Join-Path $InstallDir 'config' }
-$configFile = Join-Path $configDir 'chusql.toml'
+$configFile = Join-Path $configDir 'settings.toml'
 
 if (-not $Yes) {
     if ([Console]::IsInputRedirected) {
@@ -73,7 +73,7 @@ if (-not (Test-Path $InstallDir)) {
     Say ("  removed {0}" -f $InstallDir)
 }
 
-Step 'Removing chusql.toml'
+Step 'Removing settings.toml'
 if ($KeepConfig) {
     Say ("  kept config: {0}" -f $configFile)
 } else {

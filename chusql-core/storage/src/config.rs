@@ -8,7 +8,7 @@ use crate::log::Level;
 // 存储相关分区由本模块解析校验，其它层的分区一概不碰。
 
 /// 配置文件名
-pub const CONFIG_FILE_NAME: &str = "chusql.toml";
+pub const CONFIG_FILE_NAME: &str = "settings.toml";
 /// 配置目录名（随系统惯例放在用户配置目录下）
 pub const APP_DIR_NAME: &str = "ChuSQL";
 /// Unix 下的数据目录名（XDG 惯例小写，跟安装脚本的默认安装目录一致）
@@ -20,6 +20,8 @@ pub const DEFAULT_POOL_SIZE: usize = 1024;
 pub const DEFAULT_PAGE_SIZE: usize = 4096;
 pub const DEFAULT_BTREE_ORDER: usize = 4;
 pub const DEFAULT_LOG_LEVEL: &str = "info";
+/// 默认日志输出目录（相对启动目录）
+pub const DEFAULT_LOG_FILES: &str = "./logs";
 
 const MIN_PAGE_SIZE: usize = 512;
 const MAX_PAGE_SIZE: usize = 65536;
@@ -91,6 +93,7 @@ pub struct Config {
     pub btree_order: usize,
     pub pool_size: usize,
     pub data_dir: PathBuf,
+    pub log_files: PathBuf,
     pub log_level: Level,
 }
 
@@ -102,6 +105,7 @@ impl Default for Config {
             btree_order: DEFAULT_BTREE_ORDER,
             pool_size: DEFAULT_POOL_SIZE,
             data_dir: default_data_dir(),
+            log_files: PathBuf::from(DEFAULT_LOG_FILES),
             log_level: Level::Info,
         }
     }
@@ -161,6 +165,7 @@ struct FileBtree {
 #[serde(deny_unknown_fields)]
 struct FileStorage {
     data_dir: Option<String>,
+    log_files: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -229,6 +234,11 @@ pub fn resolve(text: Option<&str>, path: Option<PathBuf>) -> Result<Loaded, Stri
         default_data_dir().to_string_lossy().into_owned(),
         &file_origin,
     );
+    let (log_files, log_files_origin) = pick(
+        file.storage.as_ref().and_then(|s| s.log_files.clone()),
+        DEFAULT_LOG_FILES.to_string(),
+        &file_origin,
+    );
     // 管名已经没有了：存储不再是独立进程，管道/套接字那一层随 FFI 一起删掉
     let (log_level, log_origin) = pick(
         file.log.and_then(|l| l.level),
@@ -237,6 +247,7 @@ pub fn resolve(text: Option<&str>, path: Option<PathBuf>) -> Result<Loaded, Stri
     );
 
     let data_dir = data_dir.trim().to_string();
+    let log_files = log_files.trim().to_string();
     let log_level = log_level.trim().to_string();
 
     let log_level = Level::parse(&log_level)
@@ -244,6 +255,9 @@ pub fn resolve(text: Option<&str>, path: Option<PathBuf>) -> Result<Loaded, Stri
 
     if data_dir.is_empty() {
         return Err("storage.data_dir must not be empty".to_string());
+    }
+    if log_files.is_empty() {
+        return Err("storage.log_files must not be empty".to_string());
     }
     validate_layout(page_size, btree_order)?;
     if pool_size == 0 {
@@ -254,6 +268,7 @@ pub fn resolve(text: Option<&str>, path: Option<PathBuf>) -> Result<Loaded, Stri
         ("btree.order", btree_order.to_string(), order_origin),
         ("buffer.pool_size", pool_size.to_string(), pool_origin),
         ("storage.data_dir", data_dir.clone(), dir_origin),
+        ("storage.log_files", log_files.clone(), log_files_origin),
         ("log.level", log_level.name().to_string(), log_origin),
     ];
 
@@ -263,6 +278,7 @@ pub fn resolve(text: Option<&str>, path: Option<PathBuf>) -> Result<Loaded, Stri
             btree_order,
             pool_size,
             data_dir: PathBuf::from(data_dir),
+            log_files: PathBuf::from(log_files),
             log_level,
         },
         config_path: if text.is_some() { path } else { None },
@@ -318,15 +334,14 @@ size = 8192
 data_dir = "../data"
 
 [server]
-host = "127.0.0.1"
+listen_host = "127.0.0.1"
 port = 7777
 max_message = 1048576
 
 [web]
 port = 7778
-user = "root"
 "#;
-        let loaded = resolve(Some(text), Some(PathBuf::from("chusql.toml"))).unwrap();
+        let loaded = resolve(Some(text), Some(PathBuf::from("settings.toml"))).unwrap();
         assert_eq!(loaded.config.page_size, 8192);
         assert_eq!(loaded.config.data_dir, PathBuf::from("../data"));
     }

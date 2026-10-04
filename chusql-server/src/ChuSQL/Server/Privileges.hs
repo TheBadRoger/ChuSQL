@@ -19,7 +19,8 @@ module ChuSQL.Server.Privileges (
 ) where
 
 import ChuSQL.Core.Engine.Syntax.AST
-import ChuSQL.Server.Accounts (Principal, principalIsRoot, principalName)
+import ChuSQL.Core.Protocol (Account (..))
+import ChuSQL.Server.Accounts (Principal, principalIsRoot, principalIsCatalogManager, principalName)
 import ChuSQL.Interface.Protocol (Grant (..), RoleView (..))
 import ChuSQL.Server.Backend (
     Backend (..),
@@ -43,6 +44,7 @@ import ChuSQL.Server.Catalog (
     readGrants,
     readMembers,
     readRoleNames,
+    readIdentities,
     removeGrant,
     removeGrantOption,
     removeMember,
@@ -104,6 +106,10 @@ runPrivilegeCommand :: Privileges -> Principal -> Text -> PrivilegeCommand -> IO
 runPrivilegeCommand service principal database command
     | needsDatabase = pure (Left (PrivilegeError "no_database" "no database selected"))
     | principalIsRoot principal = withTables service (applyCommand service database command)
+    | principalIsCatalogManager principal = case command of
+        CreateRoleCommand{} -> withTables service (applyCommand service database command)
+        DropRoleCommand{} -> pure (Left forbidden)
+        _ -> withTables service (delegateCommand service principal database command)
     | otherwise = withTables service (delegateCommand service principal database command)
   where
     -- | 授权到具体对象时需要先选库
@@ -129,7 +135,7 @@ affectedAccounts service command = do
         GrantRoleCommand _ members -> members
         RevokeRoleCommand _ members -> members
     -- | 是角色就接着往下走它的成员，走过的名字不再走第二遍
-    walk roles seen [] = pure (reverse seen)
+    walk _ seen [] = pure (reverse seen)
     walk roles seen (name : rest)
         | name `elem` seen = walk roles seen rest
         | normalizeRole name `elem` roles = do
@@ -166,7 +172,7 @@ filterTables service principal database tables
 -- | 角色总览（REST 与测试用）
 listRoleViews :: Privileges -> IO (Either PrivilegeError [RoleView])
 listRoleViews service = withTables service $ do
-    names <- roleNames service
+    names <- fmap (fmap (map accountUser . filter (not . accountCanLogin))) (catalog (readIdentities (pvCatalog service)))
     case names of
         Left err -> pure (Left err)
         Right known -> sequence <$> mapM view (sort known)
@@ -221,14 +227,18 @@ grantsOfUser service user = do
     members <- catalog (readMembers (pvCatalog service))
     grants <- catalog (readGrants (pvCatalog service))
     options <- catalog (readGrantOptions (pvCatalog service))
-    roles <- roleNames service
+    roles <- catalog (readIdentities (pvCatalog service))
     pure $ do
         memberRows <- members
         grantRows <- grants
         optionRows <- options
-        known <- roles
-        let edges = roleEdges memberRows known
-            mine = closureUp edges [role | (role, member) <- memberRows, member == normalizeUser user]
+        identities <- roles
+        let known = map accountUser (filter accountEnabled identities)
+            disabled = map accountUser (filter (not . accountEnabled) identities)
+            activeMembers = [(role, member) | (role, member) <- memberRows, role `elem` known, member `notElem` disabled]
+            edges = roleEdges activeMembers known
+            mine = if normalizeUser user `elem` disabled then [] else closureUp edges
+                (normalizeUser user : [role | (role, member) <- activeMembers, member == normalizeUser user])
         pure [grant | grant <- grantRows ++ optionRows, grantRole grant `elem` mine]
 
 -- | 一个用户手里的 grant option，只有这些能再转授
@@ -356,7 +366,7 @@ revokeOne service role privilege object = do
 -- | 普通身份转授权：只放行 GRANT
 delegateCommand :: Privileges -> Principal -> Text -> PrivilegeCommand -> IO (Either PrivilegeError ())
 delegateCommand service principal database command = case command of
-    GrantPrivilegesCommand privileges object role _ -> do
+    GrantPrivilegesCommand _ _ role _ -> do
         allowed <- requireRole service role
         case allowed of
             Left err -> pure (Left err)
@@ -431,4 +441,5 @@ cycleMember role member =
 
 -- | 存储错误转成权限错误
 storageError :: String -> PrivilegeError
+storageError "the last enabled login superuser cannot be removed" = PrivilegeError "bad_request" "the last enabled login superuser cannot be removed"
 storageError message = PrivilegeError "storage_error" ("privilege storage: " <> T.pack message)

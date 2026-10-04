@@ -207,6 +207,31 @@ fn trailing_torn_frame_can_be_truncated() {
     assert_eq!(wal.read_all().unwrap().records.len(), 1);
 }
 
+/// 完整损坏帧返回错误而非截断成功
+#[test]
+fn complete_corrupt_frame_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wal.log");
+    std::fs::write(&path, [1, 0, 0, 0, 255]).unwrap();
+    assert!(Wal::new(&path).read_all().is_err());
+    assert_eq!(std::fs::read(path).unwrap(), [1, 0, 0, 0, 255]);
+}
+
+/// 检查点损坏与替换失败不丢旧值
+#[test]
+fn checkpoint_corruption_and_write_failure_are_explicit() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal = Wal::new(dir.path().join("wal.log"));
+    for bytes in [vec![], vec![1; 7], vec![1; 9]] {
+        std::fs::write(dir.path().join("wal.checkpoint"), bytes).unwrap();
+        assert!(wal.read_checkpoint().is_err());
+    }
+    wal.write_checkpoint(7).unwrap();
+    std::fs::create_dir(dir.path().join("wal.checkpoint.pending")).unwrap();
+    assert!(wal.write_checkpoint(9).is_err());
+    assert_eq!(wal.read_checkpoint().unwrap(), Some(7));
+}
+
 /// 检查点写读一致
 #[test]
 fn checkpoint_round_trips() {

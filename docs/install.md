@@ -80,7 +80,7 @@ Windows：
 - `csql`：命令行客户端；
 - `chusql-web`：Web 管理端；
 - `csql-bootstrap`：系统目录初始化工具；
-- `chusql.toml`：全局配置文件；
+- `settings.toml`：全局配置文件；
 - 数据目录与日志目录。
 
 常用命令：

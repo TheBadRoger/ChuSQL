@@ -104,9 +104,91 @@ chainDB = [("a", chainA), ("b", chainB), ("c", chainC)]
 chainDBWithoutStats :: Database
 chainDBWithoutStats = [(n, t { tableMeta = Nothing }) | (n, t) <- chainDB]
 
+-- | 顺序执行命名类型测试语句
+domainSql :: Database -> [String] -> Either String (Database, [Row])
+domainSql db [] = Right (db, [])
+domainSql db [sql] = parseStatement sql >>= runStatement db
+domainSql db (sql : rest) = do
+    statement <- parseStatement sql
+    (next, _) <- runStatement db statement
+    domainSql next rest
+
 -- | 跑引擎层全部 hspec 用例
 main :: IO ()
 main = hspec $ do
+    describe "identity syntax" $ do
+        it "parses role and user attributes with their aliases" $ do
+            parseStatement "ALTER ROLE worker LOGIN SUPERUSER ENABLED" `shouldBe` Right (AlterIdentity "worker" [("login", True), ("superuser", True), ("enabled", True)])
+            parseStatement "ALTER USER worker NOLOGIN NOSUPERUSER DISABLED" `shouldBe` Right (AlterIdentity "worker" [("login", False), ("superuser", False), ("enabled", False)])
+            parseStatement "ALTER ROLE worker IDENTIFIED BY 'Pass123!'" `shouldBe` Right (AlterUser "worker" "Pass123!")
+            parseStatement "SHOW ROLES" `shouldBe` Right ShowRoles
+        it "rejects empty unknown and repeated attributes" $ do
+            parseStatement "ALTER ROLE worker" `shouldSatisfy` isLeft
+            parseStatement "ALTER USER worker ACTIVE" `shouldSatisfy` isLeft
+            prepare [] (AlterIdentity "worker" [("login", True), ("login", False)]) `shouldSatisfy` isLeft
+    describe "ChuSQL.Core.Engine (DOMAIN)" $ do
+        it "parses domain commands and named columns" $ do
+            parseStatement "CREATE DOMAIN amount AS DECIMAL(12,2)" `shouldBe` Right (CreateDomain "amount" (CDecimal 12 2))
+            parseStatement "DROP DOMAIN amount" `shouldBe` Right (DropDomain "amount")
+            parseStatement "SHOW DOMAINS" `shouldBe` Right ShowDomains
+            parseStatement "CREATE TABLE items (price amount)" `shouldBe` Right (CreateTable "items" [("price", plainColumn (CDomain "amount" CStr))])
+        it "keeps a named type while applying its base semantics" $ do
+            let result = domainSql [] ["CREATE DOMAIN label AS VARCHAR(3)", "CREATE TABLE items (name label)", "INSERT INTO items (name) VALUES ('abc')"]
+            case result of
+                Left err -> expectationFailure err
+                Right (db, _) -> do
+                    fmap columnType (lookup "items" db >>= lookup "name" . tableCols) `shouldBe` Just (CDomain "label" (CVarchar 3))
+                    fmap snd (domainSql db ["SELECT name FROM items"]) `shouldBe` Right [[("name", VStr "abc")]]
+                    domainSql db ["INSERT INTO items (name) VALUES ('long')"] `shouldSatisfy` isLeft
+        it "rejects unknown, duplicate and built-in domains" $ do
+            mapM_ (\sql -> domainSql [] sql `shouldSatisfy` isLeft)
+                [ ["CREATE TABLE items (name missing)"]
+                , ["CREATE DOMAIN INT AS INT"]
+                , ["CREATE DOMAIN a AS INT", "CREATE DOMAIN A AS INT"]
+                , ["CREATE DOMAIN a AS missing"]
+                , ["CREATE DOMAIN bad AS VARCHAR(0)"]
+                ]
+        it "resolves nested domains and preserves their names and base checks" $ do
+            let result = domainSql [] ["CREATE DOMAIN label AS VARCHAR(3)", "CREATE DOMAIN product_label AS label", "CREATE DOMAIN title AS product_label", "CREATE TABLE items (name title)", "INSERT INTO items (name) VALUES ('abc')"]
+            case result of
+                Left err -> expectationFailure err
+                Right (db, _) -> do
+                    fmap columnType (lookup "items" db >>= lookup "name" . tableCols) `shouldBe` Just (CDomain "title" (CDomain "product_label" (CDomain "label" (CVarchar 3))))
+                    fmap snd (domainSql db ["SELECT name FROM items"]) `shouldBe` Right [[("name", VStr "abc")]]
+                    domainSql db ["INSERT INTO items (name) VALUES ('long')"] `shouldSatisfy` isLeft
+                    domainSql db ["DROP DOMAIN label"] `shouldSatisfy` isLeft
+        it "protects domain dependencies even without user columns" $ do
+            domainSql [] ["CREATE DOMAIN a AS INT", "CREATE DOMAIN b AS a", "DROP DOMAIN a"] `shouldSatisfy` isLeft
+            fmap snd (domainSql [] ["CREATE DOMAIN a AS INT", "CREATE DOMAIN b AS a", "DROP DOMAIN b", "DROP DOMAIN a", "SHOW DOMAINS"]) `shouldBe` Right []
+            domainSql [] ["CREATE DOMAIN self AS self"] `shouldSatisfy` isLeft
+        it "uses nested domains in column additions and conversions" $ do
+            fmap snd (domainSql [] ["CREATE DOMAIN a AS INT", "CREATE DOMAIN b AS a", "CREATE TABLE items (id INT)", "INSERT INTO items (id) VALUES (2)", "ALTER TABLE items ADD COLUMN qty b", "ALTER TABLE items ALTER COLUMN id TYPE b", "SELECT id + 1 AS next, qty FROM items"]) `shouldBe` Right [[("next", VInt 3), ("qty", VNull)]]
+        it "rejects cyclic catalog definitions without recursing forever" $ do
+            case domainSql [] ["CREATE DOMAIN a AS INT", "CREATE DOMAIN b AS a"] of
+                Left err -> expectationFailure err
+                Right (db, _) -> do
+                    let cyclic = map (\(name, table) -> if name == domainTableName "a" then (name, table {tableCols = [("base", plainColumn (CDomain "b" CStr))]}) else (name, table)) db
+                    fmap snd (domainSql cyclic ["CREATE TABLE items (id b)"]) `shouldBe` Left "cyclic domain definition: b"
+        it "prevents dropping a domain until its columns are removed" $ do
+            domainSql [] ["CREATE DOMAIN code AS INT", "CREATE TABLE items (code code)", "DROP DOMAIN code"] `shouldSatisfy` isLeft
+            fmap snd (domainSql [] ["CREATE DOMAIN code AS INT", "CREATE TABLE items (code code)", "DROP TABLE items", "DROP DOMAIN code", "SHOW DOMAINS"]) `shouldBe` Right []
+            domainSql [] ["DROP DOMAIN missing"] `shouldSatisfy` isLeft
+        it "resolves domains in ADD COLUMN and ALTER COLUMN TYPE" $ do
+            fmap snd (domainSql [] ["CREATE DOMAIN code AS INT", "CREATE TABLE items (id INT)", "INSERT INTO items (id) VALUES (1)", "ALTER TABLE items ADD COLUMN code code", "ALTER TABLE items ALTER COLUMN id TYPE code", "SELECT id, code FROM items"]) `shouldBe` Right [[("id", VInt 1), ("code", VNull)]]
+        it "hides and protects the domain catalog from SQL" $ do
+            domainSql [] ["CREATE DOMAIN code AS INT", "SELECT * FROM __system_domain_code"] `shouldSatisfy` isLeft
+            domainSql [] ["CREATE DOMAIN code AS INT", "DROP TABLE __system_domain_code"] `shouldSatisfy` isLeft
+            domainSql [] ["CREATE TABLE __system_domain_fake (base INT)"] `shouldSatisfy` isLeft
+        it "round trips named types and compares using the base type" $ do
+            let ty = CDomain "amount" (CDecimal 12 2)
+            parseColumnType (typeName ty) `shouldBe` Just ty
+            comparableTypes ty CInt `shouldBe` True
+            integerType (CDomain "code" CInt) `shouldBe` True
+            coerceValue (CDomain "code" CInt) (VStr "bad") `shouldSatisfy` isLeft
+        it "uses numeric domain columns in expressions and sorting" $ do
+            fmap snd (domainSql [] ["CREATE DOMAIN quantity AS INT", "CREATE TABLE items (qty quantity)", "INSERT INTO items (qty) VALUES (2), (1)", "SELECT qty + 1 AS next FROM items ORDER BY qty"]) `shouldBe` Right [[("next", VInt 2)], [("next", VInt 3)]]
+        it "uses boolean domains as conditions and logical operands" $ do
+            fmap snd (domainSql [] ["CREATE DOMAIN flag AS BOOL", "CREATE TABLE items (active flag)", "INSERT INTO items (active) VALUES (TRUE), (FALSE), (NULL)", "SELECT active FROM items WHERE active AND TRUE"]) `shouldBe` Right [[("active", VBool True)]]
     describe "ChuSQL.Core.Engine.Syntax.Parser" $ do
         it "resolves table-qualified columns inside database-qualified tables" $ do
             let db = [("sales.users", users)]
@@ -114,6 +196,11 @@ main = hspec $ do
                 `shouldBe` Right [[("name", VStr "Alice")]]
             rowsOf (parseStatement "SELECT sales.users.name FROM sales.users WHERE sales.users.id = 1" >>= runStatement db)
                 `shouldBe` Right [[("name", VStr "Alice")]]
+            let related = [("sales.users", users), ("sales.orders", orders)]
+            rowsOf (parseStatement "SELECT sales.users.name FROM sales.users WHERE EXISTS (SELECT orders.id FROM sales.orders WHERE orders.user_id = sales.users.id)" >>= runStatement related)
+                `shouldBe` Right [[("name", VStr "Alice")], [("name", VStr "Bob")]]
+            rowsOf (parseStatement "SELECT sales.users.name FROM sales.users WHERE EXISTS (SELECT orders.id FROM sales.orders WHERE orders.user_id = intruder.users.id)" >>= runStatement related)
+                `shouldSatisfy` either (isInfixOf "unknown column") (const False)
 
         it "derives the column prefix when the session schema is scoped to one database" $ do
             let scoped = [("users", users)]
@@ -1110,6 +1197,32 @@ main = hspec $ do
                 `shouldSatisfy` isLeft
 
     describe "ChuSQL.Core.Engine (ORDER BY)" $ do
+        it "sorts projection aliases with source keys and LIMIT" $ do
+            let query = "SELECT age + 1 AS next, name FROM users ORDER BY next DESC, name LIMIT 2"
+            rowsOf (parseStatement query >>= runStatement testDB)
+                `shouldBe` Right [[("next", VInt 31), ("name", VStr "Carol")], [("next", VInt 26), ("name", VStr "Alice")]]
+            sameResultAsUnoptimized query
+        it "prefers output aliases over same-named source columns" $
+            rowsOf (parseStatement "SELECT -age AS age FROM users ORDER BY age LIMIT 1" >>= runStatement testDB)
+                `shouldBe` Right [[("age", VInt (-30))]]
+        it "evaluates non-ordering projections after LIMIT" $ do
+            rowsOf (parseStatement "SELECT name AS who, 1 / (age - 25) AS value FROM users ORDER BY who DESC LIMIT 1" >>= runStatement testDB)
+                `shouldBe` Right [[("who", VStr "Carol"), ("value", VInt 0)]]
+            rowsOf (parseStatement "SELECT 1 / 0 AS bad FROM users ORDER BY bad LIMIT 0" >>= runStatement testDB)
+                `shouldSatisfy` isLeft
+        it "sorts aggregate aliases and rejects ungrouped source sort keys" $ do
+            rowsOf (parseStatement "SELECT user_id, count(*) AS total FROM orders GROUP BY user_id ORDER BY total DESC" >>= runStatement testDB)
+                `shouldBe` Right [[("user_id", VInt 1), ("total", VInt 2)], [("user_id", VInt 2), ("total", VInt 1)]]
+            (parseStatement "SELECT count(*) AS total FROM users ORDER BY age" >>= runStatement testDB)
+                `shouldSatisfy` isLeft
+        it "keeps ordering aliases when a CTE renames its outputs" $
+            rowsOf (parseStatement "WITH t(x) AS (SELECT age + 1 AS next FROM users ORDER BY next DESC LIMIT 1) SELECT x FROM t" >>= runStatement testDB)
+                `shouldBe` Right [[("t.x", VInt 31)]]
+        it "rejects duplicate ordering aliases without changing duplicate outputs" $ do
+            (parseStatement "SELECT age AS x, id AS x FROM users ORDER BY x" >>= runStatement testDB)
+                `shouldSatisfy` either (isInfixOf "ambiguous projection alias") (const False)
+            rowsOf (parseStatement "SELECT age AS x, id AS x, name AS who FROM users ORDER BY who LIMIT 1" >>= runStatement testDB)
+                `shouldBe` Right [[("x", VInt 25), ("x", VInt 1), ("who", VStr "Alice")]]
         it "parses ORDER BY DESC" $ do
             case parseStatement "SELECT name FROM users ORDER BY age DESC" of
                 Right q -> selectOrderBy q `shouldBe` [("age", Desc)]
@@ -1402,6 +1515,38 @@ main = hspec $ do
             sameResultAsUnoptimized "SELECT u.name FROM users u WHERE EXISTS (SELECT * FROM orders o WHERE o.user_id = u.id)"
 
     describe "ChuSQL.Core.Engine (子查询去相关)" $ do
+        it "reuses an uncorrelated JOIN subquery across all pairs" $ do
+            let query = "SELECT u.name, o.product FROM users u JOIN orders o ON u.id = o.user_id AND o.product IN (SELECT product FROM orders WHERE user_id = 1)"
+                (result, scans) = countedRun query
+            fmap (map (map snd)) result `shouldBe` Right [[VStr "Alice", VStr "Book"], [VStr "Alice", VStr "Cup"]]
+            scanTimes "orders" scans `shouldBe` 2
+            sameResultAsUnoptimized query
+
+        it "reuses JOIN subqueries by values from both sides" $ do
+            let query = "SELECT o.product FROM orders o JOIN users u ON o.user_id = u.id AND EXISTS (SELECT id FROM users x WHERE x.id = o.user_id AND x.age = u.age)"
+                (result, scans) = countedRun query
+            fmap (map (map snd)) result `shouldBe` Right [[VStr "Book"], [VStr "Pen"], [VStr "Cup"]]
+            scanTimes "users" scans `shouldBe` 7
+            sameResultAsUnoptimized query
+
+        it "keeps unmatched LEFT JOIN rows with a cached subquery" $ do
+            let query = "SELECT u.name, o.product FROM users u LEFT JOIN orders o ON u.id = o.user_id AND EXISTS (SELECT id FROM users WHERE id = 1)"
+                (result, scans) = countedRun query
+            fmap (map (map snd)) result `shouldBe` Right [[VStr "Alice", VStr "Book"], [VStr "Alice", VStr "Cup"], [VStr "Bob", VStr "Pen"], [VStr "Carol", VNull]]
+            scanTimes "users" scans `shouldBe` 2
+            sameResultAsUnoptimized query
+
+        it "does not evaluate JOIN subqueries when there are no pairs" $ do
+            let query = "SELECT u.name FROM users u LEFT JOIN (SELECT id FROM orders WHERE id < 0) o ON EXISTS (SELECT 1 / 0 FROM orders)"
+                (result, scans) = countedRun query
+            fmap (map (map snd)) result `shouldBe` Right [[VStr "Alice"], [VStr "Bob"], [VStr "Carol"]]
+            scanTimes "orders" scans `shouldBe` 1
+            sameResultAsUnoptimized query
+
+        it "propagates JOIN subquery errors before subsequent pairs" $ do
+            fst (countedRun "SELECT u.name FROM users u JOIN orders o ON EXISTS (SELECT 1 / 0 FROM orders)")
+                `shouldSatisfy` either (isInfixOf "division by zero") (const False)
+
         it "runs a non-correlated subquery only once" $ do
             let (result, scans) = countedRun "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders)"
             fmap (map (map snd)) result `shouldBe` Right [[VStr "Alice"], [VStr "Bob"]]
@@ -1602,6 +1747,28 @@ main = hspec $ do
             let cond = Gt (Col "age") (LitInt 18)
                 relOp = Filter cond (Limit 2 (Scan Nothing "users" Nothing))
             optimize testDB relOp `shouldBe` relOp
+
+        it "projects derived outputs without dropping expression errors" $ do
+            let original = Project ["d.name"] (Derived (Just "d") (Compute [("name", Col "name"), ("bad", Div (LitInt 1) (LitInt 0))] (Scan Nothing "users" Nothing)))
+            evalRelOp testDB (optimize testDB original) `shouldBe` evalRelOp testDB original
+            evalRelOp testDB original `shouldBe` Left "division by zero"
+            sameResultAsUnoptimized "SELECT d.name FROM (SELECT name, age FROM users) d WHERE d.age > 20 ORDER BY d.name"
+
+        it "supplies memory schema statistics without exposing rows" $ do
+            case runMemoryStorage (schema :: MemoryStorage Database) testDB of
+                Left err -> expectationFailure err
+                Right (structures, _) -> do
+                    map (tableRows . snd) structures `shouldBe` [[], []]
+                    fmap (fmap metaRowCount . tableMeta) (lookup "users" structures) `shouldBe` Just (Just 3)
+
+        it "uses derived schema estimates for safe join reordering" $ do
+            let query = "SELECT d.name FROM (SELECT id, name FROM a) d JOIN b ON d.id = b.a_id JOIN c ON b.id = c.b_id ORDER BY d.name"
+            case parseStatement query >>= prepare chainDB >>= translate of
+                Left err -> expectationFailure err
+                Right original -> do
+                    let optimized = optimize chainDB original
+                    planTables optimized `shouldBe` ["b", "c", "a"]
+                    evalRelOp chainDB optimized `shouldBe` evalRelOp chainDB original
 
         it "is idempotent after reaching a fixed point" $ do
             case parseStatement "SELECT u.name, o.product FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 20" of
@@ -2034,6 +2201,20 @@ main = hspec $ do
                 runIPCStorageIn (scan "iso") alpha `shouldReturn` Right [[("id", VInt 1)]]
                 runIPCStorageIn (scan "iso") beta `shouldReturn` Right [[("id", VInt 2)]]
 
+        it "persists nested domains and named columns across restart" $ do
+            withTestSession $ \srv -> do
+                withServerEnv srv $ do
+                    runIPCStorage (runStatementM (CreateDomain "label" (CVarchar 3))) `shouldReturn` Right []
+                    runIPCStorage (runStatementM (CreateDomain "product_label" (CDomain "label" CStr))) `shouldReturn` Right []
+                    runIPCStorage (runStatementM (CreateTable "typed" [("name", plainColumn (CDomain "product_label" CStr))])) `shouldReturn` Right []
+                    runIPCStorage (runStatementM (Insert "typed" ["name"] [[LitStr "abc"]])) `shouldReturn` Right []
+                closeConnection
+                openSessionIn (dataDir srv)
+                withServerEnv srv $ do
+                    runIPCStorage (runStatementM ShowDomains) `shouldReturn` Right [[("domain", VStr "label"), ("base_type", VStr "varchar(3)")], [("domain", VStr "product_label"), ("base_type", VStr "domain(label,varchar(3))")]]
+                    runIPCStorage (runStatementM (Insert "typed" ["name"] [[LitStr "long"]])) >>= (`shouldSatisfy` isLeft)
+                    runIPCStorage (runStatementM (DropDomain "label")) >>= (`shouldSatisfy` isLeft)
+
         it "rows survive a restart on the same data directory" $ do
             withTestSession $ \srv -> do
                 withServerEnv srv $ runIPCStorage (insert "persist" [("id", VInt 42)]) `shouldReturn` Right ()
@@ -2080,6 +2261,16 @@ main = hspec $ do
                 result `shouldBe` Right [[("name", VStr "Zoe")]]
                 -- 存储层的日志现在直接打在本进程的输出里，没有单独的 debug.log 可读；
                 -- 「走索引而不是全表扫」由下面 CREATE INDEX 那组用例与 Rust 侧 runtime 测试覆盖。
+
+        it "keeps correlated outer references out of physical scan columns" $ do
+            withTestSession $ \srv -> withServerEnv srv $ do
+                runIPCStorage (runStatementM (CreateTable "outer_t" [("id", TInt), ("name", TStr)])) `shouldReturn` Right []
+                runIPCStorage (runStatementM (CreateTable "inner_t" [("id", TInt), ("user_id", TInt), ("unused", TStr)])) `shouldReturn` Right []
+                runIPCStorage (runStatementM (Insert "outer_t" ["id", "name"] [[LitInt 1, LitStr "one"], [LitInt 2, LitStr "two"]])) `shouldReturn` Right []
+                runIPCStorage (runStatementM (Insert "inner_t" ["id", "user_id", "unused"] [[LitInt 10, LitInt 1, LitStr "x"]])) `shouldReturn` Right []
+                case parseStatement "SELECT u.name FROM outer_t u WHERE EXISTS (SELECT id FROM inner_t o WHERE o.user_id = u.id)" of
+                    Left err -> expectationFailure err
+                    Right statement -> runIPCStorage (runStatementM statement) `shouldReturn` Right [[("u.name", VStr "one")]]
 
         it "CREATE INDEX makes a query on that column use the index" $ do
             withTestSession $ \srv -> withServerEnv srv $ do
@@ -2273,6 +2464,31 @@ main = hspec $ do
             vals seeded "SELECT age * 2 FROM users WHERE name = 'Nine'" `shouldBe` Right [[VNull]]
 
     describe "ChuSQL.Core.Engine (TYPES)" $ do
+        it "checks rounded decimal precision, finite values and domains" $ do
+            coerceValue (CDecimal 4 2) (VFloat 99.994) `shouldBe` Right (VFloat 99.99)
+            mapM_ (\value -> coerceValue (CDecimal 4 2) value `shouldSatisfy` isLeft)
+                [VFloat 99.995, VFloat (-99.995), VInt 100, VFloat (0 / 0), VFloat (1 / 0)]
+            coerceValue (CDecimal 2 0) (VFloat 2.5) `shouldBe` Right (VFloat 2)
+            coerceValue (CDomain "amount" (CDecimal 4 2)) (VInt 100) `shouldSatisfy` isLeft
+            coerceValue (CDecimal 309 0) (VInt 1) `shouldSatisfy` isLeft
+        it "rejects invalid decimal definitions and overflowing defaults" $ do
+            mapM_ (\query -> (parseStatement query >>= runStatement testDB) `shouldSatisfy` isLeft)
+                ["CREATE TABLE bad (v DECIMAL(2,3))", "CREATE TABLE bad (v DECIMAL(309,0))", "CREATE TABLE bad (v DECIMAL(2,0) DEFAULT 100)"]
+        it "does not expose password input in syntax errors" $ do
+            let query = "ALTER USER alice IDENTIFIED BY 'never-expose-this' trailing"
+            parseStatement query `shouldSatisfy` either (\err -> "syntax" `isInfixOf` err && not ("never-expose-this" `isInfixOf` err)) (const False)
+        it "rejects arbitrary prefixes for unqualified schema columns" $ do
+            resolveColumn "intruder.id" [("id", TInt)] `shouldSatisfy` isLeft
+            resolveColumn "wrong.u.id" [("id", TInt)] `shouldSatisfy` isLeft
+            mapM_ (\query -> (parseStatement query >>= runStatement testDB) `shouldSatisfy` isLeft)
+                ["SELECT wrong.users.id FROM users", "SELECT wrong.u.id FROM users u", "SELECT users.id FROM users JOIN orders ON wrong.users.id = orders.user_id"]
+        it "preserves untyped NULL through derived tables and CTEs" $ do
+            mapM_ (\query -> rowsOf (parseStatement query >>= runStatement testDB) `shouldBe` Right [[("answer", VNull)]])
+                [ "SELECT d.n + 1 AS answer FROM (SELECT NULL AS n) d"
+                , "SELECT d.n AND TRUE AS answer FROM (SELECT NULL AS n) d"
+                , "WITH t AS (SELECT NULL AS n) SELECT t.n + 1 AS answer FROM t"
+                , "SELECT d.n + 1 AS answer FROM (SELECT x.n FROM (SELECT NULL AS n) x) d"
+                ]
         -- vals：在给定库上跑 SQL 只取值
         let vals db input = fmap (map (map snd)) (parseStatement input >>= rowsOf . runStatement db)
             -- withTable：先建表，返回新库
@@ -2296,7 +2512,7 @@ main = hspec $ do
                         , ("k", plainColumn CBool)
                         ]
                     )
-            parseStatement "CREATE TABLE t (a nope)" `shouldSatisfy` isLeft
+            fmap snd (domainSql [] ["CREATE TABLE t (a nope)"]) `shouldBe` Left "unknown domain: nope"
 
         it "reads and writes float literals" $ do
             vals testDB "SELECT 1.5 + 1" `shouldBe` Right [[VFloat 2.5]]

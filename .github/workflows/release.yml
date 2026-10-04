@@ -111,7 +111,7 @@ jobs:
           name="chusql-${{ matrix.platform }}"
           stage="dist/$name"
           rm -rf "$stage"
-          mkdir -p "$stage/bin" "$stage/scripts"
+          mkdir -p "$stage/bin" "$stage/resources"
 
           cp chusql-core/storage/target/release/libchusql_core_storage.* "$stage/bin/"
 
@@ -143,7 +143,7 @@ jobs:
             cp "$lib" "$stage/bin/"
           done
 
-          cp scripts/chusql.toml "$stage/scripts/"
+          cp resources/settings.toml.* "$stage/resources/"
           cp scripts/install.ps1 scripts/install.sh "$stage/"
           cp scripts/uninstall.ps1 scripts/uninstall.sh "$stage/"
           mkdir -p "$stage/static"
@@ -166,7 +166,7 @@ jobs:
           $name = "chusql-${{ matrix.platform }}"
           $stage = "dist/$name"
           if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
-          New-Item -ItemType Directory -Force -Path "$stage/bin", "$stage/scripts" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$stage/bin", "$stage/resources" | Out-Null
 
           Copy-Item 'chusql-core/storage/target/release/chusql_core_storage.dll' "$stage/bin/"
 
@@ -195,7 +195,7 @@ jobs:
             Where-Object { $_.Name -notlike 'chusql*' } |
             ForEach-Object { Copy-Item $_.FullName "$stage/bin/" }
 
-          Copy-Item 'scripts/chusql.toml' "$stage/scripts/"
+          Copy-Item 'resources/settings.toml.*' "$stage/resources/"
           Copy-Item 'scripts/install.ps1', 'scripts/install.sh' $stage
           Copy-Item 'scripts/uninstall.ps1', 'scripts/uninstall.sh' $stage
           New-Item -ItemType Directory -Force -Path "$stage/static" | Out-Null
