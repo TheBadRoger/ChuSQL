@@ -15,6 +15,62 @@ fn row(pairs: &[(&str, serde_json::Value)]) -> Row {
     m
 }
 
+/// 索引读失败时删除报错且保留数据
+#[test]
+fn delete_propagates_index_read_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("t.db");
+    let index = dir.path().join("t.idx");
+    let mut t = HeapTable::open_indexed(&data, &index, DEFAULT_PAGE_SIZE, 4, 1).unwrap();
+    let original = row(&[("id", json!(1))]);
+    t.insert_row(&original).unwrap();
+    t.flush().unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(&index).unwrap();
+    file.set_len(DEFAULT_PAGE_SIZE as u64).unwrap();
+    let err = t.delete_by_keys(&[1]).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    assert_eq!(t.scan().unwrap(), vec![original]);
+}
+
+/// 跨页投影与分片保持行序及隐藏列
+#[test]
+fn projected_shards_preserve_order_and_hidden_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut t = HeapTable::open(dir.path().join("t.db"), 256, 1).unwrap();
+    for i in 0..40 {
+        t.insert_row(&row(&[("id", json!(i)), ("name", json!("alice")), ("secret", json!(i))])).unwrap();
+    }
+    t.set_hidden_columns(["secret".to_string()].into_iter().collect());
+    let columns = vec!["id".to_string(), "secret".to_string()];
+    let expected: Vec<Row> = (0..40).map(|i| row(&[("id", json!(i))])).collect();
+    assert_eq!(t.scan_columns(Some(&columns)).unwrap(), expected);
+    let pages = t.num_pages().unwrap();
+    assert!(pages > 1);
+    let mut shards = t.scan_columns_pages(Some(&columns), 0, pages / 2).unwrap();
+    shards.extend(t.scan_columns_pages(Some(&columns), pages / 2, pages + 1).unwrap());
+    assert_eq!(shards, expected);
+    assert_eq!(t.read_at(0, 0).unwrap().unwrap(), row(&[("id", json!(0)), ("name", json!("alice"))]));
+}
+
+/// 扫描与点读均返回行解码错误
+#[test]
+fn malformed_rows_return_decode_errors() {
+    use chusql_core_storage::heap::HeapPage;
+    use chusql_core_storage::page::{Page, PageFile};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.db");
+    let mut file = PageFile::open(&path, DEFAULT_PAGE_SIZE).unwrap();
+    let mut page = Page::new(0, DEFAULT_PAGE_SIZE);
+    HeapPage::insert_tuple(&mut page, b"{\"id\":1} trailing").unwrap();
+    file.write_page(&page).unwrap();
+    file.flush().unwrap();
+    drop(file);
+    let mut t = HeapTable::open(&path, DEFAULT_PAGE_SIZE, 1).unwrap();
+    assert!(t.scan().is_err());
+    assert!(t.scan_columns(Some(&[])).is_err());
+    assert!(t.read_at(0, 0).is_err());
+}
+
 /// 索引文件被清空（强杀或截断）后打开，会按堆数据补齐
 #[test]
 fn empty_index_file_is_rebuilt_from_rows() {

@@ -182,6 +182,11 @@ impl HeapPage {
 
     /// 读槽位里的行字节
     pub fn get_tuple(page: &Page, slot: u16) -> Option<Vec<u8>> {
+        Self::tuple_bytes(page, slot).map(<[u8]>::to_vec)
+    }
+
+    /// 借用槽位里的行字节
+    fn tuple_bytes(page: &Page, slot: u16) -> Option<&[u8]> {
         let n = Self::slot_count(page);
         if slot >= n {
             return None;
@@ -192,7 +197,7 @@ impl HeapPage {
         if len == 0 {
             return None;
         }
-        Some(page.data[off..off + len].to_vec())
+        Some(&page.data[off..off + len])
     }
 
     /// 所有槽位号
@@ -593,14 +598,12 @@ impl HeapTable {
 
     /// 按位置读一行
     pub fn read_at(&mut self, page_id: PageId, slot: u16) -> io::Result<Option<Row>> {
-        let bytes = self.file.with_page(page_id, |p| HeapPage::get_tuple(p, slot))?;
-        match bytes {
-            None => Ok(None),
-            Some(bytes) => {
-                let row = decode_row(&bytes, None, &self.hidden_columns)?;
-                Ok(Some(row))
-            }
-        }
+        let hidden = &self.hidden_columns;
+        self.file.with_page(page_id, |p| {
+            HeapPage::tuple_bytes(p, slot)
+                .map(|bytes| decode_row(bytes, None, hidden))
+                .transpose()
+        })?
     }
 
     /// 按位置删一行并返回它
@@ -631,13 +634,9 @@ impl HeapTable {
     pub fn delete_by_keys(&mut self, keys: &[i64]) -> io::Result<Vec<Row>> {
         let mut positions: Vec<(PageId, u16)> = Vec::new();
 
-        if self.has_index("id") {
+        if let Some(idx) = self.indexes.iter_mut().find(|i| i.column == "id") {
             for &k in keys {
-                let pos = self
-                    .indexes
-                    .iter_mut()
-                    .find(|i| i.column == "id")
-                    .and_then(|i| i.tree.get(&key_of(k)).ok().flatten());
+                let pos = idx.tree.get(&key_of(k))?;
                 if let Some(p) = pos {
                     positions.push(unpack_position(p));
                 }
@@ -714,20 +713,16 @@ impl HeapTable {
     ) -> io::Result<Vec<(PageId, u16, Row)>> {
         let n = self.file.num_pages()?;
         let mut out = Vec::new();
+        let hidden = &self.hidden_columns;
         for i in from..to.min(n) {
-            let tuples = self.file.with_page(i, |p| {
-                let mut v = Vec::new();
-                for slot in HeapPage::iter_slots(p) {
-                    if let Some(bytes) = HeapPage::get_tuple(p, slot) {
-                        v.push((slot, bytes));
+            self.file.with_page(i, |p| -> io::Result<()> {
+                for slot in 0..HeapPage::slot_count(p) {
+                    if let Some(bytes) = HeapPage::tuple_bytes(p, slot) {
+                        out.push((i, slot, decode_row(bytes, columns, hidden)?));
                     }
                 }
-                v
-            })?;
-            for (slot, bytes) in tuples {
-                let row = decode_row(&bytes, columns, &self.hidden_columns)?;
-                out.push((i, slot, row));
-            }
+                Ok(())
+            })??;
         }
         Ok(out)
     }

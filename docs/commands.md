@@ -38,6 +38,11 @@ csql -d sales -e "SELECT * FROM orders LIMIT 5"
 csql -f json -e "SELECT count(*) FROM orders"
 ```
 
+在脚本里非交互使用（配合 `-e`）：
+
+- 口令从标准输入读取，行尾用 LF（`\n`）或者干脆不写行尾；CRLF 会把 `\r` 算进口令，结果是 `unauthorized`。
+- `root's password: ` 这个提示写在标准输出里，解析输出时要先去掉它；错误信息写在标准错误，失败时退出码为 `1`。
+
 表名与列名的写法：
 
 - 选定数据库后语句里直接写表名即可，例如 `SELECT name FROM orders WHERE orders.id = 1`。

@@ -693,17 +693,17 @@ checkCteArity name cols out
 
 -- | 把语句里对 CTE 的引用换成派生表
 expandStatement :: [(String, Statement)] -> Statement -> Either String Statement
-expandStatement env q = case q of
+expandStatement env stmt = case stmt of
     q@Select { selectFrom = fromC, selectWhere = mWhere } -> do
         fromC' <- expandClause env fromC
         w <- traverse (expandExpr env) mWhere
         Right q { selectFrom = fromC', selectWhere = w }
     q@SelectExpr { selectFrom = fromC, selectItems = items, selectWhere = mWhere } -> do
         fromC' <- expandClause env fromC
-        items' <- traverse (\(label, e) -> fmap ((,) label) (expandExpr env e)) items
+        items' <- traverse (\(name, e) -> fmap ((,) name) (expandExpr env e)) items
         w <- traverse (expandExpr env) mWhere
         Right q { selectFrom = fromC', selectItems = items', selectWhere = w }
-    _ -> Right q
+    _ -> Right stmt
 
 -- | 来源树里的 CTE 引用换成派生表
 expandClause :: [(String, Statement)] -> FromClause -> Either String FromClause
