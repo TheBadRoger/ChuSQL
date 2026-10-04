@@ -1,0 +1,73 @@
+# ChuSQL configuration for Windows.
+# Installation resolves @DATA_DIR@ and @LOG_DIR@ to absolute paths.
+# Omitted options use built-in defaults; command-line options take precedence.
+
+[page]
+# Data page size in bytes: a power of two from 512 to 65536.
+# Keep this value unchanged when opening existing database files.
+size = 4096
+
+[btree]
+# Maximum children per B+ tree node (at least 3); the node must fit in one page.
+# Keep this value unchanged when opening existing index files.
+order = 4
+
+[buffer]
+# Maximum number of cached pages (at least 1); memory grows with page size.
+pool_size = 1024
+
+[storage]
+# Database root: system catalog, business databases, indexes, WAL and checkpoints.
+# Default: %LOCALAPPDATA%/ChuSQL/data.
+# -DataDir overrides this location during installation; changing it moves no data.
+data_dir = "@DATA_DIR@"
+# Diagnostic logs, separate from WAL stored under data_dir.
+# Installed default: %LOCALAPPDATA%/ChuSQL/logs.
+# Use absolute paths; relative paths are resolved from the process working directory.
+log_files = "@LOG_DIR@"
+
+[server]
+# TCP address to bind; 127.0.0.1 accepts local connections only.
+listen_host = "127.0.0.1"
+# TCP database port; choose an unused port from 1 to 65535.
+port = 7777
+# Maximum size of a single protocol message in bytes.
+max_message = 1048576
+# Maximum number of rows returned by a query through the database server.
+max_rows = 1000
+
+[log]
+# Diagnostic verbosity: off, error, warn, info or debug.
+level = "info"
+
+[web]
+# HTTP address to bind; use an external address to expose the web interface.
+listen_host = "127.0.0.1"
+# HTTP port; choose an unused port from 1 to 65535, different from the TCP port.
+port = 7778
+# Send session cookies over HTTPS only; enable behind an HTTPS endpoint.
+cookie_secure = false
+# Session inactivity timeout in seconds.
+session_idle = 28800
+# Maximum total session lifetime in seconds, regardless of activity.
+session_max = 86400
+# Maximum failed login attempts allowed within the login window.
+login_max_attempts = 5
+# Login rate-limit window in seconds.
+login_window = 300
+# Maximum HTTP request body size in bytes.
+body_limit = 65536
+# Default number of rows displayed per results page.
+rows_per_page = 25
+# Maximum page size accepted by the web interface.
+max_page_size = 500
+# Maximum number of query result rows retained by the web interface.
+max_rows = 1000
+# Maximum SQL input length in characters accepted by the web interface.
+max_sql_length = 20000
+# Create demonstration data on startup; keep disabled for normal installations.
+seed = false
+# Minimum password length for ordinary accounts, in characters.
+password_min_length = 12
+# Minimum character classes required: lowercase, uppercase, digits and symbols.
+password_classes = 2

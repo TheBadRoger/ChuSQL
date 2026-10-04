@@ -38,17 +38,14 @@ target/
 # 运行时数据（Rust 服务默认数据目录 CHUSQL_DATA_DIR=data/），不入库
 chusql-core/storage/data/
 
-# 一键启动脚本的默认数据目录与日志，不入库
-localdata/
-
-# 门禁运行时目录：脚本与 README 入库，临时目录与日志不入库
-gate-check/tmp/
+# 本地运行产物：一键启动的数据目录、门禁各车道日志与临时目录、打包产物，不入库
+logs/
 
 # 本机打出来的发行包（scripts/package.sh / package.ps1 的产物），不入库
 releases/
 
-# 前端 IDE 设置（字体等，由 /api/ui-settings 读写），本机专用，不入库
-scripts/chusql.ui.settings.json
+# 前端 IDE 设置（字体等，由 /api/ui-settings 读写），本机专用，不入库；resources/ 不参与打包
+resources/chusql.ui.settings.json
 
 # Cargo.lock 要入库（本项目是要产出可执行程序的 crate，不是纯库）
 
@@ -79,7 +76,8 @@ scripts/chusql.ui.settings.json
 *~
 \#*\#
 .\#*
-agent_credientials
+AGENTS.md
+agent-credientials
 .dsh
 # 注意：.zed/tasks.json 是本仓库共享的构建任务（stack build / run / test / repl），
 # 需要入库，所以这里不忽略 .zed/
@@ -97,4 +95,3 @@ plandocs/
 Thumbs.db
 ehthumbs.db
 desktop.ini
-AGENTS.md

@@ -75,6 +75,10 @@ data Request
     | ReqAllCatalog
     | ReqInDatabase String Request
     | ReqAccountsList
+    | ReqIdentityInitialize T.Text
+    | ReqRoleCreate T.Text
+    | ReqCatalogManage Request
+    | ReqIdentityAlter T.Text (Maybe Bool) (Maybe Bool) (Maybe Bool) (Maybe Bool)
     | ReqAccountCreate T.Text T.Text
     | ReqAccountReset T.Text T.Text
     | ReqAccountLogin T.Text (Maybe T.Text)
@@ -134,7 +138,12 @@ instance ToJSON Request where
     toJSON (ReqInDatabase name req) = case toJSON req of
         A.Object fields -> A.Object (KM.insert "database" (A.String (T.pack name)) fields)
         other -> other
+    toJSON (ReqCatalogManage command) = object ["method" .= ("catalog_manage" :: T.Text), "command" .= command]
     toJSON ReqAccountsList = object ["method" .= ("accounts_list" :: T.Text)]
+    toJSON (ReqIdentityInitialize u) = object ["method" .= ("identity_initialize" :: T.Text), "administrator" .= u]
+    toJSON (ReqRoleCreate u) = object ["method" .= ("role_create" :: T.Text), "user" .= u]
+    toJSON (ReqIdentityAlter u login super enabled manager) = object ["method" .= ("identity_alter" :: T.Text), "user" .= u,
+        "can_login" .= login, "is_superuser" .= super, "enabled" .= enabled, "system_catalog_manager" .= manager]
     toJSON (ReqAccountCreate u h) = object ["method" .= ("account_create" :: T.Text), "user" .= u, "password_hash" .= h]
     toJSON (ReqAccountReset u h) = object ["method" .= ("account_reset" :: T.Text), "user" .= u, "password_hash" .= h]
     toJSON (ReqAccountLogin u at) = object ["method" .= ("account_login" :: T.Text), "user" .= u, "at" .= at]
@@ -303,6 +312,10 @@ data Account = Account
     , accountRevision :: Integer
     , accountRegisteredAt :: T.Text
     , accountLastLoginAt :: Maybe T.Text
+    , accountCanLogin :: Bool
+    , accountIsSuperuser :: Bool
+    , accountEnabled :: Bool
+    , accountSystemCatalogManager :: Bool
     } deriving (Eq)
 
 -- | 账号的展示：只露账号名与版本号
@@ -314,12 +327,14 @@ instance FromJSON Account where
     parseJSON = withObject "Account" $ \o -> Account <$> o .: "id" <*> o .: "user"
         <*> o .: "password_hash" <*> o .: "revision"
         <*> o .:? "registered_at" .!= "" <*> o .:? "last_login_at"
+        <*> o .:? "can_login" .!= True <*> o .:? "is_superuser" .!= False <*> o .:? "enabled" .!= True <*> o .:? "system_catalog_manager" .!= False
 
 -- | 账号编码成 JSON
 instance ToJSON Account where
     toJSON a = object ["id" .= accountId a, "user" .= accountUser a,
         "password_hash" .= accountHash a, "revision" .= accountRevision a,
-        "registered_at" .= accountRegisteredAt a, "last_login_at" .= accountLastLoginAt a]
+        "registered_at" .= accountRegisteredAt a, "last_login_at" .= accountLastLoginAt a,
+        "can_login" .= accountCanLogin a, "is_superuser" .= accountIsSuperuser a, "enabled" .= accountEnabled a, "system_catalog_manager" .= accountSystemCatalogManager a]
 
 -- | 存储层响应
 data Response

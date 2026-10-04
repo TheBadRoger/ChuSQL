@@ -1,8 +1,9 @@
 module ChuSQL.Core.Engine.Algebra.Planner (translate) where
 
-import ChuSQL.Core.Engine.Algebra.Expr (aggregatesIn)
+import ChuSQL.Core.Engine.Algebra.Expr (aggregatesIn, colsInExpr)
 import ChuSQL.Core.Engine.Algebra.Op
 import ChuSQL.Core.Engine.Syntax.AST
+import Data.List (nub)
 
 -- 计划生成：把语句翻译成算子树。
 
@@ -91,5 +92,16 @@ translate q = case q of
     SelectExpr items fromC mWhere groupBy orderBy mLimit -> do
         plan0 <- source fromC mWhere
         let (plan, items') = grouped groupBy items plan0
-        Right (Compute items' (limited orderBy mLimit plan))
+        Right $ if any (\(c, _) -> c `elem` map fst items') orderBy
+            then orderedProjection items' orderBy mLimit plan
+            else Compute items' (limited orderBy mLimit plan)
     _ -> Left "only SELECT is supported by translate"
+
+-- | 在排序前计算别名并保留输出顺序
+orderedProjection :: [(String, Expr)] -> [(String, SortDir)] -> Maybe Int -> RelOp -> RelOp
+orderedProjection items orderBy mLimit plan =
+    Compute items (limited ordering mLimit (Compute (carried ++ keys) plan))
+  where
+    carried = [(column, Col column) | column <- nub (concatMap (colsInExpr . snd) items)]
+    keys = [("$order" ++ show n, maybe (Col c) id (lookup c items)) | (n, (c, _)) <- zip [1 :: Int ..] orderBy]
+    ordering = [(key, direction) | ((key, _), (_, direction)) <- zip keys orderBy]

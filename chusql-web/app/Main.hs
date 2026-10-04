@@ -18,12 +18,11 @@ import ChuSQL.Interface.Config (
 import ChuSQL.Interface.Link (clientPing, closeClient, connectClient)
 import ChuSQL.Interface.RateLimit (newRateLimiter)
 import ChuSQL.Interface.Session (authenticateSession, newSession)
-import ChuSQL.Interface.Settings (effectiveSettings, readSettingsFile)
+import ChuSQL.Interface.Settings (effectiveSettings)
 import ChuSQL.Interface.TOML (resolveConfigPath)
 import ChuSQL.Web.Demo (SeedReport (..), seedDemo)
 import Control.Exception (IOException, try)
 import Data.Char (toLower)
-import qualified Data.Map.Strict as Map
 import Data.String (fromString)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -42,7 +41,6 @@ data Options = Options
     { optConfig :: Maybe FilePath
     , optHost :: Maybe String
     , optPort :: Maybe Int
-    , optStatic :: Maybe FilePath
     , optUser :: Maybe Text
     , optCookieSecure :: Maybe Bool
     , optBodyLimit :: Maybe Int
@@ -65,7 +63,6 @@ emptyOptions =
         { optConfig = Nothing
         , optHost = Nothing
         , optPort = Nothing
-        , optStatic = Nothing
         , optUser = Nothing
         , optCookieSecure = Nothing
         , optBodyLimit = Nothing
@@ -90,8 +87,7 @@ parseArgs = go emptyOptions
     go opts ("--help" : rest) = go opts{optHelp = True} rest
     go opts ("-h" : rest) = go opts{optHelp = True} rest
     go opts ("--config" : v : rest) = go opts{optConfig = Just v} rest
-    go opts ("--host" : v : rest) = go opts{optHost = Just v} rest
-    go opts ("--static" : v : rest) = go opts{optStatic = Just v} rest
+    go opts ("--listen-host" : v : rest) = go opts{optHost = Just v} rest
     go opts ("--user" : v : rest) = go opts{optUser = Just (T.pack v)} rest
     go opts ("--port" : v : rest) = withInt "--port" v (\n -> go opts{optPort = Just n} rest)
     go opts ("--body-limit" : v : rest) = withInt "--body-limit" v (\n -> go opts{optBodyLimit = Just n} rest)
@@ -120,17 +116,16 @@ usage :: IO ()
 usage = do
     putStrLn "usage: chusql-web [options]"
     putStrLn ""
-    putStrLn "config: chusql.toml sits at a fixed place and its sections hold every knob below;"
-    putStrLn "        Windows: %APPDATA%\\ChuSQL\\chusql.toml"
-    putStrLn "        other:   $XDG_CONFIG_HOME/ChuSQL/chusql.toml (or ~/.config/ChuSQL/chusql.toml)"
-    putStrLn "        [web] host/port/static_dir/user (administrator name) and the limits;"
-    putStrLn "        [storage] data_dir; [page] size; [btree] order; [buffer] pool_size; [log] level"
+    putStrLn "config: settings.toml sits at a fixed place and its sections hold every knob below;"
+    putStrLn "        Windows: %APPDATA%\\ChuSQL\\settings.toml"
+    putStrLn "        other:   $XDG_CONFIG_HOME/ChuSQL/settings.toml (or ~/.config/ChuSQL/settings.toml)"
+    putStrLn "        [web] listen_host/port and the limits;"
+    putStrLn "        [storage] data_dir/log_files; [page] size; [btree] order; [buffer] pool_size; [log] level"
     putStrLn ""
-    putStrLn "  --config FILE          read that config file instead ([web] host ...)"
-    putStrLn "  --host H               listen address              ([web] host, default 127.0.0.1)"
+    putStrLn "  --config FILE          read that config file instead ([web] listen_host ...)"
+    putStrLn "  --listen-host H        listen address              ([web] listen_host, default 127.0.0.1)"
     putStrLn "  --port N               listen port                 ([web] port, default 7778)"
-    putStrLn "  --static DIR           static asset directory      ([web] static_dir, default static)"
-    putStrLn "  --user NAME            administrator name          ([web] user, default root)"
+    putStrLn ("  --user NAME            administrator name          (default " ++ T.unpack defaultUser ++ ")")
     putStrLn "  --cookie-secure BOOL   add Secure to the cookie    ([web] cookie_secure, default false)"
     putStrLn "  --body-limit N         max request body bytes      ([web] body_limit, default 65536)"
     putStrLn "  --session-idle N       session idle timeout, sec   ([web] session_idle, default 28800)"
@@ -143,13 +138,13 @@ usage = do
     putStrLn "  --max-sql-length N     max SQL characters          ([web] max_sql_length, default 20000)"
     putStrLn "  --seed BOOL            load demo data when the db is empty ([web] seed, default false)"
     putStrLn ""
-    putStrLn "administrator password: lives in the __system_users system table, never in chusql.toml"
+    putStrLn "administrator password: lives in the __system_users system table, never in settings.toml"
     putStrLn "  the installer always sets one; an account whose hash is still empty signs in with an empty password"
-    putStrLn ("  the [web] user key only picks the administrator name (default " ++ T.unpack defaultUser ++ ")")
+    putStrLn "  the administrator name comes from --user; settings.toml does not carry it"
     putStrLn "ordinary accounts: CREATE USER / ALTER USER / DROP USER from the SQL console (administrator only)"
     putStrLn "storage: the server owns the data directory and loads the chusql_core_storage library;"
     putStrLn "  this process is a plain TCP client: every statement, lookup and account request goes to it"
-    putStrLn "  [server] host / port says where it listens; [storage] data_dir, [page] size, [btree] order,"
+    putStrLn "  [server] listen_host / port says where it listens; [storage] data_dir, [page] size, [btree] order,"
     putStrLn "  [buffer] pool_size and [log] level are the server's own"
 
 -- | 命令行覆盖配置
@@ -158,7 +153,6 @@ applyOptions cfg opts =
     cfg
         { wcHost = orElse (optHost opts) (wcHost cfg)
         , wcPort = orElse (optPort opts) (wcPort cfg)
-        , wcStaticDir = orElse (optStatic opts) (wcStaticDir cfg)
         , wcUser = orElse (optUser opts) (wcUser cfg)
         , wcCookieSecure = orElse (optCookieSecure opts) (wcCookieSecure cfg)
         , wcBodyLimit = orElse (optBodyLimit opts) (wcBodyLimit cfg)
@@ -206,7 +200,6 @@ run opts = do
         Just staticDir -> do
             let settingsFile = configPath
                 policy = SessionPolicy (fromIntegral (wcSessionIdle cfg)) (fromIntegral (wcSessionMax cfg))
-            saved <- readSettingsFile settingsFile
             legacy <- legacyPasswordKey settingsFile
             config <- loadServerConfigAt settingsFile
             limiter <-
@@ -225,9 +218,9 @@ run opts = do
             setLive env (liveFromConfig cfg)
             app <- webApp env
             printBanner cfg configPath staticDir
-            reportCredential cfg saved legacy
+            reportCredential cfg legacy
             checkServer (aeServerHost env) (aeServerPort env)
-            seedIfWanted cfg saved (aeServerHost env) (aeServerPort env)
+            seedIfWanted cfg (aeServerHost env) (aeServerPort env)
             let settings =
                     Warp.setPort (wcPort cfg) (Warp.setHost (fromString (wcHost cfg)) Warp.defaultSettings)
             serve settings app
@@ -260,9 +253,9 @@ serve settings app = do
             exitFailure
 
 -- | 报告管理员账号状态：配置里还留着明文口令键就提醒
-reportCredential :: WebConfig -> Map.Map Text Text -> Bool -> IO ()
-reportCredential cfg saved legacy = do
-    putStrLn ("administrator: " ++ T.unpack (rootUserName cfg saved))
+reportCredential :: WebConfig -> Bool -> IO ()
+reportCredential cfg legacy = do
+    putStrLn ("administrator: " ++ T.unpack (rootUserName cfg))
     if legacy
         then do
             putStrLn "  !! the [web] section still carries a plaintext password key; it is ignored now"
@@ -270,8 +263,8 @@ reportCredential cfg saved legacy = do
         else pure ()
 
 -- | 配了 seed 就补演示数据（管理员已设口令时跳过）
-seedIfWanted :: WebConfig -> Map.Map Text Text -> Text -> Int -> IO ()
-seedIfWanted cfg saved host port
+seedIfWanted :: WebConfig -> Text -> Int -> IO ()
+seedIfWanted cfg host port
     | not (wcSeedDemo cfg) = pure ()
     | otherwise = do
         opened <- connectClient host port
@@ -279,7 +272,7 @@ seedIfWanted cfg saved host port
             Left message -> TIO.putStrLn ("demo data skipped: " <> message)
             Right client -> do
                 session <- newSession client
-                signed <- authenticateSession session (rootUserName cfg saved) ""
+                signed <- authenticateSession session (rootUserName cfg) ""
                 case signed of
                     Left message -> TIO.putStrLn ("demo data skipped: " <> message <> " (set the administrator password after seeding)")
                     Right () -> do

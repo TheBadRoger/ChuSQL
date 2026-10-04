@@ -1,24 +1,24 @@
 #!/bin/sh
 set -eu
 
-# csql-web：先起独占数据目录的 server，再起 Web 服务，配置读 chusql.toml。
+# csql-web：先起独占数据目录的 server，再起 Web 服务，配置读 settings.toml。
 
 home_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 bin="$home_dir/bin"
 
 # 和在 Windows 的 csql-web.ps1（Start-Process -WorkingDirectory）保持一致：
-# 先切到安装目录，配置里写相对的 static_dir / data_dir 才有确定的解析基准。
+# 先切到安装目录，配置里写相对的 log_files 才有确定的解析基准。
 cd "$home_dir"
 
 config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ChuSQL"
-config="$config_dir/chusql.toml"
+config="$config_dir/settings.toml"
 [ -f "$config" ] || { echo "!! config not found: $config" >&2; exit 1; }
 
-# 从配置里取一个 [web] 段的值。
-web_setting() {
-    awk -v key="$1" -v def="$2" '
+# 从配置里取某分区的一个值。
+section_setting() {
+    awk -v section_key="$1" -v key="$2" -v def="$3" '
         /^[[:space:]]*\[/ { section = $0; gsub(/[][[:space:]]/, "", section); next }
-        section != "web" { next }
+        section != section_key { next }
         {
             line = $0
             sub(/#.*/, "", line)
@@ -40,9 +40,14 @@ web_exe="$bin/chusql-web"
 [ -x "$server_exe" ] || { echo "!! server binary not found in $bin" >&2; exit 1; }
 [ -x "$web_exe" ] || { echo "!! web binary not found in $bin" >&2; exit 1; }
 
-host=$(web_setting host 127.0.0.1)
-port=$(web_setting port 7778)
-log_dir="$home_dir/logs"
+# 监听地址与端口取 [web] 段，日志目录取 [storage] log_files（相对路径以安装目录为基准）。
+host=$(section_setting web listen_host 127.0.0.1)
+port=$(section_setting web port 7778)
+log_setting=$(section_setting storage log_files ./logs)
+case "$log_setting" in
+    /*) log_dir="$log_setting" ;;
+    *) log_dir="$home_dir/$log_setting" ;;
+esac
 mkdir -p "$log_dir"
 
 # server 先起来：它进程内装入存储库、独占数据目录，Web 的存储请求都经它转发

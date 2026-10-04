@@ -2,11 +2,12 @@ cabal-version: 2.4
 
 name:           chusql-interface
 version:        1.0.0
-synopsis:       ChuSQL 接口层：配置、口令、语句构造与 TCP 客户端
-description:    引擎无关的接口层。Web 管理端与命令行客户端都只依赖这层：
-                读同一份 chusql.toml、用同一个线上协议连到拥有存储库的
-                chusql-server，然后在客户端会话上跑 SQL、看数据字典与角色。
-                存储引擎与存储动态库一概不在这层。
+synopsis:       ChuSQL configuration, authentication, SQL helpers, and TCP client
+description:    Provides engine-independent interfaces shared by web and
+                command-line clients, including settings.toml configuration,
+                password handling, statement construction, and TCP sessions.
+                Supports SQL execution and catalog and role inspection through
+                chusql-server without linking the engine or storage library.
 build-type:     Simple
 
 library

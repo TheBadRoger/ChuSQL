@@ -31,7 +31,7 @@ const OP_DROP_INDEX: u8 = 14;
 pub enum WalOp {
     HideColumn { table: String, column: String },
     Compact { table: String, rows: Vec<Row> },
-    Accounts { accounts: Vec<Account> },
+    Accounts { accounts: Vec<Account>, removed: Vec<String>, migrate_roles: bool },
     Insert {
         table: String,
         row: Row,
@@ -283,7 +283,7 @@ impl Wal {
                     frames.push((lsn, op, offset, end));
                     offset = end;
                 }
-                Err(_) => break,
+                Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
             }
         }
         Ok((frames, offset))
@@ -291,9 +291,13 @@ impl Wal {
 
     /// 记录检查点：到此为止的 LSN 都已落盘
     pub fn write_checkpoint(&self, lsn: u64) -> io::Result<()> {
-        let mut f = File::create(self.checkpoint_path())?;
+        let checkpoint = self.checkpoint_path();
+        let pending = checkpoint.with_extension("checkpoint.pending");
+        let mut f = File::create(&pending)?;
         f.write_all(&lsn.to_le_bytes())?;
-        f.sync_all()
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(pending, checkpoint)
     }
 
     /// 读检查点 LSN
@@ -303,8 +307,8 @@ impl Wal {
             return Ok(None);
         }
         let bytes = std::fs::read(&path)?;
-        if bytes.len() < 8 {
-            return Ok(None);
+        if bytes.len() != 8 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid WAL checkpoint length"));
         }
         let mut raw = [0u8; 8];
         raw.copy_from_slice(&bytes[..8]);
@@ -322,10 +326,10 @@ impl Wal {
             if let Some((lsn, _, _, _)) = frames.last() {
                 base = base.max(*lsn);
             }
-            *slot = base + 1;
+            *slot = base.checked_add(1).ok_or_else(|| io::Error::other("WAL LSN exhausted"))?;
         }
         let lsn = *slot;
-        *slot += 1;
+        *slot = slot.checked_add(1).ok_or_else(|| io::Error::other("WAL LSN exhausted"))?;
         Ok(lsn)
     }
 
@@ -378,8 +382,8 @@ fn encode(op: &WalOp, lsn: u64) -> io::Result<Vec<u8>> {
             let p = serde_json::to_vec(rows).map_err(io::Error::other)?;
             (OP_COMPACT, table.clone(), p)
         }
-        WalOp::Accounts { accounts } => (OP_ACCOUNTS, USERS_TABLE.to_string(),
-            serde_json::to_vec(accounts).map_err(io::Error::other)?),
+        WalOp::Accounts { accounts, removed, migrate_roles } => (OP_ACCOUNTS, USERS_TABLE.to_string(),
+            serde_json::to_vec(&serde_json::json!({"accounts":accounts,"removed":removed,"migrate_roles":migrate_roles})).map_err(io::Error::other)?),
         WalOp::Insert { table, row } => {
             let p = serde_json::to_vec(row).map_err(io::Error::other)?;
             (OP_INSERT, table.clone(), p)
@@ -478,9 +482,15 @@ fn decode_body(body: &[u8]) -> Result<(u64, WalOp), String> {
         }
         OP_ACCOUNTS => {
             if table != USERS_TABLE { return Err("invalid account WAL table".into()); }
-            let accounts = serde_json::from_slice(payload)
-                .map_err(|e| format!("bad account payload: {e}"))?;
-            WalOp::Accounts { accounts }
+            let value: serde_json::Value = serde_json::from_slice(payload).map_err(|e| format!("bad account payload: {e}"))?;
+            let (accounts, removed, migrate_roles) = if value.is_array() {
+                (serde_json::from_value(value).map_err(|e| format!("bad account payload: {e}"))?, Vec::new(), false)
+            } else {
+                (serde_json::from_value(value.get("accounts").cloned().ok_or("missing account payload")?).map_err(|e| format!("bad account payload: {e}"))?,
+                    serde_json::from_value(value.get("removed").cloned().ok_or("missing identity cleanup")?).map_err(|e| format!("bad account cleanup: {e}"))?,
+                    value.get("migrate_roles").and_then(serde_json::Value::as_bool).ok_or("missing role migration flag")?)
+            };
+            WalOp::Accounts { accounts, removed, migrate_roles }
         }
         OP_INSERT => {
             let row: Row =

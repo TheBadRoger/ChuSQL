@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="209" height="24" viewBox="0 0 209 24" role="img" aria-label="languages: Haskell + Rust">
+  <title>ChuSQL implementation languages: Haskell and Rust.</title>
+  <defs><clipPath id="rounded"><rect width="209" height="24" rx="5"/></clipPath></defs>
+  <g clip-path="url(#rounded)"><rect width="209" height="24" fill="#1e293b"/><rect x="87" width="122" height="24" fill="#6d28d9"/></g>
+  <g fill="#fff" text-anchor="middle" font-family="Verdana,DejaVu Sans,sans-serif" font-size="11"><text x="43.5" y="16">languages</text><text x="148" y="16">Haskell + Rust</text></g>
+</svg>

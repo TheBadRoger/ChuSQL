@@ -13,6 +13,7 @@ module ChuSQL.Server.Backend (
     membersTable,
     optionsTable,
     rolesTable,
+    scopeDdl,
     statementNeedsDatabase,
     statementTables,
     systemDatabaseName,
@@ -45,6 +46,7 @@ import Data.Text (Text)
 import Data.Time (getCurrentTime)
 import Data.Time.Format (defaultTimeLocale, formatTime)
 import qualified Data.Aeson as A
+import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString.Lazy.Char8 as BL
 import qualified Data.Text as T
 
@@ -75,6 +77,7 @@ columnsFromStatement :: Database -> Statement -> [String]
 columnsFromStatement db stmt = case prepare db stmt of
     Right (Select cols _ _ _ _ _) -> cols
     Right (SelectExpr items _ _ _ _ _) -> map fst items
+    Right ShowDomains -> ["domain", "base_type"]
     _ -> []
 
 -- | 走本地存储链路的后端
@@ -85,7 +88,7 @@ ipcBackend = do
             , beCatalog = do
                 response <- sendRequest (ReqInDatabase current ReqListCatalog)
                 pure $ case response of
-                    RespCatalog infos -> Right infos
+                    RespCatalog infos -> Right (filter (not . isDomainTable . tiTable) infos)
                     RespError err -> Left err
                     _ -> Left "unexpected catalog response"
             , bePing = do
@@ -134,8 +137,9 @@ ipcBackend = do
     -- 引擎侧的数据字典按当前库过滤之后键是裸表名，补前缀会让查表落空；
     -- 库名由 database 字段随请求带走，存储层自己按它分发。
     runIpc :: String -> String -> IO (Either String StatementResult)
-    runIpc current sql = case parseStatement sql of
+    runIpc current sql = case parseStatement sql >>= scopeDdl current of
         Left e -> pure (Left e)
+        Right stmt | null current && statementNeedsDatabase stmt -> pure (Left "no database selected")
         Right stmt -> do
             let env = sessionEnv current
             result <- runIPCStorageIn (runStatementM stmt) env
@@ -157,7 +161,7 @@ memoryBackend = memoryBackendWith False
 memoryBackendWith :: Bool -> String -> MVar Database -> Backend
 memoryBackendWith trusted name ref =
     Backend
-        { beStatement = \sql -> case parseStatement sql of
+        { beStatement = \sql -> case parseStatement sql >>= scopeDdl (if trusted then systemDatabaseName else name) of
             Left e -> pure (Left e)
             -- 内存夹具也有"库"的概念：USE 只能切到它有的两个名字（自己 + system），
             -- 与 beDatabases 口径一致；引擎的内存存储不实现库管理，所以拦在这里。
@@ -167,31 +171,47 @@ memoryBackendWith trusted name ref =
             Right stmt -> modifyMVar ref $ \db -> case runStatement (scoped db) stmt of
                 Left e -> pure (db, Left e)
                 Right (db', rows)
-                    | any (hidden . fst) db' -> pure (db, Left "reserved system table")
-                    | otherwise -> pure (filter (hidden . fst) db ++ db', Right (StatementResult (colsOf (scoped db) stmt rows) rows))
+                    | any (\(key, _) -> hidden key && not (domainKey key)) db' -> pure (db, Left "reserved system table")
+                    | otherwise -> pure (mergeScoped db db', Right (StatementResult (colsOf (scoped db) stmt rows) rows))
         , beCatalog = do
             db <- readMVar ref
-            pure (Right (map tableInfoOf (filter (not . internalTable . fst) db)))
+            pure (Right (map tableInfoOf (filter (not . internalTable . fst) (scoped db))))
         , bePing = pure True
         , beAccounts = \req -> do
             stamp <- currentStamp
             modifyMVar ref $ \db -> case memoryAccounts db stamp req of
                 Left err -> pure (db, Left err)
-                Right accounts -> pure ((usersTable, Table usersTable [("account", TStr)]
-                    [[("account", VStr (BL.unpack (A.encode a))) ] | a <- accounts] Nothing) : filter ((/= usersTable) . fst) db, Right accounts)
+                Right accounts -> case memoryAccounts db stamp ReqAccountsList of
+                    Left err -> pure (db, Left err)
+                    Right previous -> pure (case req of ReqAccountsList -> db; ReqCatalogManage ReqAccountsList -> db; _ -> storeMemoryIdentities db previous accounts, Right accounts)
         , beWithDatabase = withDatabase
         , beDatabases = pure (Right (nub [name, systemDatabaseName]))
         , beStorage = \_ -> pure (Left "storage is not available in this backend")
         , beSnapshot = Right . scoped <$> readMVar ref
-        , beApplyTransaction = \ops -> modifyMVar ref $ \db -> case applyTransactionMemory ops db of
+        , beApplyTransaction = \ops -> modifyMVar ref $ \db -> case applyTransactionMemory ops (scoped db) of
             Left err -> pure (db, Left err)
-            Right db' -> pure (db', Right ())
+            Right db' -> pure (mergeScoped db db', Right ())
         }
   where
     -- | 按视角过滤库里的表
-    scoped = if trusted then filter (not . blocked . fst) else visible
+    scoped db = [(lastTablePart key, table {tableName = lastTablePart key}) | (key, table) <- db, inScope key, domainKey key || not (hidden key)]
+    -- | 限定键只属于指定工作库
+    inScope key = case break (== '.') key of
+        (_, []) -> True
+        (database, _) -> T.toLower (T.pack database) == T.toLower (T.pack (if trusted then systemDatabaseName else name))
     -- | 该视角下要隐藏的表
-    hidden = if trusted then blocked else internalTable
+    hidden = (if trusted then blocked else internalTable) . lastTablePart
+    -- | 判断裸名或限定名是否为类型目录
+    domainKey = isDomainTable . lastTablePart
+    -- | 回写当前库并保留其他库和内部目录
+    mergeScoped original changed =
+        filter (\(key, _) -> not (inScope key) || (hidden key && not (domainKey key))) original
+            ++ [(storageKey original key, table) | (key, table) <- changed]
+    -- | 保留夹具中的原始数据库限定键
+    storageKey original key = case [saved | (saved, _) <- original, inScope saved, lastTablePart saved == key] of
+        saved : _ -> saved
+        [] | any (\(saved, _) -> inScope saved && '.' `elem` saved) original -> (if trusted then systemDatabaseName else name) ++ "." ++ key
+        [] -> key
     -- | 取结果列名，空结果回落到解析
     colsOf db stmt rows = case rows of
         [] -> columnsFromStatement db stmt
@@ -256,10 +276,10 @@ statementTables :: Statement -> [Text]
 statementTables stmt = nub (case stmt of
     Select{} ->
         tableRefsOf (selectFrom stmt)
-            ++ concatMap exprTables (maybe [] (: []) (selectWhere stmt))
+            ++ concatMap exprTables (maybe [] (: []) (selectWhere stmt) ++ map Col (selectCols stmt ++ selectGroupBy stmt ++ map fst (selectOrderBy stmt)))
     SelectExpr{} ->
         tableRefsOf (selectFrom stmt)
-            ++ concatMap exprTables (maybe [] (: []) (selectWhere stmt) ++ map snd (selectItems stmt))
+            ++ concatMap exprTables (maybe [] (: []) (selectWhere stmt) ++ map snd (selectItems stmt) ++ map Col (selectGroupBy stmt ++ map fst (selectOrderBy stmt)))
     Insert table _ rows -> T.pack table : concatMap exprTables (concat rows)
     Update table assigns cond -> T.pack table : concatMap exprTables (map snd assigns ++ maybe [] (: []) cond)
     Delete table cond -> T.pack table : concatMap exprTables (maybe [] (: []) cond)
@@ -277,7 +297,52 @@ statementTables stmt = nub (case stmt of
 
 -- | 语句需不需要一个当前库：出现的表里有没写库名的就必须要
 statementNeedsDatabase :: Statement -> Bool
-statementNeedsDatabase stmt = any (not . T.any (== '.')) (statementTables stmt)
+statementNeedsDatabase stmt = case stmt of
+    CreateTable{} -> True
+    DropTable{} -> True
+    CreateIndex{} -> True
+    DropIndex{} -> True
+    DropColumn{} -> True
+    AddColumn{} -> True
+    RenameColumn{} -> True
+    AlterColumnType{} -> True
+    AlterColumnDefault{} -> True
+    AlterColumnNull{} -> True
+    CreateDomain{} -> True
+    DropDomain{} -> True
+    ShowDomains -> True
+    _ -> not (null (statementTables stmt))
+
+-- | 将当前库限定的结构目标转为裸表名
+scopeDdl :: String -> Statement -> Either String Statement
+scopeDdl current statement = case statement of
+    CreateTable table columns -> (\key -> CreateTable key columns) <$> target table
+    DropTable table -> DropTable <$> target table
+    CreateIndex table column -> (\key -> CreateIndex key column) <$> target table
+    DropIndex table column -> (\key -> DropIndex key column) <$> target table
+    DropColumn table column -> (\key -> DropColumn key column) <$> target table
+    AddColumn table column -> (\key -> AddColumn key column) <$> target table
+    RenameColumn table old new -> (\key -> RenameColumn key old new) <$> target table
+    AlterColumnType table column ty -> (\key -> AlterColumnType key column ty) <$> target table
+    AlterColumnDefault table column value -> (\key -> AlterColumnDefault key column value) <$> target table
+    AlterColumnNull table column nullable -> (\key -> AlterColumnNull key column nullable) <$> target table
+    _ -> statement <$ mapM_ checkReadTarget (statementTables statement)
+  where
+    -- | 数据引用限定在当前工作库
+    checkReadTarget table
+        | null current = Left "no database selected"
+        | otherwise = case T.breakOn "." table of
+            (_, suffix) | T.null suffix -> Right ()
+            (database, _) | T.toLower database == T.toLower (T.pack current) -> Right ()
+            _ -> Left ("table is outside the current database: " ++ T.unpack table)
+    -- | 校验库限定名并取当前库中的表名
+    target table
+        | null current = Left "no database selected"
+        | otherwise = case break (== '.') table of
+            (_, []) -> Right table
+            (database, '.' : key)
+                | T.toLower (T.pack database) == T.toLower (T.pack current) -> Right key
+            _ -> Left ("DDL target is outside the current database: " ++ table)
 
 -- | FROM 子句里的所有表
 tableRefsOf :: FromClause -> [Text]
@@ -289,6 +354,7 @@ tableRefsOf (FromJoin _ left right cond) = tableRefsOf left ++ tableRefsOf right
 -- | 表达式里出现的表（子查询是唯一的来路）
 exprTables :: Expr -> [Text]
 exprTables expr = case expr of
+    Col column | [database, table, _] <- T.splitOn "." (T.pack column) -> [database <> "." <> table]
     ScalarSub sub -> statementTables (subqueryStatement sub)
     ExistsSub sub _ -> statementTables (subqueryStatement sub)
     InSub value sub _ -> exprTables value ++ statementTables (subqueryStatement sub)
@@ -395,10 +461,6 @@ internalTable name = reserved name || privilegeTable name
 blocked :: String -> Bool
 blocked name = reserved name && not (privilegeTable name)
 
--- | 去掉内部表
-visible :: Database -> Database
-visible = filter (not . internalTable . fst)
-
 -- | 当前 UTC 时间，写法与引擎的 timestamp 一致
 currentStamp :: IO T.Text
 currentStamp = T.pack . formatTime defaultTimeLocale "%Y-%m-%d %H:%M:%S" <$> getCurrentTime
@@ -406,26 +468,98 @@ currentStamp = T.pack . formatTime defaultTimeLocale "%Y-%m-%d %H:%M:%S" <$> get
 -- | 在内存账号表上执行一条账号请求
 memoryAccounts :: Database -> T.Text -> Request -> Either String [Account]
 memoryAccounts db stamp req = do
-    accounts <- case lookup usersTable db of
-        Nothing -> Right []
-        Just table -> mapM decodeAccount (tableRows table)
+    stored <- case lookup "__system_identities" db of
+        Just table -> mapM decodeCredential (tableRows table)
+        Nothing -> case lookup usersTable db of
+            Nothing -> Right []
+            Just table -> mapM decodeAccount (tableRows table)
+    let accounts = stored
+        highWater = maximum (0 : map accountId accounts ++ [toInteger n | row <- maybe [] tableRows (lookup "__system_identity_sequence" db), Just (VInt n) <- [lookup "id" row]])
+        legacyNames = [T.toLower (T.pack name) | row <- maybe [] tableRows (lookup rolesTable db), Just (VStr name) <- [lookup "name" row]]
     case req of
+        ReqCatalogManage command -> do
+            let target = case command of
+                    ReqAccountCreate name _ -> Just name
+                    ReqAccountReset name _ -> Just name
+                    ReqAccountDrop name -> Just name
+                    ReqIdentityAlter name _ Nothing _ Nothing -> Just name
+                    _ -> Nothing
+                allowed = case command of ReqAccountsList -> True; ReqAccountCreate{} -> True; ReqAccountReset{} -> True; ReqAccountDrop{} -> True; ReqIdentityAlter _ _ Nothing _ Nothing -> True; _ -> False
+            if not allowed || any (\a -> target == Just (accountUser a) && (accountIsSuperuser a || accountSystemCatalogManager a)) accounts
+                then Left "superuser required to manage privileged identities" else memoryAccounts db stamp command
         ReqAccountsList -> Right accounts
+        ReqIdentityInitialize admin
+            | any (`elem` map accountUser accounts) legacyNames || length (nub legacyNames) /= length legacyNames -> Left "identity name collision"
+            | otherwise -> Right ([if legacyIdentity a && accountUser a == T.toLower admin then a{accountIsSuperuser = True} else a | a <- accounts] ++
+                [Account (highWater + offset) role "" 1 stamp Nothing False False True False | (offset, role) <- zip [1..] legacyNames])
+        ReqRoleCreate u
+            | any ((== T.toLower u) . accountUser) accounts -> Left "identity already exists"
+            | otherwise -> Right (accounts ++ [Account (highWater + 1) (T.toLower u) "" 1 stamp Nothing False False True False])
+        ReqIdentityAlter u login super enabled manager -> case filter ((== T.toLower u) . accountUser) accounts of
+            [_] -> preserveSuper [if accountUser a == T.toLower u then a{accountCanLogin = maybe (accountCanLogin a) id login,
+                accountIsSuperuser = maybe (accountIsSuperuser a) id super, accountEnabled = maybe (accountEnabled a) id enabled,
+                accountSystemCatalogManager = maybe (accountSystemCatalogManager a) id manager,
+                accountRevision = accountRevision a + 1} else a | a <- accounts] accounts
+            _ -> Left "unknown account"
         ReqAccountCreate u h
             | any ((== T.toLower u) . accountUser) accounts -> Left "account already exists"
-            | otherwise -> Right (accounts ++ [Account (1 + maximum (0 : map accountId accounts)) (T.toLower u) h 1 stamp Nothing])
+            | otherwise -> Right (accounts ++ [Account (highWater + 1) (T.toLower u) h 1 stamp Nothing True False True False])
         ReqAccountReset u h -> case filter ((== T.toLower u) . accountUser) accounts of
             [_] -> Right [if accountUser x == T.toLower u then x{accountHash = h, accountRevision = accountRevision x + 1} else x | x <- accounts]
             _ -> Left "unknown account"
         ReqAccountLogin u at -> case filter ((== T.toLower u) . accountUser) accounts of
-            [_] -> Right [if accountUser x == T.toLower u then x{accountLastLoginAt = at} else x | x <- accounts]
-            _ -> Left "unknown account"
+            [a] | accountEnabled a && accountCanLogin a -> Right [if accountUser x == T.toLower u then x{accountLastLoginAt = at} else x | x <- accounts]
+            _ -> Left "identity cannot login"
         ReqAccountDrop u -> case filter ((== T.toLower u) . accountUser) accounts of
             [] -> Left "unknown account"
-            _ -> Right [x | x <- accounts, accountUser x /= T.toLower u]
+            _ -> preserveSuper [x | x <- accounts, accountUser x /= T.toLower u] accounts
         _ -> Left "invalid account request"
   where
-    -- | 把一行解回账号
+    -- | 判断旧格式身份是否缺少属性
+    legacyIdentity account = any (legacyRow (accountUser account)) (maybe [] tableRows (lookup usersTable db))
+    -- | 检查旧身份的元数据版本
+    legacyRow user row = case lookup "account" row of
+        Just (VStr encoded) -> case A.decode (BL.pack encoded) of
+            Just (A.Object fields) -> KM.lookup "user" fields == Just (A.String user) && not (KM.member "is_superuser" fields)
+            _ -> False
+        _ -> False
+    -- | 读取旧格式账号
     decodeAccount row = case lookup "account" row of
         Just (VStr encoded) -> A.eitherDecode (BL.pack encoded)
         _ -> Left "invalid account record"
+    -- | 合并身份与口令
+    decodeCredential row = do
+        identity <- decodeAccount row
+        case [hash | credential <- maybe [] tableRows (lookup usersTable db), lookup "id" credential == Just (VInt (fromInteger (accountId identity))), Just (VStr hash) <- [lookup "password_hash" credential]] of
+            [hash] -> Right identity{accountHash = T.pack hash}
+            _ -> Left "invalid identity credential"
+    -- | 保留启用的登录管理员
+    preserveSuper next old
+        | any activeSuper old && not (any activeSuper next) = Left "the last enabled login superuser cannot be removed"
+        | otherwise = Right next
+    -- | 判断可登录管理员
+    activeSuper a = accountEnabled a && accountCanLogin a && accountIsSuperuser a
+
+-- | 分开保存内存身份与口令并清理授权
+storeMemoryIdentities :: Database -> [Account] -> [Account] -> Database
+storeMemoryIdentities db previous accounts =
+    (usersTable, Table usersTable [("id", TInt), ("password_hash", TStr)] credentials Nothing) :
+    ("__system_identities", Table "__system_identities" [("account", TStr)] identities Nothing) :
+    ("__system_identity_sequence", Table "__system_identity_sequence" [("id", TInt)] [[("id", VInt highWater)]] Nothing) :
+    [(name, clean name table) | (name, table) <- db, name `notElem` [usersTable, "__system_identities", "__system_identity_sequence"]]
+  where
+    -- | 保存口令与身份编号
+    credentials = [[("id", VInt (fromInteger (accountId a))), ("password_hash", VStr (T.unpack (accountHash a)))] | a <- accounts]
+    -- | 保存不含口令的身份记录
+    identities = [[("account", VStr (BL.unpack (A.encode a{accountHash = ""})))] | a <- accounts]
+    -- | 保留已用编号上界
+    highWater = maximum (0 : map (fromInteger . accountId) accounts ++ [n | row <- maybe [] tableRows (lookup "__system_identity_sequence" db), Just (VInt n) <- [lookup "id" row]])
+    -- | 清理旧目录与失效的授权边
+    clean name table
+        | name == rolesTable = table{tableRows = []}
+        | name `elem` [grantsTable, optionsTable, membersTable] = table{tableRows = filter active (tableRows table)}
+        | otherwise = table
+    -- | 识别已经删除的身份
+    removed = [accountUser a | a <- previous, accountUser a `notElem` map accountUser accounts]
+    -- | 排除已删除身份的授权和成员边
+    active row = not (any (\field -> case lookup field row of Just (VStr value) -> T.pack value `elem` removed; _ -> False) ["role", "member"])

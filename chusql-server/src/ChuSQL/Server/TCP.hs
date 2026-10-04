@@ -18,6 +18,7 @@ import ChuSQL.Interface.Policy (PasswordPolicy (..))
 import ChuSQL.Interface.Protocol (ClientRequest (..), ServerResponse (..), decodeRequest, encodeResponse, protocolVersion)
 import ChuSQL.Interface.RateLimit (RateLimiter, rateLimitBlock, rateLimitClear, rateLimitRecord)
 import qualified ChuSQL.Core.Engine.Error as E
+import ChuSQL.Core.Protocol (Account (..), Request (ReqIdentityInitialize))
 import ChuSQL.Server.Backend (Backend (..))
 import ChuSQL.Server.Session (QueryResult (..), Session, SessionError (..), accounts, authenticateSessionCoded, catalog, databases, newSessionWith, policyOf, reloadPolicy, roleViews, runStatementCoded, sessionIsAdmin, sessionUser)
 import Control.Concurrent (forkIO)
@@ -116,6 +117,12 @@ data ServerEnv = ServerEnv
 -- | 组装服务器环境：每个连接再各开一个会话
 newServerEnv :: Backend -> Text -> FilePath -> ServerConfig -> RateLimiter -> IO ServerEnv
 newServerEnv backend rootName settingsFile config limiter = do
+    migrated <- beAccounts backend (ReqIdentityInitialize rootName)
+    case migrated of
+        Left err -> ioError (userError ("identity migration failed: " ++ err ++ "; stop all processes and try csql-bootstrap repair --config <settings.toml>; use recover if data restoration is required"))
+        Right identities
+            | any (\a -> accountEnabled a && accountCanLogin a && accountIsSuperuser a) identities -> pure ()
+            | otherwise -> ioError (userError "identity migration failed: no enabled login superuser; stop all processes and try csql-bootstrap recover --config <settings.toml>; reset replaces system identities and grants")
     live <- newLiveConnections
     pure (ServerEnv backend rootName settingsFile config limiter live)
 

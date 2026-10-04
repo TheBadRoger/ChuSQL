@@ -124,6 +124,36 @@ fn stats_track_a_histogram_for_numeric_columns() {
     assert_eq!(id.hist.iter().sum::<u64>(), 0);
 }
 
+/// 重复值删除保留仍存在的不同值计数
+#[test]
+fn duplicate_deletion_keeps_distinct_until_last_occurrence() {
+    let mut catalog = Catalog::default();
+    let duplicate = row(&[("id", json!(1)), ("v", json!(7))]);
+    catalog.rebuild_stats("t", &[duplicate.clone(), duplicate.clone()]);
+    catalog.record_delete("t", std::slice::from_ref(&duplicate));
+    assert_eq!(catalog.describe("t").unwrap().stats["v"].distinct, 1);
+    catalog.record_delete("t", &[duplicate]);
+    assert_eq!(catalog.describe("t").unwrap().stats["v"].distinct, 0);
+}
+
+/// 去重封顶不影响直方图和其他列
+#[test]
+fn capped_distinct_keeps_histogram_and_other_columns_accurate() {
+    let mut catalog = Catalog::default();
+    let rows: Vec<Row> = (0..5000).map(|n| row(&[("id", json!(n)), ("v", json!(n % 2))])).collect();
+    catalog.rebuild_stats("t", &rows);
+    let schema = catalog.describe("t").unwrap();
+    assert!(schema.stats["id"].capped);
+    assert_eq!(schema.stats["id"].hist.iter().sum::<u64>(), 5000);
+    assert_eq!(schema.stats["v"].distinct, 2);
+    catalog.record_delete("t", &rows[..1000]);
+    let schema = catalog.describe("t").unwrap();
+    assert_eq!(schema.stats["id"].hist.iter().sum::<u64>(), 4000);
+    assert_eq!(schema.stats["v"].distinct, 2);
+    catalog.rebuild_stats("t", &rows[1000..]);
+    assert_eq!(catalog.describe("t").unwrap().stats["id"].distinct, 4000);
+}
+
 /// 老类型名并到新写法，参数保留，未知类型原样
 #[test]
 fn normalize_type_maps_legacy_names() {

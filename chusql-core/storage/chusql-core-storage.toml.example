@@ -1,7 +1,7 @@
 # ChuSQL 存储服务配置示例
 #
-# 用法：安装时把本文件放到固定的用户配置目录（Windows 是 %APPDATA%\ChuSQL\chusql.toml，
-#       其它平台是 ${XDG_CONFIG_HOME:-$HOME/.config}/ChuSQL/chusql.toml）；
+# 用法：安装时把本文件放到固定的用户配置目录（Windows 是 %APPDATA%\ChuSQL\settings.toml，
+#       其它平台是 ${XDG_CONFIG_HOME:-$HOME/.config}/ChuSQL/settings.toml）；
 #       临时换一份就用命令行参数 --config <path>（没有环境变量通道了）。
 #
 # 每一项都可以删掉：没写的项回退到内置默认值（下面注释里的值就是默认值）。
@@ -28,6 +28,9 @@ pool_size = 1024
 # Unix ${XDG_DATA_HOME:-$HOME/.local/share}/chusql/data，跟安装脚本装的位置一致）；
 # 要固定就写绝对路径，例如：
 # data_dir = "/srv/chusql/data"
+#
+# 日志输出目录：启动器（csql-web）与安装脚本按它决定日志写哪；相对路径以启动目录为基准。
+# log_files = "./logs"
 
 [log]
 # 日志等级：off / error / warn / info / debug。debug 会多打每个请求和连接。

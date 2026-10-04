@@ -2,9 +2,10 @@ cabal-version: 2.4
 
 name:           chusql-core-engine
 version:        1.0.0
-synopsis:       ChuSQL 执行引擎：SQL 词法与语法分析、表达式求值
-description:    ChuSQL 服务端执行引擎。负责 SQL 词法分析与 AST 构建、
-                WHERE 条件表达式求值、关系代数运算与内存表管理。
+synopsis:       ChuSQL SQL parsing, query planning, and execution engine
+description:    Provides SQL tokenization, syntax and semantic analysis, query
+                planning and optimization, expression evaluation, and relational
+                algebra execution, with in-memory and persistent storage support.
 build-type:     Simple
 
 library

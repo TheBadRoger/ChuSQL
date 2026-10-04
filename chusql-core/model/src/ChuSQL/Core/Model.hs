@@ -29,6 +29,8 @@ module ChuSQL.Core.Model
     , typeLabel
     , typeName
     , parseColumnType
+    , domainTableName
+    , isDomainTable
     , typeClassOf
     , assignable
     , comparableTypes
@@ -44,7 +46,7 @@ module ChuSQL.Core.Model
 
 import Data.Char (isDigit, isSpace, toLower)
 import Data.Hashable (Hashable (..))
-import Data.List (isSuffixOf, stripPrefix)
+import Data.List (isPrefixOf, isSuffixOf, stripPrefix)
 import Data.Maybe (fromMaybe, mapMaybe)
 
 -- 数据模型：列类型、列约束、值、行、表、数据库，外加查表小工具。
@@ -64,6 +66,8 @@ data ColumnType
     | CDate
     | CTimestamp
     | CBlob
+    | CNull
+    | CDomain String ColumnType
     deriving (Show, Eq)
 
 -- | 列定义：类型 + 约束；约束全部取默认值就是普通可空列。
@@ -115,6 +119,8 @@ typeLabel (CDecimal p s) = "TDecimal " ++ show p ++ " " ++ show s
 typeLabel CDate = "TDate"
 typeLabel CTimestamp = "TTimestamp"
 typeLabel CBlob = "TBlob"
+typeLabel CNull = "NULL"
+typeLabel (CDomain name _) = name
 
 -- | 线上/磁盘上的类型名
 typeName :: ColumnType -> String
@@ -131,35 +137,50 @@ typeName (CDecimal p s) = "decimal(" ++ show p ++ "," ++ show s ++ ")"
 typeName CDate = "date"
 typeName CTimestamp = "timestamp"
 typeName CBlob = "blob"
+typeName CNull = "null"
+typeName (CDomain name base) = "domain(" ++ name ++ "," ++ typeName base ++ ")"
+
+-- | 生成类型定义的目录键
+domainTableName :: String -> String
+domainTableName name = "__system_domain_" ++ map toLower name
+
+-- | 判断类型定义目录键
+isDomainTable :: String -> Bool
+isDomainTable name = "__system_domain_" `isPrefixOf` map toLower name
 
 -- | 解析类型名，可带长度/精度参数；不认识的给 Nothing
 parseColumnType :: String -> Maybe ColumnType
-parseColumnType raw = case (base, args) of
-    ("int", []) -> Just CInt
-    ("integer", []) -> Just CInt
-    ("bigint", []) -> Just CBigInt
-    ("smallint", []) -> Just CSmallInt
-    ("str", []) -> Just CStr
-    ("text", []) -> Just CStr
-    ("varchar", []) -> Just CStr
-    ("varchar", [n]) -> CVarchar <$> positive n
-    ("char", []) -> Just (CChar 1)
-    ("char", [n]) -> CChar <$> positive n
-    ("bool", []) -> Just CBool
-    ("boolean", []) -> Just CBool
-    ("float", []) -> Just CFloat
-    ("real", []) -> Just CFloat
-    ("double", []) -> Just CDouble
-    ("decimal", []) -> Just (CDecimal 10 0)
-    ("numeric", []) -> Just (CDecimal 10 0)
-    ("decimal", [p]) -> flip CDecimal 0 <$> positive p
-    ("numeric", [p]) -> flip CDecimal 0 <$> positive p
-    ("decimal", [p, s]) -> CDecimal <$> positive p <*> plain s
-    ("numeric", [p, s]) -> CDecimal <$> positive p <*> plain s
-    ("date", []) -> Just CDate
-    ("timestamp", []) -> Just CTimestamp
-    ("blob", []) -> Just CBlob
-    _ -> Nothing
+parseColumnType raw
+    | Just inner <- stripPrefix "domain(" raw
+    , Just body <- stripSuffixMaybe ")" inner
+    , (name, ',' : definition) <- break (== ',') body =
+        CDomain name <$> parseColumnType definition
+    | otherwise = case (base, args) of
+        ("int", []) -> Just CInt
+        ("integer", []) -> Just CInt
+        ("bigint", []) -> Just CBigInt
+        ("smallint", []) -> Just CSmallInt
+        ("str", []) -> Just CStr
+        ("text", []) -> Just CStr
+        ("varchar", []) -> Just CStr
+        ("varchar", [n]) -> CVarchar <$> positive n
+        ("char", []) -> Just (CChar 1)
+        ("char", [n]) -> CChar <$> positive n
+        ("bool", []) -> Just CBool
+        ("boolean", []) -> Just CBool
+        ("float", []) -> Just CFloat
+        ("real", []) -> Just CFloat
+        ("double", []) -> Just CDouble
+        ("decimal", []) -> Just (CDecimal 10 0)
+        ("numeric", []) -> Just (CDecimal 10 0)
+        ("decimal", [p]) -> flip CDecimal 0 <$> positive p
+        ("numeric", [p]) -> flip CDecimal 0 <$> positive p
+        ("decimal", [p, s]) -> CDecimal <$> positive p <*> plain s
+        ("numeric", [p, s]) -> CDecimal <$> positive p <*> plain s
+        ("date", []) -> Just CDate
+        ("timestamp", []) -> Just CTimestamp
+        ("blob", []) -> Just CBlob
+        _ -> Nothing
   where
     -- | 去掉空白的类型名
     cleaned = map toLower (filter (not . isSpace) raw)
@@ -209,6 +230,7 @@ data TypeClass
     | TextClass
     | TemporalClass
     | BooleanClass
+    | NullClass
     deriving (Show, Eq)
 
 -- | 整型大类判断
@@ -226,10 +248,13 @@ typeClassOf CBlob = TextClass
 typeClassOf CDate = TemporalClass
 typeClassOf CTimestamp = TemporalClass
 typeClassOf CBool = BooleanClass
+typeClassOf CNull = NullClass
+typeClassOf (CDomain _ base) = typeClassOf base
 
 -- | 同大类可赋值；日期/时间列接受字符串字面量
 assignable :: ColumnType -> ColumnType -> Bool
 assignable target source
+    | source == CNull = True
     | target == source = True
     | typeClassOf target == typeClassOf source = True
     | typeClassOf target == TemporalClass && typeClassOf source == TextClass = True
@@ -240,11 +265,12 @@ integerType :: ColumnType -> Bool
 integerType CInt = True
 integerType CBigInt = True
 integerType CSmallInt = True
+integerType (CDomain _ base) = integerType base
 integerType _ = False
 
 -- | 比较用的类型族：同大类可比，日期时间与文本互比
 comparableTypes :: ColumnType -> ColumnType -> Bool
-comparableTypes a b = sameClass || crossTemporal
+comparableTypes a b = a == CNull || b == CNull || sameClass || crossTemporal
   where
     -- | 两个类型同属一个大类
     sameClass = typeClassOf a == typeClassOf b
@@ -261,6 +287,7 @@ numericType t = typeClassOf t == NumericClass
 
 -- | 值能不能放进这一列（先不看可空）
 valueFits :: ColumnType -> Value -> Bool
+valueFits (CDomain _ base) value = valueFits base value
 valueFits _ VNull = True
 valueFits CInt (VInt _) = True
 valueFits CBigInt (VInt _) = True
@@ -297,6 +324,8 @@ coerceValue t v = case t of
     CDate -> toDate v
     CTimestamp -> toTimestamp v
     CBlob -> toText t v
+    CNull -> Left "a NULL output cannot contain a non-NULL value"
+    CDomain _ base -> coerceValue base v
 
 -- | 整数收进整型列
 toInt :: ColumnType -> Value -> Either String Value
@@ -315,15 +344,22 @@ toFloat t _ = Left ("cannot put this value into " ++ typeLabel t)
 
 -- | DECIMAL 按小数位四舍五入
 toDecimal :: Int -> Int -> Value -> Either String Value
-toDecimal p s v = case v of
-    VInt n -> rounded (fromIntegral n)
-    VFloat d -> rounded d
-    _ -> Left ("cannot put this value into " ++ typeLabel (CDecimal p s))
+toDecimal p s v
+    | p <= 0 || p > 308 || s < 0 || s > p = Left "invalid decimal precision or scale"
+    | otherwise = case v of
+        VInt n -> rounded (fromIntegral n)
+        VFloat d -> rounded d
+        _ -> Left ("cannot put this value into " ++ typeLabel (CDecimal p s))
   where
     -- | 缩放因子
-    scale = (10 :: Double) ^ max 0 s
+    scale = (10 :: Double) ^ s
     -- | 按比例四舍五入
-    rounded d = Right (VFloat (fromIntegral (round (d * scale) :: Integer) / scale))
+    rounded d
+        | isNaN d || isInfinite d || isInfinite (d * scale) = Left "decimal value is not finite or exceeds precision"
+        | abs result >= (10 :: Double) ^ (p - s) = Left "decimal value exceeds precision"
+        | otherwise = Right (VFloat result)
+      where
+        result = fromIntegral (round (d * scale) :: Integer) / scale
 
 -- | 字符串收进文本列
 toText :: ColumnType -> Value -> Either String Value
@@ -562,5 +598,6 @@ resolveColumn name env = case [(k, v) | (k, v) <- env, matches k] of
     [] -> Left ("unknown column: " ++ name)
     _ -> Left ("ambiguous column: " ++ name)
   where
-    -- | 裸名、补充了库前缀的写法，或 schema 键自带库前缀的写法
-    matches k = k == name || ('.' : name) `isSuffixOf` k || ('.' : k) `isSuffixOf` name
+    -- | 裸名匹配末段，库限定名只补一层前缀
+    matches k = k == name || ('.' : name) `isSuffixOf` k
+        || (length (filter (== '.') name) == 2 && length (filter (== '.') k) == 1 && ('.' : k) `isSuffixOf` name)

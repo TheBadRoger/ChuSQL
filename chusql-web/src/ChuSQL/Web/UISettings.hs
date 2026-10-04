@@ -22,13 +22,13 @@ import qualified Data.Vector as V
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist)
 import System.FilePath (takeDirectory, (</>))
 
--- 前端 IDE 设置单独存一份文件，与全局启动配置 chusql.toml 互不干扰。
+-- 前端 IDE 设置单独存一份文件，与全局启动配置 settings.toml 互不干扰。
 
 -- | IDE 设置文件的候选位置
 uiSettingsFileCandidates :: [FilePath]
 uiSettingsFileCandidates =
-    [ "scripts" </> "chusql.ui.settings.json"
-    , ".." </> "scripts" </> "chusql.ui.settings.json"
+    [ "resources" </> "chusql.ui.settings.json"
+    , ".." </> "resources" </> "chusql.ui.settings.json"
     , "chusql.ui.settings.json"
     ]
 

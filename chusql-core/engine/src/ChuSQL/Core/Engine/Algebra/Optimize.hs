@@ -117,8 +117,16 @@ pushProject db need (Join kind l r c)
 pushProject db need leaf@(Scan a t _)
     | needsAll need = leaf
     | all (`elem` need) (relOpCols db leaf) = leaf
-    | otherwise = Scan a t (Just (nub (map (unqualify a) need)))
-pushProject _ _ (Derived a x) = Derived a x
+    | otherwise = Scan a t (Just (nub [column | requested <- need, let column = physicalColumn requested, column `elem` available]))
+  where
+    available = map (unqualify a) (relOpCols db (Scan a t Nothing))
+    -- | 把扫描限定列换成存储物理列名
+    physicalColumn column = unqualify (Just (deriveQualifier a t)) (unqualify a column)
+pushProject db need (Derived a x)
+    | needsAll need || all (`elem` wanted) (relOpCols db x) = Derived a (pushProject db ["*"] x)
+    | otherwise = Derived a (Project wanted (pushProject db wanted x))
+  where
+    wanted = nub (map (unqualify a) need)
 pushProject db need leaf@(Lookup _ _ _ _) = pushProjectLeaf db need leaf
 pushProject db need leaf@(Range _ _ _ _ _) = pushProjectLeaf db need leaf
 

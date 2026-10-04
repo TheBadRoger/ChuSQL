@@ -1,14 +1,15 @@
 cabal-version: 2.4
 
-name:           chusql-benchmark
+name:           benchmark4csql
 version:        1.0.0
-synopsis:       ChuSQL 全链路基准：起真 server，全部请求走 TCP
-description:    以基准客户端身份起一个 chusql-server 进程（存储与引擎都在那个进程里），
-                再经 TCP JSON-lines 协议打登录、ping、catalog、查询等场景。
-                本程序不链引擎、不链 server 库，只用 TCP 客户端与协议模型。
+synopsis:       End-to-end ChuSQL benchmarks over TCP
+description:    Starts a chusql-server process and benchmarks authentication,
+                ping, catalog access, and queries through the newline-delimited
+                JSON TCP protocol. Uses the TCP client and shared protocol models;
+                query execution and storage remain in the server process.
 build-type:     Simple
 
-executable chusql-benchmark
+executable benchmark4csql
     main-is:          Main.hs
     hs-source-dirs:   src
     build-tool-depends: chusql-server:chusql-server

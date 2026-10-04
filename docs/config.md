@@ -1,11 +1,11 @@
 # 配置选项
 
-ChuSQL 使用统一配置文件 `chusql.toml`。默认位置：
+ChuSQL 使用统一配置文件 `settings.toml`。默认位置：
 
 | 平台 | 路径 |
 | --- | --- |
-| Windows | `%APPDATA%\ChuSQL\chusql.toml` |
-| Linux / macOS | `$XDG_CONFIG_HOME/ChuSQL/chusql.toml`；未设置时为 `~/.config/ChuSQL/chusql.toml` |
+| Windows | `%APPDATA%\ChuSQL\settings.toml` |
+| Linux / macOS | `$XDG_CONFIG_HOME/ChuSQL/settings.toml`；未设置时为 `~/.config/ChuSQL/settings.toml` |
 
 `chusql-server`、`chusql-web` 和 `csql` 均可通过 `--config <path>` 临时指定其他配置文件。配置优先级为：**命令行参数 > 配置文件 > 内置默认值**。
 
@@ -17,18 +17,17 @@ ChuSQL 使用统一配置文件 `chusql.toml`。默认位置：
 | `[btree] order` | `4` | B+ 树阶数 |
 | `[buffer] pool_size` | `1024` | 缓冲池页数 |
 | `[storage] data_dir` | 平台默认数据目录 | 数据文件保存位置 |
+| `[storage] log_files` | 安装时填写平台日志目录 | 诊断日志目录，不是 WAL |
 | `[log] level` | `info` | 日志级别 |
 
-数据目录仅由 `chusql-server` 访问。生产环境建议使用绝对路径。
+正常运行时数据目录由 `chusql-server` 访问，离线初始化与修复由 `csql-bootstrap` 访问。安装器填写绝对路径，日志目录由启动器与安装脚本使用。
 
 ## Web 配置
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `host` | `127.0.0.1` | Web 服务监听地址 |
 | `port` | `7778` | Web 服务端口 |
-| `static_dir` | `static` | 静态资源目录 |
-| `user` | `root` | 管理员账号名 |
+| `listen_host` | `127.0.0.1` | Web 服务监听地址 |
 | `cookie_secure` | `false` | HTTPS 部署时应启用 |
 | `body_limit` | `65536` | 请求体大小上限（字节） |
 | `session_idle` | `28800` | 会话空闲超时（秒） |
@@ -43,12 +42,14 @@ ChuSQL 使用统一配置文件 `chusql.toml`。默认位置：
 | `password_min_length` | `12` | 普通账号最短口令长度 |
 | `password_classes` | `2` | 口令至少包含的字符类别数 |
 
+监听地址见上表，静态资源目录固定为 `static`（相对安装目录），管理员账号名不在配置里、由启动参数 `--user` 指定（默认 `root`）；后两项不能用配置项改写。
+
 ## Server 配置
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `host` | `127.0.0.1` | 数据库服务监听地址 |
 | `port` | `7777` | 数据库服务端口 |
+| `listen_host` | `127.0.0.1` | 数据库服务监听地址 |
 | `max_message` | `1048576` | 单条请求最大大小（字节） |
 | `max_rows` | `1000` | 单次查询最大返回行数 |
 
@@ -70,7 +71,11 @@ ChuSQL 使用统一配置文件 `chusql.toml`。默认位置：
 
 配置可通过以下方式修改：
 
-1. 直接编辑 `chusql.toml`；
+1. 直接编辑 `settings.toml`；
 2. 通过 Web 设置页面修改。
 
 大多数配置在相关服务下次启动时生效。
+
+安装器选择 `resources/settings.toml.linux` 或 `resources/settings.toml.windows`，填入当前用户的绝对路径后释放为 `settings.toml`。两份模板逐项提供英文注释。
+
+Linux 数据目录为 `${XDG_DATA_HOME:-$HOME/.local/share}/chusql/data`，日志目录为 `${XDG_STATE_HOME:-$HOME/.local/state}/chusql/logs`。Windows 数据和日志分别为 `%LOCALAPPDATA%\ChuSQL\data` 与 `%LOCALAPPDATA%\ChuSQL\logs`。安装参数 `--data-dir` / `-DataDir` 可覆盖数据目录，指定安装目录不会改变默认数据位置。

@@ -12,15 +12,23 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 $codes = @()
 
 # 跑一个步骤：切目录、输出原样透传、记录退出码
-function Invoke-Step([string]$Label, [string]$Dir, [string[]]$Argv) {
+function Invoke-Step([string]$Label, [string]$Dir, [string[]]$Argv, [string[]]$RefreshPackages = @()) {
     Write-Host "=== $Label ==="
     $code = 1
     Push-Location -LiteralPath $Dir
     try {
         $exe = $Argv[0]
         $rest = @($Argv | Select-Object -Skip 1)
-        & $exe @rest
-        if ($null -ne $global:LASTEXITCODE) { $code = [int]$global:LASTEXITCODE }
+        $ready = $true
+        if ($RefreshPackages.Count -gt 0) {
+            & stack build @RefreshPackages --fast --force-dirty
+            $code = [int]$global:LASTEXITCODE
+            $ready = $code -eq 0
+        }
+        if ($ready) {
+            & $exe @rest
+            if ($null -ne $global:LASTEXITCODE) { $code = [int]$global:LASTEXITCODE }
+        }
     }
     catch {
         Write-Host "--- $Label raised: $_"
@@ -47,8 +55,9 @@ switch ($Kind) {
     'stack' {
         Invoke-Step 'engine' $engine @('stack', 'test', 'chusql-core-engine', '--fast')
         Invoke-Step 'server' (Join-Path $Root 'chusql-server') @('stack', 'test', 'chusql-server', '--fast')
-        Invoke-Step 'web' (Join-Path $Root 'chusql-web') @('stack', 'test', 'chusql-web', '--fast')
+        Invoke-Step 'web' (Join-Path $Root 'chusql-web') @('stack', 'test', 'chusql-web', '--fast') @('chusql-core-model', 'chusql-core-engine', 'chusql-interface', 'chusql-server')
         Invoke-Step 'cli' (Join-Path $Root 'chusql-cli') @('stack', 'test', 'chusql-cli', '--fast')
+        Invoke-Step 'bootstrap' (Join-Path $Root 'chusql-bootstrap') @('stack', 'test', 'chusql-bootstrap', '--fast')
     }
     'comments' {
         $check = Join-Path $PSScriptRoot 'comment-check.ps1'

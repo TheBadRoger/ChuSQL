@@ -9,6 +9,7 @@ import ChuSQL.Interface.Settings (
     applySettings,
     defaultOf,
     isLockedSetting,
+    isRestartRequired,
     liveKeys,
     readSettingsFile,
     settingCatalogue,
@@ -382,12 +383,12 @@ startLiveWorld label = do
     uniq <- uniqueSuffix
     let root = tmp </> ("chusql-web-live-" ++ label ++ "-" ++ uniq)
         dataDir = root </> "data"
-        config = root </> "chusql.toml"
+        config = root </> "settings.toml"
     createDirectoryIfMissing True dataDir
     writeFile config (serverConfigText dataDir)
     seedSystemCatalog config
     (_, Just out, _, process) <-
-        createProcess (proc bin ["--config", config]){std_out = CreatePipe, std_err = NoStream}
+        createProcess (proc bin ["--config", config, "--user", T.unpack adminUser]){std_out = CreatePipe, std_err = NoStream}
     port <- readListeningPort out
     _ <- forkIO (drainHandle out)
     setAdminPassword port
@@ -416,12 +417,11 @@ serverConfigText :: FilePath -> String
 serverConfigText dataDir =
     unlines
         [ "[web]"
-        , "user = \"" ++ T.unpack adminUser ++ "\""
         , "password-min-length = 8"
         , "password-classes = 2"
         , ""
         , "[server]"
-        , "host = \"127.0.0.1\""
+        , "listen_host = \"127.0.0.1\""
         , "port = 0"
         , ""
         , "[storage]"
@@ -472,7 +472,7 @@ locateServerExe = do
 seedSystemCatalog :: FilePath -> IO ()
 seedSystemCatalog config = do
     bootstrap <- locateBootstrapExe
-    (code, out, errOut) <- readProcessWithExitCode bootstrap ["--config", config, "--passwordless"] ""
+    (code, out, errOut) <- readProcessWithExitCode bootstrap ["--config", config, "--passwordless", "--user", T.unpack adminUser] ""
     case code of
         ExitSuccess -> pure ()
         _ -> fail ("the fixture bootstrap program failed (exit " ++ show code ++ "): " ++ out ++ errOut)
@@ -541,21 +541,23 @@ unitSpec = describe "pure helpers" $ do
     it "round-trips settings through a real TOML file" $ do
         path <- tempFilePath "settings"
         removeIfExists path
-        writeSettingsFile path (Map.fromList [("rows-per-page", "50"), ("user", "admin")])
+        writeSettingsFile path (Map.fromList [("rows-per-page", "50"), ("log-files", "./logs")])
             >>= (`shouldSatisfy` isRightE)
         values <- readSettingsFile path
         Map.lookup "rows-per-page" values `shouldBe` Just "50"
-        Map.lookup "user" values `shouldBe` Just "admin"
+        Map.lookup "log-files" values `shouldBe` Just "./logs"
     it "rejects unknown settings and out-of-range limits" $ do
         applySettings Map.empty (Map.fromList [("nope", "1")]) `shouldSatisfy` isLeftE
         applySettings Map.empty (Map.fromList [("password-min-length", "3")]) `shouldSatisfy` isLeftE
         applySettings Map.empty (Map.fromList [("password-min-length", "12")]) `shouldSatisfy` isRightE
-    it "marks the administrator name as locked and lists the live keys" $ do
-        isLockedSetting "user" `shouldBe` True
+    it "lists the live keys and locks nothing" $ do
+        isLockedSetting "user" `shouldBe` False
         isLockedSetting "rows-per-page" `shouldBe` False
         ("rows-per-page" `elem` liveKeys) `shouldBe` True
         length settingCatalogue `shouldSatisfy` (> 20)
         defaultOf "rows-per-page" `shouldBe` "25"
+        defaultOf "log-files" `shouldBe` "./logs"
+        isRestartRequired "log-files" `shouldBe` True
     it "validates IDE settings" $ do
         validateUISettings (object ["sqlFontSize" .= (13 :: Int), "minimap" .= False])
             `shouldSatisfy` isRightE
@@ -753,7 +755,9 @@ settingsSpec env = describe "settings and password policy" $ do
             let entries = items (at "items" (jsonBody res))
             check (length entries `shouldSatisfy` (> 20))
             check (asText (at "value" (headEntry "rows-per-page" entries)) `shouldBe` "25")
-            check (at "locked" (headEntry "user" entries) `shouldBe` A.Bool True)
+            -- 设置目录里没有任何只读键（管理员名已不写进配置），新的日志目录项在列
+            check (at "locked" (headEntry "rows-per-page" entries) `shouldBe` A.Bool False)
+            check (asText (at "value" (headEntry "log-files" entries)) `shouldBe` "./logs")
         it "writes a setting, makes the server reload the policy, and reports it applied" $ do
             hs <- adminHeaders
             res <-
@@ -777,13 +781,14 @@ settingsSpec env = describe "settings and password policy" $ do
             check (asInt (at "minLength" (at "policy" (jsonBody me))) `shouldBe` 16)
             values <- liftIO (readSettingsFile (aeSettingsFile env))
             check (Map.lookup "password-min-length" values `shouldBe` Just "16")
-            check (Map.lookup "user" values `shouldBe` Just adminUser)
-        it "refuses unknown settings and the locked administrator name" $ do
+            -- 管理员名不再落进配置文件：它由 --user 给
+            check (Map.member "user" values `shouldBe` False)
+        it "refuses unknown settings, including the retired administrator name" $ do
             hs <- adminHeaders
             unknown <- putAs hs "/api/settings" (encode (object ["values" .= object ["nope" .= ("1" :: Text)]]))
             expectStatusWith "unknown setting" unknown 400
-            locked <- putAs hs "/api/settings" (encode (object ["values" .= object ["user" .= ("hacked" :: Text)]]))
-            expectStatusWith "locked administrator name" locked 403
+            retired <- putAs hs "/api/settings" (encode (object ["values" .= object ["user" .= ("hacked" :: Text)]]))
+            expectStatusWith "retired administrator name" retired 400
 
 -- 账号表 ---------------------------------------------------------------------
 

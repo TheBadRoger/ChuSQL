@@ -20,10 +20,10 @@ readUtf8 path = TE.decodeUtf8 <$> BS.readFile path
 gateSpec :: Spec
 gateSpec = do
     describe "Installer scripts (scripts/)" $ do
-        it "install.sh releases files, writes chusql.toml, sets PATH and removes the package" $ do
+        it "install.sh releases files, writes settings.toml, sets PATH and removes the package" $ do
             installer <- readUtf8 (".." </> "scripts" </> "install.sh")
             installer `shouldSatisfy` T.isInfixOf "libchusql_core_storage"
-            installer `shouldSatisfy` T.isInfixOf "chusql.toml"
+            installer `shouldSatisfy` T.isInfixOf "settings.toml"
             installer `shouldSatisfy` T.isInfixOf "PATH"
             installer `shouldSatisfy` T.isInfixOf "rm -rf"
         -- 一份脚本三种来源：包内（旁边有 bin/）、在线（管道进来时 $0 是 sh，按平台取 release 资源）、
@@ -138,20 +138,26 @@ gateSpec = do
             ps `shouldSatisfy` T.isInfixOf "chusql-$Platform"
             ps `shouldSatisfy` T.isInfixOf "chusql-web\\static"
             ps `shouldSatisfy` T.isInfixOf "bin\\csql.exe"
+            -- 配置模板跟组件目录走：包内目录叫 resources，不再是 scripts
+            ps `shouldSatisfy` T.isInfixOf "resources\\settings.toml.windows"
+            ps `shouldSatisfy` (not . T.isInfixOf "scripts\\settings.toml")
+            sh `shouldSatisfy` T.isInfixOf "resources/settings.toml.linux"
+            sh `shouldSatisfy` (not . T.isInfixOf "scripts/settings.toml")
             ps `shouldSatisfy` T.isInfixOf "Test-Installed $name 'cli'"
             ps `shouldSatisfy` (not . T.isInfixOf "$Component")
 
             ignore <- readUtf8 (".." </> ".gitignore")
             ignore `shouldSatisfy` T.isInfixOf "releases/"
-        -- static_dir 是相对路径，启动器必须先切到安装目录；少了这一句，从别处执行
+        -- 静态目录固定在安装目录下，启动器必须先切到安装目录；少了这一句，从别处执行
         -- csql-web 就会因为找不到 static/ 直接退出（Windows 的 .ps1 靠 -WorkingDirectory）。
         it "csql-web.sh switches to the install dir before starting" $ do
             launcher <- readUtf8 (".." </> "scripts" </> "csql-web.sh")
             launcher `shouldSatisfy` T.isInfixOf "cd \"$home_dir\""
             launcher `shouldSatisfy` T.isInfixOf "chusql-server"
-        -- 默认数据目录按平台惯例算，三处必须说同一件事：Rust 代码、配置示例、模板。
-        -- 跟安装脚本装的位置也是一处：Windows 装到 %LOCALAPPDATA%\ChuSQL、Unix 装到 ~/.local/share/chusql，
-        -- 数据都放在它下面的 data/ 里。
+            -- 日志目录由 [storage] log_files 决定，不再是硬编码的 logs
+            launcher `shouldSatisfy` T.isInfixOf "log_files"
+        -- 默认数据目录按平台惯例算，两处必须说同一件事：Rust 代码与配置示例。
+        -- 模板路径占位符在安装时填入绝对路径。
         it "the default data dir follows the platform, and code and template agree" $ do
             rust <- readUtf8 (".." </> "chusql-core" </> "storage" </> "src" </> "config.rs")
             rust `shouldSatisfy` T.isInfixOf "default_data_dir"
@@ -165,10 +171,15 @@ gateSpec = do
             exampleFile `shouldSatisfy` T.isInfixOf "%LOCALAPPDATA%"
             exampleFile `shouldSatisfy` T.isInfixOf "XDG_DATA_HOME"
 
-            template <- readUtf8 (".." </> "scripts" </> "chusql.toml")
+            template <- readUtf8 (".." </> "resources" </> "settings.toml.linux")
             -- 模板那行是安装时被 sed / -replace 替换的占位，必须保持能生效
             template `shouldSatisfy` T.isInfixOf "\ndata_dir = "
-            template `shouldSatisfy` T.isInfixOf "%LOCALAPPDATA%"
+            -- 日志跟数据分家：启动器与安装脚本按 log_files 决定日志落哪个目录
+            template `shouldSatisfy` T.isInfixOf "log_files = \"@LOG_DIR@\""
+            -- 静态目录与管理员名都不再写进配置：前者写死 static，后者由 --user 给（默认 root）；
+            -- 监听地址是活的配置项（[server] listen_host / [web] listen_host），模板里可以留空靠内置默认
+            template `shouldSatisfy` (not . T.isInfixOf "static_dir =")
+            template `shouldSatisfy` (not . T.isInfixOf "user =")
         -- 管道传输退休后，两侧都不该再算套接字路径、也不该再认管名。
         it "neither side computes a socket path or a pipe name any more" $ do
             haskellIpc <- readUtf8 (".." </> "chusql-core" </> "engine" </> "src" </> "ChuSQL" </> "Core" </> "Engine" </> "Storage" </> "IPC.hs")
@@ -217,8 +228,8 @@ gateSpec = do
             release `shouldSatisfy` (not . T.isInfixOf "component: [web, cli]")
         it "no layer looks for a storage executable or a pipe name any more" $ do
             engine <- readUtf8 (".." </> "chusql-core" </> "engine" </> "test" </> "Spec.hs")
-            bench <- readUtf8 (".." </> "chusql-benchmark" </> "src" </> "Main.hs")
-            template <- readUtf8 (".." </> "scripts" </> "chusql.toml")
+            bench <- readUtf8 (".." </> "benchmark" </> "src" </> "Main.hs")
+            template <- readUtf8 (".." </> "resources" </> "settings.toml.linux")
             mapM_
                 (\src -> src `shouldSatisfy` (not . T.isInfixOf "pipe_name"))
                 [engine, bench, template]

@@ -18,7 +18,7 @@ import qualified Data.Text.Encoding as TE
 import System.Directory (XdgDirectory (XdgConfig), createDirectoryIfMissing, doesFileExist, getXdgDirectory)
 import System.FilePath (takeDirectory, (</>))
 
--- 全局 chusql.toml 的最小读写：只认 [section] 与 key = value。
+-- 全局 settings.toml 的最小读写：只认 [section] 与 key = value。
 
 -- | 读一个分区；文件不存在或没有这个分区都当空表
 readSection :: FilePath -> Text -> IO (Map Text Text)
@@ -165,7 +165,7 @@ appendSection section entries lines' =
 defaultConfigFile :: IO FilePath
 defaultConfigFile = do
     dir <- getXdgDirectory XdgConfig "ChuSQL"
-    pure (dir </> "chusql.toml")
+    pure (dir </> "settings.toml")
 
 -- | 定位配置文件：命令行 --config 优先，否则用固定路径
 resolveConfigPath :: Maybe FilePath -> IO FilePath

@@ -166,7 +166,7 @@ if (-not $Component) {
 }
 
 # 管理员口令是装机必答项：交互时当场设，非交互时给 -Password 或
-# CHUSQL_ADMIN_PASSWORD。口令只经 stdin 传给 csql-bootstrap，不落 chusql.toml。
+# CHUSQL_ADMIN_PASSWORD。口令只经 stdin 传给 csql-bootstrap，不落 settings.toml。
 $adminPassword = "$env:CHUSQL_ADMIN_PASSWORD"
 if ($Password) { $adminPassword = $Password }
 if ($canPrompt) {
@@ -202,7 +202,8 @@ $downloaded = $false
 $tempDir = ''
 
 if (-not $InstallDir) { $InstallDir = Join-Path $env:LOCALAPPDATA 'ChuSQL' }
-if (-not $DataDir) { $DataDir = Join-Path $InstallDir 'data' }
+if (-not $DataDir) { $DataDir = Join-Path (Join-Path $env:LOCALAPPDATA 'ChuSQL') 'data' }
+$LogDir = Join-Path (Join-Path $env:LOCALAPPDATA 'ChuSQL') 'logs'
 $InstallDir = [System.IO.Path]::GetFullPath($InstallDir)
 $DataDir = [System.IO.Path]::GetFullPath($DataDir)
 
@@ -289,8 +290,8 @@ if ($wantWeb) {
 if ($wantCli) {
     if (-not (Test-Path (Join-Path $pack 'bin\csql.exe'))) { Fail 'package is incomplete: bin\csql.exe not found' }
 }
-$template = Join-Path $pack 'scripts\chusql.toml'
-if (-not (Test-Path $template)) { Fail 'package is incomplete: scripts\chusql.toml not found' }
+$template = Join-Path $pack 'resources\settings.toml.windows'
+if (-not (Test-Path $template)) { Fail 'package is incomplete: resources\settings.toml.windows not found' }
 
 Say "ChuSQL installer"
 Say ("  version    {0}" -f $Version)
@@ -298,12 +299,12 @@ Say ("  components {0}" -f $componentLabel)
 if ($downloaded) { Say ("  release    {0}" -f $Version) }
 Say ("  install to {0}" -f $InstallDir)
 Say ("  data dir   {0}" -f $DataDir)
-Say ("  root user  {0} (password asked above, kept out of chusql.toml)" -f $RootUser)
+Say ("  root user  {0} (password asked above, kept out of settings.toml)" -f $RootUser)
 
 # ---- 释放文件 ----
 # 包是合在一起的（web 和 cli 都在），这里按这次的选择逐个释放：没选的组件不落地
 Step 'Installing files'
-New-Item -ItemType Directory -Force -Path (Join-Path $InstallDir 'bin'), (Join-Path $InstallDir 'logs'), $DataDir | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $InstallDir 'bin'), $LogDir, $DataDir | Out-Null
 Copy-Item $storageLib (Join-Path $InstallDir 'bin') -Force
 Copy-Item (Join-Path $pack 'bin\chusql-server.exe') (Join-Path $InstallDir 'bin') -Force
 Copy-Item (Join-Path $pack 'bin\csql-bootstrap.exe') (Join-Path $InstallDir 'bin') -Force
@@ -325,26 +326,25 @@ if ($wantWeb) {
 }
 
 # ---- 写全局配置 ----
-Step 'Writing chusql.toml'
+Step 'Writing settings.toml'
 $configDir = if ($env:APPDATA) { Join-Path $env:APPDATA 'ChuSQL' } else { Join-Path $InstallDir 'config' }
-$configFile = Join-Path $configDir 'chusql.toml'
+$configFile = Join-Path $configDir 'settings.toml'
 $toml = Get-Content -Path $template -Raw -Encoding UTF8
-$toml = $toml -replace '(?m)^(\s*user\s*=\s*).*$', "`$1`"$RootUser`""
-$toml = $toml -replace '(?m)^(\s*data_dir\s*=\s*).*$', "`$1`"$($DataDir -replace '\\', '/')`""
+$toml = $toml.Replace('@DATA_DIR@', ($DataDir -replace '\\', '/')).Replace('@LOG_DIR@', ($LogDir -replace '\\', '/'))
 New-Item -ItemType Directory -Force -Path $configDir | Out-Null
 Set-Content -Path $configFile -Value $toml -Encoding UTF8
 Say ("  config file  {0}" -f $configFile)
 
 # ---- 引导系统目录 ----
-# csql-bootstrap 建 system 数据库和 __system_users 表，口令只走 stdin，不进 chusql.toml
-Step 'Creating the system catalog'
+# 引导身份目录、root 与预装类型，口令通过标准输入传递
+Step 'Initializing the administrator identity and preinstalled types'
 $bootstrap = Join-Path $InstallDir 'bin\csql-bootstrap.exe'
 $bootstrapArgs = @('--config', $configFile, '--user', $RootUser)
 $bootstrapArgs += '--password-stdin'
 $bootstrapOutput = $adminPassword | & $bootstrap @bootstrapArgs 2>&1
 $bootstrapOutput | ForEach-Object { Say ("  {0}" -f $_) }
 if ($LASTEXITCODE -ne 0) {
-    Fail ("the bootstrap program failed (exit {0}); the system catalog is not ready" -f $LASTEXITCODE)
+    Fail ("the bootstrap program failed (exit {0}); identities or preinstalled types are not ready" -f $LASTEXITCODE)
 }
 
 # ---- 命令入口 ----
@@ -401,11 +401,11 @@ $serverPid = 0
 if ($NoStart) {
     Say '  -NoStart: the server was not started'
 } else {
-    $serverLog = Join-Path $InstallDir 'logs\server.err.log'
+    $serverLog = Join-Path $LogDir 'server.err.log'
     $serverProc = Start-Process -FilePath $serverPath `
-        -ArgumentList @('--config', $configFile) `
+        -ArgumentList @('--config', $configFile, '--user', $RootUser) `
         -WorkingDirectory $InstallDir -WindowStyle Hidden -PassThru `
-        -RedirectStandardOutput (Join-Path $InstallDir 'logs\server.log') `
+        -RedirectStandardOutput (Join-Path $LogDir 'server.log') `
         -RedirectStandardError $serverLog
     Start-Sleep -Milliseconds 1200
     if ($serverProc.HasExited) {
@@ -417,13 +417,13 @@ if ($NoStart) {
 }
 
 Step 'Done'
-Say ("  chusql.toml  {0}" -f $configFile)
+Say ("  settings.toml  {0}" -f $configFile)
 Say ("  data         {0}" -f $DataDir)
 $startWith = @()
 if ($wantWeb) { $startWith += 'csql-web' }
 if ($wantCli) { $startWith += 'csql' }
 Say ("  start with   {0}" -f ($startWith -join ', '))
-Say ("  tcp server   {0} (listens on [server] host/port, defaults 127.0.0.1:7777)" -f $serverPath)
+Say ("  tcp server   {0} (listens on [server] listen_host/port, defaults 127.0.0.1:7777)" -f $serverPath)
 if ($serverPid -gt 0) {
     Say ("  running      pid {0} (stop it with: Stop-Process -Id {0})" -f $serverPid)
 } else {

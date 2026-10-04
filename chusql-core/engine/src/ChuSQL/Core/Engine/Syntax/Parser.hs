@@ -8,7 +8,7 @@ import ChuSQL.Core.Engine.Syntax.AST
 import Control.Monad (void)
 import Control.Monad.Combinators.Expr (Operator (..), makeExprParser)
 import Data.Char (isAlpha, isAlphaNum, isHexDigit, isSpace, toLower, toUpper)
-import Data.List (intercalate)
+import Data.List (intercalate, isInfixOf)
 import Data.Maybe (fromMaybe)
 import Data.Void (Void)
 import Text.Megaparsec
@@ -475,8 +475,25 @@ alterUserStatement = do
     keyword "alter"
     keyword "user"
     name <- userName
-    pw <- identifiedBy
-    return (AlterUser name pw)
+    (AlterUser name <$> identifiedBy) <|> (AlterIdentity name <$> some identityAttribute)
+
+-- | 读身份属性开关
+identityAttribute :: Parser (String, Bool)
+identityAttribute = choice
+    [ ("system_catalog_manager", True) <$ keyword "system_catalog_manager"
+    , ("system_catalog_manager", False) <$ keyword "nosystem_catalog_manager"
+    , ("login", True) <$ keyword "login", ("login", False) <$ keyword "nologin"
+    , ("superuser", True) <$ keyword "superuser", ("superuser", False) <$ keyword "nosuperuser"
+    , ("enabled", True) <$ keyword "enabled", ("enabled", False) <$ keyword "disabled"
+    ]
+
+-- | 读 ALTER ROLE 属性或口令
+alterRoleStatement :: Parser Statement
+alterRoleStatement = do
+    keyword "alter"
+    keyword "role"
+    name <- userName
+    (AlterUser name <$> identifiedBy) <|> (AlterIdentity name <$> some identityAttribute)
 
 -- | 读 DROP USER
 dropUserStatement :: Parser Statement
@@ -599,6 +616,7 @@ columnTypeP =
         , keyword "date" >> pure CDate
         , keyword "timestamp" >> pure CTimestamp
         , keyword "blob" >> pure CBlob
+        , (\name -> CDomain (map toLower name) CStr) <$> identifier
         ]
 
 -- | DECIMAL 的精度与小数位
@@ -682,7 +700,14 @@ renameColumns name cols q@Select { selectCols = names } = do
         )
 renameColumns name cols q@SelectExpr { selectItems = items } = do
     checkCteArity name cols (map snd items)
-    Right q { selectItems = zip cols (map snd items) }
+    ordering <- mapM renameOrder (selectOrderBy q)
+    Right q { selectItems = zip cols (map snd items), selectOrderBy = ordering }
+  where
+    -- | 列清单同步改写内层排序输出别名
+    renameOrder (column, direction) = case [new | ((old, _), new) <- zip items cols, old == column] of
+        [] -> Right (column, direction)
+        [new] -> Right (new, direction)
+        _ -> Left ("WITH: ambiguous ORDER BY alias: " ++ column)
 renameColumns _ _ _ = Left "WITH: a CTE must be a SELECT"
 
 -- | 列清单个数必须和本体输出一致
@@ -808,7 +833,7 @@ transactionStatement =
 parseStatement :: String -> Either String Statement
 parseStatement input =
     case runParser (sc *> statementP <* sc <* eof) "<query>" input of
-        Left err -> Left (errorBundlePretty err)
+        Left err -> Left (safeParseError input err)
         Right q -> Right q
   where
     -- | 按关键字分派到各语句解析器
@@ -819,12 +844,17 @@ parseStatement input =
             <|> try (CreateDatabase <$> (keyword "create" *> keyword "database" *> identifier))
             <|> try (DropDatabase <$> (keyword "drop" *> keyword "database" *> identifier))
             <|> (UseDatabase <$> (keyword "use" *> identifier))
-            <|> (ShowDatabases <$ (keyword "show" *> keyword "databases"))
+            <|> try (ShowDatabases <$ (keyword "show" *> keyword "databases"))
+            <|> try (ShowDomains <$ (keyword "show" *> keyword "domains"))
+            <|> try (CreateDomain <$> (keyword "create" *> keyword "domain" *> identifier) <*> (keyword "as" *> columnTypeP))
+            <|> try (DropDomain <$> (keyword "drop" *> keyword "domain" *> identifier))
             <|> insertStatement
             <|> deleteStatement
             <|> updateStatement
             <|> try createUserStatement
             <|> try alterUserStatement
+            <|> try alterRoleStatement
+            <|> try (ShowRoles <$ (keyword "show" *> keyword "roles"))
             <|> try dropUserStatement
             <|> try createRoleStatement
             <|> try dropRoleStatement
@@ -840,8 +870,14 @@ parseStatement input =
 parseExpression :: String -> Either String Expr
 parseExpression input =
     case runParser (sc *> expr <* sc <* eof) "<expr>" input of
-        Left err -> Left (errorBundlePretty err)
+        Left err -> Left (safeParseError input err)
         Right e -> Right e
+
+-- | 隐去含口令输入的解析诊断
+safeParseError :: String -> ParseErrorBundle String Void -> String
+safeParseError input errors
+    | any (`isInfixOf` map toLower input) ["password", "identified"] = "syntax error in credential statement (input redacted)"
+    | otherwise = errorBundlePretty errors
 
 -- | 表名至多有一个库前缀。
 tableName :: Parser String

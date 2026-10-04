@@ -26,7 +26,7 @@ module ChuSQL.Server.Session
     ) where
 
 import ChuSQL.Core.Model (Database, Row, Table (..), Value (..))
-import ChuSQL.Core.Protocol (Account, QueryResult (..), TxnOp (..), queryResultJson)
+import ChuSQL.Core.Protocol (Account (..), Request (..), QueryResult (..), TxnOp (..), queryResultJson)
 import ChuSQL.Core.Engine.Storage.IPC (TableInfo (..))
 import qualified ChuSQL.Core.Engine as Engine
 import qualified ChuSQL.Core.Engine.Error as E
@@ -35,9 +35,9 @@ import ChuSQL.Core.Engine.Syntax.Parser (parseStatement)
 import ChuSQL.Interface.AccountTable (systemTableInfo)
 import ChuSQL.Interface.Auth (defaultSessionPolicy, newSessionStore)
 import ChuSQL.Server.Accounts
-import ChuSQL.Server.Backend (Backend (..), StatementResult (..), columnsFromStatement)
+import ChuSQL.Server.Backend (Backend (..), StatementResult (..), columnsFromStatement, scopeDdl)
 import ChuSQL.Server.Policy (configurePasswordPolicy)
-import ChuSQL.Server.Privileges (PrivilegeCommand, PrivilegeError (..), Privileges, RoleView, affectedAccounts, authorize, filterTables, listRoleViews, newPrivileges, privilegeCommand, runPrivilegeCommand)
+import ChuSQL.Server.Privileges (PrivilegeCommand (..), PrivilegeError (..), Privileges, RoleView, affectedAccounts, authorize, filterTables, listRoleViews, newPrivileges, privilegeCommand, runPrivilegeCommand)
 import Control.Exception (IOException, try)
 import Data.Bifunctor (first)
 import Data.Char (isAlpha, isAlphaNum)
@@ -164,7 +164,7 @@ switchDatabaseCoded :: Session -> Text -> IO (Either SessionError ())
 switchDatabaseCoded session rawName
     | not (isPlainIdentifier name) = pure (Left (SessionError "bad_request" ("not a plain database name: " <> name)))
     | name == "system" = do
-        admin <- sessionIsAdmin session
+        admin <- maybe False principalIsCatalogManager <$> readIORef (ssPrincipal session)
         if admin then go else pure (Left (SessionError "forbidden" "the system database is only available to the administrator"))
     | otherwise = go
   where
@@ -201,6 +201,7 @@ runStatementCoded session sql = case parseStatement (T.unpack sql) of
     Right (Savepoint name) -> savepointTransaction session (T.pack name)
     Right (RollbackToSavepoint name) -> rollbackToSavepoint session (T.pack name)
     Right (ReleaseSavepoint name) -> releaseSavepoint session (T.pack name)
+    Right ShowRoles -> showIdentities session
     Right statement
         | Just command <- accountCommand statement -> runAccount session command
         | Just command <- privilegeCommand statement -> runPrivilege session command
@@ -221,6 +222,8 @@ runStatementCoded session sql = case parseStatement (T.unpack sql) of
 transactionDdl :: Statement -> Bool
 transactionDdl statement = case statement of
     CreateTable{} -> True
+    CreateDomain{} -> True
+    DropDomain{} -> True
     DropTable{} -> True
     CreateIndex{} -> True
     DropIndex{} -> True
@@ -347,9 +350,10 @@ savepointIndex name entries =
 runInTransaction :: Session -> Statement -> IO (Either SessionError QueryResult)
 runInTransaction session statement = do
     existing <- readIORef (ssTransaction session)
+    current <- readIORef (ssCurrent session)
     case existing of
         Nothing -> pure (Left (SessionError "query_error" "no transaction in progress"))
-        Just transaction -> case Engine.runStatement (txStaged transaction) statement of
+        Just transaction -> case scopeDdl (T.unpack current) statement >>= Engine.runStatement (txStaged transaction) of
             Left err -> pure (Left (engineErrorCode err))
             Right (staged, rows) -> do
                 writeIORef (ssTransaction session) (Just transaction {txStaged = staged})
@@ -535,18 +539,35 @@ currentBackend session = do
     name <- readIORef (ssCurrent session)
     pure (beWithDatabase (ssBackend session) (T.unpack name))
 
--- | 账号语句走账号服务，普通账号一律拒绝；改完通知受影响账号
+-- | 展示身份属性并隐藏口令
+showIdentities :: Session -> IO (Either SessionError QueryResult)
+showIdentities session = do
+    admin <- maybe False principalIsCatalogManager <$> readIORef (ssPrincipal session)
+    if not admin then pure (Left (SessionError "forbidden" "catalog manager required")) else do
+        result <- beAccounts (ssBackend session) ReqAccountsList
+        pure $ case result of
+            Left err -> Left (SessionError "storage_error" (T.pack err))
+            Right identities -> Right (QueryResult ["id", "name", "can_login", "is_superuser", "enabled", "system_catalog_manager", "created_at"]
+                [[VInt (fromInteger (accountId a)), VStr (T.unpack (accountUser a)), VBool (accountCanLogin a),
+                    VBool (accountIsSuperuser a), VBool (accountEnabled a), VBool (accountSystemCatalogManager a), VStr (T.unpack (accountRegisteredAt a))] | a <- identities]
+                (length identities) False Nothing)
+
+-- | 执行身份管理并通知受影响会话
 runAccount :: Session -> AccountCommand -> IO (Either SessionError QueryResult)
 runAccount session command = do
     who <- readIORef (ssPrincipal session)
     case who of
         Nothing -> pure (Left (SessionError "unauthorized" "sign in first"))
         Just principal -> do
+            affected <- case command of
+                AlterAccountAttributes name _ -> affectedAccounts (ssPrivileges session) (DropRoleCommand name)
+                DropAccount name -> affectedAccounts (ssPrivileges session) (DropRoleCommand name)
+                _ -> pure (accountCommandUsers command)
             result <- runAccountCommand (ssAccounts session) principal command
             case result of
                 Left err -> pure (Left (accountErrorOf err))
                 Right () -> do
-                    notifyChanged session (accountCommandUsers command)
+                    notifyChanged session affected
                     pure (Right (emptyResult Nothing))
 
 -- | 一条账号命令影响的账号
@@ -555,6 +576,7 @@ accountCommandUsers command = case command of
     CreateAccount _ _ -> []
     ResetAccountPassword name _ -> [name]
     DropAccount name -> [name]
+    AlterAccountAttributes name _ -> [name]
 
 -- | 角色语句走权限服务，普通账号拒绝；改完通知受影响账号
 runPrivilege :: Session -> PrivilegeCommand -> IO (Either SessionError QueryResult)

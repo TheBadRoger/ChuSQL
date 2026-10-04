@@ -13,8 +13,8 @@ $env:GHC_CHARENC = 'UTF-8'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
-$LogDir = Join-Path $PSScriptRoot 'logs'
-$TmpDir = Join-Path $PSScriptRoot 'tmp'
+$LogDir = Join-Path $Root 'logs'
+$TmpDir = Join-Path $LogDir 'tmp'
 New-Item -ItemType Directory -Force -Path $LogDir, $TmpDir | Out-Null
 $env:PATH = (Join-Path $Root 'chusql-core\storage\target\release') + ';' + $env:PATH
 $env:TEMP = $TmpDir
@@ -77,7 +77,7 @@ function Wait-Lanes($Lanes) {
 
 # 清理本地依赖工件：-Clean 只清各项目自己的，-Full 连依赖副本一起清
 function Invoke-Clean {
-    foreach ($dir in @('chusql-core\engine', 'chusql-server', 'chusql-web', 'chusql-cli')) {
+    foreach ($dir in @('chusql-core\engine', 'chusql-server', 'chusql-web', 'chusql-cli', 'chusql-bootstrap')) {
         $argv = @('clean')
         if ($Full) { $argv += '--full' }
         Write-Host "== stack $($argv -join ' ') in $dir" -ForegroundColor DarkGray

@@ -6,6 +6,8 @@ use std::collections::HashMap;
 pub type Row = HashMap<String, serde_json::Value>;
 
 pub const USERS_TABLE: &str = "__system_users";
+pub const IDENTITIES_TABLE: &str = "__system_identities";
+pub const TYPES_TABLE: &str = "__system_types";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Account {
@@ -17,6 +19,16 @@ pub struct Account {
     pub registered_at: String,
     #[serde(default)]
     pub last_login_at: Option<String>,
+    #[serde(default = "default_true")]
+    pub can_login: bool,
+    #[serde(default)]
+    pub is_superuser: bool,
+    #[serde(default)]
+    pub system_catalog_manager: bool,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub identity_version: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -80,7 +92,11 @@ pub struct IndexWire {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum Request {
+    CatalogManage { command: Box<Request> },
     AccountsList,
+    IdentityInitialize { administrator: String },
+    RoleCreate { user: String },
+    IdentityAlter { user: String, can_login: Option<bool>, is_superuser: Option<bool>, enabled: Option<bool>, system_catalog_manager: Option<bool> },
     AccountCreate { user: String, password_hash: String },
     AccountReset { user: String, password_hash: String },
     AccountLogin {
@@ -97,6 +113,7 @@ pub enum Request {
         password_hash: Option<String>,
     },
     SystemStatus,
+    BootstrapTypes { types: Vec<Row> },
     Ping,
     Scan {
         table: String,
@@ -222,9 +239,11 @@ impl Request {
             | Self::DropIndex { table, .. } | Self::DropColumn { table, .. }
             | Self::Compact { table }
             | Self::ReplaceSchema { table, .. } => Some(table),
-            Self::Ping | Self::ListTables | Self::ListCatalog | Self::AccountsList
+            Self::Ping | Self::ListTables | Self::ListCatalog | Self::AccountsList | Self::CatalogManage { .. }
+            | Self::IdentityInitialize { .. } | Self::RoleCreate { .. } | Self::IdentityAlter { .. }
             | Self::AccountCreate { .. } | Self::AccountReset { .. } | Self::AccountLogin { .. }
             | Self::AccountDrop { .. } | Self::BootstrapSystem { .. } | Self::SystemStatus
+            | Self::BootstrapTypes { .. }
             | Self::ApplyTransaction { .. } => None,
         }
     }
@@ -245,7 +264,8 @@ pub const PRIVILEGE_TABLES: [&str; 4] = [
 
 /// 是不是服务自己经请求通道读写的系统表
 pub fn internal_table(table: &str) -> bool {
-    PRIVILEGE_TABLES.contains(&table.to_ascii_lowercase().as_str())
+    let name = table.to_ascii_lowercase();
+    PRIVILEGE_TABLES.contains(&name.as_str()) || name.starts_with("__system_domain_")
 }
 
 /// 是不是请求通道要拒绝的系统表

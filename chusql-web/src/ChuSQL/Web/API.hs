@@ -229,7 +229,7 @@ reservedDatabase name = name == systemDatabase
 resolveSettingsFileSafe :: IO FilePath
 resolveSettingsFileSafe = do
     found <- try defaultConfigFile :: IO (Either IOException FilePath)
-    pure (either (const "chusql.toml") id found)
+    pure (either (const "settings.toml") id found)
 
 -- | 定位 IDE 设置文件，找不到就定下首个候选路径
 resolveUISettingsFileSafe :: IO FilePath
@@ -403,7 +403,7 @@ indexH env = do
     case content of
         Nothing -> do
             status status500
-            json (apiErrorJson "missing_static" "index.html not found (check the --static directory)")
+            json (apiErrorJson "missing_static" "index.html not found in the static directory")
         Just page -> do
             nonce <- liftIO sessionToken
             let (beforeHead, afterHead) = BS.breakSubstring "</head>" page

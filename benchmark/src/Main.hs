@@ -12,10 +12,12 @@ import ChuSQL.Interface.Session (
     runStatement,
     switchDatabase,
  )
-import Control.Concurrent (forkIO, threadDelay)
-import Control.Exception (IOException, bracket, evaluate, try)
-import Control.Monad (unless, when)
-import Data.List (intercalate)
+import Control.Concurrent (forkIO, forkFinally, threadDelay)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Exception (IOException, bracket, evaluate, throwIO, try)
+import Control.Monad (forM, forM_, replicateM, unless, when)
+import Data.List (intercalate, sort)
+import ChuSQL.Core.Model (Value (..))
 import Data.Text (Text)
 import qualified Data.Text as T
 import GHC.Clock (getMonotonicTime)
@@ -24,6 +26,7 @@ import System.Directory (
     findExecutable,
     getTemporaryDirectory,
     removeDirectoryRecursive,
+    removeFile,
  )
 import System.Environment (getArgs)
 import System.Exit (ExitCode (..), exitFailure)
@@ -41,6 +44,7 @@ import System.Process (
     waitForProcess,
  )
 import Text.Printf (printf)
+import Text.Read (readMaybe)
 
 -- 全链路基准：客户端经 TCP 连 chusql-server，落盘到进程内 Rust 存储。
 -- 每条语句都走完整链路：解析、语义检查、提交。
@@ -52,11 +56,17 @@ data Bench = Bench
     , bDataDir :: FilePath
     , bClient :: Client
     , bSession :: Session
+    , bPort :: Int
+    , bConfigPath :: FilePath
     }
 
 -- | 跑一条 SQL 文本（整条链路）
 runSql :: Bench -> String -> IO (Either Text QueryResult)
-runSql bench sql = runStatement (bSession bench) (T.pack sql)
+runSql bench sql = do
+    result <- runStatement (bSession bench) (T.pack sql)
+    case result of
+        Left err -> ioError (userError (T.unpack err))
+        Right _ -> pure result
 
 -- | 量一次墙上耗时并强制求出行数
 timedQuery :: Bench -> String -> IO (Double, Either Text Int)
@@ -89,20 +99,6 @@ benchSqlOnce bench label sql = do
     (dt, r) <- timedQuery bench sql
     report label r dt
     pure r
-
--- | 造一条 INSERT 的 SQL 文本
-userSql :: Int -> String
-userSql i =
-    printf "INSERT INTO users (id, name, age) VALUES (%d, 'user%d', %d)" i i (i `mod` 100)
-
--- | 造一条订单的 INSERT
-orderSql :: Int -> Int -> String
-orderSql u j =
-    printf
-        "INSERT INTO orders (id, user_id, product) VALUES (%d, %d, 'item%d')"
-        j
-        (1 + (j - 1) `mod` u)
-        (j `mod` 50)
 
 -- | 批量插入并报平均耗时
 batchInsert :: Bench -> String -> Int -> (Int -> String) -> IO (Either Text ())
@@ -140,6 +136,7 @@ benchPing bench times = do
         (total * 1000 / fromIntegral times)
         hits
         times
+    unless (hits == times) (ioError (userError "ping failed during benchmark"))
 
 -- | 一次点查（走语句，等于把 id 索引那一支也量进去）
 benchLookup :: Bench -> Int -> Int -> IO ()
@@ -158,6 +155,7 @@ benchLookup bench key times = do
         (total * 1000 / fromIntegral times)
         hits
         times
+    unless (hits == times) (ioError (userError "point lookup failed during benchmark"))
 
 -- | 量 list_catalog（只取结构，不取行）
 benchCatalog :: Bench -> Int -> IO ()
@@ -175,6 +173,7 @@ benchCatalog bench n = do
         (total * 1000 / fromIntegral n)
         hits
         n
+    unless (hits == n) (ioError (userError "catalog failed during benchmark"))
 
 -- | 依次跑一批语句，返回 (耗时秒, 错误清单)
 runBatch :: Bench -> [String] -> IO (Double, [Text])
@@ -224,9 +223,11 @@ runScenarios bench u o = do
             putStrLn "table creation failed; stopping here"
             exitFailure
 
-    putStrLn "\n[write: every INSERT is a full durable commit]"
-    _ <- batchInsert bench (printf "%d INSERT INTO users" u) u userSql
-    _ <- batchInsert bench (printf "%d INSERT INTO orders" o) o (orderSql u)
+    putStrLn "\n[write: 500 rows per durable INSERT commit]"
+    loadBatch bench "users" "id,name,age" u (\i -> printf "(%d,'user%d',%d)" i i (i `mod` 100))
+    loadBatch bench "orders" "id,user_id,product" o (\i -> printf "(%d,%d,'item%d')" i (1 + (i - 1) `mod` u) (i `mod` 50))
+    checkCount bench "users" u
+    checkCount bench "orders" o
 
     putStrLn "\n[breakdown: protocol round trip vs one catalog call, both over TCP]"
     benchPing bench 200
@@ -245,6 +246,7 @@ runScenarios bench u o = do
 
     putStrLn "\n[point lookup]"
     benchLookup bench (u `div` 2) 100
+    pressureScenarios bench u o
 
     putStrLn "\n[batch insert: one statement with N rows, one durable commit]"
     _ <- benchSqlOnce bench "CREATE TABLE batch_t" "CREATE TABLE batch_t (id int, name str, age int)"
@@ -315,6 +317,8 @@ runScenarios bench u o = do
         (either T.unpack (show . qrRowCount) loadedCheck)
         u
     printf "secondary index: code = %d should find id = %d\n" targetCode (o `div` 2)
+    checkCount bench "batch_t" u
+    putStrLn "BENCHMARK_OK all scenarios completed"
 
 -- | 基准用的库名
 benchDatabase :: String
@@ -407,7 +411,7 @@ startBench = do
     bin <- locateServerExe
     tmp <- getTemporaryDirectory
     stamp <- getMonotonicTime
-    let name = "chusql-benchmark-" ++ show (round (stamp * 1e6) :: Int)
+    let name = "benchmark4csql-" ++ show (round (stamp * 1e6) :: Int)
         dataDir = tmp </> name
         configPath = tmp </> (name ++ ".toml")
         -- TOML 的普通字符串会吃反斜杠，路径统一用正斜杠
@@ -417,14 +421,14 @@ startBench = do
     printf "config   : %s\n" configPath
     printf "data dir : %s\n" dataDir
     bootstrap <- locateBootstrapExe
-    (bootCode, bootOut, bootErr) <- readProcessWithExitCode bootstrap ["--config", configPath, "--passwordless"] ""
+    (bootCode, bootOut, bootErr) <- readProcessWithExitCode bootstrap ["--config", configPath, "--passwordless", "--user", "admin"] ""
     case bootCode of
         ExitSuccess -> printf "bootstrap: system catalog ready\n"
         _ -> do
             putStrLn ("the bootstrap program failed (exit " ++ show bootCode ++ "): " ++ bootOut ++ bootErr)
             exitFailure
     (_, Just out, _, process) <-
-        createProcess (proc bin ["--config", configPath]){std_out = CreatePipe, std_err = NoStream}
+        createProcess (proc bin ["--config", configPath, "--user", "admin"]){std_out = CreatePipe, std_err = NoStream}
     port <- readListeningPort out
     _ <- forkIO (drainHandle out)
     printf "server   : pid launched, tcp port %d\n" port
@@ -445,17 +449,13 @@ startBench = do
                     exitFailure
                 Right () -> do
                     prepareDatabase session
-                    pure (Bench process dataDir client session)
+                    pure (Bench process dataDir client session port configPath)
 
--- | 基准用的配置：管理员名字、随机端口、临时数据目录
+-- | 基准用的配置：随机端口、临时数据目录
 benchConfigText :: String -> String
 benchConfigText dataDir =
     unlines
-        [ "[web]"
-        , "user = \"admin\""
-        , ""
-        , "[server]"
-        , "host = \"127.0.0.1\""
+        [ "[server]"
         , "port = 0"
         , ""
         , "[storage]"
@@ -471,23 +471,26 @@ stopBench bench = do
     putStrLn "\n[teardown] closing the TCP session, stopping the server, removing the data dir"
     closeClient (bClient bench)
     stopProcess (bProcess bench)
-    _ <- try (removeDirectoryRecursive (bDataDir bench)) :: IO (Either IOException ())
-    pure ()
+    removeDirectoryRecursive (bDataDir bench)
+    removeFile (bConfigPath bench)
 
 -- | 杀掉 server 进程
 stopProcess :: ProcessHandle -> IO ()
 stopProcess process = do
     terminateProcess process
-    _ <- try (waitForProcess process) :: IO (Either IOException ExitCode)
+    _ <- waitForProcess process
     pure ()
 
 -- | 主入口
 main :: IO ()
 main = do
     args <- getArgs
-    let pick i d = if length args > i then args !! i else d
-        u = read (pick 0 "200") :: Int
-        o = read (pick 1 "200") :: Int
+    unless (length args <= 2) (ioError (userError "usage: benchmark4csql [users=10000] [orders=50000]"))
+    let values = take 2 (args ++ drop (length args) ["10000", "50000"])
+    sizes <- mapM positiveSize values
+    (u, o) <- case sizes of
+        [usersSize, ordersSize] -> pure (usersSize, ordersSize)
+        _ -> ioError (userError "expected two benchmark sizes")
     printf "full-chain benchmark: TCP client --> chusql-server --> in-process Rust storage\n"
     printf "dataset  : users = %d rows, orders = %d rows\n" u o
     printf "timing   : wall clock (monotonic); every statement runs the full chain over TCP\n"
@@ -503,3 +506,121 @@ main = do
         )
         stopBench
         (\bench -> runScenarios bench u o)
+
+-- | 校验压力规模是至少一百的整数
+positiveSize :: String -> IO Int
+positiveSize raw = case readMaybe raw of
+    Just size | size >= 100 -> pure size
+    _ -> ioError (userError "benchmark row counts must be integers >= 100")
+
+-- | 批量加载并报告每秒写入行数
+loadBatch :: Bench -> String -> String -> Int -> (Int -> String) -> IO ()
+loadBatch bench table columns count row = do
+    (milliseconds, ()) <- measure $ forM_ (chunked 500 count) $ \ids -> do
+        _ <- runSql bench ("INSERT INTO " ++ table ++ " (" ++ columns ++ ") VALUES " ++ intercalate "," (map row ids))
+        pure ()
+    printf "LOAD %-16s rows=%d total_ms=%.3f rows_s=%.2f\n" table count milliseconds (fromIntegral count * 1000 / milliseconds)
+
+-- | 校验完整数据加载数量
+checkCount :: Bench -> String -> Int -> IO ()
+checkCount bench table expected = do
+    result <- runSql bench ("SELECT COUNT(*) FROM " ++ table)
+    case result of
+        Right rows | qrRows rows == [[VInt expected]] -> pure ()
+        _ -> ioError (userError ("count mismatch in " ++ table ++ ": " ++ show result))
+
+-- | 用单调时钟测量动作耗时
+measure :: IO a -> IO (Double, a)
+measure action = do
+    start <- getMonotonicTime
+    result <- action >>= evaluate
+    end <- getMonotonicTime
+    pure ((end - start) * 1000, result)
+
+-- | 打印均值分位数和请求吞吐量
+latencies :: String -> Int -> [Double] -> IO ()
+latencies label rows times = do
+    let ordered = sort times
+        count = length times
+        total = sum times
+        -- | 按最近秩取分位数
+        percentile fraction = ordered !! (ceiling (fraction * fromIntegral count) - 1)
+    printf "CASE %-24s n=%d rows=%d mean_ms=%.3f p50_ms=%.3f p95_ms=%.3f max_ms=%.3f ops_s=%.2f\n" label count rows (total / fromIntegral count) (percentile (0.5 :: Double)) (percentile (0.95 :: Double)) (last ordered) (fromIntegral count * 1000 / total)
+
+-- | 预热后反复测量并校验结果行数
+sampleQuery :: Bench -> String -> String -> Int -> IO ()
+sampleQuery bench label statement expected = do
+    -- | 执行一次并校验结果数量
+    let action = do
+            result <- runSql bench statement
+            case result of
+                Right rows | qrRowCount rows == expected -> pure ()
+                _ -> ioError (userError (label ++ ": result mismatch " ++ show result))
+    _ <- action
+    times <- replicateM 7 (fst <$> measure action)
+    latencies label expected times
+
+-- | 运行索引聚合连接事务与并发压力
+pressureScenarios :: Bench -> Int -> Int -> IO ()
+pressureScenarios bench u o = do
+    putStrLn "\n[pressure: one warmup, seven measured samples per read case]"
+    let selected = length [() | i <- [1 .. o], (1 + (i - 1) `mod` u) `mod` 100 > 90]
+        point = printf "SELECT id FROM users WHERE name = 'user%d'" (u `div` 2)
+    sampleQuery bench "scan_users" "SELECT * FROM users" u
+    sampleQuery bench "scan_orders" "SELECT * FROM orders" o
+    sampleQuery bench "id_point" (printf "SELECT id FROM users WHERE id = %d" (u `div` 2)) 1
+    sampleQuery bench "name_scan" point 1
+    _ <- benchSqlOnce bench "CREATE INDEX users(name)" "CREATE INDEX ON users (name)"
+    sampleQuery bench "name_index" point 1
+    sampleQuery bench "id_range100" "SELECT id FROM users WHERE id >= 1 AND id <= 100" 100
+    sampleQuery bench "sort_top100" "SELECT name FROM users ORDER BY age DESC LIMIT 100" 100
+    sampleQuery bench "group100" "SELECT age, COUNT(*) FROM users GROUP BY age" 100
+    sampleQuery bench "filtered_join" "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 90" selected
+    sampleQuery bench "derived_join" "SELECT d.name FROM (SELECT id,name FROM users WHERE age > 90) d JOIN orders o ON d.id = o.user_id" selected
+    sampleQuery bench "cte_group" "WITH ages AS (SELECT age FROM users) SELECT age, COUNT(*) FROM ages GROUP BY age" 100
+    sampleQuery bench "scalar_subquery" "SELECT name, (SELECT COUNT(*) FROM orders) FROM users LIMIT 100" 100
+    sampleQuery bench "correlated_exists20" "SELECT u.name FROM (SELECT id,name FROM users WHERE id <= 20) u WHERE EXISTS (SELECT id FROM orders o WHERE o.user_id = u.id)" 20
+    _ <- runSql bench "CREATE TABLE wide (id int, payload str)"
+    loadBatch bench "wide" "id,payload" (min 5000 u) (\i -> printf "(%d,'%s')" i (replicate 512 'x'))
+    checkCount bench "wide" (min 5000 u)
+    sampleQuery bench "scan_wide512B" "SELECT * FROM wide" (min 5000 u)
+    mapM_ (concurrentLookup bench) [1, 4, 8]
+    _ <- runSql bench "CREATE TABLE writes (id int, name str, age int)"
+    _ <- batchInsert bench "200 individual durable INSERTs" 200 (\i -> printf "INSERT INTO writes (id,name,age) VALUES (%d,'w%d',%d)" i i i)
+    (milliseconds, ()) <- measure $ do
+        _ <- runSql bench "BEGIN"
+        forM_ [201 .. 400 :: Int] $ \i -> runSql bench (printf "INSERT INTO writes (id,name,age) VALUES (%d,'w%d',%d)" i i i) >> pure ()
+        _ <- runSql bench "COMMIT"
+        pure ()
+    printf "WRITE transaction200 total_ms=%.3f rows_s=%.2f\n" milliseconds (200000 / milliseconds)
+    checkCount bench "writes" 400
+    _ <- benchSqlOnce bench "UPDATE writes (400 rows)" "UPDATE writes SET age = age + 1"
+    _ <- runSql bench "BEGIN"
+    _ <- benchSqlOnce bench "transaction UPDATE (400 rows)" "UPDATE writes SET age = 0"
+    _ <- benchSqlOnce bench "ROLLBACK 400 changed rows" "ROLLBACK"
+    restored <- runSql bench "SELECT age FROM writes WHERE id = 1"
+    unless (fmap qrRows restored == Right [[VInt 2]]) (ioError (userError "rollback value mismatch"))
+    _ <- benchSqlOnce bench "DELETE writes (200 rows)" "DELETE FROM writes WHERE id > 200"
+    checkCount bench "writes" 200
+    putStrLn "PRESSURE_OK all result checks passed"
+
+-- | 用多条独立会话同步开始点查
+concurrentLookup :: Bench -> Int -> IO ()
+concurrentLookup bench workers = do
+    completions <- forM [1 .. workers] $ \_ -> do
+        start <- newEmptyMVar
+        done <- newEmptyMVar
+        client <- connectClient "127.0.0.1" (bPort bench) >>= either (ioError . userError . T.unpack) pure
+        session <- newSession client
+        authenticateSession session "admin" "" >>= either (ioError . userError . T.unpack) pure
+        switchDatabase session "bench" >>= either (ioError . userError . T.unpack) pure
+        _ <- forkFinally (takeMVar start >> bracket (pure client) closeClient (\_ -> replicateM 100 (fst <$> measure (do
+            result <- runStatement session "SELECT id FROM users WHERE id = 1"
+            unless (fmap qrRows result == Right [[VInt 1]]) (ioError (userError "concurrent lookup mismatch")))))) (putMVar done)
+        pure (start, done)
+    (milliseconds, results) <- measure $ do
+        mapM_ (\(start, _) -> putMVar start ()) completions
+        mapM (takeMVar . snd) completions
+    times <- concat <$> mapM (either throwIO pure) results
+    latencies ("concurrent" ++ show workers ++ "_point") 1 times
+    printf "CONCURRENT workers=%d ops=%d wall_ms=%.3f aggregate_ops_s=%.2f\n" workers (workers * 100) milliseconds (fromIntegral (workers * 100) * 1000 / milliseconds)

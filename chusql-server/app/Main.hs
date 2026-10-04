@@ -12,7 +12,6 @@ import ChuSQL.Interface.Config (
     rootUserName,
  )
 import ChuSQL.Interface.RateLimit (newRateLimiter)
-import ChuSQL.Interface.Settings (readSettingsFile)
 import ChuSQL.Interface.TOML (resolveConfigPath)
 import ChuSQL.Server.Accounts (administratorPasswordless)
 import ChuSQL.Server.Backend (Backend (..), ipcBackend)
@@ -69,7 +68,7 @@ parseArgs = go emptyOptions
     go opts ("--help" : rest) = go opts{optHelp = True} rest
     go opts ("-h" : rest) = go opts{optHelp = True} rest
     go opts ("--config" : v : rest) = go opts{optConfig = Just v} rest
-    go opts ("--host" : v : rest) = go opts{optHost = Just v} rest
+    go opts ("--listen-host" : v : rest) = go opts{optHost = Just v} rest
     go opts ("--user" : v : rest) = go opts{optUser = Just (T.pack v)} rest
     go opts ("--port" : v : rest) = withInt "--port" v (\n -> go opts{optPort = Just n} rest)
     go opts ("--max-message" : v : rest) = withInt "--max-message" v (\n -> go opts{optMaxMessage = Just n} rest)
@@ -85,16 +84,16 @@ usage :: IO ()
 usage = do
     putStrLn "usage: chusql-server [options]"
     putStrLn ""
-    putStrLn "config: chusql.toml sits at a fixed place and holds every knob;"
-    putStrLn "        Windows: %APPDATA%\\ChuSQL\\chusql.toml"
-    putStrLn "        other:   $XDG_CONFIG_HOME/ChuSQL/chusql.toml (or ~/.config/ChuSQL/chusql.toml)"
-    putStrLn "        [storage] data_dir; [server] host/port/max_message/max_rows;"
-    putStrLn "        [web] user (administrator name; the password lives in the system table)"
+    putStrLn "config: settings.toml sits at a fixed place and holds every knob;"
+    putStrLn "        Windows: %APPDATA%\\ChuSQL\\settings.toml"
+    putStrLn "        other:   $XDG_CONFIG_HOME/ChuSQL/settings.toml (or ~/.config/ChuSQL/settings.toml)"
+    putStrLn "        [storage] data_dir/log_files; [server] listen_host/port/max_message/max_rows;"
+    putStrLn "        [web] listen_host/port and the limits; the administrator name only comes from --user"
     putStrLn ""
     putStrLn "  --config FILE          read that config file instead"
-    putStrLn "  --host H               listen address              ([server] host, default 127.0.0.1)"
+    putStrLn "  --listen-host H        listen address              ([server] listen_host, default 127.0.0.1)"
     putStrLn "  --port N               listen port                 ([server] port, default 7777)"
-    putStrLn "  --user NAME            administrator name          ([web] user, default root)"
+    putStrLn ("  --user NAME            administrator name          (default " ++ T.unpack defaultUser ++ ")")
     putStrLn "  --max-message N        max bytes per request line  ([server] max_message, default 1048576)"
     putStrLn "  --max-rows N           rows returned per query     ([server] max_rows, default 1000)"
     putStrLn ""
@@ -104,8 +103,8 @@ usage = do
     putStrLn ""
     putStrLn "storage: this process loads the chusql_core_storage library in-process and owns the data directory"
     putStrLn ""
-    putStrLn "administrator password: lives in the __system_users system table, never in chusql.toml"
-    putStrLn ("  the [web] user key only picks the administrator name (default " ++ T.unpack defaultUser ++ ")")
+    putStrLn "administrator password: lives in the __system_users system table, never in settings.toml"
+    putStrLn "  the administrator name comes from --user; settings.toml does not carry it"
     putStrLn ""
     putStrLn "first run: the installer calls csql-bootstrap, which creates the system catalog"
     putStrLn "  {\"method\":\"system_status\"} tells whether that happened; without it the server stops"
@@ -154,14 +153,15 @@ run opts = do
     configPath <- resolveConfigPath (optConfig opts)
     base <- loadWebConfigAt configPath
     let cfg = applyWebOptions base opts
-    saved <- readSettingsFile configPath
     legacy <- legacyPasswordKey configPath
-    let rootName = rootUserName cfg saved
+    let rootName = rootUserName cfg
     config <- applyServerOptions <$> loadServerConfigAt configPath <*> pure opts
     opened <- localStorageLink (Just configPath)
     case opened of
         Left err -> do
             putStrLn ("cannot open the storage library: " ++ err)
+            putStrLn "Stop all database processes, then try: csql-bootstrap repair --config <settings.toml>"
+            putStrLn "If data recovery is required, use csql-bootstrap recover; reset discards system identities and grants."
             exitFailure
         Right link -> do
             setStorageLink link
@@ -199,7 +199,8 @@ checkInitialized backend = do
             | statusInitialized value -> putStrLn "system:       ready (the catalog is initialized)"
         _ -> do
             putStrLn "!! the system catalog is not initialized; run the bootstrap program first:"
-            putStrLn "!!   csql-bootstrap --config <chusql.toml> --password-stdin"
+            putStrLn "!!   csql-bootstrap --config <settings.toml> --password-stdin"
+            putStrLn "!! For a damaged existing system catalog, stop all processes and try csql-bootstrap repair or recover."
             exitFailure
   where
     -- | 应答里的 initialized 是不是 true
@@ -247,3 +248,4 @@ printBanner cfg config configPath = do
         )
     putStrLn ("storage:      chusql_core_storage library " ++ version)
     putStrLn ("data dir:     " ++ orElse (wcDataDir cfg) "(from the config file, else the default)")
+    putStrLn ("log files:    " ++ wcLogFiles cfg)

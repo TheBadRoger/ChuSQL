@@ -2,11 +2,11 @@ cabal-version: 2.4
 
 name:           chusql-web
 version:        1.0.0
-synopsis:       ChuSQL Web 管理端：Scotty + REST API + 静态页面
-description:    ChuSQL 的浏览器管理端。负责 HTTP 交付、鉴权、静态文件，
-                并把用户的 SQL 经 TCP 转交给 chusql-server（存储由服务器进程里的
-                chusql_core_storage 动态库承担）。本进程不链引擎，也不碰存储。
-                数据库服务器与 TCP 协议在 chusql-server 包里，这里只做 HTTP 这一面。
+synopsis:       ChuSQL web administration with Scotty, REST APIs, and static pages
+description:    Provides the browser administration interface, HTTP APIs,
+                authentication, and static file delivery. Forwards SQL to
+                chusql-server over TCP; query execution and storage remain in
+                the database server process.
 build-type:     Simple
 
 library

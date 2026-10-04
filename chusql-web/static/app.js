@@ -587,7 +587,7 @@ function renderSettingsTab(el) {
 
   el.innerHTML = `
     <div class="settings-view">
-      <header><h1>设置</h1><p class="muted">IDE 设置存在 chusql.ui.settings.json，服务器设置写回 chusql.toml 的 [web] 分区。</p></header>
+      <header><h1>设置</h1><p class="muted">IDE 设置存在 chusql.ui.settings.json，服务器设置写回 settings.toml 的 [web] 分区。</p></header>
       <fieldset class="settings-group"><legend>界面</legend>
         ${fontField('uiFonts')}${numberField('uiFontSize')}
       </fieldset>

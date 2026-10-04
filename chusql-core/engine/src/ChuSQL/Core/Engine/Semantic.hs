@@ -5,7 +5,7 @@ import ChuSQL.Core.Model
 import ChuSQL.Core.Engine.Syntax.AST
 import ChuSQL.Core.Engine.Syntax.Parser (parseExpression)
 import Data.Char (isAlphaNum, isAscii, toLower)
-import Data.List (intercalate, isInfixOf, isPrefixOf, nub)
+import Data.List (intercalate, isInfixOf, isPrefixOf, isSuffixOf, nub)
 
 -- 语义检查：表和列在不在、类型对不对，全部在执行前查。
 
@@ -53,10 +53,15 @@ checkFrom db outer (FromJoin _ left right cond) = do
     checkBool db "ON" (Scope env outer) cond
     Right env
 
--- | 派生表里 NULL 字面量列没有具体类型，按字符串处理
+-- | 保留派生表输出的类型或未定型 NULL
 derivedType :: InferredType -> ColumnType
 derivedType (InferType t) = t
-derivedType InferNull = CStr
+derivedType InferNull = CNull
+
+-- | 将列类型还原为表达式推导类型
+inferredColumnType :: ColumnType -> InferredType
+inferredColumnType CNull = InferNull
+inferredColumnType ty = InferType ty
 
 -- | 合并两层列，本层优先且不重复
 scopedEnv :: [(String, Column)] -> [(String, Column)] -> [(String, Column)]
@@ -113,7 +118,7 @@ renderType (InferType t) = typeLabel t
 
 -- | 推导表达式的类型（子查询也在这里整条查一遍）
 inferExpr :: Database -> String -> Scope -> Expr -> Either String InferredType
-inferExpr _ place env (Col c) = InferType . columnType . snd <$> scopeAt place env c
+inferExpr _ place env (Col c) = inferredColumnType . columnType . snd <$> scopeAt place env c
 inferExpr _ _ _ LitNull = Right InferNull
 inferExpr _ _ _ (LitInt _) = Right (InferType CInt)
 inferExpr _ _ _ (LitFloat _) = Right (InferType CFloat)
@@ -213,7 +218,7 @@ inferSubqueryOutput db outerScope sq = case subqueryStatement sq of
     -- | 查这一列的推导类型
     columnTypeOf env c = do
         (_, col) <- scopeAt "SELECT" (Scope env enclosing) c
-        Right (c, InferType (columnType col))
+        Right (c, inferredColumnType (columnType col))
 
 -- | 聚合的参数：列要在，且不能嵌套聚合
 aggregateArg :: Database -> String -> Scope -> Expr -> Either String InferredType
@@ -282,7 +287,7 @@ boolean db place env a b = do
   where
     -- | 挨个查操作数是不是布尔
     boolOperand _ _ InferNull = Right ()
-    boolOperand _ _ (InferType CBool) = Right ()
+    boolOperand _ _ (InferType ty) | typeClassOf ty == BooleanClass = Right ()
     boolOperand p other t = Left (p ++ ": operator needs TBool on both sides, got " ++ renderType other ++ " and " ++ renderType t)
 
 -- | 要求条件能算出布尔
@@ -292,7 +297,7 @@ checkBool db place env e = do
     t <- inferExpr db place env e
     case t of
         InferNull -> Right ()
-        InferType CBool -> Right ()
+        InferType x | typeClassOf x == BooleanClass -> Right ()
         InferType x -> Left (place ++ ": condition must be a boolean, got " ++ typeLabel x)
 
 -- | 检查赋值列和类型
@@ -321,9 +326,87 @@ check db q = () <$ prepare db q
 -- | 执行前解析列名并检查类型
 prepare :: Database -> Statement -> Either String Statement
 prepare db q = do
-    resolved <- resolveStatement db q
-    checkResolved db resolved
+    typed <- resolveDomainTypes db q
+    let visible = filter (not . isDomainTable . fst) db
+    resolved <- resolveStatement visible typed
+    case resolved of
+        CreateDomain name base -> do
+            checkDomainName name
+            checkTypeParameters base
+            case base of
+                CVarchar n | n <= 0 -> Left "CREATE DOMAIN: length must be positive"
+                CChar n | n <= 0 -> Left "CREATE DOMAIN: length must be positive"
+                CDecimal p s | p <= 0 || p > 308 || s < 0 || s > p -> Left "CREATE DOMAIN: invalid precision or scale"
+                _ -> Right ()
+            if any ((== domainTableName name) . fst) db
+                then Left ("domain already exists: " ++ name)
+                else Right ()
+        DropDomain name -> do
+            _ <- maybe (Left ("unknown domain: " ++ name)) Right (lookup (domainTableName name) db)
+            if any (any (usesDomain name . columnType . snd) . tableCols . snd) db
+                then Left ("domain is still used by a column: " ++ name)
+                else Right ()
+        ShowDomains -> Right ()
+        _ -> do
+            if any (isDomainTable . lastTablePart) (ddlTargets resolved)
+                then Left "reserved domain catalog"
+                else Right ()
+            checkResolved visible resolved
     pure resolved
+
+-- | 检查命名类型的名称
+checkDomainName :: String -> Either String ()
+checkDomainName name
+    | null name || length name > 48 = Left "CREATE DOMAIN: name must contain 1 to 48 characters"
+    | any (\c -> not (isAscii c && (isAlphaNum c || c == '_'))) name = Left "CREATE DOMAIN: invalid name"
+    | Just _ <- parseColumnType name = Left "CREATE DOMAIN: built-in type name is reserved"
+    | "__system_" `isPrefixOf` map toLower name = Left "CREATE DOMAIN: reserved name"
+    | otherwise = Right ()
+
+-- | 判断列类型是否引用指定命名类型
+usesDomain :: String -> ColumnType -> Bool
+usesDomain name (CDomain other base) = map toLower name == map toLower other || usesDomain name base
+usesDomain _ _ = False
+
+-- | 列出结构语句的目标表
+ddlTargets :: Statement -> [String]
+ddlTargets statement = case statement of
+    CreateTable name _ -> [name]
+    DropTable name -> [name]
+    CreateIndex name _ -> [name]
+    DropIndex name _ -> [name]
+    AddColumn name _ -> [name]
+    DropColumn name _ -> [name]
+    RenameColumn name _ _ -> [name]
+    AlterColumnType name _ _ -> [name]
+    AlterColumnDefault name _ _ -> [name]
+    AlterColumnNull name _ _ -> [name]
+    _ -> []
+
+-- | 从 schema 解析列上的命名类型
+resolveDomainTypes :: Database -> Statement -> Either String Statement
+resolveDomainTypes db statement = case statement of
+    CreateDomain name base -> CreateDomain name <$> resolveType base
+    CreateTable name cols -> CreateTable name <$> mapM resolveColumnType cols
+    AddColumn name col -> AddColumn name <$> resolveColumnType col
+    AlterColumnType name col ty -> AlterColumnType name col <$> resolveType ty
+    _ -> Right statement
+  where
+    -- | 解析一列的类型
+    resolveColumnType (name, col) = do
+        ty <- resolveType (columnType col)
+        Right (name, col {columnType = ty})
+    -- | 从类型目录取基础类型
+    resolveType = resolveWith []
+    -- | 递归解析类型并拒绝循环定义
+    resolveWith seen (CDomain name _)
+        | map toLower name `elem` seen = Left ("cyclic domain definition: " ++ name)
+        | otherwise = do
+            table <- maybe (Left ("unknown domain: " ++ name)) Right (lookup (domainTableName name) db)
+            base <- maybe (Left ("invalid domain catalog: " ++ name)) Right (lookup "base" (tableCols table))
+            resolved <- resolveWith (map toLower name : seen) (columnType base)
+            Right (CDomain (map toLower name) resolved)
+    resolveWith _ ty = Right ty
 
 -- | 检查已解析的语句
 checkResolved :: Database -> Statement -> Either String ()
@@ -350,8 +433,8 @@ checkResolvedWith db outer q = case q of
         env <- checkFrom db outer fromC
         let full = Scope env outer
         mapM_ (\item -> () <$ inferExpr db "SELECT" full (snd item)) items
-        checkGrouping full groupBy items
-        checkColumns "ORDER BY" full (map fst orderBy)
+        checkGrouping full groupBy (items ++ [(c, Col c) | (c, _) <- orderBy, c `notElem` map fst items])
+        mapM_ (checkOrder full items . fst) orderBy
         mapM_ (checkNoAggregate "WHERE") mWhere
         mapM_ (checkBool db "WHERE" full) mWhere
     Insert tbl cols rows -> do
@@ -420,6 +503,7 @@ checkResolvedWith db outer q = case q of
     AlterColumnType tbl col ty -> do
         t <- lookupTable db tbl
         c <- requireColumn "ALTER COLUMN" t col
+        checkTypeParameters ty
         if columnAutoIncrement c && not (integerType ty)
             then Left "ALTER COLUMN: AUTO_INCREMENT column must stay an integer type"
             else Right ()
@@ -435,6 +519,12 @@ checkResolvedWith db outer q = case q of
             else Right ()
     CreateUser name password -> checkAccount name password
     AlterUser name password -> checkAccount name password
+    AlterIdentity name attributes -> do
+        checkRoleName name
+        if length (nub (map fst attributes)) == length attributes
+            then Right ()
+            else Left "duplicate identity attribute"
+    ShowRoles -> Right ()
     DropUser name -> checkUserName name
     CreateRole name -> checkRoleName name
     DropRole name -> checkRoleName name
@@ -456,6 +546,9 @@ checkResolvedWith db outer q = case q of
     DropDatabase name -> checkDatabaseName name
     UseDatabase name -> checkDatabaseName name
     ShowDatabases -> Right ()
+    CreateDomain{} -> Right ()
+    DropDomain{} -> Right ()
+    ShowDomains -> Right ()
     -- | 事务控制由会话层执行，语义层不做列检查
     BeginTransaction -> Right ()
     CommitTransaction -> Right ()
@@ -485,12 +578,23 @@ checkInsertTargets t cols = mapM_ checkTarget (tableCols t)
 -- | 检查一列定义是否合法（names 给 CHECK 用）
 checkColumnDefs :: [String] -> [(String, Column)] -> Either String ()
 checkColumnDefs names cols = do
+    mapM_ (checkTypeParameters . columnType . snd) cols
     mapM_ (\(_, c) -> mapM_ (checkDefault c) (columnDefault c)) cols
     mapM_ (\(_, c) -> checkAutoIncrement c) cols
     if length [() | (_, c) <- cols, columnAutoIncrement c] > 1
         then Left "CREATE TABLE: at most one AUTO_INCREMENT column is allowed"
         else Right ()
     checkChecks names cols
+
+-- | 校验列类型的长度和精度参数
+checkTypeParameters :: ColumnType -> Either String ()
+checkTypeParameters (CDomain _ base) = checkTypeParameters base
+checkTypeParameters CNull = Left "NULL is only valid as an inferred query output"
+checkTypeParameters (CDecimal p s)
+    | p <= 0 || p > 308 || s < 0 || s > p = Left "invalid decimal precision or scale"
+checkTypeParameters (CVarchar n) | n <= 0 = Left "character length must be positive"
+checkTypeParameters (CChar n) | n <= 0 = Left "character length must be positive"
+checkTypeParameters _ = Right ()
 
 -- | 自增列必须是整数列
 checkAutoIncrement :: Column -> Either String ()
@@ -502,8 +606,8 @@ checkAutoIncrement c
 checkDefault :: Column -> Value -> Either String ()
 checkDefault c v
     | VNull <- v = Right ()
-    | valueFits (columnType c) v = Right ()
-    | otherwise = Left ("DEFAULT: value does not fit column type " ++ show c)
+    | valueFits (columnType c) v = () <$ coerceValue (columnType c) v
+    | otherwise = Left ("DEFAULT: value does not fit column type " ++ typeLabel (columnType c))
 
 -- | CHECK 里的列必须存在
 checkChecks :: [String] -> [(String, Column)] -> Either String ()
@@ -717,6 +821,13 @@ resolveSelect db q@Select{} = resolveQuery db [] q (map (\c -> (c, Col c)) (sele
 resolveSelect db q@SelectExpr{} = resolveQuery db [] q (selectItems q)
 resolveSelect _ q = Right q
 
+-- | 检查排序输出别名或来源列
+checkOrder :: Scope -> [(String, Expr)] -> String -> Either String ()
+checkOrder env items column = case [e | (label, e) <- items, label == column] of
+    [] -> checkColumns "ORDER BY" env [column]
+    [_] -> Right ()
+    _ -> Left ("ORDER BY: ambiguous projection alias: " ++ column)
+
 -- | 解析投影、条件、排序与连接引用
 resolveQuery :: Database -> [(String, Column)] -> Statement -> [(String, Expr)] -> Either String Statement
 resolveQuery db outer q items = do
@@ -727,7 +838,13 @@ resolveQuery db outer q items = do
             FromTable Nothing tbl -> unqualify (Just (deriveQualifier Nothing tbl)) c
             _ -> c
         -- | 查一列并换算成物理名
-        name place c = physical . fst <$> scopedColumnAt place env outer c
+        name place c
+            | length (filter (== '.') c) == 2, not (qualifiedReference c) = Left (missingColumn place c env)
+            | otherwise = physical . fst <$> scopedColumnAt place env outer c
+        -- | 库限定列只引用来源中的真实表名
+        qualifiedReference c = qualifiedReferenceIn db (selectFrom q) c
+            || (any (\(key, _) -> length (filter (== '.') key) == 1 && ("." ++ key) `isSuffixOf` c) outer
+                && (not (any (elem '.' . fst) db) || any (\(table, _) -> (table ++ ".") `isPrefixOf` c) db))
         -- | 换算一个投影项：带别名时保留别名做输出列名
         output (label, Col c) = do
             k <- name "SELECT" c
@@ -742,10 +859,28 @@ resolveQuery db outer q items = do
         else mapM output items
     condition <- mapM (resolveExpr db env outer (name "WHERE")) (selectWhere q)
     grouping <- mapM (name "GROUP BY") (selectGroupBy q)
-    ordering <- mapM (\(c, d) -> (\k -> (k, d)) <$> name "ORDER BY" c) (selectOrderBy q)
+    -- | 优先解析唯一投影别名，再查来源列
+    let orderName c = case [label | (label, _) <- projected, label == c, qIsExpression] of
+            [] -> name "ORDER BY" c
+            [label] -> Right label
+            _ -> Left ("ORDER BY: ambiguous projection alias: " ++ c)
+        qIsExpression = case q of SelectExpr{} -> True; _ -> False
+    ordering <- mapM (\(c, d) -> (\k -> (k, d)) <$> orderName c) (selectOrderBy q)
     pure $ case q of
         Select{} -> Select (map fst projected) source condition grouping ordering (selectLimit q)
         _ -> SelectExpr projected source condition grouping ordering (selectLimit q)
+
+-- | 收集没有别名遮蔽的来源表名
+sourceTableNames :: FromClause -> [String]
+sourceTableNames (FromTable Nothing table) = [table]
+sourceTableNames (FromJoin _ left right _) = sourceTableNames left ++ sourceTableNames right
+sourceTableNames _ = []
+
+-- | 库限定引用必须使用当前来源的表名
+qualifiedReferenceIn :: Database -> FromClause -> String -> Bool
+qualifiedReferenceIn db source c = any (\table -> (table ++ ".") `isPrefixOf` c) tables
+  where
+    tables = sourceTableNames source ++ [key | table <- sourceTableNames source, Right (key, _) <- [resolveTable db table]]
 
 -- | 单表不加限定名，其余来源交给 resolveFrom
 resolveSource :: Database -> [(String, Column)] -> FromClause -> Either String FromClause
@@ -769,7 +904,11 @@ resolveFrom db outer (FromJoin kind left right cond) = do
     l <- resolveFrom db outer left
     r <- resolveFrom db outer right
     env <- checkFrom db outer (FromJoin kind l r cond)
-    c <- resolveExpr db env outer (fmap fst . columnAt "ON" env) cond
+    -- | 连接条件也拒绝不存在的库前缀
+    let joinName column
+            | length (filter (== '.') column) == 2, not (qualifiedReferenceIn db (FromJoin kind left right cond) column) = Left (missingColumn "ON" column env)
+            | otherwise = fst <$> columnAt "ON" env column
+    c <- resolveExpr db env outer joinName cond
     pure (FromJoin kind l r c)
 
 -- | 派生表的输出列名：列取裸名，表达式保留原标签

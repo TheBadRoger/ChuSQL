@@ -2,10 +2,19 @@ cabal-version: 2.4
 
 name:           chusql-bootstrap
 version:        1.0.0
-synopsis:       ChuSQL 引导程序：建系统库与管理员账号
-description:    ChuSQL 初始化引导。首次启动前建系统库、账号表与管理员行，
-                装完即退，保留在 bin 里备用。后续的 catalog 修复也走这里。
+synopsis:       ChuSQL system catalog initialization and offline maintenance
+description:    Initializes the system catalog, administrator identity, and builtin
+                type registry during installation, preserving existing passwords
+                and validating type definitions. Provides offline structure repair,
+                WAL recovery, and system catalog reset commands.
 build-type:     Simple
+
+library
+    hs-source-dirs: src
+    exposed-modules: ChuSQL.Bootstrap
+    build-depends: base >= 4.14 && < 5, aeson, chusql-core-model, text
+    default-language: Haskell2010
+    ghc-options: -Wall
 
 executable csql-bootstrap
     hs-source-dirs:   app
@@ -15,6 +24,16 @@ executable csql-bootstrap
                     , bytestring
                     , chusql-core-engine
                     , chusql-interface
+                    , chusql-bootstrap
                     , text
     default-language: Haskell2010
     ghc-options:      -Wall
+
+test-suite chusql-bootstrap-test
+    type: exitcode-stdio-1.0
+    hs-source-dirs: test
+    main-is: Spec.hs
+    build-depends: base >= 4.14 && < 5, aeson, bytestring, chusql-bootstrap,
+                   chusql-core-engine, chusql-core-model, directory, filepath, hspec, text
+    default-language: Haskell2010
+    ghc-options: -Wall
