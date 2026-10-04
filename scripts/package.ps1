@@ -11,6 +11,11 @@ $ErrorActionPreference = 'Stop'
 
 # Windows 打包脚本：构建、装配、打 zip、出 sha256，产物落 releases\，命名与 CI 一致。
 
+# stack / GHC 的诊断带圆点等非 ASCII 字符，输出统一按 UTF-8，免得写管道时炸编码
+$env:GHC_CHARENC = 'UTF-8'
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+$OutputEncoding = [System.Text.Encoding]::UTF8
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 if (-not $OutDir) { $OutDir = Join-Path $repoRoot 'releases' }
 $OutDir = [System.IO.Path]::GetFullPath($OutDir)

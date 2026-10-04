@@ -5,6 +5,10 @@ param(
     [switch]$NoLint
 )
 $ErrorActionPreference = 'Continue'
+# GHC / stack 的诊断带圆点等非 ASCII 字符，输出统一按 UTF-8，免得写管道时炸编码
+$env:GHC_CHARENC = 'UTF-8'
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+$OutputEncoding = [System.Text.Encoding]::UTF8
 $codes = @()
 
 # 跑一个步骤：切目录、输出原样透传、记录退出码

@@ -497,6 +497,8 @@ tcpServerSpec = do
                         allowed <- tcpQuery bob "select name from users"
                         asText (at "status" allowed) `shouldBe` "result"
                         _ <- tcpQuery admin "revoke reader from bob"
+                        refused <- tcpQuery bob "select name from users"
+                        asText (at "code" refused) `shouldBe` "unauthorized"
                         tcpClosed bob
         it "disconnects every member of a role that was dropped" $
             withTcpServer defaultServerConfig $ \_ handle ->
@@ -508,6 +510,8 @@ tcpServerSpec = do
                     withConnection handle $ \bob -> do
                         _ <- tcpLogin bob "bob" "bob-password-1"
                         _ <- tcpQuery admin "drop role reader"
+                        refused <- tcpQuery bob "use test"
+                        asText (at "code" refused) `shouldBe` "unauthorized"
                         tcpClosed bob
         it "disconnects an account whose password was reset" $
             withTcpServer defaultServerConfig $ \_ handle ->
@@ -517,6 +521,8 @@ tcpServerSpec = do
                     withConnection handle $ \bob -> do
                         _ <- tcpLogin bob "bob" "bob-password-1"
                         _ <- tcpQuery admin "alter user bob identified by 'bob-password-2'"
+                        refused <- tcpQuery bob "use test"
+                        asText (at "code" refused) `shouldBe` "unauthorized"
                         tcpClosed bob
                     withConnection handle $ \again -> do
                         relogin <- tcpLogin again "bob" "bob-password-2"
@@ -529,6 +535,8 @@ tcpServerSpec = do
                     withConnection handle $ \bob -> do
                         _ <- tcpLogin bob "bob" "bob-password-1"
                         _ <- tcpQuery admin "drop user bob"
+                        refused <- tcpQuery bob "use test"
+                        asText (at "code" refused) `shouldBe` "unauthorized"
                         tcpClosed bob
         it "leaves the connections of untouched accounts alone" $
             withTcpServer defaultServerConfig $ \_ handle ->
@@ -763,7 +771,9 @@ privilegeSpec = describe "server privileges" $ do
         _ <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "inner" ["reader"])
         _ <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "reader" ["alice"])
         directly <- affectedAccounts service (RevokeRoleCommand "inner" ["bob"])
-        directly `shouldMatchList` ["inner", "bob", "reader", "alice"]
+        directly `shouldMatchList` ["bob"]
+        granted <- affectedAccounts service (GrantRoleCommand "writer" ["inner"])
+        granted `shouldMatchList` ["inner", "reader", "alice"]
         dropped <- affectedAccounts service (DropRoleCommand "inner")
         dropped `shouldMatchList` ["inner", "reader", "alice"]
         affectedAccounts service (CreateRoleCommand "other") `shouldReturn` []

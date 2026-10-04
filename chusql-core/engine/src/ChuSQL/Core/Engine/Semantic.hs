@@ -6,7 +6,6 @@ import ChuSQL.Core.Engine.Syntax.AST
 import ChuSQL.Core.Engine.Syntax.Parser (parseExpression)
 import Data.Char (isAlphaNum, isAscii, toLower)
 import Data.List (intercalate, isInfixOf, isPrefixOf, nub)
-import Data.Maybe (fromMaybe)
 
 -- 语义检查：表和列在不在、类型对不对，全部在执行前查。
 
@@ -766,7 +765,7 @@ resolveFrom db _ (FromSubquery mAlias stmt) = do
     inner <- resolveSubqueryStatement db [] stmt
     named <- nameDerivedColumns inner
     Right (FromSubquery mAlias named)
-resolveFrom db outer fromC@(FromJoin kind left right cond) = do
+resolveFrom db outer (FromJoin kind left right cond) = do
     l <- resolveFrom db outer left
     r <- resolveFrom db outer right
     env <- checkFrom db outer (FromJoin kind l r cond)

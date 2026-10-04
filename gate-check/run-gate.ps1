@@ -8,6 +8,10 @@ param(
     [string[]]$Only
 )
 $ErrorActionPreference = 'Stop'
+# 车道里的 GHC / stack 诊断带非 ASCII 字符，父子进程统一按 UTF-8 收
+$env:GHC_CHARENC = 'UTF-8'
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+$OutputEncoding = [System.Text.Encoding]::UTF8
 
 $LogDir = Join-Path $PSScriptRoot 'logs'
 $TmpDir = Join-Path $PSScriptRoot 'tmp'

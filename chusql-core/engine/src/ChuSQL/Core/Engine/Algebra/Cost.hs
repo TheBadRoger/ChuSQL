@@ -34,6 +34,8 @@ estimateRows h lo hi = max 0 (min total (round (sum (zipWith overlap [0 ..] (his
     width = if histHigh h > histLow h then (histHigh h - histLow h) / fromIntegral (length (histBuckets h)) else 0
     lower = maybe (-1 / 0) id (boundOf lo)
     upper = maybe (1 / 0) id (boundOf hi)
+    -- | 第 i 个桶与区间重叠的行数
+    overlap :: Int -> Int -> Double
     overlap i count
         | width <= 0 = if lower <= histLow h && histLow h <= upper then fromIntegral count else 0
         | otherwise = fromIntegral count * hit / width
