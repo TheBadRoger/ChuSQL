@@ -1,9 +1,12 @@
-module ChuSQL.Core.Engine.Semantic (check, prepare) where
+module ChuSQL.Core.Engine.Semantic (check, prepare, prepareRowExpression, querySchema) where
 
 import ChuSQL.Core.Engine.Algebra.Expr (bareColumns, colsInExpr, hasAggregate)
 import ChuSQL.Core.Model
 import ChuSQL.Core.Engine.Syntax.AST
 import ChuSQL.Core.Engine.Syntax.Parser (parseExpression)
+import ChuSQL.Core.Engine.Runtime.Functions (FunctionSignature (..), builtinFunctions, functionSignature)
+import ChuSQL.Core.Engine.Runtime.SQL (resolveSQLFunction, sqlResultType, sqlType)
+import ChuSQL.Core.Engine.Runtime.Types
 import Data.Char (isAlphaNum, isAscii, toLower)
 import Data.List (intercalate, isInfixOf, isPrefixOf, isSuffixOf, nub)
 
@@ -20,6 +23,12 @@ prefixColumns :: Maybe String -> [(String, Column)] -> [(String, Column)]
 prefixColumns mAlias cols = [(prefix ++ c, ty) | (c, ty) <- cols]
   where
     prefix = maybe "" (++ ".") mAlias
+
+-- | 从 schema 推导查询输出列
+querySchema :: Database -> Statement -> Either String [(String, Column)]
+querySchema db statement = do
+    columns <- inferSubqueryOutput db (Scope [] []) (Subquery statement [])
+    Right [(name, plainColumn (derivedType ty)) | (name, ty) <- columns]
 
 -- | 检查期的作用域：本层优先，外层兜底
 data Scope = Scope
@@ -103,6 +112,7 @@ checkGrouping env keys items
     | null keys && not (any (hasAggregate . snd) items) = Right ()
     | otherwise = do
         checkColumns "GROUP BY" env keys
+        mapM_ (checkRuntimeColumn "GROUP BY" env) keys
         mapM_ okCol (nub (concatMap (bareColumns . snd) items))
   where
     -- | 这一列能不能出现在分组查询里
@@ -127,6 +137,23 @@ inferExpr _ _ _ (LitBool _) = Right (InferType CBool)
 inferExpr _ _ _ (LitDate _) = Right (InferType CDate)
 inferExpr _ _ _ (LitTimestamp _) = Right (InferType CTimestamp)
 inferExpr _ _ _ (LitBlob _) = Right (InferType CBlob)
+inferExpr db place env (Construct ty arguments) = InferType . CRuntime <$> inferConstruction db place env ty arguments
+inferExpr db place env (BoundConstruct tid arguments) = do
+    inferred <- inferConstruction db place env (typeExpression tid) arguments
+    if inferred == tid then Right (InferType (CRuntime tid)) else Left "constructor result identity mismatch"
+inferExpr _ _ _ (RuntimeLiteral tid value) = validateValue builtinTypes tid value >> Right (InferType (CRuntime tid))
+inferExpr db place env (FunctionCall name arguments) = do
+    inferred <- mapM (inferExpr db place env) arguments
+    sig <- resolveSQLFunction name (map inferredArgument inferred)
+    InferType <$> sqlResultType (signatureResult sig)
+inferExpr db place env (BoundFunction fid tid arguments) = do
+    functions <- builtinFunctions builtinTypes
+    expected <- functionSignature functions fid
+    inferred <- mapM (inferExpr db place env) arguments
+    resolved <- resolveSQLFunction (signatureName expected) (map inferredArgument inferred)
+    if signatureId resolved == fid && signatureResult resolved == tid
+        then InferType <$> sqlResultType tid
+        else Left "bound function signature identity mismatch"
 inferExpr db place env (Add a b) = arithmetic db place env a b
 inferExpr db place env (Sub a b) = arithmetic db place env a b
 inferExpr db place env (Mul a b) = arithmetic db place env a b
@@ -160,8 +187,8 @@ inferExpr db place env (AvgOf a) = do
         InferType x
             | numericType x -> Right (InferType CFloat)
             | otherwise -> Left (place ++ ": AVG needs a number, got " ++ typeLabel x)
-inferExpr db place env (MinOf a) = aggregateArg db place env a
-inferExpr db place env (MaxOf a) = aggregateArg db place env a
+inferExpr db place env (MinOf a) = aggregateArg db place env a >>= requireOrdering "MIN"
+inferExpr db place env (MaxOf a) = aggregateArg db place env a >>= requireOrdering "MAX"
 inferExpr db place env (ScalarSub sq) = do
     cols <- inferSubqueryOutput db env sq
     case cols of
@@ -386,18 +413,18 @@ ddlTargets statement = case statement of
 -- | 从 schema 解析列上的命名类型
 resolveDomainTypes :: Database -> Statement -> Either String Statement
 resolveDomainTypes db statement = case statement of
-    CreateDomain name base -> CreateDomain name <$> resolveType base
+    CreateDomain name base -> CreateDomain name <$> resolveDomainType base
     CreateTable name cols -> CreateTable name <$> mapM resolveColumnType cols
     AddColumn name col -> AddColumn name <$> resolveColumnType col
-    AlterColumnType name col ty -> AlterColumnType name col <$> resolveType ty
+    AlterColumnType name col ty -> AlterColumnType name col <$> resolveDomainType ty
     _ -> Right statement
   where
     -- | 解析一列的类型
     resolveColumnType (name, col) = do
-        ty <- resolveType (columnType col)
+        ty <- resolveDomainType (columnType col)
         Right (name, col {columnType = ty})
     -- | 从类型目录取基础类型
-    resolveType = resolveWith []
+    resolveDomainType = resolveWith []
     -- | 递归解析类型并拒绝循环定义
     resolveWith seen (CDomain name _)
         | map toLower name `elem` seen = Left ("cyclic domain definition: " ++ name)
@@ -427,6 +454,7 @@ checkResolvedWith db outer q = case q of
             checkColumns "SELECT" full cols
             checkGrouping full groupBy (map (\c -> (c, Col c)) cols)
             checkColumns "ORDER BY" full (map fst orderBy)
+            mapM_ (checkRuntimeColumn "ORDER BY" full . fst) orderBy
             mapM_ (checkNoAggregate "WHERE") mWhere
             mapM_ (checkBool db "WHERE" full) mWhere
     SelectExpr items fromC mWhere groupBy orderBy _ -> do
@@ -434,7 +462,7 @@ checkResolvedWith db outer q = case q of
         let full = Scope env outer
         mapM_ (\item -> () <$ inferExpr db "SELECT" full (snd item)) items
         checkGrouping full groupBy (items ++ [(c, Col c) | (c, _) <- orderBy, c `notElem` map fst items])
-        mapM_ (checkOrder full items . fst) orderBy
+        mapM_ (checkOrder db full items . fst) orderBy
         mapM_ (checkNoAggregate "WHERE") mWhere
         mapM_ (checkBool db "WHERE" full) mWhere
     Insert tbl cols rows -> do
@@ -468,7 +496,7 @@ checkResolvedWith db outer q = case q of
     CreateIndex tbl col -> do
         t <- lookupTable db tbl
         if col `elem` tableCols' t
-            then Right ()
+            then checkRuntimeColumn "CREATE INDEX" (Scope (tableCols t) []) col
             else Left ("CREATE INDEX: unknown column: " ++ col)
     DropIndex tbl col -> do
         t <- lookupTable db tbl
@@ -581,14 +609,22 @@ checkColumnDefs names cols = do
     mapM_ (checkTypeParameters . columnType . snd) cols
     mapM_ (\(_, c) -> mapM_ (checkDefault c) (columnDefault c)) cols
     mapM_ (\(_, c) -> checkAutoIncrement c) cols
+    mapM_ checkRuntimeKey cols
     if length [() | (_, c) <- cols, columnAutoIncrement c] > 1
         then Left "CREATE TABLE: at most one AUTO_INCREMENT column is allowed"
         else Right ()
     checkChecks names cols
+  where
+    -- | 拒绝缺少能力实现的运行时键
+    checkRuntimeKey (_, column)
+        | typeClassOf (columnType column) == RuntimeClass
+        , columnUnique column || columnPrimaryKey column = Left "runtime type key capability is not registered"
+        | otherwise = Right ()
 
 -- | 校验列类型的长度和精度参数
 checkTypeParameters :: ColumnType -> Either String ()
 checkTypeParameters (CDomain _ base) = checkTypeParameters base
+checkTypeParameters (CRuntime tid) = () <$ describeType builtinTypes tid
 checkTypeParameters CNull = Left "NULL is only valid as an inferred query output"
 checkTypeParameters (CDecimal p s)
     | p <= 0 || p > 308 || s < 0 || s > p = Left "invalid decimal precision or scale"
@@ -707,6 +743,17 @@ resolveExpr ::
     Expr ->
     Either String Expr
 resolveExpr db env outer f e = case e of
+    Construct ty arguments -> do
+        tid <- inferConstruction db "constructor" (Scope env outer) ty arguments
+        bound <- mapM (resolveExpr db env outer f) arguments
+        Right (BoundConstruct tid bound)
+    BoundConstruct tid arguments -> BoundConstruct tid <$> mapM (resolveExpr db env outer f) arguments
+    FunctionCall name arguments -> do
+        inferred <- mapM (inferExpr db "function" (Scope env outer)) arguments
+        sig <- resolveSQLFunction name (map inferredArgument inferred)
+        bound <- mapM (resolveExpr db env outer f) arguments
+        Right (BoundFunction (signatureId sig) (signatureResult sig) bound)
+    BoundFunction fid tid arguments -> BoundFunction fid tid <$> mapM (resolveExpr db env outer f) arguments
     Col c -> Col <$> f c
     Add a b -> binary Add a b
     Sub a b -> binary Sub a b
@@ -738,6 +785,36 @@ resolveExpr db env outer f e = case e of
   where
     -- | 递归处理两个子表达式
     binary ctor a b = ctor <$> resolveExpr db env outer f a <*> resolveExpr db env outer f b
+
+-- | 校验具体构造器和参数逻辑类型
+inferConstruction :: Database -> String -> Scope -> TypeExpr -> [Expr] -> Either String TypeId
+inferConstruction db place env ty@(TypeApply cid parameters) arguments = do
+    descriptor <- resolveType builtinTypes ty
+    expected <- case (cid, parameters) of
+        (TypeConstructorId 5, [child]) -> Right (replicate (length arguments) child)
+        (TypeConstructorId 6, [child]) | length arguments <= 1 -> Right (replicate (length arguments) child)
+        (TypeConstructorId 7, fields) | length fields == length arguments -> Right fields
+        _ -> Left "composite constructor argument count mismatch"
+    inferred <- mapM (inferExpr db place env) arguments
+    supplied <- mapM argumentIdentity inferred
+    required <- mapM (fmap descriptorId . resolveType builtinTypes) expected
+    if supplied == required then Right (descriptorId descriptor) else Left "composite constructor argument type mismatch"
+  where
+    -- | 解析非空参数的逻辑类型身份
+    argumentIdentity InferNull = Left "SQL NULL needs Maybe construction inside a runtime value"
+    argumentIdentity (InferType column) = sqlType column
+
+-- | 使用单行 schema 绑定表达式
+prepareRowExpression :: [(String, Column)] -> Expr -> Either String Expr
+prepareRowExpression columns expression = do
+    bound <- resolveExpr [] columns [] (nameIn columns "expression") expression
+    _ <- inferExpr [] "expression" (Scope columns []) bound
+    Right bound
+
+-- | 将推导类型转换为可空参数类型
+inferredArgument :: InferredType -> Maybe ColumnType
+inferredArgument InferNull = Nothing
+inferredArgument (InferType ty) = Just ty
 
 -- | 解析子查询，并记下它引用的外层列
 resolveSubquery :: Database -> [(String, Column)] -> Subquery -> Either String Subquery
@@ -822,11 +899,24 @@ resolveSelect db q@SelectExpr{} = resolveQuery db [] q (selectItems q)
 resolveSelect _ q = Right q
 
 -- | 检查排序输出别名或来源列
-checkOrder :: Scope -> [(String, Expr)] -> String -> Either String ()
-checkOrder env items column = case [e | (label, e) <- items, label == column] of
-    [] -> checkColumns "ORDER BY" env [column]
-    [_] -> Right ()
+checkOrder :: Database -> Scope -> [(String, Expr)] -> String -> Either String ()
+checkOrder db env items column = case [e | (label, e) <- items, label == column] of
+    [] -> checkRuntimeColumn "ORDER BY" env column
+    [expression] -> () <$ (inferExpr db "ORDER BY" env expression >>= requireOrdering "ORDER BY")
     _ -> Left ("ORDER BY: ambiguous projection alias: " ++ column)
+
+-- | 校验列已有排序能力
+checkRuntimeColumn :: String -> Scope -> String -> Either String ()
+checkRuntimeColumn place env column = do
+    (_, definition) <- scopeAt place env column
+    () <$ requireOrdering place (InferType (columnType definition))
+
+-- | 拒绝尚未注册能力的复合类型
+requireOrdering :: String -> InferredType -> Either String InferredType
+requireOrdering place inferred@(InferType ty)
+    | typeClassOf ty == RuntimeClass = Left (place ++ ": runtime type capability is not registered")
+    | otherwise = Right inferred
+requireOrdering _ inferred = Right inferred
 
 -- | 解析投影、条件、排序与连接引用
 resolveQuery :: Database -> [(String, Column)] -> Statement -> [(String, Expr)] -> Either String Statement

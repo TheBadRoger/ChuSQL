@@ -136,13 +136,21 @@ REVOKE reviewer FROM alice;
 DROP ROLE analyst;
 ```
 
-当前表级权限包括：`SELECT`、`INSERT`、`UPDATE`、`DELETE` 和 `ALL`。
+表级权限包括 `SELECT`、`INSERT`、`UPDATE`、`DELETE`；数据库权限包括 `CONNECT`、`CREATE`。`ALL` 按对象类型展开。未限定的表名及 `*` 使用当前数据库，`库名.表名` 和 `库名.*` 可指定其他数据库；系统对象不能通过业务 GRANT 授权。
+
+```sql
+REVOKE CONNECT ON DATABASE sales FROM PUBLIC;
+GRANT CONNECT, CREATE ON DATABASE sales TO analyst;
+GRANT SELECT ON TABLE sales.orders TO reviewer WITH GRANT OPTION;
+GRANT SELECT ON sales.* TO analyst;
+REVOKE SELECT ON sales.orders FROM reviewer;
+```
 
 角色可以互相继承：`GRANT analyst TO reviewer` 让 `reviewer` 成为 `analyst` 的成员并取得其授权；继承会沿成员关系传递，成环的授权被拒绝（报 `conflict`），自继承同样拒绝。用户也可以直接接受表级授权或作为其他角色的成员。
 
-管理员拥有完整权限；数据库、表、索引等结构管理操作仅允许管理员执行。
+最高权限身份拥有完整权限。数据库默认向 PUBLIC 开放 CONNECT，不默认授予 CREATE 或数据权限。具有数据库 CREATE 的身份可建表，并成为新表所有者；表所有者可管理表、字段及索引，并授予该表权限。数据库所有者可删除自己的数据库，创建数据库与管理 DOMAIN 仍要求最高权限。
 
-`GRANT ... WITH GRANT OPTION` 让拿到的授权可以再转授：普通身份只有手里那条授权带 grant option 时才能执行 `GRANT`，报错是 `grant option required: <权限> ON <表>`；`REVOKE` 仍然只允许管理员，收回授权会连它的 grant option 一起收掉，且不会级联收回别人转授出去的授权。转授权随角色继承一起传递。
+`GRANT ... WITH GRANT OPTION` 允许再转授；所有者也可授予自身对象的权限。普通授予者可撤销自己的授予，所有者及最高权限身份可撤销对象上的其他授予。撤销时收回相应 grant option，并级联清理失去合法来源的下游授权；仍有独立来源的授权保留。转授权能力随启用的角色继承，循环转授不能独立维持权限。REVOKE 不移除所有者的隐含权限。
 
 系统目录访问还受目录管理属性控制，具体能力见 [用户与角色](users-and-roles.md)。
 
@@ -152,4 +160,6 @@ DROP ROLE analyst;
 ```sql
 ALTER USER alice SYSTEM_CATALOG_MANAGER;
 ALTER USER alice NOSYSTEM_CATALOG_MANAGER;
+ALTER USER alice ALLOW_SUDO_AUTH;
+ALTER USER alice NOALLOW_SUDO_AUTH;
 ```

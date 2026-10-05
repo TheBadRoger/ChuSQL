@@ -11,19 +11,24 @@ module ChuSQL.Server.TCP (
     ServerHandle (..),
     startServer,
     runServer,
+    isLocalPeer,
 ) where
 
 import ChuSQL.Interface.Config (ServerConfig (..), defaultServerConfig, loadServerConfigAt)
+import ChuSQL.Interface.Sudo (SudoCredential, createSudoCredential, removeSudoCredential, sudoChallenge, validSudoChallenge, isLocalPeer)
+import Data.Time.Clock (UTCTime, getCurrentTime)
 import ChuSQL.Interface.Policy (PasswordPolicy (..))
 import ChuSQL.Interface.Protocol (ClientRequest (..), ServerResponse (..), decodeRequest, encodeResponse, protocolVersion)
 import ChuSQL.Interface.RateLimit (RateLimiter, rateLimitBlock, rateLimitClear, rateLimitRecord)
 import qualified ChuSQL.Core.Engine.Error as E
 import ChuSQL.Core.Protocol (Account (..), Request (ReqIdentityInitialize))
 import ChuSQL.Server.Backend (Backend (..))
-import ChuSQL.Server.Session (QueryResult (..), Session, SessionError (..), accounts, authenticateSessionCoded, catalog, databases, newSessionWith, policyOf, reloadPolicy, roleViews, runStatementCoded, sessionIsAdmin, sessionUser)
+import ChuSQL.Server.Session (QueryResult (..), Session, SessionError (..), accounts, authenticateSessionCoded, authenticateSudoSessionCoded, isPlainIdentifier, catalog, databases, newSessionWith, policyOf, reloadPolicy, roleViews, runStatementCoded, runStorageCoded, sessionIsAdmin, sessionUser)
+import ChuSQL.Server.Security (writeSecurity)
+import ChuSQL.Server.Privileges (newPrivileges, reconcileObjects)
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar)
-import Control.Exception (IOException, finally, try)
+import Control.Exception (IOException, bracket, finally, onException, try)
 import Control.Monad (filterM, void)
 import qualified Data.ByteString.Char8 as BSC
 import qualified Data.ByteString.Lazy.Char8 as BLC
@@ -48,6 +53,7 @@ import Network.Socket (
     defaultProtocol,
     getAddrInfo,
     getSocketName,
+    getPeerName,
     listen,
     setSocketOption,
     socket,
@@ -64,6 +70,8 @@ import System.IO.Error (isEOFError)
 data LiveEntry = LiveEntry
     { leWho :: IORef (Maybe Text)
     , leDropped :: IORef Bool
+    , leLocal :: Bool
+    , leChallenge :: IORef (Maybe (Text, UTCTime))
     }
 
 -- | 在线连接登记：自增编号到连接条目
@@ -77,8 +85,8 @@ newLiveConnections :: IO LiveConnections
 newLiveConnections = LiveConnections <$> newIORef 0 <*> newMVar Map.empty
 
 -- | 新建一条连接条目
-newLiveEntry :: IO LiveEntry
-newLiveEntry = LiveEntry <$> newIORef Nothing <*> newIORef False
+newLiveEntry :: Bool -> IO LiveEntry
+newLiveEntry local = LiveEntry <$> newIORef Nothing <*> newIORef False <*> pure local <*> newIORef Nothing
 
 -- | 登记一条连接，返回注销动作
 registerConnection :: LiveConnections -> LiveEntry -> IO (IO ())
@@ -112,6 +120,7 @@ data ServerEnv = ServerEnv
     , srvConfig :: ServerConfig
     , srvLimiter :: RateLimiter
     , srvLive :: LiveConnections
+    , srvSudo :: MVar (Maybe (Int, Text, SudoCredential))
     }
 
 -- | 组装服务器环境：每个连接再各开一个会话
@@ -124,7 +133,13 @@ newServerEnv backend rootName settingsFile config limiter = do
             | any (\a -> accountEnabled a && accountCanLogin a && accountIsSuperuser a) identities -> pure ()
             | otherwise -> ioError (userError "identity migration failed: no enabled login superuser; stop all processes and try csql-bootstrap recover --config <settings.toml>; reset replaces system identities and grants")
     live <- newLiveConnections
-    pure (ServerEnv backend rootName settingsFile config limiter live)
+    privileges <- newPrivileges backend
+    recovered <- writeSecurity (reconcileObjects privileges)
+    case recovered of
+        Left err -> ioError (userError ("object privilege recovery failed: " ++ show err))
+        Right () -> pure ()
+    sudo <- newMVar Nothing
+    pure (ServerEnv backend rootName settingsFile config limiter live sudo)
 
 data ServerHandle = ServerHandle
     { shPort :: Int
@@ -136,18 +151,42 @@ startServer :: ServerEnv -> IO ServerHandle
 startServer env = do
     sock <- listenSocket (scHost (srvConfig env)) (scPort (srvConfig env))
     port <- actualPort sock
+    enableSudo env port `onException` close sock
     stopped <- newMVar False
     _ <- forkIO (acceptLoop env sock stopped)
-    pure (ServerHandle port (stopListening sock stopped))
+    pure (ServerHandle port (stopListening sock stopped `finally` disableSudo env))
 
 -- | 在调用线程里收连接（可执行文件用）；绑好端口先回调一次
 runServer :: ServerEnv -> (Int -> IO ()) -> IO ()
-runServer env announce = do
-    sock <- listenSocket (scHost (srvConfig env)) (scPort (srvConfig env))
+runServer env announce = bracket (listenSocket (scHost (srvConfig env)) (scPort (srvConfig env))) close $ \sock -> do
     port <- actualPort sock
-    announce port
-    stopped <- newMVar False
-    acceptLoop env sock stopped
+    enableSudo env port
+    (do
+        announce port
+        stopped <- newMVar False
+        acceptLoop env sock stopped) `finally` disableSudo env
+
+-- 为显式配置的本机身份映射创建凭据。
+enableSudo :: ServerEnv -> Int -> IO ()
+enableSudo env port
+    | T.null user = pure ()
+    | not (isPlainIdentifier user) = ioError (userError "sudo_auth_user must be a plain identity name")
+    | otherwise = modifyMVar_ (srvSudo env) $ \current -> case current of
+        Just _ -> ioError (userError "sudo authentication is already running")
+        Nothing -> do
+            credential <- createSudoCredential port
+            hPutStrLn stderr ("sudo_auth enabled: local elevated identity -> " ++ T.unpack user)
+            pure (Just (port, user, credential))
+  where
+    user = scSudoUser (srvConfig env)
+
+-- 清理本次服务实例的本机认证凭据。
+disableSudo :: ServerEnv -> IO ()
+disableSudo env = modifyMVar_ (srvSudo env) $ \current -> do
+    case current of
+        Nothing -> pure ()
+        Just (port, _, _) -> removeSudoCredential port
+    pure Nothing
 
 -- | 置停止标记并关掉监听套接字
 stopListening :: Socket -> MVar Bool -> IO ()
@@ -209,10 +248,11 @@ reportConnection env conn = do
 -- | 一个连接一个会话：一行一条 JSON，读到 EOF 就收工
 serveConnection :: ServerEnv -> Socket -> IO ()
 serveConnection env conn = do
+    peer <- getPeerName conn
     h <- socketToHandle conn ReadWriteMode
     hSetBuffering h LineBuffering
     hSetNewlineMode h noNewlineTranslation
-    entry <- newLiveEntry
+    entry <- newLiveEntry (isLocalPeer peer)
     unregister <- registerConnection (srvLive env) entry
     session <- newSessionWith (srvBackend env) (srvRootName env) (srvSettingsFile env) (\names -> void (dropConnectionsOf (srvLive env) names))
     outcome <- try (loop h session entry `finally` unregister) :: IO (Either IOException ())
@@ -250,10 +290,24 @@ dispatch env session entry request = case request of
         | version == protocolVersion -> pure (RespHello protocolVersion, True)
         | otherwise -> pure (RespError "bad_request" ("unsupported protocol version: " <> tshow version), True)
     ReqLogin user password -> do
+        writeIORef (leChallenge entry) Nothing
         response <- login env session user password
         case response of
             RespLogin who _ -> writeIORef (leWho entry) (Just who)
             _ -> pure ()
+        pure (response, True)
+    ReqSudoChallenge -> do
+        configured <- readMVar (srvSudo env)
+        who <- sessionUser session
+        case configured of
+            Just _ | leLocal entry && who == Nothing -> do
+                nonce <- sudoChallenge
+                now <- getCurrentTime
+                writeIORef (leChallenge entry) (Just (nonce, now))
+                pure (RespSudoChallenge nonce, True)
+            _ -> pure (RespError "forbidden" "local sudo authentication is unavailable", True)
+    ReqSudoLogin user proof -> do
+        response <- sudoLogin env session entry user proof
         pure (response, True)
     ReqQuery sql -> do
         who <- sessionUser session
@@ -268,18 +322,10 @@ dispatch env session entry request = case request of
                         Right queryResult -> RespResult (trimResult (scMaxRows (srvConfig env)) queryResult)
         pure (response, True)
     ReqStorage payload -> do
-        who <- sessionUser session
-        response <- case who of
-            Nothing -> pure (RespError "unauthorized" "sign in first")
-            Just _ -> do
-                admin <- sessionIsAdmin session
-                if not admin
-                    then pure (RespError "forbidden" "administrator required")
-                    else do
-                        result <- beStorage (srvBackend env) payload
-                        pure $ case result of
-                            Left err -> RespError "storage_error" (T.pack err)
-                            Right value -> RespStorage value
+        result <- runStorageCoded session payload
+        let response = case result of
+                Left err -> RespError (sessCode err) (sessMessage err)
+                Right value -> RespStorage value
         pure (response, True)
     ReqCatalog -> do
         response <- overSession session (catalog session) RespCatalog
@@ -301,6 +347,45 @@ dispatch env session entry request = case request of
         pure (response, True)
     ReqPing -> pure (RespPong, True)
     ReqQuit -> pure (RespBye, False)
+
+-- 消费一次性证明并登录本机映射账号。
+sudoLogin :: ServerEnv -> Session -> LiveEntry -> Text -> Text -> IO ServerResponse
+sudoLogin env session entry user proof = do
+    challenge <- atomicModifyIORef' (leChallenge entry) (\value -> (Nothing, value))
+    configured <- readMVar (srvSudo env)
+    now <- getCurrentTime
+    who <- sessionUser session
+    let key = T.toLower (T.strip user)
+        mapped = maybe "" (\(_, name, _) -> name) configured
+        valid = leLocal entry && who == Nothing && key == mapped
+            && case configured of
+                Just (_, _, credential) -> validSudoChallenge credential now challenge key proof
+                Nothing -> False
+    blocked <- rateLimitBlock (srvLimiter env) key
+    response <- case blocked of
+        Just _ -> pure (RespError "too_many_attempts" "too many failed sudo logins")
+        Nothing | not valid -> do
+            rateLimitRecord (srvLimiter env) key
+            pure (RespError "unauthorized" "sudo authentication refused")
+        Nothing -> do
+            result <- authenticateSudoSessionCoded session key
+            case result of
+                Left err -> do
+                    rateLimitRecord (srvLimiter env) key
+                    pure (RespError (sessCode err) (sessMessage err))
+                Right () -> do
+                    rateLimitClear (srvLimiter env) key
+                    writeIORef (leWho entry) (Just key)
+                    admin <- sessionIsAdmin session
+                    pure (RespLogin key admin)
+    hPutStrLn stderr ("sudo_auth attempt: mapped_user=" ++ T.unpack mapped
+        ++ " local=" ++ show (leLocal entry) ++ " result=" ++ auditResult response)
+    pure response
+  where
+    -- 提取不包含凭据的认证审计结果。
+    auditResult RespLogin{} = "accepted"
+    auditResult (RespError code _) = T.unpack code
+    auditResult _ = "refused"
 
 -- | 口令策略在线上只有两个数字：最短长度与至少几类字符
 policyResponse :: PasswordPolicy -> ServerResponse

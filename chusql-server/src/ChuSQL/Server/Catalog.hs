@@ -25,7 +25,7 @@ module ChuSQL.Server.Catalog
 
 import ChuSQL.Core.Model (Row, Value (..))
 import ChuSQL.Core.Protocol (Account (..), Request (..))
-import ChuSQL.Interface.Actions (sqlLiteral)
+import ChuSQL.Interface.Actions (escapeStringLiteral)
 import ChuSQL.Interface.Protocol (Grant (..))
 import ChuSQL.Server.Backend (Backend (..), StatementResult (..), grantsTable, membersTable, optionsTable, rolesTable)
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
@@ -213,4 +213,4 @@ roleLiteral = literal . normalizeRole
 
 -- | 文本值的 SQL 字面量
 literal :: Text -> String
-literal = sqlLiteral . VStr . T.unpack
+literal text = "'" ++ escapeStringLiteral (T.unpack text) ++ "'"

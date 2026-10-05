@@ -31,6 +31,8 @@ import System.Directory (createDirectoryIfMissing, getTemporaryDirectory, remove
 import System.FilePath ((</>))
 import System.Timeout (timeout)
 import Test.Hspec
+import qualified NormalizationSpec
+import qualified RuntimeSpec
 
 -- 引擎层的 hspec 测试：语法、执行、优化器与存储链路行为。
 
@@ -116,7 +118,12 @@ domainSql db (sql : rest) = do
 -- | 跑引擎层全部 hspec 用例
 main :: IO ()
 main = hspec $ do
+    NormalizationSpec.spec
+    RuntimeSpec.spec
     describe "identity syntax" $ do
+        it "parses independent sudo authentication switches" $ do
+            parseStatement "ALTER USER worker ALLOW_SUDO_AUTH" `shouldBe` Right (AlterIdentity "worker" [("allow_sudo_auth", True)])
+            parseStatement "ALTER ROLE worker NOALLOW_SUDO_AUTH" `shouldBe` Right (AlterIdentity "worker" [("allow_sudo_auth", False)])
         it "parses role and user attributes with their aliases" $ do
             parseStatement "ALTER ROLE worker LOGIN SUPERUSER ENABLED" `shouldBe` Right (AlterIdentity "worker" [("login", True), ("superuser", True), ("enabled", True)])
             parseStatement "ALTER USER worker NOLOGIN NOSUPERUSER DISABLED" `shouldBe` Right (AlterIdentity "worker" [("login", False), ("superuser", False), ("enabled", False)])
@@ -1055,6 +1062,16 @@ main = hspec $ do
                 `shouldBe` Right (GrantPrivileges ["SELECT", "INSERT"] "*" "analyst" True)
             parseStatement "GRANT SELECT ON users TO analyst WITH"
                 `shouldSatisfy` isLeft
+
+        it "parses database scopes, explicit tables and qualified wildcards" $ do
+            parseStatement "GRANT CONNECT, CREATE ON DATABASE sales TO analyst"
+                `shouldBe` Right (GrantPrivileges ["CONNECT", "CREATE"] "database:sales" "analyst" False)
+            parseStatement "REVOKE CONNECT ON DATABASE sales FROM PUBLIC"
+                `shouldBe` Right (RevokePrivileges ["CONNECT"] "database:sales" "PUBLIC")
+            parseStatement "GRANT SELECT ON TABLE sales.orders TO analyst"
+                `shouldBe` Right (GrantPrivileges ["SELECT"] "sales.orders" "analyst" False)
+            parseStatement "REVOKE ALL ON sales.* FROM analyst"
+                `shouldBe` Right (RevokePrivileges ["ALL"] "sales.*" "analyst")
 
         it "parses REVOKE symmetrically" $ do
             parseStatement "REVOKE SELECT ON users FROM analyst"
@@ -2077,6 +2094,27 @@ main = hspec $ do
                                    ]
 
     describe "ChuSQL.Core.Engine.Storage.IPC" $ do
+        it "persists runtime type identities and nested values across restart" $ do
+            withTestSession $ \srv -> do
+                -- | 解析并通过真实存储执行 SQL
+                let query source = case parseStatement source of
+                        Left err -> expectationFailure err >> pure (Left err)
+                        Right statement -> runIPCStorage (runStatementM statement)
+                originalRows <- withServerEnv srv $ do
+                    query "CREATE TABLE compound (id Int, xs [Int], opt Maybe String, pair (Int, String), text String)" `shouldReturn` Right []
+                    query "INSERT INTO compound (id, xs, opt, pair, text) VALUES (1, LIST<Int>(1, 2), MAYBE<String>('x'), TUPLE<Int, String>(3, 'y'), 'abc')" `shouldReturn` Right []
+                    query "SELECT xs, opt, pair, length(text) FROM compound"
+                originalRows `shouldSatisfy` isRight
+                closeConnection
+                openSessionIn (dataDir srv)
+                reloadedRows <- withServerEnv srv $ query "SELECT xs, opt, pair, length(text) FROM compound"
+                reloadedRows `shouldBe` originalRows
+                withServerEnv srv $ do
+                    query "INSERT INTO compound (xs) VALUES (LIST<String>('wrong'))" >>= (`shouldSatisfy` isLeft)
+                    query "UPDATE compound SET xs = LIST<Int>(9) WHERE id = 1" `shouldReturn` Right []
+                    updated <- query "SELECT xs FROM compound WHERE id = 1"
+                    updated `shouldSatisfy` isRight
+
         it "projects scan columns and preserves constant rows" $ do
             withTestSession $ \srv -> withServerEnv srv $ do
                 runIPCStorage (insertMany "projected" [[("id", VInt 1), ("name", VStr "one")], [("id", VInt 2), ("name", VNull)]]) `shouldReturn` Right ()

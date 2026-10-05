@@ -186,12 +186,13 @@ data ServerConfig = ServerConfig
     , scPort :: Int
     , scMaxMessage :: Int
     , scMaxRows :: Int
+    , scSudoUser :: Text
     }
     deriving (Eq, Show)
 
 -- | 默认本机 7777，行 1 MiB，最多 1000 行
 defaultServerConfig :: ServerConfig
-defaultServerConfig = ServerConfig "127.0.0.1" 7777 (1024 * 1024) 1000
+defaultServerConfig = ServerConfig "127.0.0.1" 7777 (1024 * 1024) 1000 ""
 
 -- | 读 [server] 段键，缺的用默认
 loadServerConfigAt :: FilePath -> IO ServerConfig
@@ -211,4 +212,5 @@ loadServerConfigAt path = do
             , scPort = intOf "port" (scPort defaultServerConfig)
             , scMaxMessage = intOf "max_message" (scMaxMessage defaultServerConfig)
             , scMaxRows = intOf "max_rows" (scMaxRows defaultServerConfig)
+            , scSudoUser = T.toLower (T.pack (textOf "sudo_auth_user" ""))
             }

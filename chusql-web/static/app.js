@@ -46,6 +46,12 @@ const state = {
   tabs: [],
   activeId: undefined,
   changes: createEmptyChangeSet(),
+  edit: null,
+  editStarting: null,
+  editAttempt: null,
+  editBusy: false,
+  editNeedsReload: false,
+  editUncertain: null,
   insertSeq: 0,
   messages: [],
   tabSeq: 0,
@@ -301,8 +307,8 @@ function renderSidebar() {
     <section class="side-section">
       <div class="side-title">变更</div>
       <div class="side-row">
-        <button data-action="commit"${count ? '' : ' disabled'}>提交 ${count}</button>
-        <button data-action="rollback"${count ? '' : ' disabled'}>撤销</button>
+        <button data-action="commit"${count && !state.editBusy && !state.editNeedsReload ? '' : ' disabled'}>提交 ${count}</button>
+        <button data-action="rollback"${(state.edit || state.editAttempt) && !state.editBusy ? '' : ' disabled'}>撤销</button>
       </div>
     </section>`;
 }
@@ -364,7 +370,9 @@ function renderTableTab(el, tab) {
   }
   const columns = data.columns;
   const keyColumn = columns.find((column) => column.name === 'id');
-  const editable = Boolean(keyColumn);
+  const editable = Boolean(keyColumn) && tab.table !== accountsTable && Boolean(state.edit)
+    && data.editId === state.edit.id && !data.loading
+    && !state.editBusy && !state.editNeedsReload && !state.editUncertain;
   const filters = data.filters ?? {};
   const count = changeCount(state.changes);
 
@@ -413,8 +421,8 @@ function renderTableTab(el, tab) {
         <button data-action="insert-row"${editable ? '' : ' disabled'}>＋ 新增行</button>
         <button data-action="delete-selected"${editable && (tab.selected?.size ?? 0) ? '' : ' disabled'}>删除选中</button>
         <span class="sep"></span>
-        <button class="primary" data-action="commit"${count ? '' : ' disabled'}>提交 (${count})</button>
-        <button data-action="rollback"${count ? '' : ' disabled'}>撤销</button>
+        <button class="primary" data-action="commit"${count && !state.editBusy && !state.editNeedsReload ? '' : ' disabled'}>提交 (${count})</button>
+        <button data-action="rollback"${(state.edit || state.editAttempt) && !state.editBusy ? '' : ' disabled'}>撤销</button>
         <span class="sep"></span>
         <button data-action="reload-table">刷新</button>
         <span class="flex-spacer"></span>
@@ -438,7 +446,7 @@ function renderTableTab(el, tab) {
         ${data.rows.length || stagedInserts.length ? '' : '<p class="empty">这张表没有数据。</p>'}
       </div>
       ${data.loading ? '<div class="grid-loading">加载中…</div>' : ''}
-      ${editable ? '' : '<p class="notice">这张表没有 id 列，只能浏览。</p>'}
+      ${editable ? '' : '<p class="notice">当前表或事务状态仅允许浏览；系统身份请通过 SQL 管理。</p>'}
     </div>`;
 }
 
@@ -650,8 +658,8 @@ function renderBottom() {
       <button class="${state.bottomTab === 'changes' ? 'active' : ''}" data-action="bottom-tab" data-tab="changes">待提交变更 (${count})</button>
       <button class="${state.bottomTab === 'messages' ? 'active' : ''}" data-action="bottom-tab" data-tab="messages">消息 (${state.messages.length})</button>
       <span class="flex-spacer"></span>
-      <button data-action="commit"${count ? '' : ' disabled'}>提交全部</button>
-      <button data-action="rollback"${count ? '' : ' disabled'}>撤销全部</button>
+      <button data-action="commit"${count && !state.editBusy && !state.editNeedsReload ? '' : ' disabled'}>提交全部</button>
+      <button data-action="rollback"${(state.edit || state.editAttempt) && !state.editBusy ? '' : ' disabled'}>撤销全部</button>
       <button data-action="copy-sql"${count ? '' : ' disabled'}>复制 SQL</button>
     </div>
     <div class="bottom-body">${state.bottomTab === 'changes' ? changeList : messages}</div>`;
@@ -694,19 +702,36 @@ async function loadWorkspace() {
 
 // 切换当前数据库。
 async function switchDatabase(name) {
+  if (state.editBusy || state.editStarting) return;
   if (name === state.database) return;
   if (changeCount(state.changes) > 0) {
     log('warn', '请先提交或撤销当前库的修改，再切换数据库。');
     renderSidebar();
     return;
   }
+  const previousEdit = state.edit ?? state.editAttempt;
+  state.editBusy = true;
+  afterChange();
+  try {
+    if (previousEdit) await api.rollbackEdit(previousEdit.id, previousEdit.database);
+  } catch (error) {
+    state.editBusy = false;
+    fail(error);
+    afterChange();
+    return;
+  }
+  state.edit = null;
+  state.editAttempt = null;
   const result = await api.query(`USE ${name}`, state.database);
+  state.editBusy = false;
   if (result.type === 'error') {
     fail(new Error(result.message));
     renderSidebar();
     return;
   }
   state.database = result.database ?? name;
+  state.tabs = state.tabs.filter((entry) => entry.kind !== 'table');
+  state.activeId = state.tabs[0]?.id;
   log('info', `已切换到数据库 ${state.database}`);
   await loadWorkspace();
   renderEditor();
@@ -732,10 +757,12 @@ async function openTable(database, name) {
 
 // 加载表标签的一页数据。
 async function loadTableData(tab) {
+  if (state.editBusy || state.editNeedsReload || state.editUncertain) return;
   const data = tab.data;
   data.loading = true;
   renderEditor();
   try {
+    if (tab.table !== accountsTable) await ensureEdit(tab.database);
     const meta = await api.getTable(tab.database, tab.table);
     const filters = Object.entries(data.filters ?? {})
       .filter(([, expression]) => String(expression).trim().length > 0)
@@ -756,6 +783,7 @@ async function loadTableData(tab) {
     data.offset = offset;
     data.pageSize = pageSize;
     data.error = null;
+    data.editId = state.edit?.id;
     // 服务端做等值过滤，界面上的 like / 比较表达式再在本地收敛一次
     data.rows = filters.length
       ? page.rows.filter((row) => filters.every((filter) => matchesFilter(row[filter.column], filter.expression)))
@@ -768,6 +796,28 @@ async function loadTableData(tab) {
     renderEditor();
     renderBottom();
   }
+}
+
+// 在首个数据表加载时固定编辑快照。
+async function ensureEdit(database) {
+  if (database !== state.database) throw new Error('请切换到表所属数据库后重新打开。');
+  if (state.edit) {
+    if (state.edit.database !== database) throw new Error('请先撤销当前数据库的编辑事务。');
+    return;
+  }
+  if (!state.editStarting) {
+    const edit = state.editAttempt ?? { id: [...crypto.getRandomValues(new Uint8Array(16))].map((byte) => byte.toString(16).padStart(2, '0')).join(''), database };
+    if (edit.database !== database) throw new Error('请先撤销之前的编辑快照，再切换数据库。');
+    state.editAttempt = edit;
+    const session = state.session;
+    state.editStarting = api.beginEdit(edit.id, database).then(() => {
+      if (state.session !== session) throw new Error('登录会话已更换，请重新加载。');
+      state.edit = edit;
+      state.editAttempt = null;
+    })
+      .finally(() => { state.editStarting = null; });
+  }
+  await state.editStarting;
 }
 
 // 重新加载所有表标签。
@@ -790,6 +840,7 @@ function unstageRow(table, pk) {
 
 // 暂存单元格修改。
 function stageUpdate(table, database, pk, column, oldValue, newValue) {
+  if (!canEdit(database)) return;
   if (oldValue === newValue) state.changes.updates.delete(changeKey(table, pk, column));
   else state.changes.updates.set(changeKey(table, pk, column), { table, database, pk, column, oldValue, newValue });
   afterChange();
@@ -797,6 +848,7 @@ function stageUpdate(table, database, pk, column, oldValue, newValue) {
 
 // 暂存新增行。
 function stageInsert(table, database, values) {
+  if (!canEdit(database)) return;
   state.insertSeq += 1;
   const tempId = `new-${state.insertSeq}`;
   state.changes.inserts.set(insertKey(table, tempId), { table, database, tempId, values });
@@ -805,6 +857,7 @@ function stageInsert(table, database, values) {
 
 // 暂存删除行。
 function stageDelete(table, database, pk, row) {
+  if (!canEdit(database)) return;
   unstageRow(table, pk);
   state.changes.deletes.set(deleteKey(table, pk), { table, database, pk, row });
   afterChange();
@@ -819,6 +872,7 @@ function afterChange() {
 
 // 撤下一条暂存变更。
 function removeStaged(key) {
+  if (!canEdit(state.database)) return;
   if (state.changes.updates.has(key)) state.changes.updates.delete(key);
   else if (state.changes.inserts.has(key)) state.changes.inserts.delete(key);
   else if (state.changes.deletes.has(key)) state.changes.deletes.delete(key);
@@ -826,48 +880,70 @@ function removeStaged(key) {
 }
 
 // 撤销全部暂存变更。
-function rollbackAll() {
-  state.changes = createEmptyChangeSet();
-  for (const tab of state.tabs) if (tab.selected) tab.selected.clear();
-  log('info', '已撤销全部待提交变更。');
+async function rollbackAll() {
+  if (state.editBusy || state.editStarting) return;
+  state.editBusy = true;
   afterChange();
+  try {
+    const edit = state.edit ?? state.editAttempt;
+    const result = edit ? await api.rollbackEdit(edit.id, edit.database) : null;
+    state.edit = null;
+    state.editAttempt = null;
+    state.editNeedsReload = false;
+    state.editUncertain = null;
+    state.changes = createEmptyChangeSet();
+    for (const tab of state.tabs) if (tab.selected) tab.selected.clear();
+    log('info', result?.state === 'committed' ? '先前提交已成功，现重新加载数据。' : '已回滚编辑事务，重新加载数据。');
+    state.editBusy = false;
+    await loadWorkspace();
+    await reloadOpenTables();
+  } catch (error) {
+    state.editNeedsReload = true;
+    fail(error);
+  } finally {
+    state.editBusy = false;
+    afterChange();
+  }
+}
+
+// 检查编辑事务与页面操作状态。
+function canEdit(database) {
+  return Boolean(state.edit) && state.edit.database === database && !state.editBusy
+    && !state.editNeedsReload && !state.editUncertain;
 }
 
 // 提交全部暂存变更。
 async function commitAll() {
-  const payload = toCommitPayload(state.changes);
+  if (state.editBusy || state.editStarting) return;
+  if (state.editNeedsReload || !state.edit) {
+    fail(new Error('编辑快照已失效，请撤销并重新加载后编辑。'));
+    return;
+  }
+  const payload = state.editUncertain ?? toCommitPayload(state.changes);
   if (!payload.length) {
     log('info', '没有待提交的变更。');
     return;
   }
-  const database = state.database;
-  const result = await api.commitChanges(database, payload);
+  state.editBusy = true;
+  afterChange();
+  const edit = state.edit;
+  const result = await api.commitChanges(edit.id, edit.database, payload);
+  if (state.edit !== edit) { state.editBusy = false; return; }
   if (result.ok) {
+    state.edit = null;
+    state.editUncertain = null;
     state.changes = createEmptyChangeSet();
     for (const tab of state.tabs) if (tab.selected) tab.selected.clear();
     log('info', `已提交 ${result.applied} 条变更。`);
     setStatus(`已提交 ${result.applied} 条变更`);
   } else {
-    const failed = result.errors?.[0];
-    // 成功的部分不再保留，失败的那条留在面板上等修正
-    state.changes = createEmptyChangeSet();
-    payload.slice(result.applied).forEach((change) => {
-      if (change.op === 'insert') {
-        state.insertSeq += 1;
-        const tempId = `new-${state.insertSeq}`;
-        state.changes.inserts.set(insertKey(change.table, tempId), { table: change.table, database, tempId, values: change.values });
-      } else if (change.op === 'delete') {
-        state.changes.deletes.set(deleteKey(change.table, change.pk), { table: change.table, database, pk: change.pk, row: {} });
-      } else {
-        for (const [column, value] of Object.entries(change.set)) {
-          state.changes.updates.set(changeKey(change.table, change.pk, column), {
-            table: change.table, database, pk: change.pk, column, oldValue: undefined, newValue: value,
-          });
-        }
-      }
-    });
-    log('error', `提交在第 ${(failed?.index ?? 0) + 1} 条失败：${failed?.message ?? '未知错误'}（已成功 ${result.applied} 条）`);
+    state.editNeedsReload = result.reloadRequired === true;
+    state.editUncertain = result.state === 'unknown' ? payload : null;
+    log('error', `${result.message ?? '提交失败'}（事务状态：${result.state}）。${state.editNeedsReload
+      ? result.state === 'lost' ? '连接已失效，请重新登录，确认数据后重新编辑。' : '请撤销并重新加载，禁止覆盖其他会话修改。' : state.editUncertain
+        ? '结果尚未确认，编辑已冻结；再次提交仅查询同一提交结果。' : '全部修改已回退，编辑内容保留，可修正后重试。'}`);
   }
+  state.editBusy = false;
   await loadWorkspace();
   await reloadOpenTables();
   afterChange();
@@ -877,10 +953,31 @@ async function commitAll() {
 
 // 运行 SQL 并展示结果。
 async function runSql(tab) {
+  if (state.editBusy || state.editStarting || state.editUncertain || state.editNeedsReload) return;
+  if (changeCount(state.changes)) {
+    log('warn', '请先提交或撤销表格修改，再运行 SQL。');
+    return;
+  }
   const sql = String(tab.sql ?? '').trim();
   if (!sql) return;
+  state.editBusy = true;
+  afterChange();
+  const previousEdit = state.edit ?? state.editAttempt;
+  if (previousEdit) {
+    try {
+      await api.rollbackEdit(previousEdit.id, previousEdit.database);
+      state.edit = null;
+      state.editAttempt = null;
+    } catch (error) {
+      state.editBusy = false;
+      fail(error);
+      afterChange();
+      return;
+    }
+  }
   setStatus('执行中…');
-  const result = await api.query(sql, tab.database);
+  const result = await api.query(sql, tab.database, tab.id);
+  state.editBusy = false;
   tab.result = result;
   if (result.type === 'error') {
     log('error', result.message ?? '执行失败');
@@ -888,6 +985,7 @@ async function runSql(tab) {
   } else {
     if (result.database && result.database !== state.database) {
       state.database = result.database;
+      state.tabs = state.tabs.filter((entry) => entry.kind !== 'table');
       tab.database = result.database;
       await loadWorkspace();
     }
@@ -897,8 +995,10 @@ async function runSql(tab) {
     } else {
       log('info', `语句影响 ${result.affected ?? 0} 行`);
       setStatus(`影响 ${result.affected ?? 0} 行`);
-      await loadWorkspace();
-      await reloadOpenTables();
+      if (!result.transactionActive) {
+        await loadWorkspace();
+        await reloadOpenTables();
+      }
     }
   }
   renderEditor();
@@ -912,15 +1012,22 @@ function activateTab(id) {
   const tab = activeTab();
   if (tab?.kind === 'sql') tab.database = state.database;
   if (tab?.kind === 'settings' && !state.serverSettings) void loadServerSettings();
+  if (tab?.kind === 'table' && !state.edit && tab.table !== accountsTable) void loadTableData(tab);
   renderTabs();
 }
 
 // 关闭指定标签。
 function closeTabById(id) {
+  if (state.tabs.find((tab) => tab.id === id)?.kind === 'sql') {
+    void api.rollbackConsole(id).catch(fail);
+  }
   const closed = closeTab(state.tabs, id, state.activeId);
   state.tabs = closed.tabs;
   state.activeId = closed.activeId;
   renderTabs();
+  if (!state.tabs.some((tab) => tab.kind === 'table') && !changeCount(state.changes) && (state.edit || state.editAttempt)) {
+    void rollbackAll();
+  }
 }
 
 // 新开一个查询标签。
@@ -1066,6 +1173,10 @@ function deleteSelected(tab) {
 
 // 就地编辑单元格：提交或放弃。
 function beginCellEdit(cell, options) {
+  if (/^runtime\(\[1,\[[567],/.test(String(options.type))) {
+    setStatus('复合值请通过 SQL 控制台修改');
+    return;
+  }
   if (cell.querySelector('input')) return;
   const input = document.createElement('input');
   input.className = 'cell-input';
@@ -1292,6 +1403,7 @@ function onClick(event) {
   const target = event.target.closest('[data-action]');
   if (!target) return;
   const action = target.dataset.action;
+  if (state.editBusy || state.editStarting) return;
   const tab = activeTab();
 
   // 没有选库时，需要当前库的动作先拦下来（服务端也会拒，这里给人话）
@@ -1305,13 +1417,19 @@ function onClick(event) {
       void (async () => {
         try {
           await api.logout();
-        } catch {
-          // 退出失败也要回到登录页
+        } catch (error) {
+          fail(error);
+          return;
         }
         state.session = null;
         state.tabs = [];
         state.activeId = undefined;
         state.changes = createEmptyChangeSet();
+        state.edit = null;
+        state.editAttempt = null;
+        state.editNeedsReload = false;
+        state.editUncertain = null;
+        api.forgetEdit();
         renderLogin('已退出登录。', 'info');
       })();
       return;
@@ -1450,7 +1568,7 @@ function onClick(event) {
       void commitAll();
       return;
     case 'rollback':
-      rollbackAll();
+      void rollbackAll();
       return;
     case 'copy-sql': {
       const text = changesSql(state.changes).join('\n');
@@ -1493,10 +1611,12 @@ function onClick(event) {
       if (!meta || !row) return;
       const staged = state.changes.updates.get(changeKey(tab.table, pk, column));
       const oldValue = staged ? staged.oldValue : row[column.name];
+      const editId = state.edit?.id;
       beginCellEdit(target, {
         type: meta.type,
         currentValue: staged ? staged.newValue : row[column.name],
         commit: (value) => {
+          if (state.edit?.id !== editId) return;
           if (value === undefined) renderEditor();
           else stageUpdate(tab.table, tab.database, pk, column, oldValue, value);
         },
@@ -1513,6 +1633,7 @@ function onClick(event) {
         type: meta ? meta.type : 'str',
         currentValue: insert.values[column],
         commit: (value) => {
+          if (!canEdit(tab.database)) return;
           if (value === undefined) renderEditor();
           else {
             insert.values[column] = value;
@@ -1617,7 +1738,31 @@ window.addEventListener(AUTH_EVENT, () => {
   state.session = null;
   state.tabs = [];
   state.activeId = undefined;
+  state.changes = createEmptyChangeSet();
+  state.edit = null;
+  state.editAttempt = null;
+  state.editStarting = null;
+  state.editUncertain = null;
+  state.editNeedsReload = false;
+  api.forgetEdit();
   renderLogin('会话已过期，请重新登录。', 'warn');
+});
+
+// 离开页面时请求回滚仍持有的编辑快照。
+window.addEventListener('pagehide', () => {
+  api.closeConsoleOnPagehide();
+  const edit = state.edit ?? state.editAttempt;
+  if (edit && !state.editBusy) {
+    navigator.sendBeacon('/api/edit/rollback', new Blob([JSON.stringify(edit)], { type: 'application/json' }));
+  }
+});
+
+// 未提交或结果未知时提示页面关闭。
+window.addEventListener('beforeunload', (event) => {
+  if (changeCount(state.changes) || state.editBusy) {
+    event.preventDefault();
+    event.returnValue = '';
+  }
 });
 
 root.addEventListener('click', onClick);

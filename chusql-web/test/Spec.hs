@@ -3,8 +3,12 @@
 module Main (main) where
 
 import ChuSQL.Interface.Link (closeClient, connectClient)
+import ChuSQL.Interface.Auth (SessionPolicy (..), defaultSessionPolicy, lookupPayload, setPayloadPolicy)
 import ChuSQL.Interface.RateLimit (newRateLimiter)
 import ChuSQL.Interface.Session (authenticateSession, newSession, runStatement)
+import qualified ChuSQL.Interface.Actions as Actions
+import qualified ChuSQL.Core.Model as Model
+import ChuSQL.Core.Runtime
 import ChuSQL.Interface.Settings (
     applySettings,
     defaultOf,
@@ -17,6 +21,7 @@ import ChuSQL.Interface.Settings (
  )
 import ChuSQL.Web.API (
     AppEnv (..),
+    WebSession (..),
     Live (..),
     defaultLive,
     isIdentifier,
@@ -27,8 +32,9 @@ import ChuSQL.Web.API (
  )
 import ChuSQL.Web.Static (contentTypeOf, safeRelative)
 import ChuSQL.Web.UISettings (validateUISettings)
-import Control.Concurrent (forkIO)
-import Control.Exception (IOException, bracket, try)
+import Control.Concurrent (forkFinally, forkIO)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Exception (IOException, bracket, throwIO, try)
 import Control.Monad (when)
 import Data.Aeson (encode, object, (.=))
 import qualified Data.Aeson as A
@@ -39,6 +45,7 @@ import qualified Data.ByteString.Char8 as BSC
 import qualified Data.ByteString.Lazy as BL
 import Data.Char (isDigit)
 import Data.List (isInfixOf)
+import Data.IORef (readIORef)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
@@ -511,6 +518,17 @@ stopServer world = do
 -- | 纯函数用例
 unitSpec :: Spec
 unitSpec = describe "pure helpers" $ do
+    it "rejects malformed runtime values before producing write SQL" $ do
+        case resolveType builtinTypes (listType intType) of
+            Left err -> expectationFailure err
+            Right descriptor ->
+                Actions.insertRowSql "t" [("xs", Model.VRuntime (descriptorId descriptor) (RList [RString "wrong"]))]
+                    `shouldSatisfy` either (const True) (const False)
+    it "escapes nested runtime string literals" $ do
+        case resolveType builtinTypes (listType stringType) of
+            Left err -> expectationFailure err
+            Right descriptor -> Actions.sqlLiteral (Model.VRuntime (descriptorId descriptor) (RList [RString "a'b"]))
+                `shouldBe` Right "LIST<String>('a''b')"
     it "parses the session cookie out of a Cookie header" $ do
         parseCookieHeader sessionCookieName "a=1; chusql_session=abc123; b=2" `shouldBe` Just "abc123"
         parseCookieHeader sessionCookieName "other=1" `shouldBe` Nothing
@@ -835,17 +853,54 @@ accountSpec env = describe "the account table (system database, admin only)" $ d
 roleSpec :: AppEnv -> Spec
 roleSpec env = describe "roles and grants" $ do
     withApp (webApp env) $ do
+        it "uses database scopes and owner permissions through REST and rejects private data" $ do
+            admin <- adminHeaders
+            ensureDatabase admin testDatabaseName
+            ensureAccount admin "acl_web_owner" "Owner-Secret-1234"
+            ensureAccount admin "acl_web_reader" "Reader-Secret-1234"
+            ensureTable admin "acl_private" (encode (object ["name" .= ("acl_private" :: Text), "columns" .= [column "id" "int"]]))
+            permission <- postAs admin "/api/roles/acl_web_owner/grants" (encode (object ["object" .= ("database:" <> testDatabaseName), "privileges" .= (["connect", "create"] :: [Text])]))
+            expectStatusWith "database object grant" permission 200
+            owner <- ordinaryHeaders "acl_web_owner" "Owner-Secret-1234"
+            created <- postAs (withDb testDatabaseName owner) "/api/tables" (encode (object ["name" .= ("acl_owned" :: Text), "columns" .= [column "id" "int"]]))
+            expectStatusWith "owner creates table" created 200
+            denied <- testSql owner "SELECT * FROM acl_private"
+            expectStatusWith "private table denied" denied 403
+            grantDenied <- postAs (withDb testDatabaseName owner) "/api/roles/acl_web_reader/grants" (encode (object ["object" .= (testDatabaseName <> ".acl_private"), "privileges" .= (["select"] :: [Text])]))
+            expectStatusWith "missing grant option" grantDenied 403
+            delegated <- postAs (withDb testDatabaseName owner) "/api/roles/acl_web_reader/grants" (encode (object ["object" .= (testDatabaseName <> ".acl_owned"), "privileges" .= (["select"] :: [Text])]))
+            expectStatusWith "owner delegates via REST" delegated 200
+            reader <- ordinaryHeaders "acl_web_reader" "Reader-Secret-1234"
+            visible <- testSql reader "SELECT * FROM acl_owned"
+            expectStatusWith "delegated query" visible 200
+            revoked <- testSql admin "REVOKE SELECT ON acl_owned FROM acl_web_reader"
+            expectStatusWith "root revokes owner delegation" revoked 200
+            invalidated <- testSql reader "SELECT * FROM acl_owned"
+            expectStatusWith "revoked Web session" invalidated 401
+        it "filters database visibility after PUBLIC CONNECT is revoked" $ do
+            admin <- adminHeaders
+            ensureDatabase admin "acl_closed"
+            ensureAccount admin "acl_web_guest" "Guest-Secret-1234"
+            closed <- postAs admin "/api/query" (encode (object ["sql" .= ("REVOKE CONNECT ON DATABASE acl_closed FROM PUBLIC" :: Text)]))
+            expectStatusWith "close default connection" closed 200
+            guest <- ordinaryHeaders "acl_web_guest" "Guest-Secret-1234"
+            listed <- getAs guest "/api/databases"
+            expectStatusWith "filtered database list" listed 200
+            check (("acl_closed" `elem` map asText (items (jsonBody listed))) `shouldBe` False)
+            refused <- getAs (withDb "acl_closed" guest) "/api/tables"
+            expectStatusWith "CONNECT denied through Web" refused 403
         it "creates a role, grants a privilege, adds a member and drops it" $ do
             hs <- adminHeaders
             ensureDatabase hs testDatabaseName
             ensureAccount hs "bob" "bob-Secret-123456"
+            ensureTable (withDb testDatabaseName hs) "grant_probe" (encode (object ["name" .= ("grant_probe" :: Text), "columns" .= [column "id" "int"]]))
             created <- postAs hs "/api/roles" (encode (object ["name" .= ("analyst" :: Text)]))
             expectStatusWith "create role" created 200
             granted <-
                 postAs
                     hs
                     "/api/roles/analyst/grants"
-                    (encode (object ["object" .= testDatabaseName, "privileges" .= (["select"] :: [Text])]))
+                    (encode (object ["object" .= (testDatabaseName <> ".grant_probe"), "privileges" .= (["select"] :: [Text])]))
             expectStatusWith "grant privilege" granted 200
             member <- postAs hs "/api/roles/analyst/members" (encode (object ["user" .= ("bob" :: Text)]))
             expectStatusWith "add member" member 200
@@ -865,13 +920,14 @@ roleSpec env = describe "roles and grants" $ do
         it "carries the grant option through the API" $ do
             hs <- adminHeaders
             ensureDatabase hs testDatabaseName
+            ensureTable (withDb testDatabaseName hs) "grant_option_probe" (encode (object ["name" .= ("grant_option_probe" :: Text), "columns" .= [column "id" "int"]]))
             created <- postAs hs "/api/roles" (encode (object ["name" .= ("passer" :: Text)]))
             expectStatusWith "create passer" created 200
             granted <-
                 postAs
                     (withDb testDatabaseName hs)
                     "/api/roles/passer/grants"
-                    (encode (object ["object" .= testDatabaseName, "privileges" .= (["select"] :: [Text]), "grantOption" .= True]))
+                    (encode (object ["object" .= (testDatabaseName <> ".grant_option_probe"), "privileges" .= (["select"] :: [Text]), "grantOption" .= True]))
             expectStatusWith "grant with option" granted 200
             listed <- getAs hs "/api/roles"
             expectStatusWith "list roles" listed 200
@@ -890,6 +946,16 @@ roleSpec env = describe "roles and grants" $ do
 querySpec :: AppEnv -> Spec
 querySpec env = describe "the SQL console" $ do
     withApp (webApp env) $ do
+        it "returns typed compound values through HTTP and TCP" $ do
+            hs <- adminHeaders
+            ensureDatabase hs testDatabaseName
+            result <- testSql hs "SELECT LIST<Int>(1, 2), length('abc')"
+            expectStatusWith "typed SQL values" result 200
+            let value = maybe A.Null id (nth 0 (firstRow result))
+                envelope = at "__chusql_runtime_v1" value
+            check (arrayLen envelope `shouldBe` 3)
+            check (asInt (maybe A.Null id (nth 0 (items envelope))) `shouldBe` 1)
+            check (asInt (maybe A.Null id (nth 1 (firstRow result))) `shouldBe` 3)
         it "runs DDL and DML and returns positional rows" $ do
             hs <- adminHeaders
             ensureDatabase hs testDatabaseName
@@ -916,8 +982,229 @@ querySpec env = describe "the SQL console" $ do
             ensureDatabase hs testDatabaseName
             res <- postAs (withDb testDatabaseName hs) "/api/query" (encode (object ["sql" .= ("SELEC nonsense" :: Text)]))
             expectStatusWith "syntax error" res 400
+        it "redacts credentials from malformed SQL responses" $ do
+            hs <- adminHeaders
+            ensureDatabase hs testDatabaseName
+            let secret = "Web-Secret-DoNotEcho123!" :: Text
+            res <- postAs (withDb testDatabaseName hs) "/api/query" (encode (object ["sql" .= ("CREATE USER broken IDENTIFIED BY '" <> secret <> "' trailing")]))
+            expectStatusWith "credential syntax error" res 400
+            check (BSC.isInfixOf "Web-Secret-DoNotEcho123!" (BL.toStrict (WT.simpleBody res)) `shouldBe` False)
+            check (BSC.isInfixOf "redacted" (BL.toStrict (WT.simpleBody res)) `shouldBe` True)
 
 -- IDE 设置 -------------------------------------------------------------------
+
+-- | 发出编辑事务控制请求。
+editRequest :: [Header] -> BS.ByteString -> Text -> [A.Value] -> TestSession WT.SResponse
+editRequest hs path owner changes = postAs hs path (encode (object
+    ["id" .= owner, "database" .= testDatabaseName, "changes" .= changes]))
+
+-- | 在测试库执行一条 SQL。
+testSql :: [Header] -> Text -> TestSession WT.SResponse
+testSql hs sql = postAs (withDb testDatabaseName hs) "/api/query" (encode (object ["sql" .= sql]))
+
+-- | 生成整数行插入编辑。
+editInsert :: Text -> Int -> A.Value
+editInsert table key = object ["op" .= ("insert" :: Text), "table" .= table,
+    "values" .= object ["id" .= key, "value" .= key]]
+
+-- | 验证编辑原子性、隔离与失效清理。
+editSpec :: AppEnv -> Spec
+editSpec env = describe "web editing transactions" $ withApp (webApp env) $ do
+    it "commits across tables atomically and deduplicates successful retries" $ do
+        hs <- adminHeaders
+        ensureDatabase hs testDatabaseName
+        madeA <- testSql hs "CREATE TABLE edit_atomic_a (id int PRIMARY KEY, value int)"
+        expectStatusWith "create first table" madeA 200
+        madeB <- testSql hs "CREATE TABLE edit_atomic_b (id int PRIMARY KEY, value int)"
+        expectStatusWith "create second table" madeB 200
+        begun <- editRequest hs "/api/edit/begin" "atomic" []
+        expectStatusWith "begin" begun 200
+        let changes = [editInsert "edit_atomic_a" 1, editInsert "edit_atomic_b" 2]
+        committed <- editRequest hs "/api/edit/commit" "atomic" changes
+        expectStatusWith "commit" committed 200
+        check (at "applied" (jsonBody committed) `shouldBe` A.Number 2)
+        duplicate <- editRequest hs "/api/edit/commit" "atomic" changes
+        expectStatusWith "duplicate commit" duplicate 200
+        check (jsonBody duplicate `shouldBe` jsonBody committed)
+        changed <- editRequest hs "/api/edit/commit" "atomic" [editInsert "edit_atomic_a" 9]
+        expectStatusWith "changed duplicate" changed 409
+        rowsA <- testSql hs "SELECT * FROM edit_atomic_a"
+        rowsB <- testSql hs "SELECT * FROM edit_atomic_b"
+        check (asInt (at "rowCount" (jsonBody rowsA)) `shouldBe` 1)
+        check (asInt (at "rowCount" (jsonBody rowsB)) `shouldBe` 1)
+    it "rolls back a mid-batch constraint error to the savepoint and permits correction" $ do
+        hs <- adminHeaders
+        ensureDatabase hs testDatabaseName
+        made <- testSql hs "CREATE TABLE edit_constraints (id int PRIMARY KEY, value int)"
+        expectStatusWith "create table" made 200
+        begun <- editRequest hs "/api/edit/begin" "constraints" []
+        expectStatusWith "begin" begun 200
+        failed <- editRequest hs "/api/edit/commit" "constraints" [editInsert "edit_constraints" 1, editInsert "edit_constraints" 1]
+        expectStatusWith "constraint failure" failed 400
+        check (at "state" (jsonBody failed) `shouldBe` A.String "active")
+        check (at "applied" (jsonBody failed) `shouldBe` A.Number 0)
+        visible <- testSql hs "SELECT * FROM edit_constraints"
+        check (asInt (at "rowCount" (jsonBody visible)) `shouldBe` 0)
+        snapshot <- getAs (("X-ChuSQL-Edit", "constraints") : withDb testDatabaseName hs) "/api/tables/edit_constraints/rows"
+        expectStatusWith "snapshot after failure" snapshot 200
+        check (asInt (at "total" (jsonBody snapshot)) `shouldBe` 0)
+        corrected <- editRequest hs "/api/edit/commit" "constraints" [editInsert "edit_constraints" 2]
+        expectStatusWith "corrected replay" corrected 200
+        visibleAgain <- testSql hs "SELECT id FROM edit_constraints"
+        check (firstRow visibleAgain `shouldBe` [A.Number 2])
+    it "preserves the initial snapshot and rejects a conflicting external update" $ do
+        hs <- adminHeaders
+        ensureDatabase hs testDatabaseName
+        made <- testSql hs "CREATE TABLE edit_conflicts (id int PRIMARY KEY, value int)"
+        expectStatusWith "create table" made 200
+        seeded <- testSql hs "INSERT INTO edit_conflicts (id, value) VALUES (1, 10)"
+        expectStatusWith "seed row" seeded 200
+        begun <- editRequest hs "/api/edit/begin" "conflicts" []
+        expectStatusWith "begin" begun 200
+        observer <- adminHeaders
+        updated <- testSql observer "UPDATE edit_conflicts SET value = 20 WHERE id = 1"
+        expectStatusWith "concurrent update" updated 200
+        snapshot <- getAs (("X-ChuSQL-Edit", "conflicts") : withDb testDatabaseName hs) "/api/tables/edit_conflicts/rows"
+        check (firstRow snapshot `shouldBe` [A.Number 1, A.Number 10])
+        let change = object ["op" .= ("update" :: Text), "table" .= ("edit_conflicts" :: Text),
+                "pk" .= (1 :: Int), "set" .= object ["value" .= (30 :: Int)]]
+        failed <- editRequest hs "/api/edit/commit" "conflicts" [change]
+        expectStatusWith "serialization conflict" failed 409
+        check (at "reloadRequired" (jsonBody failed) `shouldBe` A.Bool True)
+        live <- testSql observer "SELECT value FROM edit_conflicts"
+        check (firstRow live `shouldBe` [A.Number 20])
+        retried <- editRequest hs "/api/edit/commit" "conflicts" [change]
+        expectStatusWith "stale retry" retried 409
+        reopened <- editRequest hs "/api/edit/begin" "conflicts" []
+        expectStatusWith "stale begin" reopened 409
+    it "binds editing to one page and database and makes rollback idempotent" $ do
+        hs <- adminHeaders
+        ensureDatabase hs testDatabaseName
+        begun <- editRequest hs "/api/edit/begin" "owner" []
+        expectStatusWith "begin" begun 200
+        repeated <- editRequest hs "/api/edit/begin" "owner" []
+        expectStatusWith "repeated begin" repeated 200
+        otherPage <- editRequest hs "/api/edit/begin" "intruder" []
+        expectStatusWith "another page" otherPage 409
+        otherDatabase <- postAs hs "/api/edit/commit" (encode (object
+            ["id" .= ("owner" :: Text), "database" .= ("system" :: Text), "changes" .= ([] :: [A.Value])]))
+        expectStatusWith "another database" otherDatabase 409
+        forged <- getAs (("X-ChuSQL-Edit", "intruder") : withDb testDatabaseName hs) "/api/tables"
+        expectStatusWith "another page snapshot" forged 409
+        rolled <- editRequest hs "/api/edit/rollback" "owner" []
+        expectStatusWith "rollback" rolled 200
+        duplicate <- editRequest hs "/api/edit/rollback" "owner" []
+        expectStatusWith "repeated rollback" duplicate 200
+        stale <- editRequest hs "/api/edit/begin" "owner" []
+        expectStatusWith "ended identity" stale 409
+    it "keeps SQL-console transactions separate from grid editing" $ do
+        hs <- adminHeaders
+        ensureDatabase hs testDatabaseName
+        made <- testSql hs "CREATE TABLE edit_console (id int PRIMARY KEY, value int)"
+        expectStatusWith "create table" made 200
+        consoleBegin <- testSql hs "BEGIN"
+        expectStatusWith "console begin" consoleBegin 200
+        consoleWrite <- testSql hs "INSERT INTO edit_console (id, value) VALUES (1, 1)"
+        expectStatusWith "console write" consoleWrite 200
+        begun <- editRequest hs "/api/edit/begin" "console" []
+        expectStatusWith "editor begin" begun 200
+        committed <- editRequest hs "/api/edit/commit" "console" [editInsert "edit_console" 2]
+        expectStatusWith "editor commit" committed 200
+        consoleRollback <- testSql hs "ROLLBACK"
+        expectStatusWith "console rollback" consoleRollback 200
+        live <- testSql hs "SELECT id FROM edit_console"
+        check (firstRow live `shouldBe` [A.Number 2])
+    it "drops the editing connection on logout and rejects the old transaction after login" $ do
+        hs <- adminHeaders
+        ensureDatabase hs testDatabaseName
+        begun <- editRequest hs "/api/edit/begin" "logout" []
+        expectStatusWith "begin" begun 200
+        gone <- postAs hs "/api/logout" "{}"
+        expectStatusWith "logout" gone 204
+        rejected <- editRequest hs "/api/edit/commit" "logout" []
+        expectStatusWith "old cookie" rejected 401
+        newHs <- adminHeaders
+        stale <- editRequest newHs "/api/edit/commit" "logout" []
+        expectStatusWith "old transaction on new connection" stale 409
+    it "rejects system identity transactions" $ do
+        hs <- adminHeaders
+        res <- postAs hs "/api/edit/begin" (encode (object ["id" .= ("identities" :: Text), "database" .= ("system" :: Text)]))
+        expectStatusWith "identity transaction" res 400
+    it "invalidates editing when the account loses its permission" $ do
+        hs <- adminHeaders
+        ensureDatabase hs testDatabaseName
+        made <- testSql hs "CREATE TABLE edit_permissions (id int PRIMARY KEY, value int)"
+        expectStatusWith "create table" made 200
+        ensureAccount hs "edit_user" "Editor-Secret-1234"
+        granted <- testSql hs "GRANT SELECT, INSERT ON edit_permissions TO edit_user"
+        expectStatusWith "grant editing" granted 200
+        editor <- ordinaryHeaders "edit_user" "Editor-Secret-1234"
+        begun <- editRequest editor "/api/edit/begin" "permissions" []
+        expectStatusWith "begin" begun 200
+        revoked <- testSql hs "REVOKE INSERT ON edit_permissions FROM edit_user"
+        expectStatusWith "revoke insert" revoked 200
+        rejected <- editRequest editor "/api/edit/commit" "permissions" [editInsert "edit_permissions" 1]
+        expectStatusWith "invalidated editor" rejected 401
+        live <- testSql hs "SELECT * FROM edit_permissions"
+        check (asInt (at "rowCount" (jsonBody live)) `shouldBe` 0)
+    it "restricts an SQL transaction to its owning console and blocks unrelated REST writes" $ do
+        hs <- adminHeaders
+        ensureDatabase hs testDatabaseName
+        let owner = ("X-ChuSQL-Console", "page:console-a") : hs
+            intruder = ("X-ChuSQL-Console", "page:console-b") : hs
+        begun <- testSql owner "/* owner */ BEGIN"
+        expectStatusWith "console begin" begun 200
+        rejected <- testSql intruder "ROLLBACK"
+        expectStatusWith "other console rollback" rejected 409
+        rest <- postAs (withDb testDatabaseName hs) "/api/tables" (encode (object
+            ["name" .= ("edit_rest_intruder" :: Text), "columns" .= [column "id" "int"]]))
+        expectStatusWith "REST write inside console transaction" rest 409
+        closed <- postAs hs "/api/query/rollback" (encode (object ["console" .= ("page:console-a" :: Text)]))
+        expectStatusWith "close owning console" closed 204
+        next <- testSql intruder "SELECT 1"
+        expectStatusWith "other console after rollback" next 200
+    it "cleans the editing snapshot when its web session expires" $ do
+        hs <- adminHeaders
+        ensureDatabase hs testDatabaseName
+        begun <- editRequest hs "/api/edit/begin" "expires" []
+        expectStatusWith "begin" begun 200
+        let token = fromMaybe "" (lookup "Cookie" hs >>= parseCookieHeader sessionCookieName . TE.decodeUtf8)
+        stored <- liftIO (lookupPayload (aeSessions env) token)
+        app <- getState
+        res <- liftIO $ bracket
+            (setPayloadPolicy (aeSessions env) (SessionPolicy (-1) 86400))
+            (const (setPayloadPolicy (aeSessions env) defaultSessionPolicy))
+            (const (editFromApp app hs "expires" []))
+        expectStatusWith "expired commit" res 401
+        case stored of
+            Nothing -> check (expectationFailure "missing live web session")
+            Just (_, ws) -> check (readIORef (wsEdit ws) >>= (`shouldBe` Nothing))
+    it "serializes duplicate HTTP commits and applies the edit set once" $ do
+        hs <- adminHeaders
+        ensureDatabase hs testDatabaseName
+        made <- testSql hs "CREATE TABLE edit_double_click (id int PRIMARY KEY, value int)"
+        expectStatusWith "create table" made 200
+        begun <- editRequest hs "/api/edit/begin" "double-click" []
+        expectStatusWith "begin" begun 200
+        app <- getState
+        results <- liftIO $ do
+            first <- newEmptyMVar
+            second <- newEmptyMVar
+            _ <- forkFinally (editFromApp app hs "double-click" [editInsert "edit_double_click" 1]) (putMVar first)
+            _ <- forkFinally (editFromApp app hs "double-click" [editInsert "edit_double_click" 1]) (putMVar second)
+            mapM (either throwIO pure) =<< sequence [takeMVar first, takeMVar second]
+        mapM_ (\res -> expectStatusWith "duplicate concurrent commit" res 200) results
+        live <- testSql hs "SELECT * FROM edit_double_click"
+        check (asInt (at "rowCount" (jsonBody live)) `shouldBe` 1)
+
+-- | 从独立请求上下文提交编辑事务。
+editFromApp :: Wai.Application -> [Header] -> Text -> [A.Value] -> IO WT.SResponse
+editFromApp app hs owner changes = WT.runSession send app
+  where
+    -- | 构造带 Cookie 的原子提交请求。
+    send = WT.srequest (WT.SRequest
+        (WT.setPath WT.defaultRequest {Wai.requestMethod = methodPost, Wai.requestHeaders = jsonHeaders hs} "/api/edit/commit")
+        (encode (object ["id" .= owner, "database" .= testDatabaseName, "changes" .= changes])))
 
 -- | IDE 设置用例
 uiSettingsSpec :: AppEnv -> Spec
@@ -1000,7 +1287,25 @@ main = do
             limitedEnv <- liveEnv limitedWorld staticDir 1
             hspec (spec staticDir env limitedEnv)
 
--- | 汇总挂载全部用例组
+-- | 执行前端事务状态回归。
+frontendSpec :: Spec
+frontendSpec = describe "browser transaction state" $ do
+    it "passes the Node runtime value suite" $ do
+        node <- findExecutable "node"
+        case node of
+            Nothing -> expectationFailure "Node.js is required for runtime value tests"
+            Just executable -> do
+                (exitCode, output, errors) <- readProcessWithExitCode executable ["test/runtime-values.mjs"] ""
+                when (exitCode /= ExitSuccess) (expectationFailure (output ++ errors))
+    it "passes the Node frontend transaction suite" $ do
+        node <- findExecutable "node"
+        case node of
+            Nothing -> expectationFailure "Node.js is required for frontend transaction tests"
+            Just executable -> do
+                (exitCode, output, errors) <- readProcessWithExitCode executable ["--test", "--test-reporter=tap", "test/transactions.mjs"] ""
+                when (exitCode /= ExitSuccess) (expectationFailure (output ++ errors))
+
+-- | 汇总挂载全部用例组。
 spec :: FilePath -> AppEnv -> AppEnv -> Spec
 spec staticDir env limitedEnv = do
     unitSpec
@@ -1013,6 +1318,8 @@ spec staticDir env limitedEnv = do
     accountSpec env
     roleSpec env
     querySpec env
+    editSpec env
+    frontendSpec
     uiSettingsSpec env
     e2eSpec env
     rateLimitSpec limitedEnv

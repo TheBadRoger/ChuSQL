@@ -3,6 +3,7 @@ module ChuSQL.Core.Engine.Algebra.Expr (evalExpr, evalCondForRow, colsInExpr, su
 import ChuSQL.Core.Model
 import ChuSQL.Core.Engine.Syntax.AST
 import ChuSQL.Core.Engine.Builtin (Operator (..), compareNode, executeOperator, inValues, threeValuedNot)
+import ChuSQL.Core.Engine.Runtime.SQL (invokeSQLFunction, constructSQLValue)
 
 -- 表达式求值：三值逻辑，NULL 参与运算结果仍是 NULL。
 
@@ -10,6 +11,12 @@ import ChuSQL.Core.Engine.Builtin (Operator (..), compareNode, executeOperator, 
 evalExpr :: Expr -> Row -> Either String Value
 evalExpr (Col name) row =
     maybe (Left ("unknown column: " ++ name)) Right (lookup name row)
+evalExpr (FunctionCall name _) _ = Left ("unbound function call: " ++ name)
+evalExpr (Construct _ _) _ = Left "unbound runtime constructor"
+evalExpr (BoundConstruct tid arguments) row = mapM (\argument -> evalExpr argument row) arguments >>= constructSQLValue tid
+evalExpr (RuntimeLiteral tid value) _ = coerceValue (CRuntime tid) (VRuntime tid value)
+evalExpr (BoundFunction fid tid arguments) row =
+    mapM (\argument -> evalExpr argument row) arguments >>= invokeSQLFunction fid tid
 evalExpr LitNull _ = Right VNull
 evalExpr (LitInt n) _ = Right (VInt n)
 evalExpr (LitFloat d) _ = Right (VFloat d)
@@ -63,6 +70,10 @@ quantifiedCompare op lhs vs q = case vs of
 -- | 表达式用到了哪些列
 colsInExpr :: Expr -> [String]
 colsInExpr (Col c) = [c]
+colsInExpr (Construct _ arguments) = concatMap colsInExpr arguments
+colsInExpr (BoundConstruct _ arguments) = concatMap colsInExpr arguments
+colsInExpr (FunctionCall _ arguments) = concatMap colsInExpr arguments
+colsInExpr (BoundFunction _ _ arguments) = concatMap colsInExpr arguments
 colsInExpr (Add a b) = colsInExpr a ++ colsInExpr b
 colsInExpr (Sub a b) = colsInExpr a ++ colsInExpr b
 colsInExpr (Mul a b) = colsInExpr a ++ colsInExpr b
@@ -93,6 +104,10 @@ colsInExpr _ = []
 -- | 表达式里子查询引用的外层列
 subqueryRefsIn :: Expr -> [String]
 subqueryRefsIn e = case e of
+    Construct _ arguments -> concatMap subqueryRefsIn arguments
+    BoundConstruct _ arguments -> concatMap subqueryRefsIn arguments
+    FunctionCall _ arguments -> concatMap subqueryRefsIn arguments
+    BoundFunction _ _ arguments -> concatMap subqueryRefsIn arguments
     ScalarSub sq -> subqueryRefs sq
     InSub a sq _ -> subqueryRefsIn a ++ subqueryRefs sq
     InList a es _ -> concatMap subqueryRefsIn (a : es)
@@ -126,6 +141,10 @@ subqueryRefsIn e = case e of
 -- | 表达式里有没有除法（除法可能报错，不能提前或延后求值）
 hasDivision :: Expr -> Bool
 hasDivision e = case e of
+    Construct _ arguments -> any hasDivision arguments
+    BoundConstruct _ arguments -> any hasDivision arguments
+    FunctionCall _ arguments -> any hasDivision arguments
+    BoundFunction _ _ arguments -> any hasDivision arguments
     Div _ _ -> True
     Neg a -> hasDivision a
     Add a b -> both a b
@@ -148,6 +167,10 @@ hasDivision e = case e of
 -- | 表达式里有没有子查询
 hasSubquery :: Expr -> Bool
 hasSubquery e = case e of
+    Construct _ arguments -> any hasSubquery arguments
+    BoundConstruct _ arguments -> any hasSubquery arguments
+    FunctionCall _ arguments -> any hasSubquery arguments
+    BoundFunction _ _ arguments -> any hasSubquery arguments
     ScalarSub _ -> True
     InSub _ _ _ -> True
     InList a es _ -> any hasSubquery (a : es)
@@ -181,6 +204,10 @@ hasSubquery e = case e of
 -- | 表达式里出现的聚合调用（按出现顺序）
 aggregatesIn :: Expr -> [Expr]
 aggregatesIn e = case e of
+    Construct _ arguments -> concatMap aggregatesIn arguments
+    BoundConstruct _ arguments -> concatMap aggregatesIn arguments
+    FunctionCall _ arguments -> concatMap aggregatesIn arguments
+    BoundFunction _ _ arguments -> concatMap aggregatesIn arguments
     a@CountAll -> [a]
     a@(CountOf _) -> [a]
     a@(SumOf _) -> [a]
@@ -215,6 +242,10 @@ hasAggregate = not . null . aggregatesIn
 -- | 聚合之外的列引用（聚合参数里的列不算）
 bareColumns :: Expr -> [String]
 bareColumns e = case e of
+    Construct _ arguments -> concatMap bareColumns arguments
+    BoundConstruct _ arguments -> concatMap bareColumns arguments
+    FunctionCall _ arguments -> concatMap bareColumns arguments
+    BoundFunction _ _ arguments -> concatMap bareColumns arguments
     Col c -> [c]
     Add a b -> both a b
     Sub a b -> both a b

@@ -1,6 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="139" height="24" viewBox="0 0 139 24" role="img" aria-label="commit: fd5f320">
-  <title>Local HEAD snapshot when the badges were generated; open commit history for latest updates.</title>
-  <defs><clipPath id="rounded"><rect width="139" height="24" rx="5"/></clipPath></defs>
-  <g clip-path="url(#rounded)"><rect width="139" height="24" fill="#1e293b"/><rect x="66" width="73" height="24" fill="#475569"/></g>
-  <g fill="#fff" text-anchor="middle" font-family="Verdana,DejaVu Sans,sans-serif" font-size="11"><text x="33" y="16">commit</text><text x="102.5" y="16">fd5f320</text></g>
-</svg>

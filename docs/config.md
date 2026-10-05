@@ -53,6 +53,8 @@ ChuSQL 使用统一配置文件 `settings.toml`。默认位置：
 | `max_message` | `1048576` | 单条请求最大大小（字节） |
 | `max_rows` | `1000` | 单次查询最大返回行数 |
 
+本机 sudo 认证额外使用 `[server] sudo_auth_user`，默认空字符串，表示关闭。设置为一个已启用 `ALLOW_SUDO_AUTH` 的数据库身份后，必须以 Unix root 或 Windows 提升后的管理员运行 `chusql-server`。这是明确的本机身份映射，与启动参数 `--user` 和最高权限属性分别设置。配置变更后重启服务生效，Web 设置页面不提供此项。操作步骤见 [用户与角色](users-and-roles.md#本机-sudo-认证)。
+
 修改 Server 相关配置后需要重启 `chusql-server`。
 
 ## 账号与安全

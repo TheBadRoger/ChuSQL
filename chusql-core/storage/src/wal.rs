@@ -61,6 +61,7 @@ pub enum WalOp {
     CreateTable {
         table: String,
         columns: Vec<SchemaColumn>,
+        object_id: Option<u64>,
     },
     DropTable {
         table: String,
@@ -92,6 +93,8 @@ struct ReplaceSchemaPayload {
 #[derive(Debug, Serialize, Deserialize)]
 struct CreateTablePayload {
     columns: Vec<SchemaColumn>,
+    #[serde(default)]
+    object_id: Option<u64>,
 }
 
 pub struct Wal {
@@ -416,10 +419,10 @@ fn encode(op: &WalOp, lsn: u64) -> io::Result<Vec<u8>> {
             .map_err(io::Error::other)?;
             (OP_REPLACE_SCHEMA, table.clone(), p)
         }
-        WalOp::CreateTable { table, columns } => (
+        WalOp::CreateTable { table, columns, object_id } => (
             OP_CREATE_TABLE,
             table.clone(),
-            serde_json::to_vec(&CreateTablePayload { columns: columns.clone() })
+            serde_json::to_vec(&CreateTablePayload { columns: columns.clone(), object_id: *object_id })
                 .map_err(io::Error::other)?,
         ),
         WalOp::DropTable { table } => (OP_DROP_TABLE, table.clone(), Vec::new()),
@@ -536,6 +539,7 @@ fn decode_body(body: &[u8]) -> Result<(u64, WalOp), String> {
             WalOp::CreateTable {
                 table,
                 columns: p.columns,
+                object_id: p.object_id,
             }
         }
         OP_DROP_TABLE => WalOp::DropTable { table },

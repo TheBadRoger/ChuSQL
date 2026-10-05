@@ -14,6 +14,7 @@ module ChuSQL.CLI.Format
 
 import ChuSQL.Core.Model (Value (..))
 import ChuSQL.Core.Protocol (QueryResult (..), queryResultJson)
+import ChuSQL.Core.Runtime (renderRuntimeValue)
 import qualified Data.Aeson as A
 import qualified Data.ByteString.Lazy as BL
 import Data.Text (Text)
@@ -109,3 +110,4 @@ displayValue (VFloat d) = T.pack (show d)
 displayValue (VStr s) = T.pack s
 displayValue (VBool True) = "true"
 displayValue (VBool False) = "false"
+displayValue (VRuntime _ value) = T.pack (renderRuntimeValue value)

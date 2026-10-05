@@ -7,6 +7,7 @@ module ChuSQL.Interface.Session (
     sessionDatabase,
     isPlainIdentifier,
     authenticateSession,
+    authenticateSudoSession,
     switchDatabase,
     runStatement,
     catalog,
@@ -22,9 +23,11 @@ import ChuSQL.Interface.Link (
     clientCatalog,
     clientDatabases,
     clientLogin,
+    clientSudoLogin,
     clientQuery,
     clientRoles,
  )
+import ChuSQL.Interface.Sudo (SudoCredential)
 import ChuSQL.Interface.Protocol (RoleView)
 import Data.Char (isAlpha, isAlphaNum)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
@@ -64,6 +67,14 @@ isPlainIdentifier name =
 authenticateSession :: Session -> Text -> Text -> IO (Either Text ())
 authenticateSession session user password = do
     answer <- clientLogin (ssClient session) user password
+    case answer of
+        Left message -> pure (Left message)
+        Right admin -> writeIORef (ssAdmin session) admin >> pure (Right ())
+
+-- 用受保护本机凭据登录并记录身份。
+authenticateSudoSession :: Session -> SudoCredential -> Text -> IO (Either Text ())
+authenticateSudoSession session credential user = do
+    answer <- clientSudoLogin (ssClient session) credential user
     case answer of
         Left message -> pure (Left message)
         Right admin -> writeIORef (ssAdmin session) admin >> pure (Right ())

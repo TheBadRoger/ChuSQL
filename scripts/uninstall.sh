@@ -94,6 +94,13 @@ if [ "$assume_yes" = 'no' ]; then
 fi
 
 step 'Stopping the service'
+service_file="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/chusql-server.service"
+if [ "$(uname -s)" = 'Linux' ] && [ -f "$service_file" ]; then
+    command -v systemctl >/dev/null 2>&1 || fail 'systemctl is required to remove the service'
+    systemctl --user disable --now chusql-server.service || fail 'cannot stop and disable chusql-server.service'
+    rm -f "$service_file"
+    systemctl --user daemon-reload || fail 'cannot reload systemd units'
+fi
 stop_by_path "$install_dir/bin/chusql-server"
 stop_by_path "$install_dir/bin/chusql-web"
 

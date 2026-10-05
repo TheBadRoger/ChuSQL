@@ -2,12 +2,13 @@
 
 module Main (main) where
 
-import ChuSQL.CLI.Format (OutputFormat (..), parseFormat, renderCsv, renderJson, renderTable)
+import ChuSQL.CLI.Format (OutputFormat (..), parseFormat, renderCsv, renderJson, renderTable, displayValue)
 import ChuSQL.CLI.History (historySettings, rememberStatement)
 import ChuSQL.CLI.Password (readPasswordInput)
 import ChuSQL.CLI.Script (Meta (..), errorHint, parseMeta, statementComplete, stripTerminator, takeStatement)
 import ChuSQL.Core.Model (Value (..))
 import ChuSQL.Core.Protocol (QueryResult (..), queryResultJson)
+import ChuSQL.Core.Runtime
 import Data.Aeson (decode)
 import qualified Data.Aeson as A
 import qualified Data.ByteString.Lazy as BL
@@ -30,6 +31,10 @@ main = hspec spec
 -- | 全部测试用例
 spec :: Spec
 spec = do
+    it "renders typed compound values without losing their wire identity" $ do
+        case resolveType builtinTypes (listType intType) of
+            Left err -> expectationFailure err
+            Right descriptor -> displayValue (VRuntime (descriptorId descriptor) (RList [RInt 1, RInt 2])) `shouldBe` "[1, 2]"
     formatSpec
     scriptSpec
     passwordSpec

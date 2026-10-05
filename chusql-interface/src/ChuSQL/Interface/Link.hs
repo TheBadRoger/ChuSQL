@@ -5,6 +5,7 @@ module ChuSQL.Interface.Link (
     connectClient,
     closeClient,
     clientLogin,
+    clientSudoLogin,
     clientQuery,
     clientPing,
     clientCatalog,
@@ -15,6 +16,7 @@ module ChuSQL.Interface.Link (
     clientReloadPolicy,
 ) where
 
+import ChuSQL.Interface.Sudo (SudoCredential, sudoProof, isLocalPeer)
 import ChuSQL.Core.Protocol (Account, QueryResult (..), TableInfo (..))
 import ChuSQL.Interface.Protocol (
     ClientRequest (..),
@@ -40,6 +42,7 @@ import Network.Socket (
     defaultHints,
     defaultProtocol,
     getAddrInfo,
+    getPeerName,
     socket,
     socketToHandle,
  )
@@ -52,17 +55,18 @@ import System.IO.Error (isEOFError)
 data Client = Client
     { clHandle :: Handle
     , clLock :: MVar ()
+    , clLocal :: Bool
     }
 
 -- | 连上 server 并对协议版本，失败给人话错误
 connectClient :: Text -> Int -> IO (Either Text Client)
 connectClient host port = do
-    opened <- try (openConnection host port) :: IO (Either IOException Handle)
+    opened <- try (openConnection host port) :: IO (Either IOException (Handle, Bool))
     case opened of
         Left err -> pure (Left ("cannot reach the server at " <> T.pack (address host port) <> ": " <> T.pack (describe err)))
-        Right handle -> do
+        Right (handle, local) -> do
             lock <- newMVar ()
-            let client = Client handle lock
+            let client = Client handle lock local
             greeted <- request client (ReqHello protocolVersion)
             case greeted of
                 Right (RespHello version)
@@ -116,6 +120,26 @@ clientLogin client user password = do
         Left message -> pure (Left message)
         Right (RespLogin _ admin) -> pure (Right admin)
         Right other -> pure (failed "login" other)
+
+-- 验证一次性挑战并用本机身份登录。
+clientSudoLogin :: Client -> SudoCredential -> Text -> IO (Either Text Bool)
+clientSudoLogin client _ _ | not (clLocal client) = pure (Left "sudo authentication requires a local server")
+clientSudoLogin client credential user = withMVar (clLock client) $ \_ -> do
+    outcome <- try authenticate :: IO (Either IOException (Either Text Bool))
+    pure $ either (Left . T.pack . describe) id outcome
+  where
+    -- 在同一连接连续交换挑战与证明。
+    authenticate = do
+        challenge <- exchange (clHandle client) ReqSudoChallenge
+        case challenge of
+            Right (RespSudoChallenge nonce) | T.length nonce == 64 -> do
+                answer <- exchange (clHandle client) (ReqSudoLogin user (sudoProof credential nonce user))
+                pure $ case answer of
+                    Left message -> Left message
+                    Right (RespLogin _ admin) -> Right admin
+                    Right other -> failed "sudo login" other
+            Right other -> pure (failed "sudo challenge" other)
+            Left message -> pure (Left message)
 
 -- | 跑一条语句，拿回结果集
 clientQuery :: Client -> Text -> IO (Either Text QueryResult)
@@ -196,7 +220,7 @@ failed what response = case response of
     _ -> Left ("unexpected response to " <> what)
 
 -- | 建连接（套接字转成文本模式的行缓冲句柄）
-openConnection :: Text -> Int -> IO Handle
+openConnection :: Text -> Int -> IO (Handle, Bool)
 openConnection host port = do
     let hints = defaultHints{addrSocketType = Stream}
     infos <- getAddrInfo (Just hints) (Just (T.unpack host)) (Just (show port))
@@ -205,10 +229,11 @@ openConnection host port = do
         (info : _) -> do
             sock <- socket (addrFamily info) Stream defaultProtocol
             connect sock (addrAddress info)
+            peer <- getPeerName sock
             handle <- socketToHandle sock ReadWriteMode
             hSetBuffering handle LineBuffering
             hSetNewlineMode handle noNewlineTranslation
-            pure handle
+            pure (handle, isLocalPeer peer)
 
 -- | 把主机端口拼成地址字样
 address :: Text -> Int -> String

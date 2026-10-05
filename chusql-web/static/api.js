@@ -2,6 +2,9 @@
 // 请求都带 X-ChuSQL-Database 头；401 时广播登录事件。
 
 export const AUTH_EVENT = 'chusql-auth-required';
+let editing = null;
+let consoleTransaction = null;
+const pageOwner = [...crypto.getRandomValues(new Uint8Array(16))].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 
 // 是否是普通对象。
 function isObject(value) {
@@ -12,6 +15,9 @@ function isObject(value) {
 async function request(url, init, database) {
   const headers = new Headers(init && init.headers ? init.headers : undefined);
   if (database) headers.set('X-ChuSQL-Database', database);
+  if (editing && editing.database === database && url.startsWith('/api/tables') && (!init || init.method === 'GET')) {
+    headers.set('X-ChuSQL-Edit', editing.id);
+  }
   let response;
   try {
     response = await fetch(url, { credentials: 'same-origin', ...(init ?? {}), headers });
@@ -31,7 +37,10 @@ async function request(url, init, database) {
     const message = isObject(body) && typeof body.message === 'string'
       ? body.message
       : `请求失败（HTTP ${response.status}）。`;
-    throw new Error(message);
+    const error = new Error(message);
+    error.result = body;
+    error.code = body?.error;
+    throw error;
   }
   return body;
 }
@@ -215,33 +224,68 @@ export async function deleteRow(database, table, id) {
   await request(`/api/tables/${encodeURIComponent(table)}/rows/${encodeURIComponent(id)}`, jsonInit('DELETE'), database);
 }
 
-// 逐条提交，遇到第一条失败就停，返回已经成功了几条。
-export async function commitChanges(database, changes) {
-  let applied = 0;
-  for (const [index, change] of changes.entries()) {
-    try {
-      if (change.op === 'insert') await insertRow(database, change.table, change.values);
-      else if (change.op === 'delete') await deleteRow(database, change.table, change.pk);
-      else await updateRow(database, change.table, change.pk, change.set);
-      applied += 1;
-    } catch (error) {
-      return { ok: false, applied, errors: [{ index, message: error instanceof Error ? error.message : String(error) }] };
-    }
+// 为页面开启固定数据库的编辑快照。
+export async function beginEdit(id, database) {
+  await request('/api/edit/begin', jsonInit('POST', { id, database }));
+  editing = { id, database };
+}
+
+// 在服务端事务中原子提交编辑集。
+export async function commitChanges(id, database, changes) {
+  try {
+    const result = await request('/api/edit/commit', jsonInit('POST', { id, database, changes }));
+    if (!isObject(result) || result.ok !== true || result.state !== 'committed') throw new Error('服务器未返回可确认的提交结果。');
+    editing = null;
+    return result;
+  } catch (error) {
+    if (isObject(error.result) && typeof error.result.state === 'string') return error.result;
+    return { ok: false, applied: 0, state: error.result ? 'lost' : 'unknown',
+      reloadRequired: Boolean(error.result), message: error.message };
   }
-  return { ok: true, applied };
+}
+
+// 回滚编辑快照并清除本地事务标识。
+export async function rollbackEdit(id, database) {
+  const result = await request('/api/edit/rollback', jsonInit('POST', { id, database }));
+  editing = null;
+  return result;
+}
+
+// 忘记已失效的登录会话编辑标识。
+export function forgetEdit() {
+  editing = null;
+  consoleTransaction = null;
+}
+
+// 标签关闭时回滚它持有的控制台事务。
+export async function rollbackConsole(tabId) {
+  if (!consoleTransaction || consoleTransaction.console !== `${pageOwner}:${tabId ?? 'default'}`) return;
+  await request('/api/query/rollback', jsonInit('POST', { console: consoleTransaction.console }));
+  consoleTransaction = null;
+}
+
+// 页面离开时请求清理控制台事务。
+export function closeConsoleOnPagehide() {
+  if (consoleTransaction) {
+    navigator.sendBeacon('/api/query/rollback', new Blob([JSON.stringify({ console: consoleTransaction.console })], { type: 'application/json' }));
+  }
 }
 
 // ---------------------------------------------------------------- 查询
 
 // 执行 SQL 并规整结果。
-export async function query(sql, database) {
+export async function query(sql, database, tabId) {
   const started = performance.now();
   try {
-    const body = await request('/api/query', jsonInit('POST', { sql }), database);
+    const console = `${pageOwner}:${tabId ?? 'default'}`;
+    const init = jsonInit('POST', { sql });
+    init.headers['X-ChuSQL-Console'] = console;
+    const body = await request('/api/query', init, database);
     if (!isObject(body) || !Array.isArray(body.columns) || !Array.isArray(body.rows)) {
       throw new Error('服务器返回的查询结果无法识别。');
     }
     const durationMs = performance.now() - started;
+    consoleTransaction = body.transaction === true ? { console, database } : null;
     return {
       type: body.columns.length ? 'rows' : 'affected',
       columns: body.columns,
@@ -249,6 +293,7 @@ export async function query(sql, database) {
       affected: typeof body.rowCount === 'number' ? body.rowCount : 0,
       truncated: body.truncated === true,
       database: typeof body.database === 'string' ? body.database : undefined,
+      transactionActive: body.transaction === true,
       durationMs,
     };
   } catch (error) {

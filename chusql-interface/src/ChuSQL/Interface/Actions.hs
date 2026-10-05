@@ -34,6 +34,9 @@ module ChuSQL.Interface.Actions (
 
 import ChuSQL.Core.Model (Column (..), ColumnType (..), Value (..), integerType, numericType, parseColumnType, plainColumn, typeName)
 import qualified ChuSQL.Core.Model as M
+import ChuSQL.Core.Runtime
+import ChuSQL.Core.Protocol (valueFromJSON)
+import Data.Aeson.Types (parseEither)
 import qualified Data.Aeson as A
 import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
 import Data.List (intercalate)
@@ -88,24 +91,50 @@ columnTypeOf = fmap plainColumn . parseColumnType . T.unpack . T.strip
 
 -- | 本地类型转线上名字
 columnTypeName :: Column -> Text
-columnTypeName = T.pack . typeName . columnType
+columnTypeName column = T.pack $ case columnType column of
+    CRuntime tid -> renderTypeExpr (typeExpression tid)
+    ty -> typeName ty
 
 -- | 字符串字面量转义：单引号翻倍（引擎的词法器就是这么折回去的）
 escapeStringLiteral :: String -> String
 escapeStringLiteral = concatMap (\c -> if c == '\'' then "''" else [c])
 
 -- | 值转 SQL 字面量
-sqlLiteral :: Value -> String
-sqlLiteral VNull = "NULL"
-sqlLiteral (VInt n) = show n
-sqlLiteral (VFloat d) = show d
-sqlLiteral (VStr s) = "'" ++ escapeStringLiteral s ++ "'"
-sqlLiteral (VBool True) = "TRUE"
-sqlLiteral (VBool False) = "FALSE"
+sqlLiteral :: Value -> Either String String
+sqlLiteral VNull = Right "NULL"
+sqlLiteral (VInt n) = Right (show n)
+sqlLiteral (VFloat d)
+    | isNaN d || isInfinite d = Left "SQL floating literal must be finite"
+    | otherwise = Right (show d)
+sqlLiteral (VStr s) = Right ("'" ++ escapeStringLiteral s ++ "'")
+sqlLiteral (VBool True) = Right "TRUE"
+sqlLiteral (VBool False) = Right "FALSE"
+sqlLiteral (VRuntime tid value) = do
+    validateValue builtinTypes tid value
+    runtimeLiteral (typeExpression tid) value
+
+-- | 渲染类型化构造器的 SQL 字面量
+runtimeLiteral :: TypeExpr -> RuntimeValue -> Either String String
+runtimeLiteral _ (RInt n) = Right (show n)
+runtimeLiteral _ (RDouble n) = Right (show n)
+runtimeLiteral _ (RBool b) = Right (if b then "TRUE" else "FALSE")
+runtimeLiteral _ (RString text) = Right ("'" ++ escapeStringLiteral text ++ "'")
+runtimeLiteral (TypeApply (TypeConstructorId 5) [child]) (RList values) = do
+    items <- mapM (runtimeLiteral child) values
+    Right ("LIST<" ++ renderTypeExpr child ++ ">(" ++ intercalate ", " items ++ ")")
+runtimeLiteral (TypeApply (TypeConstructorId 6) [child]) (RMaybe value) = do
+    item <- maybe (Right "") (runtimeLiteral child) value
+    Right ("MAYBE<" ++ renderTypeExpr child ++ ">(" ++ item ++ ")")
+runtimeLiteral (TypeApply (TypeConstructorId 7) fields) (RTuple values)
+    | length fields == length values = do
+        items <- sequence (zipWith runtimeLiteral fields values)
+        Right ("TUPLE<" ++ intercalate ", " (map renderTypeExpr fields) ++ ">(" ++ intercalate ", " items ++ ")")
+runtimeLiteral _ _ = Left "runtime value does not match its type expression"
 
 -- | JSON 值按列类型转成引擎的值；类型对不上就报错
 coerceValue :: Column -> A.Value -> Either String Value
 coerceValue col v = case v of
+    A.Object _ -> parseEither valueFromJSON v >>= M.coerceValue t
     A.Null -> Right VNull
     A.Bool b -> M.coerceValue t (VBool b)
     A.Number n -> case floatingOrInteger n :: Either Double Integer of
@@ -186,13 +215,14 @@ insertRowSql table row = do
     tbl <- checkIdent "table" table
     cols <- requireNonEmpty "values" row
     names <- mapM (checkIdent "column" . T.pack . fst) cols
+    literals <- mapM (sqlLiteral . snd) cols
     pure
         ( "INSERT INTO "
             ++ T.unpack tbl
             ++ " ("
             ++ intercalate ", " (map T.unpack names)
             ++ ") VALUES ("
-            ++ intercalate ", " (map (sqlLiteral . snd) cols)
+            ++ intercalate ", " literals
             ++ ")"
         )
 
@@ -208,14 +238,15 @@ insertRowsSql table rows = do
             let widths = map length rs
             if any (/= length first) widths
                 then Left "all rows must have the same columns"
-                else
+                else do
+                    literals <- mapM (mapM (sqlLiteral . snd)) rs
                     pure
                         ( "INSERT INTO "
                             ++ T.unpack tbl
                             ++ " ("
                             ++ intercalate ", " (map T.unpack names)
                             ++ ") VALUES "
-                            ++ intercalate ", " ["(" ++ intercalate ", " (map (sqlLiteral . snd) r) ++ ")" | r <- rs]
+                            ++ intercalate ", " ["(" ++ intercalate ", " values ++ ")" | values <- literals]
                         )
 
 -- | 构造按 id 改行的 UPDATE 语句
@@ -223,8 +254,14 @@ updateRowSql :: Text -> Int -> [(String, Value)] -> Either String String
 updateRowSql table key assigns = do
     tbl <- checkIdent "table" table
     cols <- requireNonEmpty "values" assigns
-    sets <- mapM (\(n, v) -> (\c -> T.unpack c ++ " = " ++ sqlLiteral v) <$> checkIdent "column" (T.pack n)) cols
+    sets <- mapM assignment cols
     pure ("UPDATE " ++ T.unpack tbl ++ " SET " ++ intercalate ", " sets ++ " WHERE id = " ++ show key)
+  where
+    -- | 校验列名并编码赋值
+    assignment (name, value) = do
+        column <- checkIdent "column" (T.pack name)
+        literal <- sqlLiteral value
+        Right (T.unpack column ++ " = " ++ literal)
 
 -- | 按 id 删一行，存储层原地删
 deleteRowSql :: Text -> Int -> Either String String
@@ -251,7 +288,8 @@ whereClause filters = case filters of
     -- | 一个等值条件
     term (column, value) = do
         col <- checkIdent "column" column
-        pure (T.unpack col ++ " = " ++ sqlLiteral value)
+        literal <- sqlLiteral value
+        pure (T.unpack col ++ " = " ++ literal)
 
 -- | 拼 ORDER BY 子句，无排序给空串
 orderClause :: Maybe (Text, Bool) -> Either String String
@@ -309,6 +347,8 @@ roleName name
 -- | 授权对象：`*`，或长度不超过 128 的裸表名/`库.表`
 grantObject :: Text -> Either String Text
 grantObject object
+    | "database:" `T.isPrefixOf` T.toLower object = ("DATABASE " <>) <$> checkIdent "database" (T.drop 9 object)
+    | ".*" `T.isSuffixOf` object = (<> ".*") <$> checkIdent "database" (T.dropEnd 2 object)
     | T.strip object == "*" = Right "*"
     | T.null object || T.length object > 128 = Left "object name is empty or too long"
     | not (T.all allowed object) = Left ("object name may only contain ASCII letters, digits, dot, dash or underscore: " ++ T.unpack object)

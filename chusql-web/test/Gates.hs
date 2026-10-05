@@ -179,7 +179,8 @@ gateSpec = do
             -- 静态目录与管理员名都不再写进配置：前者写死 static，后者由 --user 给（默认 root）；
             -- 监听地址是活的配置项（[server] listen_host / [web] listen_host），模板里可以留空靠内置默认
             template `shouldSatisfy` (not . T.isInfixOf "static_dir =")
-            template `shouldSatisfy` (not . T.isInfixOf "user =")
+            template `shouldSatisfy` (not . any ((== "user") . T.strip . fst . T.breakOn "=") . T.lines)
+            template `shouldSatisfy` T.isInfixOf ("sudo_auth_user = " <> T.pack (show ("" :: String)))
         -- 管道传输退休后，两侧都不该再算套接字路径、也不该再认管名。
         it "neither side computes a socket path or a pipe name any more" $ do
             haskellIpc <- readUtf8 (".." </> "chusql-core" </> "engine" </> "src" </> "ChuSQL" </> "Core" </> "Engine" </> "Storage" </> "IPC.hs")

@@ -20,6 +20,7 @@ library
                     , aeson
                     , bytestring
                     , chusql-core-model
+                    , chusql-core-engine
                     , chusql-interface
                     , containers
                     , directory

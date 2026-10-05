@@ -21,7 +21,9 @@ module ChuSQL.Web.API (
 ) where
 
 import ChuSQL.Core.Model (Row, Value (..))
-import ChuSQL.Core.Protocol (Account (..), QueryResult (..), SchemaColumn (..), TableInfo (..))
+import ChuSQL.Core.Engine.Syntax.AST (Statement (BeginTransaction, CommitTransaction, RollbackTransaction))
+import ChuSQL.Core.Engine.Syntax.Parser (parseStatement)
+import ChuSQL.Core.Protocol (Account (..), QueryResult (..), SchemaColumn (..), TableInfo (..), valueToJSON)
 import ChuSQL.Interface.AccountTable (accountColumns, accountTableName, isAccountTable, passwordColumn, systemTableInfo)
 import ChuSQL.Interface.Actions (
     ColumnSpec (..),
@@ -108,16 +110,19 @@ import ChuSQL.Web.UISettings (
     writeUISettings,
  )
 import Control.Concurrent.MVar (MVar, modifyMVar, newMVar, withMVar)
+import Control.Concurrent (forkIO, threadDelay)
 import Control.Exception (IOException, try)
+import Control.Monad (forever, when)
 import Data.Aeson (FromJSON (..), eitherDecode, object, withObject, (.:), (.=))
 import qualified Data.Aeson as A
 import qualified Data.Aeson.Key as K
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (nub, sortBy)
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Scientific (fromFloatDigits)
 import Data.Text (Text)
@@ -176,6 +181,7 @@ data AppEnv = AppEnv
     , aeUISettingsFile :: FilePath
     , aeEffective :: Map.Map Text Text
     , aeLog :: Text -> IO ()
+    , aeReaperStarted :: IORef Bool
     }
 
 -- | 一条网页会话：TCP 连接、登录状态与账号名
@@ -184,6 +190,12 @@ data WebSession = WebSession
     , wsSession :: Session
     , wsUser :: Text
     , wsAdmin :: Bool
+    , wsEditor :: Session
+    , wsEditorClient :: Client
+    , wsEdit :: IORef (Maybe (Text, Text))
+    , wsEditReceipt :: IORef (Maybe (Text, A.Value, A.Value))
+    , wsEditEnded :: IORef (Set.Set Text)
+    , wsConsole :: IORef (Maybe (Text, Text))
     }
 
 -- | 会话 Cookie 名
@@ -201,6 +213,7 @@ newAppEnvAt :: FilePath -> Text -> Int -> RateLimiter -> FilePath -> IO AppEnv
 newAppEnvAt settingsFile host port limiter staticDir = do
     sessions <- newPayloadStore getCurrentTime defaultSessionPolicy
     liveRef <- newIORef defaultLive
+    reaperStarted <- newIORef False
     uiSettingsFile <- resolveUISettingsFileSafe
     pure
         AppEnv
@@ -215,6 +228,7 @@ newAppEnvAt settingsFile host port limiter staticDir = do
             , aeUISettingsFile = uiSettingsFile
             , aeEffective = Map.empty
             , aeLog = const (pure ())
+            , aeReaperStarted = reaperStarted
             }
 
 -- | 系统库：账号表住在这里，只有管理员能进
@@ -256,6 +270,12 @@ liveBodyLimit env = lvBodyLimit <$> readLive env
 -- | 组装 WAI 应用：路由外套四层中间件
 webApp :: AppEnv -> IO Application
 webApp env = do
+    started <- atomicModifyIORef' (aeReaperStarted env) (\old -> (True, old))
+    when (not started) $ do
+        _ <- forkIO $ forever $ do
+            threadDelay 60000000
+            sweepWebSessions env
+        pure ()
     inner <- scottyApp (routes env)
     locks <- newMVar Map.empty
     pure (securityHeaders (sameOriginOnly (bodyLimitDynamic (liveBodyLimit env) (serializeSessions locks inner))))
@@ -318,6 +338,10 @@ routes env = do
     post "/api/roles/:name/members" (withDatabase env addRoleMemberH)
     delete "/api/roles/:name/members/:user" (withDatabase env removeRoleMemberH)
     post "/api/query" (withDatabase env queryH)
+    post "/api/query/rollback" (rollbackConsoleH env)
+    post "/api/edit/begin" (beginEditH env)
+    post "/api/edit/commit" (commitEditH env)
+    post "/api/edit/rollback" (rollbackEditH env)
     notFound (notFoundH env)
 
 -- | 先认会话，再按请求头切本会话的库
@@ -331,7 +355,18 @@ withDatabase env action = do
             if chosen == systemDatabase && not (wsAdmin ws)
                 then reply403 "the system database is only available to the administrator"
                 else do
-                    ready <- liftIO (if T.null chosen then pure (Right ()) else switchDatabase (wsSession ws) chosen)
+                    editing <- header "X-ChuSQL-Edit"
+                    req <- request
+                    let snapshotRead = editing /= Nothing && requestMethod req == "GET" && take 2 (pathInfo req) == ["api", "tables"]
+                    console <- liftIO (readIORef (wsConsole ws))
+                    caller <- consoleOwner
+                    case console of
+                        Just (owner, database) | not snapshotRead &&
+                            (pathInfo req /= ["api", "query"] || caller /= owner || (not (T.null chosen) && chosen /= database)) ->
+                                apiError "conflict" "another SQL console owns this connection transaction; commit or rollback there first"
+                        _ -> pure ()
+                    current <- liftIO (sessionDatabase (wsSession ws))
+                    ready <- liftIO (if T.null chosen || chosen == current || snapshotRead then pure (Right ()) else switchDatabase (wsSession ws) chosen)
                     case ready of
                         Left message -> serverError message
                         Right () -> action env
@@ -347,11 +382,31 @@ requireDatabaseName ws = do
 -- | 取本请求的会话，没有令牌就 401
 requireSession :: AppEnv -> ActionM WebSession
 requireSession env = do
+    liftIO (sweepWebSessions env)
     token <- requestSessionToken >>= maybe (apiError "unauthorized" "sign in first") pure
     found <- liftIO (lookupPayload (aeSessions env) token)
     case found of
         Nothing -> apiError "unauthorized" "sign in first"
-        Just (_, ws) -> pure ws
+        Just (_, ws) -> do
+            editHeader <- fmap TL.toStrict <$> header "X-ChuSQL-Edit"
+            req <- request
+            case editHeader of
+                Just editId | requestMethod req == "GET" && take 2 (pathInfo req) == ["api", "tables"] -> do
+                    active <- liftIO (readIORef (wsEdit ws))
+                    database <- maybe "" (T.toLower . TL.toStrict) <$> header "X-ChuSQL-Database"
+                    case active of
+                        Just (owner, name) | owner == editId && name == database ->
+                            pure ws {wsSession = wsEditor ws, wsClient = wsEditorClient ws}
+                        _ -> apiError "conflict" "the editing snapshot is no longer available; rollback and reload"
+                _ -> pure ws
+
+-- | 关闭网页会话的两个服务端连接。
+closeWebSession :: WebSession -> IO ()
+closeWebSession ws = endEdit ws >> writeIORef (wsConsole ws) Nothing >> closeClient (wsEditorClient ws) >> closeClient (wsClient ws)
+
+-- | 清理过期会话与未提交快照。
+sweepWebSessions :: AppEnv -> IO ()
+sweepWebSessions env = sweepPayloads (aeSessions env) >>= mapM_ closeWebSession
 
 -- | 管理员专属操作
 requireAdminSession :: AppEnv -> ActionM WebSession
@@ -388,7 +443,7 @@ createDatabaseH env = do
 -- | 删除数据库；系统库 system 一律拒绝。
 dropDatabaseH :: AppEnv -> ActionM ()
 dropDatabaseH env = do
-    ws <- requireAdminSession env
+    ws <- requireSession env
     name <- pathParam "name"
     if reservedDatabase name
         then reply400 "bad_request" "the system database cannot be dropped"
@@ -443,8 +498,7 @@ healthH = json (object ["status" .= ("ok" :: Text)])
 -- | 探活：回进程与存储状态，顺带清理过期会话
 statusH :: AppEnv -> ActionM ()
 statusH env = do
-    expired <- liftIO (sweepPayloads (aeSessions env))
-    liftIO (mapM_ (closeClient . wsClient) expired)
+    liftIO (sweepWebSessions env)
     opened <- liftIO (connectClient (aeServerHost env) (aeServerPort env))
     case opened of
         Left message -> json (object ["status" .= ("ok" :: Text), "storage" .= ("down" :: Text), "detail" .= message])
@@ -504,7 +558,21 @@ openSession env user password = do
                         else serverError message
                 Right () -> do
                     admin <- liftIO (sessionIsAdmin session)
-                    token <- liftIO (createPayloadSession (aeSessions env) user (WebSession client session user admin))
+                    openedEditor <- liftIO (connectClient (aeServerHost env) (aeServerPort env))
+                    editorClient <- case openedEditor of
+                        Left message -> liftIO (closeClient client) >> serverError message
+                        Right connected -> pure connected
+                    editor <- liftIO (newSession editorClient)
+                    editorSigned <- liftIO (authenticateSession editor user password)
+                    case editorSigned of
+                        Left message -> liftIO (closeClient editorClient >> closeClient client) >> serverError message
+                        Right () -> pure ()
+                    edit <- liftIO (newIORef Nothing)
+                    receipt <- liftIO (newIORef Nothing)
+                    ended <- liftIO (newIORef Set.empty)
+                    console <- liftIO (newIORef Nothing)
+                    liftIO (sweepWebSessions env)
+                    token <- liftIO (createPayloadSession (aeSessions env) user (WebSession client session user admin editor editorClient edit receipt ended console))
                     liftIO (rateLimitClear (aeLimiter env) user)
                     setHeader "Set-Cookie" (TL.fromStrict (sessionCookie env token (Just (lvSessionMax live))))
                     liftIO (aeLog env ("sign-in ok user=" <> user))
@@ -513,6 +581,7 @@ openSession env user password = do
 -- | 退出：收掉会话与连接，清除 Cookie
 logoutH :: AppEnv -> ActionM ()
 logoutH env = do
+    liftIO (sweepWebSessions env)
     token <- requestSessionToken
     case token of
         Nothing -> pure ()
@@ -520,7 +589,7 @@ logoutH env = do
             gone <- liftIO (dropPayload (aeSessions env) t)
             case gone of
                 Nothing -> pure ()
-                Just ws -> liftIO (closeClient (wsClient ws))
+                Just ws -> liftIO (closeWebSession ws)
     setHeader "Set-Cookie" (TL.fromStrict (sessionCookie env "" (Just 0)))
     status status204
 
@@ -1036,7 +1105,6 @@ createTableH :: AppEnv -> ActionM ()
 createTableH env = do
     ws <- requireSession env
     _ <- requireDatabaseName ws
-    adminOnly ws
     withJsonObject env $ \o -> case decodeCreateTable o of
         Left err -> reply400 "bad_request" err
         Right spec -> case createTableSql spec of
@@ -1048,7 +1116,6 @@ dropTableH :: AppEnv -> ActionM ()
 dropTableH env = do
     ws <- requireSession env
     _ <- requireDatabaseName ws
-    adminOnly ws
     name <- pathParam "t"
     account <- accountRoute ws name
     if account
@@ -1117,7 +1184,6 @@ createIndexH :: AppEnv -> ActionM ()
 createIndexH env = do
     ws <- requireSession env
     _ <- requireDatabaseName ws
-    adminOnly ws
     name <- pathParam "t"
     account <- accountRoute ws name
     if account
@@ -1137,7 +1203,6 @@ dropIndexH :: AppEnv -> ActionM ()
 dropIndexH env = do
     ws <- requireSession env
     _ <- requireDatabaseName ws
-    adminOnly ws
     name <- pathParam "t"
     column <- pathParam "col"
     account <- accountRoute ws name
@@ -1156,7 +1221,6 @@ dropColumnH :: AppEnv -> ActionM ()
 dropColumnH env = do
     ws <- requireSession env
     _ <- requireDatabaseName ws
-    adminOnly ws
     name <- pathParam "t"
     column <- pathParam "col"
     account <- accountRoute ws name
@@ -1233,7 +1297,7 @@ dropRoleH env = do
 -- | 给角色加权限
 grantRoleH :: AppEnv -> ActionM ()
 grantRoleH env = do
-    ws <- requireAdminSession env
+    ws <- requireSession env
     role <- pathParam "name"
     withJsonObject env $ \o -> case grantFields o of
         Left err -> reply400 "bad_request" err
@@ -1243,7 +1307,7 @@ grantRoleH env = do
 -- | 收角色的权限
 revokeRoleH :: AppEnv -> ActionM ()
 revokeRoleH env = do
-    ws <- requireAdminSession env
+    ws <- requireSession env
     role <- pathParam "name"
     withJsonObject env $ \o -> case grantFields o of
         Left err -> reply400 "bad_request" err
@@ -1418,7 +1482,219 @@ columnTypeText cols name = case [c | c <- cols, scName c == T.unpack name] of
     (c : _) -> T.pack (scType c)
     [] -> ""
 
--- | 查询接口：校验请求体后执行 SQL
+-- | 校验编辑事务的页面与数据库标识。
+editIdentity :: A.Object -> Either Text (Text, Text)
+editIdentity o = do
+    owner <- textField "id" o
+    database <- textField "database" o
+    if T.null owner || T.length owner > 128 || not (isPlainIdentifier database)
+        then Left "invalid edit identity or database"
+        else Right (owner, T.toLower database)
+
+-- | 开始或确认同一页面的编辑快照。
+beginEditH :: AppEnv -> ActionM ()
+beginEditH env = do
+    ws <- requireSession env
+    withJsonObject env $ \o -> case editIdentity o of
+        Left message -> reply400 "bad_request" message
+        Right identity@(owner, database) -> do
+            when (database == systemDatabase) (apiError "bad_request" "system identities cannot be edited in a data transaction")
+            active <- liftIO (readIORef (wsEdit ws))
+            ended <- liftIO (readIORef (wsEditEnded ws))
+            case active of
+                Just existing | existing == identity -> json (object ["state" .= ("active" :: Text), "id" .= owner])
+                Just _ -> apiError "conflict" "another page owns the editing transaction"
+                Nothing | Set.member owner ended -> apiError "conflict" "this editing transaction has already ended"
+                Nothing -> do
+                    switched <- liftIO (switchDatabase (wsEditor ws) database)
+                    either serverError pure switched
+                    begun <- liftIO (runStatement (wsEditor ws) "BEGIN")
+                    either serverError (const (pure ())) begun
+                    saved <- liftIO (runStatement (wsEditor ws) "SAVEPOINT web_edit_base")
+                    case saved of
+                        Left message -> do
+                            liftIO (closeClient (wsEditorClient ws))
+                            serverError message
+                        Right _ -> do
+                            liftIO (writeIORef (wsEdit ws) (Just identity))
+                            json (object ["state" .= ("active" :: Text), "id" .= owner])
+
+-- | 确认当前页面仍持有编辑事务。
+requireEdit :: WebSession -> (Text, Text) -> ActionM ()
+requireEdit ws identity = do
+    active <- liftIO (readIORef (wsEdit ws))
+    when (active /= Just identity) (apiError "conflict" "editing transaction is stale; rollback and reload")
+
+-- | 结束事务并禁止旧页面标识重新使用。
+endEdit :: WebSession -> IO ()
+endEdit ws = do
+    active <- readIORef (wsEdit ws)
+    case active of
+        Nothing -> pure ()
+        Just (owner, _) -> atomicModifyIORef' (wsEditEnded ws) (\ended -> (Set.insert owner ended, ()))
+    writeIORef (wsEdit ws) Nothing
+
+-- | 按表结构生成一条编辑语句。
+editStatement :: [TableInfo] -> A.Value -> Either Text Text
+editStatement infos (A.Object o) = do
+    name <- textField "table" o
+    operation <- textField "op" o
+    when (isAccountTable name) (Left "system identities cannot be edited in a data transaction")
+    info <- maybe (Left ("table not found: " <> name)) Right (findTable name infos)
+    sql <- case operation of
+        "insert" -> do
+            row <- valuesField o >>= readRowValues False (tiColumns info)
+            either (Left . T.pack) Right (insertRowSql name row)
+        "update" -> do
+            key <- editRowKey o
+            values <- case KM.lookup "set" o of
+                Just (A.Object assigns) -> Right assigns
+                _ -> Left "update requires a set object"
+            row <- readRowValues False (tiColumns info) values
+            either (Left . T.pack) Right (updateRowSql name key row)
+        "delete" -> do
+            key <- editRowKey o
+            either (Left . T.pack) Right (deleteRowSql name key)
+        _ -> Left "unknown edit operation"
+    pure (T.pack sql)
+editStatement _ _ = Left "each change must be an object"
+
+-- | 读取行编辑的整数主键。
+editRowKey :: A.Object -> Either Text Int
+editRowKey o = case KM.lookup "pk" o of
+    Just (A.String rawKey) -> maybe (Left "invalid row id") Right (readMaybe (T.unpack rawKey))
+    Just rawKey -> case A.fromJSON rawKey of
+        A.Success key -> Right key
+        A.Error _ -> Left "invalid row id"
+    Nothing -> Left "missing row id"
+
+-- | 顺序执行编辑集并定位首个错误。
+runEditStatements :: Session -> Int -> [Text] -> IO (Either (Int, Text) ())
+runEditStatements _ _ [] = pure (Right ())
+runEditStatements session index (sql : rest) = do
+    result <- runStatement session sql
+    case result of
+        Left message -> pure (Left (index, message))
+        Right _ -> runEditStatements session (index + 1) rest
+
+-- | 返回明确的事务失败状态。
+editFailure :: Text -> Text -> Maybe Int -> Bool -> ActionM ()
+editFailure stateName message index reload = do
+    let code = errorCodeOf message
+    status (if code == "unauthorized" then status401 else if reload || code == "serialization_failure" then status409 else statusOf code)
+    json (object ["ok" .= False, "applied" .= (0 :: Int), "state" .= stateName,
+        "reloadRequired" .= reload, "error" .= code, "message" .= message,
+        "errors" .= [object ["index" .= index, "message" .= message]]])
+
+-- | 回退提交失败的暂存语句并保留快照。
+resetEditAfterFailure :: WebSession -> Maybe Int -> Text -> ActionM ()
+resetEditAfterFailure ws index message = do
+    reset <- liftIO (runStatement (wsEditor ws) "ROLLBACK TO SAVEPOINT web_edit_base")
+    case reset of
+        Right _ -> editFailure "active" message index False
+        Left resetError -> do
+            liftIO (endEdit ws >> closeClient (wsEditorClient ws))
+            editFailure "lost" (message <> "; rollback failed: " <> resetError) index True
+
+-- | 原子提交跨表编辑集并缓存成功回执。
+commitEditH :: AppEnv -> ActionM ()
+commitEditH env = do
+    ws <- requireSession env
+    withJsonObject env $ \o -> case (editIdentity o, KM.lookup "changes" o) of
+        (Right identity@(owner, _), Just (A.Array entries)) -> do
+            receipt <- liftIO (readIORef (wsEditReceipt ws))
+            case receipt of
+                Just (old, submitted, result) | old == owner && submitted == A.Object o -> json result
+                Just (old, _, _) | old == owner -> apiError "conflict" "transaction already committed with a different edit set"
+                _ -> do
+                    requireEdit ws identity
+                    found <- liftIO (catalog (wsEditor ws))
+                    infos <- case found of
+                        Left message -> do
+                            when (errorCodeOf message == "unauthorized") (liftIO (endEdit ws >> closeWebSession ws))
+                            serverError message
+                        Right tables -> pure tables
+                    case mapM (editStatement infos) (V.toList entries) of
+                        Left message -> editFailure "active" ("bad_request: " <> message) Nothing False
+                        Right statements -> do
+                            reset <- liftIO (runStatement (wsEditor ws) "ROLLBACK TO SAVEPOINT web_edit_base")
+                            case reset of
+                                Left message -> do
+                                    liftIO (endEdit ws >> closeClient (wsEditorClient ws))
+                                    editFailure "lost" message Nothing True
+                                    finish
+                                Right _ -> pure ()
+                            staged <- liftIO (runEditStatements (wsEditor ws) 0 statements)
+                            case staged of
+                                Left (index, message) -> resetEditAfterFailure ws (Just index) message
+                                Right () -> do
+                                    committed <- liftIO (runStatement (wsEditor ws) "COMMIT")
+                                    case committed of
+                                        Right _ -> do
+                                            let result = object ["ok" .= True, "applied" .= V.length entries, "state" .= ("committed" :: Text)]
+                                            liftIO (endEdit ws >> writeIORef (wsEditReceipt ws) (Just (owner, A.Object o, result)))
+                                            json result
+                                        Left message | errorCodeOf message == "serialization_failure" -> do
+                                            rolledBack <- liftIO (runStatement (wsEditor ws) "ROLLBACK")
+                                            liftIO (endEdit ws)
+                                            case rolledBack of
+                                                Right _ -> editFailure "rolled_back" message Nothing True
+                                                Left err -> do
+                                                    liftIO (closeClient (wsEditorClient ws))
+                                                    editFailure "lost" (message <> "; rollback failed: " <> err) Nothing True
+                                        Left message | errorCodeOf message `elem` ["query_error", "bad_request", "forbidden"] -> resetEditAfterFailure ws Nothing message
+                                        Left message -> do
+                                            liftIO (endEdit ws >> closeClient (wsEditorClient ws))
+                                            editFailure "lost" (message <> "; commit outcome requires reload") Nothing True
+        _ -> reply400 "bad_request" "expected edit identity and a changes array"
+
+-- | 撤销页面持有的编辑事务。
+rollbackEditH :: AppEnv -> ActionM ()
+rollbackEditH env = do
+    ws <- requireSession env
+    withJsonObject env $ \o -> case editIdentity o of
+        Left message -> reply400 "bad_request" message
+        Right identity -> do
+            active <- liftIO (readIORef (wsEdit ws))
+            case active of
+                Nothing -> do
+                    receipt <- liftIO (readIORef (wsEditReceipt ws))
+                    let stateName = case receipt of
+                            Just (owner, _, _) | owner == fst identity -> "committed" :: Text
+                            _ -> "rolled_back"
+                    json (object ["state" .= stateName])
+                Just _ -> do
+                    requireEdit ws identity
+                    result <- liftIO (runStatement (wsEditor ws) "ROLLBACK")
+                    liftIO (endEdit ws)
+                    case result of
+                        Left message -> liftIO (closeClient (wsEditorClient ws)) >> serverError message
+                        Right _ -> json (object ["state" .= ("rolled_back" :: Text)])
+
+-- | 读取 SQL 控制台的请求所有者。
+consoleOwner :: ActionM Text
+consoleOwner = do
+    owner <- maybe "legacy" TL.toStrict <$> header "X-ChuSQL-Console"
+    if T.null owner || T.length owner > 128 then apiError "bad_request" "invalid console identity" else pure owner
+
+-- | 回滚关闭页面或标签的控制台事务。
+rollbackConsoleH :: AppEnv -> ActionM ()
+rollbackConsoleH env = do
+    ws <- requireSession env
+    withJsonObject env $ \o -> case textField "console" o of
+        Left message -> reply400 "bad_request" message
+        Right owner -> do
+            active <- liftIO (readIORef (wsConsole ws))
+            case active of
+                Nothing -> status status204
+                Just (existing, _) | existing /= owner -> apiError "conflict" "another console owns this transaction"
+                Just _ -> do
+                    result <- liftIO (runStatement (wsSession ws) "ROLLBACK")
+                    case result of
+                        Left message -> serverError message
+                        Right _ -> liftIO (writeIORef (wsConsole ws) Nothing) >> status status204
+
+-- | 查询接口：校验请求体后执行 SQL。
 queryH :: AppEnv -> ActionM ()
 queryH env = do
     ws <- requireSession env
@@ -1447,6 +1723,15 @@ executeSql ws live sql = do
     case result of
         Left message -> serverError message
         Right res -> do
+            owner <- consoleOwner
+            case parseStatement (T.unpack sql) of
+                Right BeginTransaction -> do
+                    database <- liftIO (sessionDatabase (wsSession ws))
+                    liftIO (writeIORef (wsConsole ws) (Just (owner, database)))
+                Right CommitTransaction -> liftIO (writeIORef (wsConsole ws) Nothing)
+                Right RollbackTransaction -> liftIO (writeIORef (wsConsole ws) Nothing)
+                _ -> pure ()
+            transaction <- liftIO (readIORef (wsConsole ws))
             let shown = take (lvMaxRows live) (qrRows res)
             json
                 ( object
@@ -1455,6 +1740,7 @@ executeSql ws live sql = do
                     , "rowCount" .= qrRowCount res
                     , "truncated" .= (qrTruncated res || qrRowCount res > lvMaxRows live)
                     , "database" .= qrDatabase res
+                    , "transaction" .= (transaction /= Nothing)
                     ]
                 )
 
@@ -1516,6 +1802,7 @@ valueJson (VInt n) = A.Number (fromIntegral n)
 valueJson (VFloat d) = A.Number (fromFloatDigits d)
 valueJson (VStr s) = A.String (T.pack s)
 valueJson (VBool b) = A.Bool b
+valueJson value@VRuntime{} = valueToJSON value
 
 -- | 一张表的线上信息：列、行数、索引与统计
 tableInfoJson :: TableInfo -> A.Value

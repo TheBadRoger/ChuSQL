@@ -37,6 +37,10 @@ rewriteAggs :: [(String, Expr)] -> Expr -> Expr
 rewriteAggs aggs e = case [label | (label, agg) <- aggs, agg == e] of
     (label : _) -> Col label
     [] -> case e of
+        Construct tid arguments -> Construct tid (map go arguments)
+        BoundConstruct tid arguments -> BoundConstruct tid (map go arguments)
+        FunctionCall name arguments -> FunctionCall name (map go arguments)
+        BoundFunction fid tid arguments -> BoundFunction fid tid (map go arguments)
         Add a b -> Add (go a) (go b)
         Sub a b -> Sub (go a) (go b)
         Mul a b -> Mul (go a) (go b)

@@ -5,6 +5,7 @@ module ChuSQL.Core.Engine.Syntax.Parser (parseStatement, parseExpression) where
 import ChuSQL.Core.Model (Column (..), ColumnType (..), Value (..), plainColumn)
 import ChuSQL.Core.Engine.Builtin (Builtin (..), builtinName, builtinNames, builtinNode, compareNode)
 import ChuSQL.Core.Engine.Syntax.AST
+import ChuSQL.Core.Engine.Runtime.Types
 import Control.Monad (void)
 import Control.Monad.Combinators.Expr (Operator (..), makeExprParser)
 import Data.Char (isAlpha, isAlphaNum, isHexDigit, isSpace, toLower, toUpper)
@@ -167,6 +168,8 @@ atom =
         , LitInt <$> integer
         , LitStr <$> stringLit
         , try aggregateCall
+        , try constructorCall
+        , try scalarFunctionCall
         , try existsPredicate
         , Col <$> qualifiedName
         , try scalarSubquery
@@ -201,6 +204,33 @@ inPredicate = do
 -- | 括号里的子查询；对外层列的引用留给语义检查填
 subquerySelect :: Parser Subquery
 subquerySelect = Subquery <$> queryStatement <*> pure []
+
+-- | 读取带具体类型参数的构造器
+constructorCall :: Parser Expr
+constructorCall = do
+    cid <- (TypeConstructorId 5 <$ keyword "list") <|> (TypeConstructorId 6 <$ keyword "maybe")
+        <|> (TypeConstructorId 7 <$ keyword "tuple")
+    arguments <- between (symbol "<") (symbol ">") (sepBy runtimeTypeP (symbol ","))
+    values <- between (symbol "(") (symbol ")") (sepBy expr (symbol ","))
+    pure (Construct (TypeApply cid arguments) values)
+
+-- | 解析运行时逻辑类型语法
+runtimeTypeP :: Parser TypeExpr
+runtimeTypeP = choice
+    [ intType <$ keyword "int", doubleType <$ keyword "double", boolType <$ keyword "bool"
+    , stringType <$ keyword "string", stringType <$ keyword "str", stringType <$ keyword "text"
+    , listType <$> between (symbol "[") (symbol "]") runtimeTypeP
+    , listType <$> (keyword "list" *> runtimeTypeP)
+    , maybeType <$> (keyword "maybe" *> runtimeTypeP)
+    , tupleType <$> between (symbol "(") (symbol ")") (sepBy runtimeTypeP (symbol ","))
+    ]
+
+-- | 读取待绑定的标量函数调用
+scalarFunctionCall :: Parser Expr
+scalarFunctionCall = do
+    name <- identifier
+    arguments <- between (symbol "(") (symbol ")") (sepBy expr (symbol ","))
+    pure (FunctionCall name arguments)
 
 -- | 聚合调用：名称与节点都由内置函数表给出
 aggregateCall :: Parser Expr
@@ -480,7 +510,9 @@ alterUserStatement = do
 -- | 读身份属性开关
 identityAttribute :: Parser (String, Bool)
 identityAttribute = choice
-    [ ("system_catalog_manager", True) <$ keyword "system_catalog_manager"
+    [ ("allow_sudo_auth", True) <$ keyword "allow_sudo_auth"
+    , ("allow_sudo_auth", False) <$ keyword "noallow_sudo_auth"
+    , ("system_catalog_manager", True) <$ keyword "system_catalog_manager"
     , ("system_catalog_manager", False) <$ keyword "nosystem_catalog_manager"
     , ("login", True) <$ keyword "login", ("login", False) <$ keyword "nologin"
     , ("superuser", True) <$ keyword "superuser", ("superuser", False) <$ keyword "nosuperuser"
@@ -525,12 +557,16 @@ privilegeName =
         , "INSERT" <$ keyword "insert"
         , "UPDATE" <$ keyword "update"
         , "DELETE" <$ keyword "delete"
+        , "CONNECT" <$ keyword "connect"
+        , "CREATE" <$ keyword "create"
         , "ALL" <$ keyword "all"
         ]
 
 -- | ON 后面的授权对象：* 或一张表
 grantObject :: Parser String
-grantObject = ("*" <$ symbol "*") <|> tableName
+grantObject = try (("database:" ++) <$> (keyword "database" *> identifier))
+    <|> try ((++ ".*") <$> (identifier <* symbol "." <* symbol "*"))
+    <|> ("*" <$ symbol "*") <|> (optional (keyword "table") *> tableName)
 
 -- | 可选的 WITH GRANT OPTION
 grantOption :: Parser Bool
@@ -597,7 +633,8 @@ sizeParen = try (between (symbol "(") (symbol ")") integer)
 columnTypeP :: Parser ColumnType
 columnTypeP =
     choice
-        [ keyword "integer" >> pure CInt
+        [ try runtimeColumnType
+        , keyword "integer" >> pure CInt
         , keyword "int" >> pure CInt
         , keyword "bigint" >> pure CBigInt
         , keyword "smallint" >> pure CSmallInt
@@ -618,6 +655,20 @@ columnTypeP =
         , keyword "blob" >> pure CBlob
         , (\name -> CDomain (map toLower name) CStr) <$> identifier
         ]
+
+-- | 解析复合列的稳定类型身份
+runtimeColumnType :: Parser ColumnType
+runtimeColumnType = do
+    expression <- choice
+        [ listType <$> between (symbol "[") (symbol "]") runtimeTypeP
+        , listType <$> (keyword "list" *> runtimeTypeP)
+        , maybeType <$> (keyword "maybe" *> runtimeTypeP)
+        , tupleType <$> between (symbol "(") (symbol ")") (sepBy runtimeTypeP (symbol ","))
+        , stringType <$ keyword "string"
+        ]
+    case resolveType builtinTypes expression of
+        Left err -> fail err
+        Right descriptor -> pure (CRuntime (descriptorId descriptor))
 
 -- | DECIMAL 的精度与小数位
 decimalType :: Parser ColumnType
@@ -744,6 +795,10 @@ expandClause env fromC = case fromC of
 -- | 表达式里的子查询也要展开
 expandExpr :: [(String, Statement)] -> Expr -> Either String Expr
 expandExpr env e = case e of
+    Construct tid arguments -> Construct tid <$> mapM go arguments
+    BoundConstruct tid arguments -> BoundConstruct tid <$> mapM go arguments
+    FunctionCall name arguments -> FunctionCall name <$> mapM go arguments
+    BoundFunction fid tid arguments -> BoundFunction fid tid <$> mapM go arguments
     Add a b -> Add <$> go a <*> go b
     Sub a b -> Sub <$> go a <*> go b
     Mul a b -> Mul <$> go a <*> go b

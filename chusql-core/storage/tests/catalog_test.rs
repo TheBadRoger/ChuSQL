@@ -4,6 +4,55 @@ use serde_json::json;
 
 // 数据字典测试：补列、去重、未知表。
 
+/// 表删除重建和重载均保留编号规则
+#[test]
+fn object_ids_survive_reload_and_are_not_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.json");
+    let mut catalog = Catalog::default();
+    catalog.create_table("t", vec![]).unwrap();
+    let old = catalog.describe("t").unwrap().object_id;
+    assert_ne!(old, 0);
+    catalog.save(&path).unwrap();
+    let mut catalog = Catalog::load(&path).unwrap();
+    assert_eq!(catalog.describe("t").unwrap().object_id, old);
+    catalog.drop_table("t").unwrap();
+    catalog.save(&path).unwrap();
+    let mut catalog = Catalog::load(&path).unwrap();
+    catalog.create_table("t", vec![]).unwrap();
+    assert!(catalog.describe("t").unwrap().object_id > old);
+}
+
+/// 旧目录迁移保留已有编号并拒绝重复
+#[test]
+fn legacy_object_ids_upgrade_without_collisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.json");
+    std::fs::write(&path, json!({"tables": {
+        "a": {"columns": [], "object_id": 42},
+        "b": {"columns": []}
+    }}).to_string()).unwrap();
+    let catalog = Catalog::load(&path).unwrap();
+    assert_eq!(catalog.describe("a").unwrap().object_id, 42);
+    assert_eq!(catalog.describe("b").unwrap().object_id, 43);
+    catalog.save(&path).unwrap();
+    assert_eq!(Catalog::load(&path).unwrap().describe("b").unwrap().object_id, 43);
+    std::fs::write(&path, json!({"tables": {
+        "a": {"columns": [], "object_id": 42},
+        "b": {"columns": [], "object_id": 42}
+    }}).to_string()).unwrap();
+    assert!(Catalog::load(&path).unwrap_err().to_string().contains("duplicate"));
+}
+
+/// 编号耗尽明确失败且不建立对象
+#[test]
+fn exhausted_object_ids_fail_without_creating_table() {
+    let mut catalog = Catalog::default();
+    catalog.object_high_water = u64::MAX;
+    assert!(catalog.create_table("t", vec![]).is_err());
+    assert!(catalog.describe("t").is_none());
+}
+
 
 
 /// 用键值对构造一行
@@ -152,6 +201,28 @@ fn capped_distinct_keeps_histogram_and_other_columns_accurate() {
     assert_eq!(schema.stats["v"].distinct, 2);
     catalog.rebuild_stats("t", &rows[1000..]);
     assert_eq!(catalog.describe("t").unwrap().stats["id"].distinct, 4000);
+}
+
+/// 重建直方图不受行顺序影响
+#[test]
+fn rebuilt_histogram_has_exact_buckets_in_any_order() {
+    let rows: Vec<Row> = (0..160).map(|n| row(&[("v", json!(n))])).collect();
+    let mut forward = Catalog::default();
+    forward.rebuild_stats("t", &rows);
+    let mut reverse = Catalog::default();
+    let reversed: Vec<Row> = rows.iter().rev().cloned().collect();
+    reverse.rebuild_stats("t", &reversed);
+    let stat = &forward.describe("t").unwrap().stats["v"];
+    assert_eq!(stat.hist, vec![10; 16]);
+    assert_eq!(stat.hist, reverse.describe("t").unwrap().stats["v"].hist);
+    forward.record_insert("t", &row(&[("v", json!(10000))]));
+    forward.record_delete("t", &[row(&[("v", json!(10000))])]);
+    forward.rebuild_stats("t", &rows[80..]);
+    let repaired = &forward.describe("t").unwrap().stats["v"];
+    assert_eq!(repaired.lo, Some(80.0));
+    assert_eq!(repaired.hi, Some(159.0));
+    assert_eq!(repaired.hist, vec![5; 16]);
+    assert_eq!(forward.describe("t").unwrap().row_count, 80);
 }
 
 /// 老类型名并到新写法，参数保留，未知类型原样

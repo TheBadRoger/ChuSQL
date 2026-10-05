@@ -172,7 +172,7 @@ memoryBackendWith trusted name ref =
                 Left e -> pure (db, Left e)
                 Right (db', rows)
                     | any (\(key, _) -> hidden key && not (domainKey key)) db' -> pure (db, Left "reserved system table")
-                    | otherwise -> pure (mergeScoped db db', Right (StatementResult (colsOf (scoped db) stmt rows) rows))
+                    | otherwise -> pure (syncMemoryObjects name (mergeScoped db db'), Right (StatementResult (colsOf (scoped db) stmt rows) rows))
         , beCatalog = do
             db <- readMVar ref
             pure (Right (map tableInfoOf (filter (not . internalTable . fst) (scoped db))))
@@ -186,7 +186,7 @@ memoryBackendWith trusted name ref =
                     Right previous -> pure (case req of ReqAccountsList -> db; ReqCatalogManage ReqAccountsList -> db; _ -> storeMemoryIdentities db previous accounts, Right accounts)
         , beWithDatabase = withDatabase
         , beDatabases = pure (Right (nub [name, systemDatabaseName]))
-        , beStorage = \_ -> pure (Left "storage is not available in this backend")
+        , beStorage = memorySecurityRequest name ref
         , beSnapshot = Right . scoped <$> readMVar ref
         , beApplyTransaction = \ops -> modifyMVar ref $ \db -> case applyTransactionMemory ops (scoped db) of
             Left err -> pure (db, Left err)
@@ -223,6 +223,52 @@ memoryBackendWith trusted name ref =
         | target == name = memoryBackendWith False name ref
         | null target = noDatabaseBackend (memoryBackendWith False name ref)
         | otherwise = unavailableDatabase ("unknown database: " ++ target) (memoryBackendWith False name ref)
+
+-- 更新内存夹具的稳定表编号。
+syncMemoryObjects :: String -> Database -> Database
+syncMemoryObjects database db = (registry, Table registry [("name", TStr), ("id", TInt)] records Nothing) : filter ((/= registry) . fst) db
+  where
+    registry = "__system_object_ids"
+    previous = [(key, identifier) | row <- maybe [] tableRows (lookup registry db), Just (VStr key) <- [lookup "name" row], Just (VInt identifier) <- [lookup "id" row]]
+    keys = [if '.' `elem` key then key else database ++ "." ++ key | (key, _) <- db, not (internalTable (lastTablePart key))]
+    retained = [(key, identifier) | (key, identifier) <- previous, key `elem` keys]
+    high = maximum (0 : map snd previous)
+    added = zip [key | key <- keys, key `notElem` map fst retained] [high + 1 ..]
+    records = [[("name", VStr key), ("id", VInt identifier)] | (key, identifier) <- ("__high_water", high + length added) : retained ++ added]
+
+-- 执行内存夹具的权限快照协议。
+memorySecurityRequest :: String -> MVar Database -> A.Value -> IO (Either String A.Value)
+memorySecurityRequest database ref payload = modifyMVar ref $ \original -> do
+    let db = syncMemoryObjects database original
+    pure $ case operation db of
+        Left err -> (original, Left err)
+        Right (next, value) -> (next, Right value)
+  where
+    -- 读取协议文本字段。
+    field key = case payload of
+        A.Object fields -> case KM.lookup key fields of
+            Just (A.String value) -> Just value
+            _ -> Nothing
+        _ -> Nothing
+    -- 解析并执行一条权限请求。
+    operation db = case field "method" of
+        Just "resolve_object" -> do
+            selected <- maybe (Left "missing database") Right (field "database")
+            if selected `notElem` [T.pack database, "system"] then Left "unknown database" else do
+                identifier <- case field "table" of
+                    Nothing -> Right A.Null
+                    Just table -> case [number | row <- maybe [] tableRows (lookup "__system_object_ids" db), lookup "name" row == Just (VStr (T.unpack (selected <> "." <> table))), Just (VInt number) <- [lookup "id" row]] of
+                        [number] -> Right (A.toJSON number)
+                        _ -> Left "unknown table"
+                Right (db, A.object ["status" A..= ("object" :: Text), "database_id" A..= (if selected == "system" then (2 :: Int) else 1), "object_id" A..= identifier])
+        Just "object_acl_read" -> Right (db, A.object ["status" A..= ("rows" :: Text), "rows" A..= [A.object ["id" A..= (1 :: Int), "payload" A..= value] | row <- maybe [] tableRows (lookup acl db), Just (VStr value) <- [lookup "payload" row]]])
+        Just "object_acl_replace" -> do
+            let previous = case lookup acl db of Nothing -> Nothing; Just table -> case tableRows table of [[("payload", VStr value)]] -> Just (T.pack value); _ -> Just "invalid ACL"
+            if previous /= field "expected" then Left "object ACL changed concurrently" else do
+                value <- maybe (Left "missing ACL payload") Right (field "payload")
+                Right ((acl, Table acl [("payload", TStr)] [[("payload", VStr (T.unpack value))]] Nothing) : filter ((/= acl) . fst) db, A.object ["status" A..= ("ok" :: Text)])
+        _ -> Left "storage is not available in this backend"
+    acl = "__system_object_acl"
 
 -- | 把后端的语句与字典都改成同一条错误
 unavailableDatabase :: String -> Backend -> Backend
@@ -468,6 +514,10 @@ currentStamp = T.pack . formatTime defaultTimeLocale "%Y-%m-%d %H:%M:%S" <$> get
 -- | 在内存账号表上执行一条账号请求
 memoryAccounts :: Database -> T.Text -> Request -> Either String [Account]
 memoryAccounts db stamp req = do
+    case req of
+        ReqAccountCreate name _ | T.toLower name == "public" -> Left "public is reserved for default privileges"
+        ReqRoleCreate name | T.toLower name == "public" -> Left "public is reserved for default privileges"
+        _ -> Right ()
     stored <- case lookup "__system_identities" db of
         Just table -> mapM decodeCredential (tableRows table)
         Nothing -> case lookup usersTable db of
@@ -482,28 +532,29 @@ memoryAccounts db stamp req = do
                     ReqAccountCreate name _ -> Just name
                     ReqAccountReset name _ -> Just name
                     ReqAccountDrop name -> Just name
-                    ReqIdentityAlter name _ Nothing _ Nothing -> Just name
+                    ReqIdentityAlter name _ Nothing _ Nothing Nothing -> Just name
                     _ -> Nothing
-                allowed = case command of ReqAccountsList -> True; ReqAccountCreate{} -> True; ReqAccountReset{} -> True; ReqAccountDrop{} -> True; ReqIdentityAlter _ _ Nothing _ Nothing -> True; _ -> False
-            if not allowed || any (\a -> target == Just (accountUser a) && (accountIsSuperuser a || accountSystemCatalogManager a)) accounts
+                allowed = case command of ReqAccountsList -> True; ReqAccountCreate{} -> True; ReqAccountReset{} -> True; ReqAccountDrop{} -> True; ReqIdentityAlter _ _ Nothing _ Nothing Nothing -> True; _ -> False
+            if not allowed || any (\a -> target == Just (accountUser a) && (accountIsSuperuser a || accountSystemCatalogManager a || accountAllowSudoAuth a)) accounts
                 then Left "superuser required to manage privileged identities" else memoryAccounts db stamp command
         ReqAccountsList -> Right accounts
         ReqIdentityInitialize admin
             | any (`elem` map accountUser accounts) legacyNames || length (nub legacyNames) /= length legacyNames -> Left "identity name collision"
             | otherwise -> Right ([if legacyIdentity a && accountUser a == T.toLower admin then a{accountIsSuperuser = True} else a | a <- accounts] ++
-                [Account (highWater + offset) role "" 1 stamp Nothing False False True False | (offset, role) <- zip [1..] legacyNames])
+                [Account (highWater + offset) role "" 1 stamp Nothing False False True False False | (offset, role) <- zip [1..] legacyNames])
         ReqRoleCreate u
             | any ((== T.toLower u) . accountUser) accounts -> Left "identity already exists"
-            | otherwise -> Right (accounts ++ [Account (highWater + 1) (T.toLower u) "" 1 stamp Nothing False False True False])
-        ReqIdentityAlter u login super enabled manager -> case filter ((== T.toLower u) . accountUser) accounts of
+            | otherwise -> Right (accounts ++ [Account (highWater + 1) (T.toLower u) "" 1 stamp Nothing False False True False False])
+        ReqIdentityAlter u login super enabled manager sudo -> case filter ((== T.toLower u) . accountUser) accounts of
             [_] -> preserveSuper [if accountUser a == T.toLower u then a{accountCanLogin = maybe (accountCanLogin a) id login,
                 accountIsSuperuser = maybe (accountIsSuperuser a) id super, accountEnabled = maybe (accountEnabled a) id enabled,
                 accountSystemCatalogManager = maybe (accountSystemCatalogManager a) id manager,
+                accountAllowSudoAuth = maybe (accountAllowSudoAuth a) id sudo,
                 accountRevision = accountRevision a + 1} else a | a <- accounts] accounts
             _ -> Left "unknown account"
         ReqAccountCreate u h
             | any ((== T.toLower u) . accountUser) accounts -> Left "account already exists"
-            | otherwise -> Right (accounts ++ [Account (highWater + 1) (T.toLower u) h 1 stamp Nothing True False True False])
+            | otherwise -> Right (accounts ++ [Account (highWater + 1) (T.toLower u) h 1 stamp Nothing True False True False False])
         ReqAccountReset u h -> case filter ((== T.toLower u) . accountUser) accounts of
             [_] -> Right [if accountUser x == T.toLower u then x{accountHash = h, accountRevision = accountRevision x + 1} else x | x <- accounts]
             _ -> Left "unknown account"

@@ -91,6 +91,8 @@ serverName = "chusql-server"
 data ClientRequest
     = ReqHello Int
     | ReqLogin Text Text
+    | ReqSudoChallenge
+    | ReqSudoLogin Text Text
     | ReqQuery Text
     | ReqPing
     | ReqQuit
@@ -109,6 +111,7 @@ data WireRequest = WireRequest
     , wrProtocol :: Maybe Int
     , wrUser :: Maybe Text
     , wrPassword :: Maybe Text
+    , wrProof :: Maybe Text
     , wrSql :: Maybe Text
     , wrRequest :: Maybe Value
     }
@@ -121,6 +124,7 @@ instance A.FromJSON WireRequest where
             <*> o A..:? "protocol"
             <*> o A..:? "user"
             <*> o A..:? "password"
+            <*> o A..:? "proof"
             <*> o A..:? "sql"
             <*> o A..:? "request"
 
@@ -133,6 +137,10 @@ decodeRequest raw = case A.eitherDecodeStrict raw of
         "login" -> case (wrUser wire, wrPassword wire) of
             (Just user, Just password) -> Right (ReqLogin user password)
             _ -> Left "login needs both user and password"
+        "sudo_challenge" -> Right ReqSudoChallenge
+        "sudo_login" -> case (wrUser wire, wrProof wire) of
+            (Just user, Just proof) -> Right (ReqSudoLogin user proof)
+            _ -> Left "sudo_login needs both user and proof"
         "query" -> maybe (Left "query needs sql") (Right . ReqQuery) (wrSql wire)
         "storage" -> maybe (Left "storage needs request") (Right . ReqStorage) (wrRequest wire)
         "catalog" -> Right ReqCatalog
@@ -154,6 +162,8 @@ requestJson :: ClientRequest -> Value
 requestJson request = case request of
     ReqHello version -> object ["method" .= ("hello" :: Text), "protocol" .= version]
     ReqLogin user password -> object ["method" .= ("login" :: Text), "user" .= user, "password" .= password]
+    ReqSudoChallenge -> object ["method" .= ("sudo_challenge" :: Text)]
+    ReqSudoLogin user proof -> object ["method" .= ("sudo_login" :: Text), "user" .= user, "proof" .= proof]
     ReqQuery sql -> object ["method" .= ("query" :: Text), "sql" .= sql]
     ReqPing -> object ["method" .= ("ping" :: Text)]
     ReqQuit -> object ["method" .= ("quit" :: Text)]
@@ -169,6 +179,7 @@ requestJson request = case request of
 data ServerResponse
     = RespHello Int
     | RespLogin Text Bool
+    | RespSudoChallenge Text
     | RespResult QueryResult
     | RespPong
     | RespBye
@@ -190,6 +201,7 @@ responseJson :: ServerResponse -> Value
 responseJson response = case response of
     RespHello version -> object ["status" .= ("hello" :: Text), "protocol" .= version, "server" .= serverName]
     RespLogin user admin -> object ["status" .= ("ok" :: Text), "user" .= user, "admin" .= admin]
+    RespSudoChallenge challenge -> object ["status" .= ("sudo_challenge" :: Text), "challenge" .= challenge]
     RespPong -> object ["status" .= ("pong" :: Text)]
     RespBye -> object ["status" .= ("bye" :: Text)]
     RespError code message -> object ["status" .= ("error" :: Text), "code" .= code, "message" .= message]
@@ -216,6 +228,7 @@ decodeResponse raw = case A.eitherDecode raw of
     decodeStatus status fields = case status of
         "hello" -> Right (RespHello (intOf "protocol" fields))
         "ok" -> Right (RespLogin (textOf "user" fields) (boolOf "admin" fields))
+        "sudo_challenge" -> fromField "challenge" RespSudoChallenge fields
         "pong" -> Right RespPong
         "bye" -> Right RespBye
         "error" -> Right (RespError (textOf "code" fields) (textOf "message" fields))

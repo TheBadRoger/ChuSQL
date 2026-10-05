@@ -5,18 +5,22 @@ module Main (main) where
 
 import ChuSQL.Core.Engine.Storage.IPC (
     Account (..),
-    Request (ReqAccountReset, ReqAccountsList),
+    Request (ReqAccountCreate, ReqAccountReset, ReqAccountsList, ReqIdentityAlter),
     TableInfo (..),
     closeConnection,
     localStorageLink,
     setStorageLink,
  )
 import ChuSQL.Core.Engine.Syntax.AST (Statement)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import ChuSQL.Core.Engine.Syntax.Parser (parseStatement)
 import ChuSQL.Core.Model (Database, Histogram (..), Row, Table (..), Value (..), pattern TInt, pattern TStr)
 import ChuSQL.Interface.Auth (hashPasswordWith)
 import ChuSQL.Interface.Protocol (ClientRequest (..), Grant (..), RoleView (..), ServerResponse (..), decodeRequest, encodeResponse)
 import ChuSQL.Interface.RateLimit (newRateLimiter)
+import ChuSQL.Interface.Link (connectClient, closeClient, clientSudoLogin, clientQuery)
+import ChuSQL.Interface.Sudo (SudoCredential, newSudoCredential, sudoProof, verifySudoProof, validSudoChallenge,
+    createSudoCredential, removeSudoCredential, readSudoCredential, sudoPrivileged)
 import ChuSQL.Server.Accounts (Principal (..), ensureRootAccount)
 import ChuSQL.Server.Backend (Backend (..), StatementResult (..), ipcBackend, memoryBackend)
 import ChuSQL.Server.Privileges (
@@ -25,24 +29,30 @@ import ChuSQL.Server.Privileges (
     Privileges,
     affectedAccounts,
     authorize,
+    authorizeConnect,
+    claimObject,
+    prepareObject,
     listRoleViews,
     newPrivileges,
     runPrivilegeCommand,
  )
-import ChuSQL.Server.Session (QueryResult (..), Session, SessionError (..), newSession, runStatementCoded)
+import ChuSQL.Server.Session (QueryResult (..), Session, SessionError (..), newSession, runStatementCoded, runStorageCoded, authenticateSessionCoded)
 import ChuSQL.Server.TCP (
     ServerConfig (..),
-    ServerEnv,
+    ServerEnv (..),
     ServerHandle (..),
     defaultServerConfig,
     loadServerConfigAt,
     newServerEnv,
     startServer,
+    isLocalPeer,
  )
 import Control.Concurrent (forkIO, threadDelay)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, takeMVar)
+import System.Timeout (timeout)
 import Control.Exception (IOException, bracket, finally, try)
 import Control.Monad (void)
+import Data.List (sort)
 import Data.Aeson (decode)
 import qualified Data.Aeson as A
 import qualified Data.Aeson.Key as K
@@ -54,9 +64,12 @@ import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Vector as V
-import Data.Time.Clock (getCurrentTime)
+import Data.Time.Clock (addUTCTime, getCurrentTime)
 import Network.Socket (
     AddrInfo (..),
+    SockAddr (..),
+    tupleToHostAddress,
+    tupleToHostAddress6,
     SocketType (Stream),
     addrAddress,
     addrFamily,
@@ -81,7 +94,6 @@ import System.IO (
     hSetNewlineMode,
     noNewlineTranslation,
  )
-import System.Timeout (timeout)
 import Test.Hspec hiding (after, before)
 
 -- TCP 服务器测试：协议编解码、配置读取与真连服务器的端到端用例。
@@ -93,9 +105,119 @@ main = hspec spec
 -- | 全部用例
 spec :: Spec
 spec = do
+    describe "sudo authentication" $ do
+        it "defaults to disabled and rejects unconfigured TCP authentication" $
+            withTcpServer defaultServerConfig $ \_ handle -> withConnection handle $ \client -> do
+                scSudoUser defaultServerConfig `shouldBe` ""
+                challenge <- tcpTalk client "{\"method\":\"sudo_challenge\"}"
+                at "code" challenge `shouldBe` A.String "forbidden"
+                denied <- tcpTalk client "{\"method\":\"sudo_login\",\"user\":\"admin\",\"proof\":\"fake\"}"
+                at "code" denied `shouldBe` A.String "unauthorized"
+        it "loads an explicit normalized local identity mapping" $ do
+            path <- tempSettingsPath "sudo-config"
+            writeFile path (unlines ["[server]", "sudo_auth_user = " ++ show ("Local_User" :: String)])
+            config <- loadServerConfigAt path `finally` removeIfExists path
+            scSudoUser config `shouldBe` "local_user"
+        it "supports the client challenge and login exchange" $
+            withTestSudo $ \_ handle credential -> do
+                connected <- connectClient "127.0.0.1" (shPort handle)
+                case connected of
+                    Left message -> expectationFailure (T.unpack message)
+                    Right client -> (do
+                        clientSudoLogin client credential "local_user" >>= (`shouldBe` Right False)
+                        result <- clientQuery client "select 1"
+                        result `shouldSatisfy` isRightResult) `finally` closeClient client
+        it "only treats kernel loopback addresses as local" $ do
+            isLocalPeer (SockAddrInet 7777 (tupleToHostAddress (127, 0, 0, 1))) `shouldBe` True
+            isLocalPeer (SockAddrInet 7777 (tupleToHostAddress (192, 168, 1, 2))) `shouldBe` False
+            isLocalPeer (SockAddrInet6 7777 0 (tupleToHostAddress6 (0,0,0,0,0,0,0,1)) 0) `shouldBe` True
+            isLocalPeer (SockAddrInet6 7777 0 (tupleToHostAddress6 (0,0,0,0,0,65535,32512,1)) 0) `shouldBe` True
+            isLocalPeer (SockAddrInet6 7777 0 (tupleToHostAddress6 (0,0,0,0,0,65535,49320,1)) 0) `shouldBe` False
+        it "binds proofs to the instance, challenge, account and expiration" $ do
+            credential <- newSudoCredential
+            other <- newSudoCredential
+            now <- getCurrentTime
+            let proof = sudoProof credential "nonce" "local_user"
+            verifySudoProof credential "nonce" "LOCAL_USER" proof `shouldBe` True
+            verifySudoProof other "nonce" "local_user" proof `shouldBe` False
+            verifySudoProof credential "other" "local_user" proof `shouldBe` False
+            verifySudoProof credential "nonce" "admin" proof `shouldBe` False
+            validSudoChallenge credential now (Just ("nonce", addUTCTime (-61) now)) "local_user" proof `shouldBe` False
+            validSudoChallenge credential now (Just ("nonce", addUTCTime 1 now)) "local_user" proof `shouldBe` False
+            validSudoChallenge credential now Nothing "local_user" proof `shouldBe` False
+        it "requires an OS elevated identity to provision or read credentials" $ do
+            privileged <- sudoPrivileged
+            if privileged then do
+                bracket (createSudoCredential 65534) (const (removeSudoCredential 65534)) $ \credential -> do
+                    stored <- readSudoCredential 65534
+                    case stored of
+                        Left message -> expectationFailure (T.unpack message)
+                        Right restored -> sudoProof restored "native" "local_user" `shouldBe` sudoProof credential "native" "local_user"
+                    duplicate <- try (createSudoCredential 65534) :: IO (Either IOException SudoCredential)
+                    duplicate `shouldSatisfy` isLeftResult
+            else do
+                created <- try (createSudoCredential 65534) :: IO (Either IOException SudoCredential)
+                created `shouldSatisfy` isLeftResult
+                readSudoCredential 65534 >>= (`shouldSatisfy` isLeftResult)
+        it "logs in an ordinary mapped identity without elevating its privileges" $
+            withTestSudo $ \_ handle credential -> withConnection handle $ \client -> do
+                answer <- tcpSudo client credential "local_user"
+                at "status" answer `shouldBe` A.String "ok"
+                at "admin" answer `shouldBe` A.Bool False
+                denied <- tcpQuery client "create database forbidden"
+                at "code" denied `shouldBe` A.String "forbidden"
+        it "rejects a forged proof and consumes its challenge" $
+            withTestSudo $ \_ handle credential -> withConnection handle $ \client -> do
+                nonce <- tcpTalk client "{\"method\":\"sudo_challenge\"}"
+                denied <- tcpTalk client "{\"method\":\"sudo_login\",\"user\":\"local_user\",\"proof\":\"forged\"}"
+                at "code" denied `shouldBe` A.String "unauthorized"
+                replay <- tcpSudoProof client "local_user" (sudoProof credential (asText (at "challenge" nonce)) "local_user")
+                at "code" replay `shouldBe` A.String "unauthorized"
+        it "rejects proof reuse on another connection and account mapping" $
+            withTestSudo $ \_ handle credential -> withConnection handle $ \first -> withConnection handle $ \second -> do
+                nonce <- tcpTalk first "{\"method\":\"sudo_challenge\"}"
+                let proof = sudoProof credential (asText (at "challenge" nonce)) "local_user"
+                replay <- tcpSudoProof second "local_user" proof
+                at "code" replay `shouldBe` A.String "unauthorized"
+                mismatch <- tcpSudo first credential "admin"
+                at "code" mismatch `shouldBe` A.String "unauthorized"
+        it "revokes the attribute and drops existing sudo sessions" $
+            withTestSudo $ \_ handle credential -> withConnection handle $ \admin -> withConnection handle $ \client -> do
+                _ <- tcpLogin admin testRootName testRootPassword
+                _ <- tcpSudo client credential "local_user"
+                changed <- tcpQuery admin "alter user local_user noallow_sudo_auth"
+                at "status" changed `shouldBe` A.String "result"
+                expired <- tcpQuery client "select 1"
+                at "code" expired `shouldBe` A.String "unauthorized"
+                tcpClosed client
+                withConnection handle $ \fresh -> do
+                    denied <- tcpSudo fresh credential "local_user"
+                    at "code" denied `shouldBe` A.String "unauthorized"
+        it "rejects disabled and NOLOGIN identities" $
+            withTestSudo $ \_ handle credential -> withConnection handle $ \admin -> do
+                _ <- tcpLogin admin testRootName testRootPassword
+                mapM_ (checkSudoDisabled admin handle credential)
+                    ["alter user local_user disabled", "alter user local_user enabled nologin"]
+        it "does not inherit sudo authentication from a role" $
+            withTestSudo $ \_ handle credential -> withConnection handle $ \admin -> do
+                _ <- tcpLogin admin testRootName testRootPassword
+                _ <- tcpQuery admin "create role sudo_role"
+                _ <- tcpQuery admin "alter role sudo_role allow_sudo_auth"
+                _ <- tcpQuery admin "grant sudo_role to local_user"
+                _ <- tcpQuery admin "alter user local_user noallow_sudo_auth"
+                withConnection handle $ \client -> do
+                    denied <- tcpSudo client credential "local_user"
+                    at "code" denied `shouldBe` A.String "unauthorized"
+        it "keeps password login independent of the sudo attribute" $
+            withTestSudo $ \_ handle _ -> withConnection handle $ \client -> do
+                denied <- tcpLogin client "local_user" ""
+                at "code" denied `shouldBe` A.String "unauthorized"
+                accepted <- tcpLogin client "local_user" "Local-Pass123!"
+                at "status" accepted `shouldBe` A.String "ok"
     tcpSpec
     tcpServerSpec
     privilegeSpec
+    objectPrivilegeSpec
     transactionSpec
     ipcConcurrencySpec
     identitySpec
@@ -118,7 +240,7 @@ identitySpec = describe "unified identities" $ do
             switched <- tcpQuery manager "use system"
             asText (at "status" switched) `shouldBe` "result"
             mapM_ (\sql -> tcpQuery manager sql >>= \reply -> asText (at "code" reply) `shouldBe` "forbidden")
-                ["alter user manager superuser", "alter user managed system_catalog_manager", "alter user admin identified by 'Another-Pass123!'", "create database forbidden"]
+                ["alter user manager superuser", "alter user managed system_catalog_manager", "alter user managed allow_sudo_auth", "alter user admin identified by 'Another-Pass123!'", "create database forbidden"]
     it "does not inherit catalog management through role membership" $ withTcpServer defaultServerConfig $ \_ handle ->
         withConnection handle $ \admin -> withConnection handle $ \worker -> do
             _ <- tcpLogin admin "admin" "s3cret"
@@ -139,7 +261,7 @@ identitySpec = describe "unified identities" $ do
             other <- tcpQuery h "create role alice"
             asText (at "code" other) `shouldBe` "conflict"
             shown <- tcpQuery h "show roles"
-            map asText (items (at "columns" shown)) `shouldBe` ["id", "name", "can_login", "is_superuser", "enabled", "system_catalog_manager", "created_at"]
+            map asText (items (at "columns" shown)) `shouldBe` ["id", "name", "can_login", "is_superuser", "enabled", "system_catalog_manager", "allow_sudo_auth", "created_at"]
             asInt (at "rowCount" shown) `shouldBe` 3
             reader <- tcpQuery h "alter role reader login nologin"
             asText (at "code" reader) `shouldBe` "bad_request"
@@ -697,7 +819,7 @@ tcpServerSpec = do
 
 -- | 一个普通账号
 testAccount :: Account
-testAccount = Account 0 "alice" "" 0 "" Nothing True False True False
+testAccount = Account 0 "alice" "" 0 "" Nothing True False True False False
 
 -- | 权限用例传的当前库名
 testDatabase :: Text
@@ -707,7 +829,10 @@ testDatabase = T.pack testDatabaseName
 withPrivileges :: (Privileges -> Principal -> IO a) -> IO a
 withPrivileges body = do
     db <- newMVar testDb
-    service <- newPrivileges (memoryBackend testDatabaseName db)
+    let backend = memoryBackend testDatabaseName db
+    _ <- beAccounts backend (ReqAccountCreate "alice" "hash")
+    _ <- beAccounts backend (ReqAccountCreate "bob" "hash")
+    service <- newPrivileges backend
     body service (Root testRootName)
 
 -- | 解析一条 SQL，失败就丢掉用例
@@ -747,7 +872,7 @@ privilegeSpec = describe "server privileges" $ do
         views <- listRoleViews service
         fmap (concatMap (map grantPrivilege) . map roleGrants) views
             `shouldBe` Right ["select", "insert", "update", "delete"]
-        fmap (concatMap (map grantObject) . map roleGrants) views `shouldBe` Right (replicate 4 "*")
+        fmap (concatMap (map grantObject) . map roleGrants) views `shouldBe` Right (replicate 4 "test.*")
 
     it "revokes a privilege again" $ withPrivileges $ \service root -> do
         _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
@@ -919,12 +1044,12 @@ privilegeSpec = describe "server privileges" $ do
         _ <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "inner" ["reader"])
         _ <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "reader" ["alice"])
         directly <- affectedAccounts service (RevokeRoleCommand "inner" ["bob"])
-        directly `shouldMatchList` ["bob"]
+        fmap sort directly `shouldBe` Right ["bob"]
         granted <- affectedAccounts service (GrantRoleCommand "writer" ["inner"])
-        granted `shouldMatchList` ["inner", "reader", "alice"]
+        fmap sort granted `shouldBe` Right (sort ["inner", "reader", "alice"])
         dropped <- affectedAccounts service (DropRoleCommand "inner")
-        dropped `shouldMatchList` ["inner", "reader", "alice"]
-        affectedAccounts service (CreateRoleCommand "other") `shouldReturn` []
+        fmap sort dropped `shouldBe` Right (sort ["inner", "reader", "alice"])
+        affectedAccounts service (CreateRoleCommand "other") `shouldReturn` Right []
 
     it "keeps the role tables on the real storage" $ withIpcStorage $ do
         base <- ipcBackend
@@ -944,6 +1069,7 @@ privilegeSpec = describe "server privileges" $ do
 
     it "inherits a role on the real storage" $ withIpcStorage $ do
         base <- ipcBackend
+        seedPrivilegeObjects base
         service <- newPrivileges base
         _ <- runPrivilegeCommand service (Root testRootName) testDatabase (CreateRoleCommand "reader")
         _ <- runPrivilegeCommand service (Root testRootName) testDatabase (CreateRoleCommand "writer")
@@ -955,6 +1081,7 @@ privilegeSpec = describe "server privileges" $ do
 
     it "keeps a grant option on the real storage" $ withIpcStorage $ do
         base <- ipcBackend
+        seedPrivilegeObjects base
         service <- newPrivileges base
         _ <- runPrivilegeCommand service (Root testRootName) testDatabase (CreateRoleCommand "reader")
         _ <- runPrivilegeCommand service (Root testRootName) testDatabase (CreateRoleCommand "writer")
@@ -968,6 +1095,239 @@ privilegeSpec = describe "server privileges" $ do
         fmap (map roleGrants) after `shouldBe` Right [[Grant "reader" "select" "test.users" True], [Grant "writer" "select" "test.users" False]]
 
 -- 真存储夹具：一个用例一份数据目录，跑完关链路删干净
+-- 创建独立的对象授权内存夹具。
+withObjectPrivileges :: (Backend -> Privileges -> Principal -> IO ()) -> IO ()
+withObjectPrivileges body = do
+    db <- newMVar testDb
+    let backend = memoryBackend testDatabaseName db
+    mapM_ (\name -> beAccounts backend (ReqAccountCreate name "hash") >>= either (fail . show) (const (pure ()))) ["alice", "bob", "carol"]
+    service <- newPrivileges backend
+    body backend service (Root testRootName)
+
+-- 验证对象作用域、授权来源和外部入口。
+objectPrivilegeSpec :: Spec
+objectPrivilegeSpec = describe "stable object privileges" $ do
+    it "migrates old table grants once and ignores later legacy writes" $ withObjectPrivileges $ \backend service _ -> do
+        let system = beWithDatabase backend "system"
+        mustRun (beStatement system "CREATE TABLE __system_grants (role VARCHAR(64), privilege VARCHAR(16), object VARCHAR(128))")
+        mustRun (beStatement system "INSERT INTO __system_grants (role, privilege, object) VALUES ('alice', 'select', 'test.users')")
+        authorizeSql service (Ordinary testAccount) "SELECT * FROM users" `shouldReturn` Right ()
+        mustRun (beStatement system "INSERT INTO __system_grants (role, privilege, object) VALUES ('bob', 'select', 'test.users')")
+        authorizeSql service (Ordinary testAccount{accountUser = "bob"}) "SELECT * FROM users" `shouldReturn` Left (PrivilegeError "forbidden" "permission denied: SELECT ON users")
+    it "recovers a durable creator intent after table creation and cancels absent objects" $ withIpcStorage $ do
+        backend <- ipcBackend
+        seedPrivilegeObjects backend
+        service <- newPrivileges backend
+        prepareObject service (Ordinary testAccount) "test" "recovered_owned" `shouldReturn` Right ()
+        mustRun (beStatement (beWithDatabase backend "test") "CREATE TABLE recovered_owned (id INT)")
+        closeConnection
+        dir <- ipcDataDir
+        opened <- localStorageLink (Just (dir ++ ".toml"))
+        link <- either fail pure opened
+        setStorageLink link
+        fresh <- ipcBackend >>= newPrivileges
+        authorizeSql fresh (Ordinary testAccount) "SELECT * FROM recovered_owned" `shouldReturn` Right ()
+        prepareObject fresh (Ordinary testAccount) "test" "never_created" `shouldReturn` Right ()
+        authorizeSql fresh (Ordinary testAccount) "SELECT * FROM recovered_owned" `shouldReturn` Right ()
+        mustRun (beStatement (beWithDatabase backend "test") "CREATE TABLE never_created (id INT)")
+        authorizeSql fresh (Ordinary testAccount) "SELECT * FROM never_created" `shouldReturn` Left (PrivilegeError "forbidden" "permission denied: SELECT ON never_created")
+    it "holds authorization through a concurrent query and orders revocation after it" $ withObjectPrivileges $ \backend service root -> do
+        runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "alice" False) `shouldReturn` Right ()
+        _ <- beAccounts backend (ReqAccountCreate testRootName (testPasswordHash testRootPassword))
+        _ <- beAccounts backend (ReqIdentityAlter testRootName Nothing (Just True) Nothing Nothing Nothing)
+        _ <- beAccounts backend (ReqAccountReset "alice" (testPasswordHash "Alice-Secret-1234"))
+        started <- newEmptyMVar
+        release <- newEmptyMVar
+        finished <- newEmptyMVar
+        revoked <- newEmptyMVar
+        let slow = backend{beWithDatabase = \name -> (beWithDatabase backend name){beStatement = \sql -> do
+                if sql == "SELECT * FROM users" then putMVar started () >> takeMVar release else pure ()
+                beStatement (beWithDatabase backend name) sql}}
+        settings <- tempSettingsPath "permission-race"
+        reader <- newSession slow testRootName settings
+        admin <- newSession backend testRootName settings
+        authenticateSessionCoded reader "alice" "Alice-Secret-1234" `shouldReturn` Right ()
+        authenticateSessionCoded admin testRootName testRootPassword `shouldReturn` Right ()
+        _ <- mustSql reader "USE test"
+        _ <- mustSql admin "USE test"
+        _ <- forkIO (runStatementCoded reader "SELECT * FROM users" >>= putMVar finished)
+        takeMVar started
+        _ <- forkIO (runStatementCoded admin "REVOKE SELECT ON users FROM alice" >>= putMVar revoked)
+        blocked <- timeout 100000 (takeMVar revoked)
+        case blocked of Nothing -> pure (); Just _ -> expectationFailure "revocation raced past an authorized query"
+        putMVar release ()
+        takeMVar finished >>= either (expectationFailure . show) (const (pure ()))
+        takeMVar revoked >>= either (expectationFailure . show) (const (pure ()))
+        result <- runStatementCoded reader "SELECT * FROM users"
+        case result of Left err -> sessCode err `shouldBe` "forbidden"; Right _ -> expectationFailure "revoked privilege remained active"
+    it "requires existing objects and validates database privilege scope" $ withObjectPrivileges $ \_ service root -> do
+        runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "missing" "alice" False)
+            `shouldReturn` Left (PrivilegeError "not_found" "unknown table")
+        runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "database:test" "alice" False)
+            `shouldReturn` Left (PrivilegeError "bad_request" "invalid privilege for object scope")
+    it "applies PUBLIC CONNECT defaults and explicit inherited connections" $ withObjectPrivileges $ \_ service root -> do
+        authorizeConnect service (Ordinary testAccount) "test" `shouldReturn` Right ()
+        runPrivilegeCommand service root "" (RevokePrivilegesCommand ["connect"] "database:test" "public") `shouldReturn` Right ()
+        authorizeConnect service (Ordinary testAccount) "test" `shouldReturn` Left (PrivilegeError "forbidden" "permission denied: CONNECT ON database:test")
+        runPrivilegeCommand service root "" (CreateRoleCommand "connector") `shouldReturn` Right ()
+        runPrivilegeCommand service root "" (GrantPrivilegesCommand ["connect"] "database:test" "connector" False) `shouldReturn` Right ()
+        runPrivilegeCommand service root "" (GrantRoleCommand "connector" ["alice"]) `shouldReturn` Right ()
+        authorizeConnect service (Ordinary testAccount) "test" `shouldReturn` Right ()
+        runPrivilegeCommand service root "" (GrantPrivilegesCommand ["connect"] "database:test" "public" False) `shouldReturn` Right ()
+    it "grants CREATE without granting existing table access" $ withObjectPrivileges $ \_ service root -> do
+        runPrivilegeCommand service root "" (GrantPrivilegesCommand ["create"] "database:test" "alice" False) `shouldReturn` Right ()
+        authorizeSql service (Ordinary testAccount) "CREATE TABLE owned (id INT)" `shouldReturn` Right ()
+        authorizeSql service (Ordinary testAccount) "SELECT * FROM users" `shouldReturn` Left (PrivilegeError "forbidden" "permission denied: SELECT ON users")
+    it "gives table owners management and delegation without giving database management" $ withObjectPrivileges $ \_ service root -> do
+        claimObject service (Ordinary testAccount) testDatabase "users" `shouldReturn` Right ()
+        authorizeSql service (Ordinary testAccount) "DROP TABLE users" `shouldReturn` Right ()
+        authorizeSql service (Ordinary testAccount) "INSERT INTO users (id) VALUES (10)" `shouldReturn` Right ()
+        runPrivilegeCommand service (Ordinary testAccount) testDatabase (GrantPrivilegesCommand ["select"] "users" "bob" False) `shouldReturn` Right ()
+        authorizeSql service (Ordinary testAccount) "DROP DATABASE test" `shouldReturn` Left (PrivilegeError "forbidden" "object owner required")
+        runPrivilegeCommand service root testDatabase (RevokePrivilegesCommand ["select"] "users" "alice") `shouldReturn` Right ()
+        authorizeSql service (Ordinary testAccount) "SELECT * FROM users" `shouldReturn` Right ()
+    it "cascades multihop delegations after the source grant is revoked" $ withObjectPrivileges $ \_ service root -> do
+        runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "alice" True) `shouldReturn` Right ()
+        runPrivilegeCommand service (Ordinary testAccount) testDatabase (GrantPrivilegesCommand ["select"] "users" "bob" True) `shouldReturn` Right ()
+        let bob = Ordinary testAccount{accountUser = "bob"}
+        runPrivilegeCommand service bob testDatabase (GrantPrivilegesCommand ["select"] "users" "carol" False) `shouldReturn` Right ()
+        affectedAccounts service (RevokePrivilegesCommand ["select"] "users" "alice") `shouldReturn` Right ["alice", "bob", "carol"]
+        runPrivilegeCommand service root testDatabase (RevokePrivilegesCommand ["select"] "users" "alice") `shouldReturn` Right ()
+        authorizeSql service (Ordinary testAccount{accountUser = "carol"}) "SELECT * FROM users"
+            `shouldReturn` Left (PrivilegeError "forbidden" "permission denied: SELECT ON users")
+    it "keeps an independent source when another delegation chain is revoked" $ withObjectPrivileges $ \_ service root -> do
+        runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "alice" True) `shouldReturn` Right ()
+        runPrivilegeCommand service (Ordinary testAccount) testDatabase (GrantPrivilegesCommand ["select"] "users" "bob" False) `shouldReturn` Right ()
+        runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "bob" False) `shouldReturn` Right ()
+        runPrivilegeCommand service root testDatabase (RevokePrivilegesCommand ["select"] "users" "alice") `shouldReturn` Right ()
+        authorizeSql service (Ordinary testAccount{accountUser = "bob"}) "SELECT * FROM users" `shouldReturn` Right ()
+    it "removes delegations whose grantor loses an inherited source" $ withObjectPrivileges $ \_ service root -> do
+        runPrivilegeCommand service root testDatabase (CreateRoleCommand "delegator") `shouldReturn` Right ()
+        runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "delegator" True) `shouldReturn` Right ()
+        runPrivilegeCommand service root testDatabase (GrantRoleCommand "delegator" ["alice"]) `shouldReturn` Right ()
+        runPrivilegeCommand service (Ordinary testAccount) testDatabase (GrantPrivilegesCommand ["select"] "users" "bob" False) `shouldReturn` Right ()
+        runPrivilegeCommand service root testDatabase (RevokeRoleCommand "delegator" ["alice"]) `shouldReturn` Right ()
+        authorizeSql service (Ordinary testAccount{accountUser = "bob"}) "SELECT * FROM users" `shouldReturn` Left (PrivilegeError "forbidden" "permission denied: SELECT ON users")
+    it "does not preserve circular delegation after its last independent root is revoked" $ withObjectPrivileges $ \_ service root -> do
+        runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "alice" True) `shouldReturn` Right ()
+        runPrivilegeCommand service (Ordinary testAccount) testDatabase (GrantPrivilegesCommand ["select"] "users" "bob" True) `shouldReturn` Right ()
+        runPrivilegeCommand service (Ordinary testAccount{accountUser = "bob"}) testDatabase (GrantPrivilegesCommand ["select"] "users" "alice" True) `shouldReturn` Right ()
+        runPrivilegeCommand service root testDatabase (RevokePrivilegesCommand ["select"] "users" "alice") `shouldReturn` Right ()
+        authorizeSql service (Ordinary testAccount{accountUser = "bob"}) "SELECT * FROM users" `shouldReturn` Left (PrivilegeError "forbidden" "permission denied: SELECT ON users")
+    it "never transfers a dropped table's grant to a same-name replacement" $ withObjectPrivileges $ \backend service root -> do
+        runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "alice" False) `shouldReturn` Right ()
+        mustRun (beStatement backend "DROP TABLE users")
+        mustRun (beStatement backend "CREATE TABLE users (id INT)")
+        authorizeSql service (Ordinary testAccount) "SELECT * FROM users" `shouldReturn` Left (PrivilegeError "forbidden" "permission denied: SELECT ON users")
+    it "does not let disabled grantors keep downstream grants alive" $ withObjectPrivileges $ \backend service root -> do
+        runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "alice" True) `shouldReturn` Right ()
+        runPrivilegeCommand service (Ordinary testAccount) testDatabase (GrantPrivilegesCommand ["select"] "users" "bob" False) `shouldReturn` Right ()
+        changed <- beAccounts backend (ReqIdentityAlter "alice" Nothing Nothing (Just False) Nothing Nothing)
+        either expectationFailure (const (pure ())) changed
+        authorizeSql service (Ordinary testAccount{accountUser = "bob"}) "SELECT * FROM users" `shouldReturn` Left (PrivilegeError "forbidden" "permission denied: SELECT ON users")
+    it "preserves dormant direct grants and ownership across unrelated ACL writes" $ withObjectPrivileges $ \backend service root -> do
+        runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "alice" False) `shouldReturn` Right ()
+        mustRun (beStatement backend "CREATE TABLE owned (id INT)")
+        claimObject service (Ordinary testAccount) testDatabase "owned" `shouldReturn` Right ()
+        changed <- beAccounts backend (ReqIdentityAlter "alice" Nothing Nothing (Just False) Nothing Nothing)
+        either expectationFailure (const (pure ())) changed
+        runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "bob" False) `shouldReturn` Right ()
+        enabled <- beAccounts backend (ReqIdentityAlter "alice" Nothing Nothing (Just True) Nothing Nothing)
+        either expectationFailure (const (pure ())) enabled
+        authorizeSql service (Ordinary testAccount) "SELECT * FROM users" `shouldReturn` Right ()
+        authorizeSql service (Ordinary testAccount) "DROP TABLE owned" `shouldReturn` Right ()
+    it "keeps same-name tables in separate database scopes and persists the ACL" $ withIpcStorage $ do
+        backend <- ipcBackend
+        seedPrivilegeObjects backend
+        mustRun (beStatement backend "CREATE DATABASE other")
+        mustRun (beStatement (beWithDatabase backend "other") "CREATE TABLE users (id INT)")
+        service <- newPrivileges backend
+        runPrivilegeCommand service (Root testRootName) "test" (GrantPrivilegesCommand ["select"] "users" "alice" False) `shouldReturn` Right ()
+        statement <- parseOrFail "SELECT * FROM users"
+        authorize service (Ordinary testAccount) "other" statement `shouldReturn` Left (PrivilegeError "forbidden" "permission denied: SELECT ON users")
+        closeConnection
+        dir <- ipcDataDir
+        opened <- localStorageLink (Just (dir ++ ".toml"))
+        link <- either fail pure opened
+        setStorageLink link
+        fresh <- ipcBackend >>= newPrivileges
+        authorize fresh (Ordinary testAccount) "test" statement `shouldReturn` Right ()
+        authorize fresh (Ordinary testAccount) "other" statement `shouldReturn` Left (PrivilegeError "forbidden" "permission denied: SELECT ON users")
+    it "checks CONNECT and CREATE through TCP and assigns ownership to the creator" $
+        withTcpServer defaultServerConfig $ \_ handle -> withConnection handle $ \admin -> do
+            _ <- tcpLogin admin "admin" "s3cret"
+            _ <- tcpQuery admin "CREATE USER object_owner IDENTIFIED BY 'Owner-Secret-1234'"
+            tcpQuery admin "REVOKE CONNECT ON DATABASE test FROM PUBLIC" >>= \reply -> at "status" reply `shouldBe` A.String "result"
+            withConnection handle $ \client -> do
+                _ <- tcpLogin client "object_owner" "Owner-Secret-1234"
+                tcpQuery client "USE test" >>= \reply -> at "code" reply `shouldBe` A.String "forbidden"
+            _ <- tcpQuery admin "GRANT CONNECT, CREATE ON DATABASE test TO object_owner"
+            withConnection handle $ \client -> do
+                _ <- tcpLogin client "object_owner" "Owner-Secret-1234"
+                tcpQuery client "USE test" >>= \reply -> at "status" reply `shouldBe` A.String "result"
+                tcpQuery client "CREATE TABLE owned_probe (id INT)" >>= \reply -> at "status" reply `shouldBe` A.String "result"
+                tcpQuery client "INSERT INTO owned_probe (id) VALUES (1)" >>= \reply -> at "status" reply `shouldBe` A.String "result"
+                tcpQuery client "SELECT * FROM users" >>= \reply -> at "code" reply `shouldBe` A.String "forbidden"
+                tcpTalk client "{\"method\":\"storage\",\"request\":{\"method\":\"scan\",\"database\":\"test\",\"table\":\"users\"}}" >>= \reply -> at "code" reply `shouldBe` A.String "forbidden"
+    it "disconnects downstream TCP grantees and protects staged commits after revocation" $
+        withTcpServer defaultServerConfig $ \_ handle -> withConnection handle $ \admin -> do
+            _ <- tcpLogin admin "admin" "s3cret"
+            _ <- tcpQuery admin "USE test"
+            _ <- tcpQuery admin "CREATE USER source_user IDENTIFIED BY 'Source-Secret-1234'"
+            _ <- tcpQuery admin "CREATE USER target_user IDENTIFIED BY 'Target-Secret-1234'"
+            _ <- tcpQuery admin "GRANT SELECT, UPDATE ON users TO source_user WITH GRANT OPTION"
+            withConnection handle $ \source -> do
+                _ <- tcpLogin source "source_user" "Source-Secret-1234"
+                _ <- tcpQuery source "USE test"
+                _ <- tcpQuery source "GRANT SELECT, UPDATE ON users TO target_user"
+                withConnection handle $ \target -> do
+                    _ <- tcpLogin target "target_user" "Target-Secret-1234"
+                    _ <- tcpQuery target "USE test"
+                    _ <- tcpQuery target "BEGIN"
+                    _ <- tcpQuery target "UPDATE users SET age = 90 WHERE id = 1"
+                    _ <- tcpQuery admin "REVOKE UPDATE ON users FROM source_user"
+                    tcpQuery target "COMMIT" >>= \reply -> at "code" reply `shouldBe` A.String "unauthorized"
+                    tcpClosed target
+                    reply <- tcpQuery admin "SELECT age FROM users WHERE id = 1"
+                    map items (items (at "rows" reply)) `shouldBe` [[A.Number 21]]
+    it "rejects a stale local transaction after a granted object is replaced" $ withObjectPrivileges $ \backend service root -> do
+        runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["all"] "users" "alice" False) `shouldReturn` Right ()
+        _ <- beAccounts backend (ReqAccountReset "alice" (testPasswordHash "Alice-Secret-1234"))
+        settings <- tempSettingsPath "object-transaction"
+        _ <- beAccounts backend (ReqAccountCreate testRootName (testPasswordHash testRootPassword))
+        _ <- beAccounts backend (ReqIdentityAlter testRootName Nothing (Just True) Nothing Nothing Nothing)
+        session <- newSession backend testRootName settings
+        authenticateSessionCoded session "alice" "Alice-Secret-1234" `shouldReturn` Right ()
+        _ <- mustSql session "USE test"
+        _ <- mustSql session "BEGIN"
+        _ <- mustSql session "UPDATE users SET age = 90 WHERE id = 1"
+        mustRun (beStatement backend "DROP TABLE users")
+        mustRun (beStatement backend "CREATE TABLE users (id INT, name VARCHAR(32), age INT)")
+        result <- runStatementCoded session "COMMIT"
+        case result of Left err -> sessCode err `shouldBe` "forbidden"; Right _ -> expectationFailure "stale transaction committed"
+    it "checks the current administrator identity before executing a raw storage request" $ withObjectPrivileges $ \backend _ _ -> do
+        _ <- beAccounts backend (ReqAccountCreate testRootName (testPasswordHash testRootPassword))
+        _ <- beAccounts backend (ReqIdentityAlter testRootName Nothing (Just True) Nothing Nothing Nothing)
+        _ <- beAccounts backend (ReqAccountCreate "spare_admin" "hash")
+        _ <- beAccounts backend (ReqIdentityAlter "spare_admin" Nothing (Just True) Nothing Nothing Nothing)
+        executed <- newIORef False
+        let guarded = backend{beStorage = \_ -> writeIORef executed True >> pure (Right A.Null)}
+        settings <- tempSettingsPath "raw-storage-identity"
+        session <- newSession guarded testRootName settings
+        authenticateSessionCoded session testRootName testRootPassword `shouldReturn` Right ()
+        changed <- beAccounts backend (ReqIdentityAlter testRootName Nothing (Just False) Nothing Nothing Nothing)
+        either expectationFailure (const (pure ())) changed
+        result <- runStorageCoded session (A.object ["method" A..= ("ping" :: Text)])
+        case result of Left err -> sessCode err `shouldBe` "unauthorized"; Right _ -> expectationFailure "stale administrator executed storage request"
+        readIORef executed `shouldReturn` False
+
+-- 为权限测试创建真实对象和登录身份。
+seedPrivilegeObjects :: Backend -> IO ()
+seedPrivilegeObjects backend = do
+    mustRun (beStatement backend "CREATE DATABASE test")
+    mustRun (beStatement (beWithDatabase backend "test") "CREATE TABLE users (id INT)")
+    result <- beAccounts backend (ReqAccountCreate "alice" "hash")
+    case result of Left err -> expectationFailure err; Right _ -> pure ()
 
 -- | 本次用例的数据目录（用例串行跑，固定名够用）
 ipcDataDir :: IO FilePath
@@ -1058,6 +1418,27 @@ intValues rows = [n | row <- rows, Just (VInt n) <- [nth 0 row]]
 -- | 显式事务用例
 transactionSpec :: Spec
 transactionSpec = describe "server transactions" $ do
+    it "preserves concurrent changes in a large untouched table" $ withTwoSessions $ \first second -> do
+        _ <- mustSql first "CREATE TABLE untouched (id INT, value INT)"
+        let values = T.intercalate "," [T.pack ("(" ++ show key ++ ",0)") | key <- [1 .. 5000 :: Int]]
+        _ <- mustSql first ("INSERT INTO untouched (id,value) VALUES " <> values)
+        _ <- mustSql first "BEGIN"
+        _ <- mustSql first "UPDATE users SET age = 77 WHERE id = 1"
+        _ <- mustSql second "UPDATE untouched SET value = 9 WHERE id = 5000"
+        _ <- mustSql first "COMMIT"
+        sessionAge first 1 `shouldReturn` Just 77
+        result <- mustSql first "SELECT value FROM untouched WHERE id = 5000"
+        qrRows result `shouldBe` [[VInt 9]]
+
+    it "preserves staged row order for unsorted integer ids" $ withMemorySession $ \session -> do
+        _ <- mustSql session "CREATE TABLE keys (id INT, value INT)"
+        _ <- mustSql session "INSERT INTO keys (id,value) VALUES (7,0),(-3,0),(4,0)"
+        _ <- mustSql session "BEGIN"
+        _ <- mustSql session "UPDATE keys SET value = 1"
+        _ <- mustSql session "COMMIT"
+        result <- mustSql session "SELECT id FROM keys"
+        qrRows result `shouldBe` [[VInt 7], [VInt (-3)], [VInt 4]]
+
     it "filters qualified memory tables and preserves other databases on writes" $ do
         let local = Table "users" [("id", TInt)] [[("id", VInt 1)]] Nothing
             otherTable = Table "users" [("id", TInt)] [[("id", VInt 2)]] Nothing
@@ -1504,3 +1885,46 @@ ipcConcurrencySpec = describe "server backend on the real storage" $ do
         intColumn "id" rows `shouldBe` [1]
         intColumn "age" rows `shouldBe` [31]
 
+
+-- 判断明确错误返回。
+isLeftResult :: Either a b -> Bool
+isLeftResult (Left _) = True
+isLeftResult _ = False
+
+-- 启动带独立本机认证凭据的测试会话。
+withTestSudo :: (ServerEnv -> ServerHandle -> SudoCredential -> IO a) -> IO a
+withTestSudo body = withTcpServer defaultServerConfig $ \env handle -> do
+    credential <- newSudoCredential
+    withConnection handle $ \admin -> do
+        _ <- tcpLogin admin testRootName testRootPassword
+        created <- tcpQuery admin "create user local_user identified by 'Local-Pass123!'"
+        at "status" created `shouldBe` A.String "result"
+        enabled <- tcpQuery admin "alter user local_user allow_sudo_auth"
+        at "status" enabled `shouldBe` A.String "result"
+    modifyMVar_ (srvSudo env) (const (pure (Just (0, "local_user", credential))))
+    body env handle credential `finally` modifyMVar_ (srvSudo env) (const (pure Nothing))
+
+-- 交换本机挑战并提交账号绑定证明。
+tcpSudo :: Handle -> SudoCredential -> Text -> IO A.Value
+tcpSudo client credential user = do
+    challenge <- tcpTalk client "{\"method\":\"sudo_challenge\"}"
+    tcpSudoProof client user (sudoProof credential (asText (at "challenge" challenge)) user)
+
+-- 发送本机认证证明。
+tcpSudoProof :: Handle -> Text -> Text -> IO A.Value
+tcpSudoProof client user proof = tcpTalk client (BL.toStrict (A.encode (A.object
+    ["method" A..= ("sudo_login" :: Text), "user" A..= user, "proof" A..= proof])))
+
+-- 验证身份禁用或取消登录后拒绝本机认证。
+checkSudoDisabled :: Handle -> ServerHandle -> SudoCredential -> Text -> IO ()
+checkSudoDisabled admin handle credential sql = do
+    changed <- tcpQuery admin sql
+    at "status" changed `shouldBe` A.String "result"
+    withConnection handle $ \client -> do
+        denied <- tcpSudo client credential "local_user"
+        at "code" denied `shouldBe` A.String "unauthorized"
+
+-- 判断明确成功返回。
+isRightResult :: Either a b -> Bool
+isRightResult (Right _) = True
+isRightResult _ = False

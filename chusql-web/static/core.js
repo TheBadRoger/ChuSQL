@@ -23,6 +23,8 @@ export const accountsTable = '__system_users';
 // 值转 SQL 字面量（字符串加引号转义）。
 export function sqlLiteral(value) {
   if (value === null || value === undefined) return 'NULL';
+  const runtime = runtimeEnvelope(value);
+  if (runtime) return runtimeValueText(runtime[1], runtime[2], true);
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
   return `'${String(value).replaceAll("'", "''")}'`;
 }
@@ -235,6 +237,11 @@ export function isBooleanType(type) {
 
 // 类型的显示名。
 export function typeLabel(type) {
+  if (String(type).startsWith('runtime(') && String(type).endsWith(')')) {
+    const envelope = JSON.parse(String(type).slice(8, -1));
+    if (!Array.isArray(envelope) || envelope.length !== 2 || envelope[0] !== 1) throw new Error('Unsupported runtime type encoding');
+    return runtimeTypeText(envelope[1]);
+  }
   const kind = columnKind(type);
   const label = typeLabels[kind];
   const args = String(type).includes('(') ? String(type).slice(String(type).indexOf('(')) : '';
@@ -247,6 +254,8 @@ export function typeLabel(type) {
 // 单元格显示文本（空值用占位文本）。
 export function cellText(value, nullText) {
   if (value === null || value === undefined) return nullText;
+  const runtime = runtimeEnvelope(value);
+  if (runtime) return runtimeValueText(runtime[1], runtime[2], false);
   if (typeof value === 'boolean') return value ? 'true' : 'false';
   return String(value);
 }
@@ -254,7 +263,58 @@ export function cellText(value, nullText) {
 // 编辑框里回填的文本（null 给空串）。
 export function editText(value) {
   if (value === null || value === undefined) return '';
+  const runtime = runtimeEnvelope(value);
+  if (runtime && runtime[1][0] <= 4) return String(runtime[2]);
+  if (runtime) return runtimeValueText(runtime[1], runtime[2], false);
   return String(value);
+}
+
+// 读取版本化运行时值封装。
+function runtimeEnvelope(value) {
+  if (!value || typeof value !== 'object' || !Object.hasOwn(value, '__chusql_runtime_v1')) return null;
+  const envelope = value.__chusql_runtime_v1;
+  if (!Array.isArray(envelope) || envelope.length !== 3 || envelope[0] !== 1) throw new Error('Unsupported runtime value encoding');
+  return envelope;
+}
+
+// 渲染运行时类型的 SQL 语法。
+function runtimeTypeText(type) {
+  if (!Array.isArray(type) || type.length !== 2 || !Array.isArray(type[1])) throw new Error('Invalid runtime type identity');
+  const [id, args] = type;
+  if (!Number.isInteger(id)) throw new Error('Invalid runtime constructor identity');
+  if (id >= 1 && id <= 4 && args.length === 0) return ['Int', 'Double', 'Bool', 'String'][id - 1];
+  if (id === 5 && args.length === 1) return `[${runtimeTypeText(args[0])}]`;
+  if (id === 6 && args.length === 1) return `Maybe ${runtimeTypeText(args[0])}`;
+  if (id === 7) return `(${args.map(runtimeTypeText).join(', ')})`;
+  throw new Error('Unknown runtime type identity');
+}
+
+// 渲染复合值或对应的 SQL 构造器。
+function runtimeValueText(type, value, sql) {
+  runtimeTypeText(type);
+  const [id, args] = type;
+  if (id === 1 || id === 2) {
+    if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error('Invalid runtime numeric value');
+    if (id === 1 && !Number.isInteger(value)) throw new Error('Invalid runtime integer value');
+    const text = String(value);
+    return sql && id === 2 && !/[.eE]/.test(text) ? `${text}.0` : text;
+  }
+  if (id === 3 && typeof value === 'boolean') return sql ? (value ? 'TRUE' : 'FALSE') : String(value);
+  if (id === 4 && typeof value === 'string') return sql ? sqlLiteral(value) : JSON.stringify(value);
+  if (!Array.isArray(value)) throw new Error('Invalid runtime compound value');
+  if (id === 5) {
+    const items = value.map((item) => runtimeValueText(args[0], item, sql)).join(', ');
+    return sql ? `LIST<${runtimeTypeText(args[0])}>(${items})` : `[${items}]`;
+  }
+  if (id === 6 && value.length <= 1) {
+    const item = value.length ? runtimeValueText(args[0], value[0], sql) : '';
+    return sql ? `MAYBE<${runtimeTypeText(args[0])}>(${item})` : (value.length ? `Just (${item})` : 'Nothing');
+  }
+  if (id === 7 && value.length === args.length) {
+    const items = value.map((item, index) => runtimeValueText(args[index], item, sql)).join(', ');
+    return sql ? `TUPLE<${args.map(runtimeTypeText).join(', ')}>(${items})` : `(${items})`;
+  }
+  throw new Error('Runtime value type mismatch');
 }
 
 // 编辑框文本转提交值（空串当 null）。

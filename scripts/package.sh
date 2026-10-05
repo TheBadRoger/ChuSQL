@@ -122,7 +122,7 @@ verify_package() {
         if ! ( cd "$vtmp/pkg" && HOME="$vtmp/home" CHUSQL_ADMIN_PASSWORD='verify-package' \
                 sh install.sh --component "$comp" \
                 --install-dir "$vtmp/opt" --data-dir "$vtmp/data" --user root \
-                --no-start ) \
+                --no-start --no-service ) \
                 >"$vtmp/log" 2>&1; then
             sed -n '1,120p' "$vtmp/log" >&2
             rm -rf "$vtmp"

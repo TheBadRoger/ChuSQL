@@ -25,6 +25,8 @@ pub struct Account {
     pub is_superuser: bool,
     #[serde(default)]
     pub system_catalog_manager: bool,
+    #[serde(default)]
+    pub allow_sudo_auth: bool,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
@@ -96,7 +98,7 @@ pub enum Request {
     AccountsList,
     IdentityInitialize { administrator: String },
     RoleCreate { user: String },
-    IdentityAlter { user: String, can_login: Option<bool>, is_superuser: Option<bool>, enabled: Option<bool>, system_catalog_manager: Option<bool> },
+    IdentityAlter { user: String, can_login: Option<bool>, is_superuser: Option<bool>, enabled: Option<bool>, system_catalog_manager: Option<bool>, allow_sudo_auth: Option<bool> },
     AccountCreate { user: String, password_hash: String },
     AccountReset { user: String, password_hash: String },
     AccountLogin {
@@ -305,11 +307,16 @@ pub enum Response {
     },
     Error { message: String },
     Catalog { schemas: Vec<TableSchemaWire> },
+    Object { database_id: u64, object_id: Option<u64> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableSchemaWire {
     pub table: String,
+    #[serde(default)]
+    pub database_id: u64,
+    #[serde(default)]
+    pub object_id: u64,
     pub columns: Vec<SchemaColumn>,
     #[serde(default)]
     pub row_count: u64,
