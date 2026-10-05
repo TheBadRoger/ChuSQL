@@ -33,6 +33,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  validate:
+    uses: ./.github/workflows/linux.yml
+    with:
+      phase: release
+
   build:
     name: ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
@@ -133,7 +138,7 @@ jobs:
 
   publish:
     name: publish release
-    needs: build
+    needs: [build, validate]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

@@ -203,8 +203,7 @@ gateSpec = do
             -- 仓库里没有 rustfmt.toml，历史代码不是按当前 rustfmt 排的：格式化不是门禁
             pipeline `shouldSatisfy` (not . T.isInfixOf "cargo fmt")
         -- 装的人不该被要求装两个工具链：发版流水线出预编译包，install.sh 按同一套平台标签去取。
-        -- 流水线里装配与打归档是直接写的（两个平台各一段）；本机要打同一个包用 scripts/ 下的
-        -- package.sh 与它的 PowerShell 版，两边的布局必须一致。
+        -- 发布流水线调用共享打包脚本，校验归档及安装结果。
         it "the release pipeline publishes one archive per platform, tagged the way install.sh looks it up" $ do
             release <- readUtf8 (".." </> ".github" </> "workflows" </> "release.yml")
             release `shouldSatisfy` T.isInfixOf "linux-x86_64"
@@ -214,17 +213,18 @@ gateSpec = do
             release `shouldSatisfy` T.isInfixOf "cargo build --release"
             release `shouldSatisfy` T.isInfixOf "stack build --fast chusql-web:exe:chusql-web"
             release `shouldSatisfy` T.isInfixOf "stack build --fast chusql-cli:exe:csql"
-            release `shouldSatisfy` T.isInfixOf "tar -czf"
-            release `shouldSatisfy` T.isInfixOf "Compress-Archive"
+            release `shouldSatisfy` T.isInfixOf "sh scripts/package.sh"
+            release `shouldSatisfy` T.isInfixOf "./scripts/package.ps1"
+            release `shouldSatisfy` (not . T.isInfixOf "--no-verify")
+            release `shouldSatisfy` (not . T.isInfixOf "-NoVerify")
             release `shouldSatisfy` T.isInfixOf "scripts/install.sh"
-            release `shouldSatisfy` (not . T.isInfixOf "package.ps1")
             release `shouldSatisfy` T.isInfixOf "sha256"
             release `shouldSatisfy` T.isInfixOf "gh release upload"
             -- 四个平台各一个包，名字里没有组件那一层：一个包里 web 与 cli 都有；
             -- 矩阵里也不该再出现 web / cli 这一维（那样又会产出两个按组件命名的资产）
             release `shouldSatisfy` T.isInfixOf "name: ${{ matrix.platform }}"
-            release `shouldSatisfy` T.isInfixOf "name=\"chusql-${{ matrix.platform }}\""
-            release `shouldSatisfy` T.isInfixOf "name = \"chusql-${{ matrix.platform }}\""
+            release `shouldSatisfy` T.isInfixOf "--platform '${{ matrix.platform }}'"
+            release `shouldSatisfy` T.isInfixOf "-Platform '${{ matrix.platform }}'"
             release `shouldSatisfy` (not . T.isInfixOf "matrix.component")
             release `shouldSatisfy` (not . T.isInfixOf "component: [web, cli]")
         it "no layer looks for a storage executable or a pipe name any more" $ do
