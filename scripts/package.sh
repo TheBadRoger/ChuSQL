@@ -119,7 +119,8 @@ verify_package() {
             rm -rf "$vtmp"
             Fail "$name: the archive does not unpack"
         fi
-        if ! ( cd "$vtmp/pkg" && HOME="$vtmp/home" CHUSQL_ADMIN_PASSWORD='verify-package' \
+        if ! ( cd "$vtmp/pkg" && HOME="$vtmp/home" XDG_CONFIG_HOME="$vtmp/home/.config" \
+                XDG_STATE_HOME="$vtmp/home/.local/state" CHUSQL_ADMIN_PASSWORD='verify-package' \
                 sh install.sh --component "$comp" \
                 --install-dir "$vtmp/opt" --data-dir "$vtmp/data" --user root \
                 --no-start --no-service ) \
