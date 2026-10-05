@@ -188,8 +188,13 @@ Step "Packing $name"
 rm -rf "$out_dir/.stage"
 mkdir -p "$stage/bin" "$stage/resources"
 
-cp "$repo_root/chusql-core/storage/target/release/"libchusql_core_storage.* "$stage/bin/" \
-    || Fail "chusql-core/storage/target/release/libchusql_core_storage.* is not built (run without --no-build)"
+case "$platform" in
+    linux-*) storage_name=libchusql_core_storage.so ;;
+    macos-*) storage_name=libchusql_core_storage.dylib ;;
+    *) Fail "unsupported Unix platform: $platform" ;;
+esac
+cp "$repo_root/chusql-core/storage/target/release/$storage_name" "$stage/bin/" \
+    || Fail "$storage_name is not built (run without --no-build)"
 
 stack_root=$(cd "$repo_root/chusql-cli" && stack path --local-install-root | tail -n 1 | tr -d '\r')
 for front_name in chusql-web chusql-server csql; do
