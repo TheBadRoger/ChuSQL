@@ -29,6 +29,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -141,6 +145,10 @@ jobs:
     needs: [build, validate]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -153,5 +161,8 @@ jobs:
         run: |
           set -eu
           ls -l dist
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "ChuSQL $TAG" --generate-notes
+          notes="docs/release-$TAG.md"
+          test -f "$notes"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "ChuSQL $TAG" --notes-file "$notes" --verify-tag
+          gh release edit "$TAG" --notes-file "$notes"
           gh release upload "$TAG" dist/* --clobber
