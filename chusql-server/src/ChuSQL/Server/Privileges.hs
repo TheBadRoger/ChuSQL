@@ -1,445 +1,233 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module ChuSQL.Server.Privileges (
-    Grant (..),
-    Membership (..),
-    PrivilegeCommand (..),
-    PrivilegeError (..),
-    Privileges,
-    RoleView (..),
-    affectedAccounts,
-    authorize,
-    authorizeTables,
-    filterTables,
-    listRoleViews,
-    newPrivileges,
-    normalizeObject,
-    privilegeCommand,
-    runPrivilegeCommand,
-) where
+module ChuSQL.Server.Privileges
+    ( Grant (..), Membership (..), PrivilegeCommand (..), PrivilegeError (..), Privileges, RoleView (..)
+    , affectedAccounts, authorize, authorizeTables, authorizeConnect, filterTables, listRoleViews
+    , newPrivileges, normalizeObject, privilegeCommand, runPrivilegeCommand, claimObject, prepareObject, reconcileObjects, affectedObject
+    ) where
 
 import ChuSQL.Core.Engine.Syntax.AST
 import ChuSQL.Core.Protocol (Account (..))
-import ChuSQL.Server.Accounts (Principal, principalIsRoot, principalIsCatalogManager, principalName)
 import ChuSQL.Interface.Protocol (Grant (..), RoleView (..))
-import ChuSQL.Server.Backend (
-    Backend (..),
-    exprTables,
-    systemDatabaseName,
-    tableRefsOf,
- )
-import ChuSQL.Server.Catalog (
-    Catalog,
-    addGrant,
-    addGrantOption,
-    addMember,
-    dropRole,
-    eachAction,
-    insertRole,
-    newCatalog,
-    normalizeObject,
-    normalizeRole,
-    normalizeUser,
-    readGrantOptions,
-    readGrants,
-    readMembers,
-    readRoleNames,
-    readIdentities,
-    removeGrant,
-    removeGrantOption,
-    removeMember,
-    withCatalogLock,
-    ensureCatalog,
- )
+import ChuSQL.Server.Accounts (Principal, principalIsRoot, principalIsCatalogManager)
+import ChuSQL.Server.Backend (Backend (..), exprTables, tableRefsOf, systemDatabaseName)
+import ChuSQL.Server.Catalog
+import qualified ChuSQL.Server.ObjectACL as OA
 import Data.List (nub, sort)
 import Data.Text (Text)
 import qualified Data.Text as T
 
--- 角色与权限服务：角色、授权与成员关系落在 system 库的表里，并据此判权限。
+-- 权限服务：稳定对象授权、角色继承与受影响会话展开。
 
--- | 出错口径与账号服务一致
-data PrivilegeError = PrivilegeError Text Text
-    deriving (Show, Eq)
+data PrivilegeError = PrivilegeError Text Text deriving (Show, Eq)
+data Membership = Membership { memberRole :: Text, memberUser :: Text } deriving (Show, Eq, Ord)
+data PrivilegeCommand = CreateRoleCommand Text | DropRoleCommand Text
+    | GrantPrivilegesCommand [Text] Text Text Bool | RevokePrivilegesCommand [Text] Text Text
+    | GrantRoleCommand Text [Text] | RevokeRoleCommand Text [Text] deriving (Show, Eq)
+data Privileges = Privileges { pvCatalog :: Catalog, pvBackend :: Backend }
 
--- 一条角色授权（定义在共享协议层）
--- | 角色成员资格
-data Membership = Membership
-    { memberRole :: Text
-    , memberUser :: Text
-    }
-    deriving (Show, Eq, Ord)
-
--- | 一个角色的全貌：授权与成员
-
-data PrivilegeCommand
-    = CreateRoleCommand Text
-    | DropRoleCommand Text
-    | GrantPrivilegesCommand [Text] Text Text Bool
-    | RevokePrivilegesCommand [Text] Text Text
-    | GrantRoleCommand Text [Text]
-    | RevokeRoleCommand Text [Text]
-    deriving (Show, Eq)
-
-data Privileges = Privileges
-    { pvCatalog :: Catalog
-    }
-
--- | 建权限服务，固定在 system 库上
+-- 创建权限目录服务。
 newPrivileges :: Backend -> IO Privileges
-newPrivileges base = Privileges <$> newCatalog (beWithDatabase base systemDatabaseName)
+newPrivileges backend = do
+    directory <- newCatalog (beWithDatabase backend systemDatabaseName)
+    pure (Privileges directory backend)
 
--- | 语句转管理命令，不认的给 Nothing
+-- 将管理语句转换为权限命令。
 privilegeCommand :: Statement -> Maybe PrivilegeCommand
-privilegeCommand stmt = case stmt of
+privilegeCommand statement = case statement of
     CreateRole name -> Just (CreateRoleCommand (T.pack name))
     DropRole name -> Just (DropRoleCommand (T.pack name))
-    GrantPrivileges privs obj role withOption ->
-        Just (GrantPrivilegesCommand (map T.toLower (map T.pack privs)) (T.pack obj) (T.pack role) withOption)
-    RevokePrivileges privs obj role ->
-        Just (RevokePrivilegesCommand (map T.toLower (map T.pack privs)) (T.pack obj) (T.pack role))
+    GrantPrivileges items object role option -> Just (GrantPrivilegesCommand (map (T.toLower . T.pack) items) (T.pack object) (T.pack role) option)
+    RevokePrivileges items object role -> Just (RevokePrivilegesCommand (map (T.toLower . T.pack) items) (T.pack object) (T.pack role))
     GrantRole role members -> Just (GrantRoleCommand (T.pack role) (map T.pack members))
     RevokeRole role members -> Just (RevokeRoleCommand (T.pack role) (map T.pack members))
     _ -> Nothing
 
--- | 执行管理命令：管理员全通，普通身份只能转授自己拿到的权限
+-- 执行角色管理或有来源记录的对象授权。
 runPrivilegeCommand :: Privileges -> Principal -> Text -> PrivilegeCommand -> IO (Either PrivilegeError ())
-runPrivilegeCommand service principal database command
-    | needsDatabase = pure (Left (PrivilegeError "no_database" "no database selected"))
-    | principalIsRoot principal = withTables service (applyCommand service database command)
-    | principalIsCatalogManager principal = case command of
-        CreateRoleCommand{} -> withTables service (applyCommand service database command)
-        DropRoleCommand{} -> pure (Left forbidden)
-        _ -> withTables service (delegateCommand service principal database command)
-    | otherwise = withTables service (delegateCommand service principal database command)
+runPrivilegeCommand service principal database command = withTables service $ case command of
+    GrantPrivilegesCommand items object role option -> catalog (OA.objectGrant backend directory principal database items object role option)
+    RevokePrivilegesCommand items object role -> catalog (OA.objectRevoke backend directory principal database items object role)
+    CreateRoleCommand role
+        | principalIsCatalogManager principal -> do
+            known <- catalog (readRoleNames directory)
+            case known of
+                Left err -> pure (Left err)
+                Right names | normalizeRole role `elem` names -> pure (Left (PrivilegeError "conflict" ("role already exists: " <> role)))
+                            | normalizeRole role == "public" -> pure (Left (PrivilegeError "bad_request" "public is reserved for default privileges"))
+                            | otherwise -> catalog (insertRole directory role)
+    DropRoleCommand role
+        | principalIsRoot principal -> after (catalog (dropRole directory role))
+    GrantRoleCommand role members
+        | principalIsRoot principal -> do
+            known <- catalog (readRoleNames directory)
+            edges <- catalog (readMembers directory)
+            case (,) <$> known <*> edges of
+                Left err -> pure (Left err)
+                Right (names, pairs) -> case validateMembers names pairs role members of
+                    Left err -> pure (Left err)
+                    Right () -> eachAction members $ \member -> if (normalizeRole role, normalizeUser member) `elem` pairs then pure (Right ()) else catalog (addMember directory role member)
+    RevokeRoleCommand role members
+        | principalIsRoot principal -> after (eachAction members (\member -> catalog (removeMember directory role member)))
+    _ -> pure (Left forbidden)
   where
-    -- | 授权到具体对象时需要先选库
-    needsDatabase = T.null database && case command of
-        GrantPrivilegesCommand _ object _ _ -> T.strip object /= "*"
-        RevokePrivilegesCommand _ object _ -> T.strip object /= "*"
-        _ -> False
+    backend = pvBackend service
+    directory = pvCatalog service
+    -- 清理成员或身份变更失效的授权链。
+    after action = do
+        result <- action
+        case result of Left err -> pure (Left err); Right () -> catalog (OA.objectReconcile backend directory)
 
--- | 一条命令会影响的账号：角色连它的成员一起展开，账号名原样留下
-affectedAccounts :: Privileges -> PrivilegeCommand -> IO [Text]
-affectedAccounts service command = do
-    known <- roleNames service
-    case known of
-        Left _ -> pure (direct command)
-        Right roles -> walk roles [] (direct command)
+-- 在写入前校验全部成员和循环依赖。
+validateMembers :: [Text] -> [(Text, Text)] -> Text -> [Text] -> Either PrivilegeError ()
+validateMembers names pairs role members
+    | parent `notElem` names = Left (PrivilegeError "not_found" ("unknown role: " <> role))
+    | any ((`notElem` names) . normalizeUser) members = Left (PrivilegeError "not_found" "unknown role member")
+    | otherwise = foldMembers pairs members
   where
-    -- | 命令直接点到的名字
-    direct cmd = case cmd of
+    parent = normalizeRole role
+    -- 逐项加入候选成员边并检查闭包。
+    foldMembers _ [] = Right ()
+    foldMembers edges (member : rest)
+        | child `elem` closureUp edges [parent] = Left (PrivilegeError "conflict" ("role membership would create a cycle: " <> parent <> " and " <> child))
+        | otherwise = foldMembers ((parent, child) : edges) rest
+      where child = normalizeUser member
+
+-- 展开角色的继承闭包。
+closureUp :: [(Text, Text)] -> [Text] -> [Text]
+closureUp edges known = let more = [parent | (parent, child) <- edges, child `elem` known, parent `notElem` known]
+                       in if null more then known else closureUp edges (nub (known ++ more))
+
+-- 展开成员和转授权变更影响的全部身份。
+affectedAccounts :: Privileges -> PrivilegeCommand -> IO (Either PrivilegeError [Text])
+affectedAccounts service command = withTables service (catalog (OA.objectAffected (pvBackend service) (pvCatalog service) direct))
+  where
+    direct = case command of
         CreateRoleCommand _ -> []
         DropRoleCommand role -> [role]
         GrantPrivilegesCommand _ _ role _ -> [role]
         RevokePrivilegesCommand _ _ role -> [role]
         GrantRoleCommand _ members -> members
         RevokeRoleCommand _ members -> members
-    -- | 是角色就接着往下走它的成员，走过的名字不再走第二遍
-    walk _ seen [] = pure (reverse seen)
-    walk roles seen (name : rest)
-        | name `elem` seen = walk roles seen rest
-        | normalizeRole name `elem` roles = do
-            members <- membersOfRole service name
-            case members of
-                Left _ -> walk roles (name : seen) rest
-                Right found -> walk roles (name : seen) (found ++ rest)
-        | otherwise = walk roles (name : seen) rest
 
--- | 语句鉴权：管理员全通，普通身份按需查
+-- 检查 SQL 的对象作用域权限。
 authorize :: Privileges -> Principal -> Text -> Statement -> IO (Either PrivilegeError ())
-authorize service principal database stmt
+authorize service principal database statement
     | principalIsRoot principal = pure (Right ())
-    | otherwise = case requiredActions stmt of
-        Nothing -> pure (Left forbidden)
-        Just needed -> authorizeTables service principal database needed
+    | otherwise = case statement of
+        CreateTable{} -> authorizeTables service principal database [("database:" <> database, "create")]
+        DropDatabase name -> owner ("database:" <> T.pack name)
+        DropTable name -> owner (T.pack name)
+        CreateIndex name _ -> owner (T.pack name)
+        DropIndex name _ -> owner (T.pack name)
+        DropColumn name _ -> owner (T.pack name)
+        AddColumn name _ -> owner (T.pack name)
+        RenameColumn name _ _ -> owner (T.pack name)
+        AlterColumnType name _ _ -> owner (T.pack name)
+        AlterColumnDefault name _ _ -> owner (T.pack name)
+        AlterColumnNull name _ _ -> owner (T.pack name)
+        ShowDomains -> authorizeConnect service principal database
+        ShowDatabases -> pure (Right ())
+        _ -> case requiredActions statement of Nothing -> pure (Left forbidden); Just needed -> authorizeTables service principal database needed
+  where
+    -- 检查结构操作的对象所有权。
+    owner object = withTables service (catalog (OA.objectOwner (pvBackend service) (pvCatalog service) principal database object))
 
--- | 直接查一组 (表, 权限)：一键接口用这个
+-- 检查数据库的 CONNECT 权限。
+authorizeConnect :: Privileges -> Principal -> Text -> IO (Either PrivilegeError ())
+authorizeConnect service principal database
+    | principalIsRoot principal = pure (Right ())
+    | otherwise = withTables service (catalog (OA.objectConnect (pvBackend service) (pvCatalog service) principal database))
+
+-- 检查 CONNECT 和表上的业务权限。
 authorizeTables :: Privileges -> Principal -> Text -> [(Text, Text)] -> IO (Either PrivilegeError ())
 authorizeTables service principal database needed
     | principalIsRoot principal = pure (Right ())
+    | T.null database && any (not . T.isPrefixOf "database:" . fst) needed = pure (Left (PrivilegeError "no_database" "no database selected"))
     | otherwise = withTables service $ do
-        grants <- grantsOfUser service (principalName principal)
-        pure (grants >>= \found -> checkAll database found needed)
+        connected <- if T.null database then pure (Right ()) else catalog (OA.objectConnect (pvBackend service) (pvCatalog service) principal database)
+        case connected of Left err -> pure (Left err); Right () -> catalog (OA.objectAuthorize (pvBackend service) (pvCatalog service) principal database needed)
 
--- | 只留下用户有 SELECT 权的表
+-- 仅返回拥有 SELECT 权限的表名。
 filterTables :: Privileges -> Principal -> Text -> [Text] -> IO (Either PrivilegeError [Text])
 filterTables service principal database tables
     | principalIsRoot principal = pure (Right tables)
-    | otherwise = withTables service $ do
-        grants <- grantsOfUser service (principalName principal)
-        pure ((\found -> [table | table <- tables, checkAll database found [(table, "select")] == Right ()]) <$> grants)
+    | otherwise = do
+        connected <- authorizeConnect service principal database
+        case connected of
+            Left err -> pure (Left err)
+            Right () -> do
+                results <- mapM (\table -> authorizeTables service principal database [(table, "select")]) tables
+                pure $ case [err | Left err@(PrivilegeError code _) <- results, code /= "forbidden"] of
+                    err : _ -> Left err
+                    [] -> Right [table | (table, Right ()) <- zip tables results]
 
--- | 角色总览（REST 与测试用）
+-- 返回角色的有效对象授权和直接成员。
 listRoleViews :: Privileges -> IO (Either PrivilegeError [RoleView])
 listRoleViews service = withTables service $ do
-    names <- fmap (fmap (map accountUser . filter (not . accountCanLogin))) (catalog (readIdentities (pvCatalog service)))
-    case names of
+    names <- catalog (readIdentities (pvCatalog service))
+    members <- catalog (readMembers (pvCatalog service))
+    case (,) <$> names <*> members of
         Left err -> pure (Left err)
-        Right known -> sequence <$> mapM view (sort known)
+        Right (identities, pairs) -> fmap sequence $ mapM (view pairs) (sort (map accountUser (filter (not . accountCanLogin) identities)))
   where
-    -- | 组装一个角色的总览
-    view role = do
-        grants <- roleGrantsOf service role
-        members <- membersOfRole service role
-        pure (RoleView role <$> grants <*> members)
+    -- 组装一个角色的公开权限视图。
+    view members name = do
+        grants <- catalog (OA.objectViews (pvBackend service) (pvCatalog service) name)
+        pure ((\rows -> RoleView name rows [member | (role, member) <- members, role == name]) <$> grants)
 
--- | 一条语句需要哪些 (表, 权限)
+-- 登记创建对象的所有者。
+claimObject :: Privileges -> Principal -> Text -> Text -> IO (Either PrivilegeError ())
+claimObject service principal database object = withTables service (catalog (OA.objectClaim (pvBackend service) (pvCatalog service) principal database object))
+
+-- 持久化即将建表的所有者声明。
+prepareObject :: Privileges -> Principal -> Text -> Text -> IO (Either PrivilegeError ())
+prepareObject service principal database object = withTables service (catalog (OA.objectPrepareCreate (pvBackend service) (pvCatalog service) principal database object))
+
+-- 获取删除对象影响的授权身份。
+affectedObject :: Privileges -> Text -> Text -> IO (Either PrivilegeError [Text])
+affectedObject service database object = withTables service (catalog (OA.objectUsers (pvBackend service) (pvCatalog service) database object))
+
+-- 清理身份或对象删除后的权限记录。
+reconcileObjects :: Privileges -> IO (Either PrivilegeError ())
+reconcileObjects service = withTables service (catalog (OA.objectReconcile (pvBackend service) (pvCatalog service)))
+
+-- 收集数据语句及子查询所需的表权限。
 requiredActions :: Statement -> Maybe [(Text, Text)]
-requiredActions stmt = case stmt of
-    Select{} -> Just (selectNeeds (selectFrom stmt) (maybe [] (: []) (selectWhere stmt)))
-    SelectExpr{} ->
-        Just (selectNeeds (selectFrom stmt) (maybe [] (: []) (selectWhere stmt) ++ map snd (selectItems stmt)))
+requiredActions statement = case statement of
+    Select{} -> Just (selectNeeds (selectFrom statement) (maybe [] (: []) (selectWhere statement)))
+    SelectExpr{} -> Just (selectNeeds (selectFrom statement) (maybe [] (: []) (selectWhere statement) ++ map snd (selectItems statement)))
     Insert table _ rows -> Just ((T.pack table, "insert") : selectsOf (concat rows))
-    Update table assigns cond -> Just ((T.pack table, "update") : selectsOf (map snd assigns ++ maybe [] (: []) cond))
-    Delete table cond -> Just ((T.pack table, "delete") : selectsOf (maybe [] (: []) cond))
+    Update table assignments condition -> Just ((T.pack table, "update") : selectsOf (map snd assignments ++ maybe [] (: []) condition))
+    Delete table condition -> Just ((T.pack table, "delete") : selectsOf (maybe [] (: []) condition))
     _ -> Nothing
   where
-    -- | FROM 子句要的 SELECT 权限
-    selectNeeds source exprs = [(ref, "select") | ref <- nub (tableRefsOf source)] ++ selectsOf exprs
-    -- | 表达式里子查询要的 SELECT 权限
-    selectsOf exprs = [(ref, "select") | ref <- nub (concatMap exprTables exprs)]
+    -- 收集来源树和表达式的读取权限。
+    selectNeeds source expressions = [(ref, "select") | ref <- nub (tableRefsOf source)] ++ selectsOf expressions
+    -- 收集表达式中子查询的读取权限。
+    selectsOf expressions = [(ref, "select") | ref <- nub (concatMap exprTables expressions)]
 
--- | 每项 (表, 权限) 都要被某条授权覆盖
-checkAll :: Text -> [Grant] -> [(Text, Text)] -> Either PrivilegeError ()
-checkAll database grants needed = checkCovered database grants needed "permission denied: "
-
--- | 转授权要查 grant option，报错口径与普通鉴权分开
-checkOptions :: Text -> [Grant] -> [(Text, Text)] -> Either PrivilegeError ()
-checkOptions database grants needed = checkCovered database grants needed "grant option required: "
-
--- | 覆盖检查的公共实现
-checkCovered :: Text -> [Grant] -> [(Text, Text)] -> Text -> Either PrivilegeError ()
-checkCovered database grants needed prefix = case [pair | pair@(table, privilege) <- needed, not (covered table privilege)] of
-    [] -> Right ()
-    ((table, privilege) : _) ->
-        Left (PrivilegeError "forbidden" (prefix <> T.toUpper privilege <> " ON " <> table))
-  where
-    -- | 某一项是否被授权覆盖
-    covered table privilege =
-        let target = normalizeObject database table
-         in any
-                (\grant -> (grantObject grant == "*" || grantObject grant == target) && grantPrivilege grant == privilege)
-                grants
-
--- | 一个用户实际能用的授权：含角色继承
-grantsOfUser :: Privileges -> Text -> IO (Either PrivilegeError [Grant])
-grantsOfUser service user = do
-    members <- catalog (readMembers (pvCatalog service))
-    grants <- catalog (readGrants (pvCatalog service))
-    options <- catalog (readGrantOptions (pvCatalog service))
-    roles <- catalog (readIdentities (pvCatalog service))
-    pure $ do
-        memberRows <- members
-        grantRows <- grants
-        optionRows <- options
-        identities <- roles
-        let known = map accountUser (filter accountEnabled identities)
-            disabled = map accountUser (filter (not . accountEnabled) identities)
-            activeMembers = [(role, member) | (role, member) <- memberRows, role `elem` known, member `notElem` disabled]
-            edges = roleEdges activeMembers known
-            mine = if normalizeUser user `elem` disabled then [] else closureUp edges
-                (normalizeUser user : [role | (role, member) <- activeMembers, member == normalizeUser user])
-        pure [grant | grant <- grantRows ++ optionRows, grantRole grant `elem` mine]
-
--- | 一个用户手里的 grant option，只有这些能再转授
-optionsOfUser :: Privileges -> Text -> IO (Either PrivilegeError [Grant])
-optionsOfUser service user = fmap (fmap (filter grantable)) (grantsOfUser service user)
-
--- | 角色到角色的成员边：父角色在前
-roleEdges :: [(Text, Text)] -> [Text] -> [(Text, Text)]
-roleEdges members roles = [pair | pair@(_, child) <- members, child `elem` roles]
-
--- | 向上闭包：这群角色直接或间接所属的全部角色
-closureUp :: [(Text, Text)] -> [Text] -> [Text]
-closureUp edges = go
-  where
-    -- | 展开一轮，没有再新增就停
-    go known =
-        let more = [parent | (parent, child) <- edges, child `elem` known, parent `notElem` known]
-         in if null more then known else go (known ++ more)
-
--- | 一个角色挂着的授权，带 grant option 的会标出来
-roleGrantsOf :: Privileges -> Text -> IO (Either PrivilegeError [Grant])
-roleGrantsOf service role = do
-    grants <- catalog (readGrants (pvCatalog service))
-    options <- catalog (readGrantOptions (pvCatalog service))
-    pure (do
-        rows <- grants
-        optionRows <- options
-        let mine = filter (\grant -> grantRole grant == normalizeRole role) rows
-        pure (markOptions mine optionRows))
-
--- | 给授权标上有没有对应的 grant option
-markOptions :: [Grant] -> [Grant] -> [Grant]
-markOptions grants options = [grant {grantable = hasOption grant} | grant <- grants]
-  where
-    -- | 有没有一条同角色同权限同对象的 option
-    hasOption grant = any (same grant) options
-    -- | 两条授权指向同一处
-    same one other =
-        grantRole one == grantRole other
-            && grantPrivilege one == grantPrivilege other
-            && grantObject one == grantObject other
-
--- | 角色名清单（统一小写）
-roleNames :: Privileges -> IO (Either PrivilegeError [Text])
-roleNames service = catalog (readRoleNames (pvCatalog service))
-
--- | 一个角色的直接成员：用户与子角色
-membersOfRole :: Privileges -> Text -> IO (Either PrivilegeError [Text])
-membersOfRole service role = do
-    members <- catalog (readMembers (pvCatalog service))
-    pure (map snd . filter (\(name, _) -> name == normalizeRole role) <$> members)
-
--- | 角色必须存在，否则命令不落地
-requireRole :: Privileges -> Text -> IO (Either PrivilegeError ())
-requireRole service role = do
-    known <- roleNames service
-    pure $ case known of
-        Left err -> Left err
-        Right names
-            | normalizeRole role `elem` names -> Right ()
-            | otherwise -> Left (unknownRole role)
-
--- | 真正落库（表已经保证存在）
-applyCommand :: Privileges -> Text -> PrivilegeCommand -> IO (Either PrivilegeError ())
-applyCommand service database command = case command of
-    CreateRoleCommand role -> do
-        known <- roleNames service
-        case known of
-            Left err -> pure (Left err)
-            Right names
-                | normalizeRole role `elem` names -> pure (Left (PrivilegeError "conflict" ("role already exists: " <> role)))
-                | otherwise -> catalog (insertRole (pvCatalog service) role)
-    DropRoleCommand role -> do
-        allowed <- requireRole service role
-        case allowed of
-            Left err -> pure (Left err)
-            Right () -> catalog (dropRole (pvCatalog service) role)
-    GrantPrivilegesCommand privileges object role withOption -> do
-        allowed <- requireRole service role
-        case allowed of
-            Left err -> pure (Left err)
-            Right () ->
-                eachAction (expandPrivileges privileges) $ \privilege ->
-                    grantOne service withOption role privilege (normalizeObject database object)
-    RevokePrivilegesCommand privileges object role -> do
-        allowed <- requireRole service role
-        case allowed of
-            Left err -> pure (Left err)
-            Right () ->
-                eachAction (expandPrivileges privileges) $ \privilege ->
-                    revokeOne service role privilege (normalizeObject database object)
-    GrantRoleCommand role members -> do
-        allowed <- requireRole service role
-        case allowed of
-            Left err -> pure (Left err)
-            Right () -> do
-                known <- roleNames service
-                case known of
-                    Left err -> pure (Left err)
-                    Right roles -> eachAction members (grantMember service roles role)
-    RevokeRoleCommand role users -> do
-        allowed <- requireRole service role
-        case allowed of
-            Left err -> pure (Left err)
-            Right () -> eachAction users $ \user -> catalog (removeMember (pvCatalog service) role user)
-
--- | 落一条授权，带 grant option 的再落一条转授权
-grantOne :: Privileges -> Bool -> Text -> Text -> Text -> IO (Either PrivilegeError ())
-grantOne service withOption role privilege object = do
-    written <- catalog (addGrant (pvCatalog service) role privilege object)
-    case written of
-        Left err -> pure (Left err)
-        Right ()
-            | withOption -> catalog (addGrantOption (pvCatalog service) role privilege object)
-            | otherwise -> pure (Right ())
-
--- | 收一条授权，连同它的 grant option
-revokeOne :: Privileges -> Text -> Text -> Text -> IO (Either PrivilegeError ())
-revokeOne service role privilege object = do
-    dropped <- catalog (removeGrant (pvCatalog service) role privilege object)
-    case dropped of
-        Left err -> pure (Left err)
-        Right () -> catalog (removeGrantOption (pvCatalog service) role privilege object)
-
--- | 普通身份转授权：只放行 GRANT
-delegateCommand :: Privileges -> Principal -> Text -> PrivilegeCommand -> IO (Either PrivilegeError ())
-delegateCommand service principal database command = case command of
-    GrantPrivilegesCommand _ _ role _ -> do
-        allowed <- requireRole service role
-        case allowed of
-            Left err -> pure (Left err)
-            Right () -> do
-                owned <- optionsOfUser service (principalName principal)
-                case owned >>= \found -> checkOptions database found needed of
-                    Left err -> pure (Left err)
-                    Right () -> applyCommand service database command
-    _ -> pure (Left forbidden)
-  where
-    -- | 命令里每个 (对象, 权限) 都要对得上
-    needed = case command of
-        GrantPrivilegesCommand privileges object _ _ -> [(object, privilege) | privilege <- expandPrivileges privileges]
-        _ -> []
-
--- | 加一条成员边：名字是角色就查环，否则当用户加
-grantMember :: Privileges -> [Text] -> Text -> Text -> IO (Either PrivilegeError ())
-grantMember service roles role member = do
-    current <- membersOfRole service role
-    case current of
-        Left err -> pure (Left err)
-        Right known
-            | normalizeUser member `elem` known -> pure (Right ())
-            | normalizeRole member `notElem` roles -> catalog (addMember (pvCatalog service) role member)
-            | otherwise -> do
-                edges <- membershipEdges service
-                case edges of
-                    Left err -> pure (Left err)
-                    Right pairs
-                        | normalizeRole member `elem` closureUp pairs [normalizeRole role] ->
-                            pure (Left (cycleMember role member))
-                        | otherwise -> catalog (addMember (pvCatalog service) role member)
-
--- | 只保留两端都是角色的成员边
-membershipEdges :: Privileges -> IO (Either PrivilegeError [(Text, Text)])
-membershipEdges service = do
-    members <- catalog (readMembers (pvCatalog service))
-    roles <- roleNames service
-    pure (roleEdges <$> members <*> roles)
-
--- | 全程持锁，先保证系统表存在再跑动作
+-- 持目录锁并确保旧权限表存在。
 withTables :: Privileges -> IO (Either PrivilegeError a) -> IO (Either PrivilegeError a)
 withTables service action = withCatalogLock (pvCatalog service) $ do
     ready <- ensureCatalog (pvCatalog service)
-    case ready of
-        Left err -> pure (Left (storageError err))
-        Right () -> action
+    case ready of Left err -> pure (Left (storageError err)); Right () -> action
 
--- | 目录操作转成权限错误
+-- 将目录结果转换为权限错误。
 catalog :: IO (Either String a) -> IO (Either PrivilegeError a)
 catalog action = fmap (either (Left . storageError) Right) action
 
--- | 把 ALL 展开成四种具体权限
-expandPrivileges :: [Text] -> [Text]
-expandPrivileges privileges = nub (concatMap expand (map (T.toLower . T.strip) privileges))
+-- 分类稳定对象目录的明确错误。
+storageError :: String -> PrivilegeError
+storageError message = PrivilegeError code (T.pack message)
   where
-    -- | 展开一条权限名
-    expand "all" = ["select", "insert", "update", "delete"]
-    expand other = [other]
+    code | message == "no database selected" = "no_database"
+         | any (`T.isPrefixOf` T.pack message) ["permission denied:", "grant option required:", "object owner required", "administrator required", "system objects cannot be granted"] = "forbidden"
+         | any (`T.isPrefixOf` T.pack message) ["unknown role:", "unknown table", "unknown database"] = "not_found"
+         | message == "object ACL changed concurrently" = "conflict"
+         | message == "invalid privilege for object scope" = "bad_request"
+         | message == "the last enabled login superuser cannot be removed" = "bad_request"
+         | otherwise = "storage_error"
 
 forbidden :: PrivilegeError
 forbidden = PrivilegeError "forbidden" "administrator required"
-
--- | 未知角色的错误
-unknownRole :: Text -> PrivilegeError
-unknownRole role = PrivilegeError "not_found" ("unknown role: " <> role)
-
--- | 角色成员成环的错误
-cycleMember :: Text -> Text -> PrivilegeError
-cycleMember role member =
-    PrivilegeError "conflict" ("role membership would create a cycle: " <> normalizeRole role <> " and " <> normalizeRole member)
-
--- | 存储错误转成权限错误
-storageError :: String -> PrivilegeError
-storageError "the last enabled login superuser cannot be removed" = PrivilegeError "bad_request" "the last enabled login superuser cannot be removed"
-storageError message = PrivilegeError "storage_error" ("privilege storage: " <> T.pack message)

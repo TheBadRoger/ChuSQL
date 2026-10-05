@@ -21,6 +21,7 @@ library
                       ChuSQL.Interface.Protocol
                       ChuSQL.Interface.RateLimit
                       ChuSQL.Interface.Session
+                      ChuSQL.Interface.Sudo
                       ChuSQL.Interface.Settings
                       ChuSQL.Interface.TOML
     build-depends:    base >= 4.14 && < 5
@@ -36,5 +37,8 @@ library
                     , scientific
                     , text
                     , time
+    c-sources:        cbits/sudo_credential.c
+    if os(windows)
+        extra-libraries: advapi32
     default-language: Haskell2010
     ghc-options:      -Wall

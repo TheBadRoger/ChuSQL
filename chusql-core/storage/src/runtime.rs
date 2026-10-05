@@ -30,10 +30,48 @@ struct Server {
 type TableDescription = (Vec<SchemaColumn>, u64, Vec<IndexWire>, Vec<ColumnStatWire>);
 
 impl Server {
+    /// 读取受保护的对象权限快照
+    fn object_acl_read(&self) -> std::io::Result<Vec<Row>> {
+        if !self.table_exists("__system_object_acl")? { return Ok(Vec::new()); }
+        let rows = self.with_existing_table("__system_object_acl", |table| table.scan())?;
+        let mut payload = String::new();
+        for (index, row) in rows.iter().enumerate() {
+            if row.get("id").and_then(|value| value.as_u64()) != Some(index as u64 + 1) {
+                return Err(std::io::Error::other("invalid object ACL chunk sequence"));
+            }
+            payload.push_str(row.get("payload").and_then(|value| value.as_str())
+                .ok_or_else(|| std::io::Error::other("invalid object ACL chunk"))?);
+        }
+        if rows.is_empty() { return Err(std::io::Error::other("empty object ACL snapshot")); }
+        Ok(vec![serde_json::from_value(serde_json::json!({"id":1,"payload":payload})).map_err(std::io::Error::other)?])
+    }
+
+    /// 比较并原子替换对象权限快照
+    fn object_acl_replace(&self, expected: Option<&str>, payload: &str) -> std::io::Result<()> {
+        let rows = self.object_acl_read()?;
+        let current = rows.first().and_then(|row| row.get("payload")).and_then(|value| value.as_str());
+        if current != expected { return Err(std::io::Error::other("object ACL changed concurrently")); }
+        let _: serde_json::Value = serde_json::from_str(payload).map_err(std::io::Error::other)?;
+        let mut ops = Vec::new();
+        if !self.table_exists("__system_object_acl")? {
+            ops.push(WalOp::CreateTable { table: "__system_object_acl".into(),
+                columns: vec![SchemaColumn { name: "id".into(), ty: "int".into(), ..Default::default() },
+                    SchemaColumn { name: "payload".into(), ty: "str".into(), ..Default::default() }], object_id: None });
+        }
+        let chars: Vec<char> = payload.chars().collect();
+        let rows = chars.chunks(256).enumerate().map(|(index, chunk)| {
+            serde_json::from_value(serde_json::json!({"id":index + 1,"payload":chunk.iter().collect::<String>()}))
+                .map_err(std::io::Error::other)
+        }).collect::<std::io::Result<Vec<Row>>>()?;
+        ops.push(WalOp::ReplaceAll { table: "__system_object_acl".into(), rows });
+        self.group_via_wal(&ops)
+    }
+
     /// 新建服务器状态
     fn new(cfg: Config) -> std::io::Result<Self> {
         std::fs::create_dir_all(&cfg.data_dir)?;
         let catalog = Catalog::load(cfg.data_dir.join("catalog.json"))?;
+        catalog.save(cfg.data_dir.join("catalog.json"))?;
         let wal = Wal::new(cfg.data_dir.join("wal.log"));
         Ok(Server {
             cfg,
@@ -306,11 +344,11 @@ impl Server {
                 let _ = std::fs::remove_file(self.index_path(table, column));
                 Ok(())
             }
-            WalOp::CreateTable { table, columns } => {
+            WalOp::CreateTable { table, columns, object_id } => {
                 self.with_table(table, |_t| Ok(()))?;
                 let mut c = self.catalog.lock().map_err(|_| std::io::Error::other("catalog lock poisoned"))?;
-                c.create_table(table, columns.clone())?;
-                if table == TYPES_TABLE { c.mark_system(table)?; }
+                c.create_table_with_id(table, columns.clone(), *object_id)?;
+                if table == TYPES_TABLE || table == "__system_object_acl" { c.mark_system(table)?; }
                 c.save(self.catalog_path())
             }
             WalOp::DropTable { table } => {
@@ -506,12 +544,22 @@ impl Server {
     fn group_via_wal(&self, ops: &[WalOp]) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.cfg.data_dir)?;
         let wal = &self.wal;
-        let commit_lsn = wal.append_group(ops)?;
+        let mut ops = std::borrow::Cow::Borrowed(ops);
+        if ops.iter().any(|op| matches!(op, WalOp::CreateTable { object_id: None, .. })) {
+            let mut catalog = self.catalog.lock().map_err(|_| std::io::Error::other("catalog lock poisoned"))?;
+            for op in ops.to_mut() {
+                if let WalOp::CreateTable { object_id, .. } = op
+                    && object_id.is_none() {
+                    *object_id = Some(catalog.reserve_object_id()?);
+                }
+            }
+        }
+        let commit_lsn = wal.append_group(&ops)?;
         self.recovery_required.store(true, Ordering::Release);
-        for op in ops {
+        for op in ops.iter() {
             self.apply_op(op)?;
         }
-        for op in ops {
+        for op in ops.iter() {
             self.flush_op_tables(op)?;
         }
         self.flush_all_tables()?;
@@ -639,7 +687,16 @@ impl Server {
                 let c = self.catalog.lock().unwrap();
                 Ok(c.describe(table).is_some_and(|s| !s.columns.iter().any(|col| &col.name == column)))
             }
-            WalOp::CreateTable { table, .. } => self.table_exists(table),
+            WalOp::CreateTable { table, object_id, .. } => {
+                let catalog = self.catalog.lock().map_err(|_| std::io::Error::other("catalog lock poisoned"))?;
+                match catalog.describe(table) {
+                    Some(schema) if object_id.is_some_and(|id| id != schema.object_id) => {
+                        Err(std::io::Error::other("WAL catalog object id mismatch"))
+                    }
+                    Some(_) => Ok(true),
+                    None => Ok(false),
+                }
+            }
             WalOp::DropTable { table } => Ok(!self.table_exists(table)?
                 && !self.table_path(table).exists()
                 && !self.index_path(table, "id").exists()),
@@ -1063,11 +1120,11 @@ impl Server {
             Request::CatalogManage { command } => {
                 let target = match command.as_ref() {
                     Request::AccountCreate { user, .. } | Request::AccountReset { user, .. } | Request::AccountDrop { user }
-                        | Request::IdentityAlter { user, is_superuser: None, system_catalog_manager: None, .. } => Some(account_name(user)?),
+                        | Request::IdentityAlter { user, is_superuser: None, system_catalog_manager: None, allow_sudo_auth: None, .. } => Some(account_name(user)?),
                     Request::AccountsList => None,
                     _ => return Err(Error::other("superuser required for this catalog operation")),
                 };
-                if accounts.iter().any(|a| target.as_ref() == Some(&a.user) && (a.is_superuser || a.system_catalog_manager)) {
+                if accounts.iter().any(|a| target.as_ref() == Some(&a.user) && (a.is_superuser || a.system_catalog_manager || a.allow_sudo_auth)) {
                     return Err(Error::other("superuser required to manage privileged identities"));
                 }
                 *command
@@ -1116,10 +1173,13 @@ impl Server {
                 }
                 let unified = self.catalog.lock().map_err(|_| Error::other("catalog lock poisoned"))?.describe(IDENTITIES_TABLE).is_some();
                 if !accounts.is_empty() { require_superuser(&accounts)?; }
-                if unified && previous == accounts { return Ok(accounts); }
+                let sudo_column = self.catalog.lock().map_err(|_| Error::other("catalog lock poisoned"))?.describe(IDENTITIES_TABLE)
+                    .is_some_and(|schema| schema.columns.iter().any(|column| column.name == "allow_sudo_auth"));
+                if unified && sudo_column && previous == accounts { return Ok(accounts); }
             }
             Request::AccountCreate { user, password_hash } => {
                 let name = account_name(&user)?;
+                if name == "public" { return Err(Error::other("public is reserved for default privileges")); }
                 if accounts.iter().any(|a| a.user == name) {
                     return Err(Error::new(ErrorKind::AlreadyExists, "account already exists"));
                 }
@@ -1129,6 +1189,7 @@ impl Server {
             }
             Request::RoleCreate { user } => {
                 let name = account_name(&user)?;
+                if name == "public" { return Err(Error::other("public is reserved for default privileges")); }
                 if accounts.iter().any(|a| a.user == name) { return Err(Error::new(ErrorKind::AlreadyExists, "identity already exists")); }
                 let id = accounts.iter().map(|a| a.id).max().unwrap_or(0).max(self.catalog.lock().map_err(|_| Error::other("catalog lock poisoned"))?.identity_high_water)
                     .checked_add(1).ok_or_else(|| Error::other("account id exhausted"))?;
@@ -1136,13 +1197,14 @@ impl Server {
                 role.can_login = false;
                 accounts.push(role);
             }
-            Request::IdentityAlter { user, can_login, is_superuser, enabled, system_catalog_manager } => {
+            Request::IdentityAlter { user, can_login, is_superuser, enabled, system_catalog_manager, allow_sudo_auth } => {
                 let name = account_name(&user)?;
                 let account = accounts.iter_mut().find(|a| a.user == name).ok_or_else(|| Error::new(ErrorKind::NotFound, "unknown account"))?;
                 account.can_login = can_login.unwrap_or(account.can_login);
                 account.is_superuser = is_superuser.unwrap_or(account.is_superuser);
                 account.enabled = enabled.unwrap_or(account.enabled);
                 account.system_catalog_manager = system_catalog_manager.unwrap_or(account.system_catalog_manager);
+                account.allow_sudo_auth = allow_sudo_auth.unwrap_or(account.allow_sudo_auth);
                 account.revision = account.revision.checked_add(1).ok_or_else(|| Error::other("account revision exhausted"))?;
                 if had_superuser { require_superuser(&accounts)?; }
             }
@@ -1226,7 +1288,7 @@ impl Server {
         }
         if existing.is_some() && original == rows { return Ok(rows); }
         let mut ops = Vec::new();
-        if existing.is_none() { ops.push(WalOp::CreateTable { table: TYPES_TABLE.into(), columns }); }
+        if existing.is_none() { ops.push(WalOp::CreateTable { table: TYPES_TABLE.into(), columns, object_id: None }); }
         ops.push(WalOp::ReplaceAll { table: TYPES_TABLE.into(), rows: rows.clone() });
         self.recovery_required.store(true, Ordering::Release);
         self.group_via_wal(&ops)?;
@@ -1499,6 +1561,8 @@ impl Server {
                     .filter(|(name, _)| !blocked_table(name))
                     .map(|(name, ts)| TableSchemaWire {
                         table: name.to_string(),
+                        database_id: c.database_id,
+                        object_id: ts.object_id,
                         columns: ts.columns.clone(),
                         row_count: ts.row_count,
                         indexes: index_wires(ts),
@@ -1543,7 +1607,7 @@ impl Server {
                     };
                 }
                 let tname = table.clone();
-                let op = WalOp::CreateTable { table, columns };
+                let op = WalOp::CreateTable { table, columns, object_id: None };
                 match self.write_via_wal(&op) {
                     Ok(()) => Response::Ok,
                     Err(e) => {
@@ -1733,6 +1797,7 @@ fn identity_rows(accounts: &[Account]) -> std::io::Result<Vec<Row>> {
         ("can_login".into(), serde_json::json!(a.can_login)),
         ("is_superuser".into(), serde_json::json!(a.is_superuser)),
         ("system_catalog_manager".into(), serde_json::json!(a.system_catalog_manager)),
+        ("allow_sudo_auth".into(), serde_json::json!(a.allow_sudo_auth)),
         ("enabled".into(), serde_json::json!(a.enabled)),
         ("identity_version".into(), serde_json::json!(a.identity_version)),
         ("registered_at".into(), serde_json::Value::String(a.registered_at.clone())),
@@ -1764,6 +1829,7 @@ fn identity_columns() -> Vec<SchemaColumn> {
         SchemaColumn { name: "can_login".into(), ty: "bool".into(), nullable: false, ..Default::default() },
         SchemaColumn { name: "is_superuser".into(), ty: "bool".into(), nullable: false, ..Default::default() },
         SchemaColumn { name: "system_catalog_manager".into(), ty: "bool".into(), nullable: false, ..Default::default() },
+        SchemaColumn { name: "allow_sudo_auth".into(), ty: "bool".into(), nullable: false, ..Default::default() },
         SchemaColumn { name: "enabled".into(), ty: "bool".into(), nullable: false, ..Default::default() },
         SchemaColumn { name: "identity_version".into(), ty: "int".into(), nullable: false, ..Default::default() },
         SchemaColumn { name: "registered_at".into(), ty: "timestamp".into(),
@@ -1805,6 +1871,10 @@ fn decode_account_row(row: &Row) -> std::io::Result<Account> {
         can_login: row.get("can_login").and_then(serde_json::Value::as_bool).unwrap_or(true),
         is_superuser: row.get("is_superuser").and_then(serde_json::Value::as_bool).unwrap_or(false),
         system_catalog_manager: row.get("system_catalog_manager").and_then(serde_json::Value::as_bool).unwrap_or(false),
+        allow_sudo_auth: match row.get("allow_sudo_auth") {
+            None => false,
+            Some(value) => value.as_bool().ok_or_else(|| std::io::Error::other("invalid sudo authentication attribute"))?,
+        },
         enabled: row.get("enabled").and_then(serde_json::Value::as_bool).unwrap_or(true),
         identity_version: row.get("identity_version").and_then(serde_json::Value::as_u64).unwrap_or(0) as u8,
     })
@@ -1880,6 +1950,7 @@ fn new_account(id: i64, user: &str, password_hash: String) -> std::io::Result<Ac
         can_login: true,
         is_superuser: false,
         system_catalog_manager: false,
+        allow_sudo_auth: false,
         enabled: true,
         identity_version: 1,
     })
@@ -2019,7 +2090,37 @@ impl Databases {
                 named.insert(name, Arc::new(server));
             }
         }
-        Ok(Self { root: cfg, system, named: Mutex::new(named) })
+        {
+            let mut catalog = system.catalog.lock().map_err(|_| std::io::Error::other("catalog lock poisoned"))?;
+            let mut ids = HashSet::new();
+            if catalog.database_id != 0 { ids.insert(catalog.database_id); }
+            for server in named.values() {
+                let id = server.catalog.lock().map_err(|_| std::io::Error::other("catalog lock poisoned"))?.database_id;
+                if id != 0 && !ids.insert(id) { return Err(std::io::Error::other("duplicate database object id")); }
+                catalog.object_high_water = catalog.object_high_water.max(id);
+            }
+            if catalog.database_id == 0 { catalog.database_id = catalog.reserve_object_id()?; }
+            catalog.save(system.catalog_path())?;
+        }
+        let databases = Self { root: cfg, system, named: Mutex::new(named) };
+        {
+            let named = databases.named.lock().map_err(|_| std::io::Error::other("database lock poisoned"))?;
+            for server in named.values() { databases.assign_database_id(server)?; }
+        }
+        Ok(databases)
+    }
+
+    /// 为数据库持久化不复用的编号
+    fn assign_database_id(&self, server: &Server) -> std::io::Result<()> {
+        let mut catalog = server.catalog.lock().map_err(|_| std::io::Error::other("catalog lock poisoned"))?;
+        if catalog.database_id == 0 {
+            let mut system = self.system.catalog.lock().map_err(|_| std::io::Error::other("catalog lock poisoned"))?;
+            let id = system.reserve_object_id()?;
+            system.save(self.system.catalog_path())?;
+            catalog.database_id = id;
+            catalog.save(server.catalog_path())?;
+        }
+        Ok(())
     }
 
     /// 按名字打开或新建一个库
@@ -2049,6 +2150,42 @@ impl Databases {
         if !name.is_empty() && !valid_database(&name) { return Err(Error::other("invalid database name")); }
         let mut named = self.named.lock().map_err(|_| Error::other("database lock poisoned"))?;
         match method.as_str() {
+            "object_acl_read" => {
+                drop(named);
+                let _gate = self.system.gate.read().map_err(|_| Error::other("database gate poisoned"))?;
+                if self.system.recovery_required.load(Ordering::Acquire) { return Err(Error::other("recovery required")); }
+                return Ok(Response::Rows { rows: self.system.object_acl_read()? });
+            }
+            "object_acl_replace" => {
+                drop(named);
+                let _gate = self.system.gate.write().map_err(|_| Error::other("database gate poisoned"))?;
+                if self.system.recovery_required.load(Ordering::Acquire) { return Err(Error::other("recovery required")); }
+                let expected = match value.get("expected") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(serde_json::Value::String(value)) => Some(value.as_str()),
+                    _ => return Err(Error::other("invalid expected ACL payload")),
+                };
+                let payload = value.get("payload").and_then(|value| value.as_str()).ok_or_else(|| Error::other("missing ACL payload"))?;
+                self.system.object_acl_replace(expected, payload)?;
+                return Ok(Response::Ok);
+            }
+            "resolve_object" => {
+                let server = if name == SYSTEM_DATABASE { &self.system }
+                    else { named.get(&name).ok_or_else(|| Error::other("unknown database"))? };
+                let _gate = server.gate.read().map_err(|_| Error::other("database gate poisoned"))?;
+                if server.recovery_required.load(Ordering::Acquire) { return Err(Error::other("recovery required")); }
+                let catalog = server.catalog.lock().map_err(|_| Error::other("catalog lock poisoned"))?;
+                let object_id = match value.get("table") {
+                    None => None,
+                    Some(serde_json::Value::String(table)) if !blocked_table(table) => {
+                        let schema = catalog.describe(table).ok_or_else(|| Error::other("unknown table"))?;
+                        if schema.object_id == 0 { return Err(Error::other("missing catalog object id")); }
+                        Some(schema.object_id)
+                    }
+                    _ => return Err(Error::other("invalid object table")),
+                };
+                return Ok(Response::Object { database_id: catalog.database_id, object_id });
+            }
             "all_catalogs" => {
                 let servers: Vec<(String, Arc<Server>)> =
                     std::iter::once((SYSTEM_DATABASE.to_string(), Arc::clone(&self.system)))
@@ -2082,6 +2219,7 @@ impl Databases {
                 cfg.data_dir = cfg.data_dir.join("databases").join(&name);
                 std::fs::create_dir(&cfg.data_dir)?;
                 let server = Server::new(cfg)?;
+                self.assign_database_id(&server)?;
                 server.catalog.lock().map_err(|_| Error::other("catalog lock poisoned"))?.save(server.catalog_path())?;
                 named.insert(name, Arc::new(server));
                 return Ok(Response::Ok);
@@ -2215,7 +2353,11 @@ fn maintenance_candidate(cfg: Config, mode: &str, user: &str, hash: &str, types:
     }
     let repair = mode == "repair";
     let catalog_path = cfg.data_dir.join("catalog.json");
-    let schemas = maintenance_schemas();
+    let mut schemas = maintenance_schemas();
+    if cfg.data_dir.join("__system_object_acl.db").is_file() {
+        schemas.push(("__system_object_acl", vec![SchemaColumn { name: "id".into(), ty: "int".into(), ..Default::default() },
+            SchemaColumn { name: "payload".into(), ty: "str".into(), ..Default::default() }]));
+    }
     let mut missing_data = Vec::new();
     let mut catalog = match Catalog::load(&catalog_path) {
         Ok(catalog) => catalog,

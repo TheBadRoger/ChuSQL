@@ -5,9 +5,163 @@ use chusql_core_storage::runtime::Storage;
 
 // 进程内存储集成测试：协议请求、索引、账号与配置。
 
+/// 权限快照支持跨页文本并拒绝旧版本覆盖
+#[test]
+fn object_acl_snapshots_are_private_and_compare_versions() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, data) = start_server();
+    let mut c = connect()?;
+    let payload = serde_json::json!({"grants": "权限\"\\".repeat(4000)}).to_string();
+    request_ok(&mut c, serde_json::json!({"method":"object_acl_replace","expected":null,"payload":payload}))?;
+    let current: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"object_acl_read"}"#))?;
+    assert_eq!(current["rows"][0]["payload"], payload);
+    let conflict = send(&mut c, r#"{"method":"object_acl_replace","expected":null,"payload":"{}"}"#);
+    assert!(conflict.contains("changed concurrently"), "{conflict}");
+    assert!(send(&mut c, r#"{"method":"scan","database":"system","table":"__system_object_acl"}"#).contains("reserved system table"));
+    assert!(!send(&mut c, r#"{"method":"all_catalogs"}"#).contains("__system_object_acl"));
+    drop(c);
+    drop(server);
+    let _restarted = restart_at(data.path())?;
+    let mut c = connect()?;
+    let reloaded: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"object_acl_read"}"#))?;
+    assert_eq!(reloaded, current);
+    Ok(())
+}
+
+/// 权限并发替换只能有一个版本提交
+#[test]
+fn concurrent_object_acl_replacement_preserves_one_winner() -> Result<(), Box<dyn std::error::Error>> {
+    let (_server, _data) = start_server();
+    let mut c = connect()?;
+    let workers: Vec<_> = (0..8).map(|index| {
+        let storage = Arc::clone(&c.0);
+        std::thread::spawn(move || storage.request_line(&serde_json::json!({
+            "method":"object_acl_replace","expected":null,"payload":serde_json::json!({"winner":index}).to_string()
+        }).to_string()))
+    }).collect();
+    let replies: Vec<serde_json::Value> = workers.into_iter().map(|worker| serde_json::from_str(&worker.join().unwrap()).unwrap()).collect();
+    assert_eq!(replies.iter().filter(|reply| reply["status"] == "ok").count(), 1);
+    assert_eq!(replies.iter().filter(|reply| reply["message"].as_str().is_some_and(|message| message.contains("changed concurrently"))).count(), 7);
+    let loaded: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"object_acl_read"}"#))?;
+    assert!(serde_json::from_str::<serde_json::Value>(loaded["rows"][0]["payload"].as_str().unwrap())?["winner"].is_number());
+    Ok(())
+}
+
+/// 权限快照落盘失败后重放完整替换
+#[test]
+fn object_acl_commit_failure_replays_the_complete_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, data) = start_server();
+    let mut c = connect()?;
+    let pending = data.path().join("system/catalog.json.pending");
+    std::fs::create_dir(&pending)?;
+    let failed = send(&mut c, r#"{"method":"object_acl_replace","expected":null,"payload":"{\"version\":1}"}"#);
+    assert!(failed.contains("error"), "{failed}");
+    assert!(send(&mut c, r#"{"method":"object_acl_read"}"#).contains("recovery required"));
+    drop(c);
+    drop(server);
+    std::fs::remove_dir(pending)?;
+    let _restarted = restart_at(data.path())?;
+    let mut c = connect()?;
+    let loaded: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"object_acl_read"}"#))?;
+    assert_eq!(loaded["rows"][0]["payload"], "{\"version\":1}");
+    Ok(())
+}
+
+/// 对象编号区分跨库同名及删除重建
+#[test]
+fn object_identity_tracks_database_and_table_incarnations() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, data) = start_server();
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"create_database","database":"other"}))?;
+    for database in ["main", "other"] {
+        request_ok(&mut c, serde_json::json!({"method":"create_table","database":database,"table":"items","columns":[{"name":"id","ty":"int"}]}))?;
+    }
+    let old: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"resolve_object","database":"main","table":"items"}"#))?;
+    let other: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"resolve_object","database":"other","table":"items"}"#))?;
+    assert_eq!(old["status"], "object");
+    assert_ne!(old["database_id"], other["database_id"]);
+    assert!(old["object_id"].as_u64().unwrap() > 0);
+    let catalog: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"list_catalog","database":"main"}"#))?;
+    let info = catalog["schemas"].as_array().unwrap().iter().find(|entry| entry["table"] == "items").unwrap();
+    assert_eq!(info["database_id"], old["database_id"]);
+    assert_eq!(info["object_id"], old["object_id"]);
+    drop(c);
+    drop(server);
+    let restarted = restart_at(data.path())?;
+    let mut c = connect()?;
+    let stable: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"resolve_object","database":"main","table":"items"}"#))?;
+    assert_eq!(stable, old);
+    request_ok(&mut c, serde_json::json!({"method":"drop_table","database":"main","table":"items"}))?;
+    assert!(send(&mut c, r#"{"method":"resolve_object","database":"main","table":"items"}"#).contains("unknown table"));
+    request_ok(&mut c, serde_json::json!({"method":"create_table","database":"main","table":"items","columns":[{"name":"id","ty":"int"}]}))?;
+    let new: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"resolve_object","database":"main","table":"items"}"#))?;
+    assert_eq!(new["database_id"], old["database_id"]);
+    assert_ne!(new["object_id"], old["object_id"]);
+    request_ok(&mut c, serde_json::json!({"method":"drop_database","database":"other"}))?;
+    request_ok(&mut c, serde_json::json!({"method":"create_database","database":"other"}))?;
+    let new_database: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"resolve_object","database":"other"}"#))?;
+    assert_ne!(new_database["database_id"], other["database_id"]);
+    assert!(new_database["object_id"].is_null());
+    drop(c);
+    drop(restarted);
+    Ok(())
+}
+
 thread_local! {
     /// 当前线程的存储实例：一个用例一个线程，用例内部按顺序起/停
     static CURRENT: RefCell<Option<Arc<Storage>>> = const { RefCell::new(None) };
+}
+
+/// 建表应用失败后按日志恢复原编号
+#[test]
+fn object_id_survives_committed_create_recovery() -> Result<(), Box<dyn std::error::Error>> {
+    use chusql_core_storage::wal::{Wal, WalOp};
+    let (server, data) = start_server();
+    let mut c = connect()?;
+    let directory = data.path().join("databases/main");
+    let pending = directory.join("catalog.json.pending");
+    std::fs::create_dir(&pending)?;
+    assert!(send(&mut c, r#"{"method":"create_table","table":"recovered","columns":[{"name":"id","ty":"int"}]}"#).contains("error"));
+    assert!(send(&mut c, r#"{"method":"resolve_object","database":"main","table":"recovered"}"#).contains("recovery required"));
+    let wal = Wal::new(directory.join("wal.log"));
+    let scan = wal.read_all()?;
+    let id = scan.records.iter().find_map(|(_, op)| match op {
+        WalOp::CreateTable { table, object_id, .. } if table == "recovered" => *object_id,
+        _ => None,
+    }).unwrap();
+    drop(wal);
+    drop(c);
+    drop(server);
+    std::fs::remove_dir(pending)?;
+    let _restarted = restart_at(data.path())?;
+    let mut c = connect()?;
+    let resolved: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"resolve_object","database":"main","table":"recovered"}"#))?;
+    assert_eq!(resolved["object_id"], id);
+    Ok(())
+}
+
+/// 并发建表分配互不重复的编号
+#[test]
+fn concurrent_table_creation_allocates_distinct_object_ids() -> Result<(), Box<dyn std::error::Error>> {
+    let (_server, _data) = start_server();
+    let mut c = connect()?;
+    let workers: Vec<_> = (0..16).map(|index| {
+        let storage = Arc::clone(&c.0);
+        std::thread::spawn(move || storage.request_line(&serde_json::json!({
+            "method":"create_table", "database":"main", "table":format!("concurrent_{index}"),
+            "columns":[{"name":"id","ty":"int"}]
+        }).to_string()))
+    }).collect();
+    for worker in workers {
+        let result: serde_json::Value = serde_json::from_str(&worker.join().unwrap())?;
+        assert_eq!(result["status"], "ok");
+    }
+    let response: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"list_catalog","database":"main"}"#))?;
+    let ids: std::collections::HashSet<_> = response["schemas"].as_array().unwrap().iter()
+        .filter(|schema| schema["table"].as_str().unwrap().starts_with("concurrent_"))
+        .map(|schema| schema["object_id"].as_u64().unwrap()).collect();
+    assert_eq!(ids.len(), 16);
+    assert!(!ids.contains(&0));
+    Ok(())
 }
 
 /// 定点写入检查舍入和整批原子拒绝
@@ -243,6 +397,66 @@ fn legacy_account_wal_migrates_without_promoting_other_names() -> Result<(), Box
     assert_eq!(migrated["accounts"][2]["user"], "reader");
     assert_eq!(migrated["accounts"][2]["id"], 10);
     assert_eq!(serde_json::from_str::<serde_json::Value>(&send(&mut c, r#"{"method":"identity_initialize","administrator":"alice"}"#))?, migrated);
+    Ok(())
+}
+
+/// 读取并校验身份命令响应
+fn account_response(c: &mut Conn, request: serde_json::Value) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let response: serde_json::Value = serde_json::from_str(&send(c, &request.to_string()))?;
+    assert_eq!(response["status"], "accounts", "{response}");
+    Ok(response)
+}
+
+/// 本机认证开关独立持久化并推进会话版本
+#[test]
+fn sudo_auth_is_independent_revocable_and_persistent() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, data) = start_server();
+    let mut c = connect()?;
+    let original = account_response(&mut c, serde_json::json!({"method":"account_create","user":"local_user","password_hash":"hash"}))?;
+    let created = original["accounts"].as_array().unwrap().iter().find(|a| a["user"] == "local_user").unwrap();
+    assert_eq!(created["allow_sudo_auth"], false);
+    let changed = account_response(&mut c, serde_json::json!({"method":"identity_alter","user":"local_user","allow_sudo_auth":true}))?;
+    let local = changed["accounts"].as_array().unwrap().iter().find(|a| a["user"] == "local_user").unwrap();
+    assert_eq!(local["allow_sudo_auth"], true);
+    assert_eq!(local["is_superuser"], false);
+    assert_eq!(local["system_catalog_manager"], false);
+    assert_eq!(local["revision"], 2);
+    for command in [
+        serde_json::json!({"method":"identity_alter","user":"local_user","allow_sudo_auth":false}),
+        serde_json::json!({"method":"account_reset","user":"local_user","password_hash":"other"}),
+        serde_json::json!({"method":"identity_alter","user":"root","allow_sudo_auth":true}),
+    ] {
+        let denied = send(&mut c, &serde_json::json!({"method":"catalog_manage","command":command}).to_string());
+        assert!(denied.contains("superuser required"), "{denied}");
+    }
+    drop(c);
+    drop(server);
+    let _restarted = restart_at(data.path())?;
+    let mut c = connect()?;
+    assert_eq!(account_response(&mut c, serde_json::json!({"method":"accounts_list"}))?, changed);
+    let revoked = account_response(&mut c, serde_json::json!({"method":"identity_alter","user":"local_user","allow_sudo_auth":false}))?;
+    let local = revoked["accounts"].as_array().unwrap().iter().find(|a| a["user"] == "local_user").unwrap();
+    assert_eq!(local["allow_sudo_auth"], false);
+    assert_eq!(local["revision"], 3);
+    Ok(())
+}
+
+/// 升级缺失本机认证列的旧目录
+#[test]
+fn sudo_auth_upgrades_old_identity_schema() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, data) = start_server();
+    drop(server);
+    CURRENT.with(|slot| *slot.borrow_mut() = None);
+    let path = data.path().join("system/catalog.json");
+    let mut catalog: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    catalog["tables"]["__system_identities"]["columns"].as_array_mut().unwrap().retain(|column| column["name"] != "allow_sudo_auth");
+    std::fs::write(&path, serde_json::to_vec(&catalog)?)?;
+    let _restarted = restart_at(data.path())?;
+    let mut c = connect()?;
+    let upgraded = account_response(&mut c, serde_json::json!({"method":"identity_initialize","administrator":"root"}))?;
+    assert!(upgraded["accounts"].as_array().unwrap().iter().all(|a| a["allow_sudo_auth"] == false));
+    let catalog: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    assert!(catalog["tables"]["__system_identities"]["columns"].as_array().unwrap().iter().any(|column| column["name"] == "allow_sudo_auth"));
     Ok(())
 }
 
@@ -1691,6 +1905,7 @@ fn create_table_replays_after_restart() -> Result<(), Box<dyn std::error::Error>
     drop(server);
 
     let group = vec![WalOp::CreateTable {
+        object_id: None,
         table: "m4_create".into(),
         columns: vec![
             SchemaColumn {
@@ -1835,6 +2050,7 @@ fn already_applied_create_table_is_skipped_on_restart() -> Result<(), Box<dyn st
 
     let wal = Wal::new(data.path().join("databases/main/wal.log"));
     wal.append_group(&[WalOp::CreateTable {
+        object_id: None,
         table: "m4_done".into(),
         columns: vec![SchemaColumn {
             name: "id".into(),
@@ -1993,6 +2209,36 @@ fn create_index_accepts_duplicate_values() {
 
     let r = send(&mut c, r#"{"method":"insert","table":"dup_t","row":{"id":2,"age":99}}"#);
     assert!(r.contains(r#""status":"error""#), "the id index stays unique: {}", r);
+}
+
+/// 重启修复统计并保持点查范围结果
+#[test]
+fn restart_rebuilds_stale_stats_without_changing_index_results() -> Result<(), Box<dyn std::error::Error>> {
+    let (server, data) = start_server();
+    let mut c = connect()?;
+    let rows: Vec<serde_json::Value> = (0..160).map(|id| serde_json::json!({"id":id,"v":id})).collect();
+    request_ok(&mut c, serde_json::json!({"method":"insert_batch","table":"rebuilt","rows":rows}))?;
+    request_ok(&mut c, serde_json::json!({"method":"create_index","table":"rebuilt","column":"v"}))?;
+    let point: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"lookup_by_index","table":"rebuilt","column":"v","key":80}"#))?;
+    let range: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"range_by_index","table":"rebuilt","column":"v","lo":80,"hi":89}"#))?;
+    let scan: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"scan","table":"rebuilt"}"#))?;
+    drop(c);
+    drop(server);
+    let path = data.path().join("databases/main/catalog.json");
+    let mut catalog: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    catalog["tables"]["rebuilt"]["row_count"] = serde_json::json!(9999);
+    catalog["tables"]["rebuilt"]["stats"] = serde_json::json!({});
+    std::fs::write(&path, serde_json::to_vec(&catalog)?)?;
+    let _restarted = restart_at(data.path())?;
+    let mut c = connect()?;
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&send(&mut c, r#"{"method":"lookup_by_index","table":"rebuilt","column":"v","key":80}"#))?, point);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&send(&mut c, r#"{"method":"range_by_index","table":"rebuilt","column":"v","lo":80,"hi":89}"#))?, range);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&send(&mut c, r#"{"method":"scan","table":"rebuilt"}"#))?, scan);
+    let schema: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"describe_table","table":"rebuilt"}"#))?;
+    assert_eq!(schema["row_count"], 160);
+    let stat = schema["stats"].as_array().unwrap().iter().find(|stat| stat["name"] == "v").unwrap();
+    assert_eq!(stat["hist"], serde_json::json!([10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10]));
+    Ok(())
 }
 
 /// 数据字典里的统计：不同值个数
@@ -2264,9 +2510,9 @@ fn account_table_uses_typed_columns_and_stamps_login() -> Result<(), Box<dyn std
     let entry = &catalog["tables"]["__system_identities"];
     let columns = entry["columns"].as_array().ok_or("missing columns")?;
     let names: Vec<&str> = columns.iter().map(|col| col["name"].as_str().unwrap_or("")).collect();
-    assert_eq!(names, vec!["id", "user", "can_login", "is_superuser", "system_catalog_manager", "enabled", "identity_version", "registered_at", "last_login_at", "revision"]);
+    assert_eq!(names, vec!["id", "user", "can_login", "is_superuser", "system_catalog_manager", "allow_sudo_auth", "enabled", "identity_version", "registered_at", "last_login_at", "revision"]);
     let types: Vec<&str> = columns.iter().map(|col| col["ty"].as_str().unwrap_or("")).collect();
-    assert_eq!(types, vec!["int", "varchar(64)", "bool", "bool", "bool", "bool", "int", "timestamp", "timestamp", "int"]);
+    assert_eq!(types, vec!["int", "varchar(64)", "bool", "bool", "bool", "bool", "bool", "int", "timestamp", "timestamp", "int"]);
     assert_eq!(columns[0]["primary_key"], true, "id 是主键");
     assert_eq!(columns[0]["nullable"], false);
     assert_eq!(columns[1]["unique"], true, "用户名唯一");

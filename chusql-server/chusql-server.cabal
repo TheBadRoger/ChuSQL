@@ -16,6 +16,8 @@ library
                       ChuSQL.Server.Catalog
                       ChuSQL.Server.Policy
                       ChuSQL.Server.Privileges
+                      ChuSQL.Server.ObjectACL
+                      ChuSQL.Server.Security
                       ChuSQL.Server.Session
                       ChuSQL.Server.TCP
     build-depends:    base >= 4.14 && < 5

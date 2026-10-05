@@ -1,6 +1,8 @@
 module ChuSQL.Core.Engine.Syntax.AST (Statement (..), FromClause (..), JoinKind (..), Expr (..), Subquery (..), Quantifier (..), CompareOp (..), SortDir (..), makeSelect) where
 
 import ChuSQL.Core.Model (Column (..), ColumnType, Value (..))
+import ChuSQL.Core.Engine.Runtime.Types (TypeId, TypeExpr, RuntimeValue)
+import ChuSQL.Core.Engine.Runtime.Functions (FunctionId)
 
 -- 语法树：语句、数据来源、条件表达式、排序方向。
 
@@ -112,6 +114,11 @@ data CompareOp
 -- | 条件表达式：列、字面量、算术、比较、逻辑、聚合与子查询
 data Expr
     = Col String
+    | FunctionCall String [Expr]
+    | BoundFunction FunctionId TypeId [Expr]
+    | Construct TypeExpr [Expr]
+    | BoundConstruct TypeId [Expr]
+    | RuntimeLiteral TypeId RuntimeValue
     | LitNull
     | LitInt Int
     | LitFloat Double

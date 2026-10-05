@@ -48,6 +48,8 @@ import Data.Char (isDigit, isSpace, toLower)
 import Data.Hashable (Hashable (..))
 import Data.List (isPrefixOf, isSuffixOf, stripPrefix)
 import Data.Maybe (fromMaybe, mapMaybe)
+import ChuSQL.Core.Runtime
+import qualified Data.ByteString.Lazy.Char8 as BS
 
 -- 数据模型：列类型、列约束、值、行、表、数据库，外加查表小工具。
 
@@ -68,6 +70,7 @@ data ColumnType
     | CBlob
     | CNull
     | CDomain String ColumnType
+    | CRuntime TypeId
     deriving (Show, Eq)
 
 -- | 列定义：类型 + 约束；约束全部取默认值就是普通可空列。
@@ -121,6 +124,7 @@ typeLabel CTimestamp = "TTimestamp"
 typeLabel CBlob = "TBlob"
 typeLabel CNull = "NULL"
 typeLabel (CDomain name _) = name
+typeLabel (CRuntime tid) = renderTypeExpr (typeExpression tid)
 
 -- | 线上/磁盘上的类型名
 typeName :: ColumnType -> String
@@ -139,6 +143,7 @@ typeName CTimestamp = "timestamp"
 typeName CBlob = "blob"
 typeName CNull = "null"
 typeName (CDomain name base) = "domain(" ++ name ++ "," ++ typeName base ++ ")"
+typeName (CRuntime tid) = "runtime(" ++ BS.unpack (encodeType tid) ++ ")"
 
 -- | 生成类型定义的目录键
 domainTableName :: String -> String
@@ -151,6 +156,9 @@ isDomainTable name = "__system_domain_" `isPrefixOf` map toLower name
 -- | 解析类型名，可带长度/精度参数；不认识的给 Nothing
 parseColumnType :: String -> Maybe ColumnType
 parseColumnType raw
+    | Just inner <- stripPrefix "runtime(" raw
+    , Just body <- stripSuffixMaybe ")" inner =
+        either (const Nothing) (Just . CRuntime) (decodeType builtinTypes (BS.pack body))
     | Just inner <- stripPrefix "domain(" raw
     , Just body <- stripSuffixMaybe ")" inner
     , (name, ',' : definition) <- break (== ',') body =
@@ -180,7 +188,7 @@ parseColumnType raw
         ("date", []) -> Just CDate
         ("timestamp", []) -> Just CTimestamp
         ("blob", []) -> Just CBlob
-        _ -> Nothing
+        _ -> either (const Nothing) (Just . CRuntime . descriptorId) (parseTypeExpr raw >>= resolveType builtinTypes)
   where
     -- | 去掉空白的类型名
     cleaned = map toLower (filter (not . isSpace) raw)
@@ -231,6 +239,7 @@ data TypeClass
     | TemporalClass
     | BooleanClass
     | NullClass
+    | RuntimeClass
     deriving (Show, Eq)
 
 -- | 整型大类判断
@@ -250,12 +259,15 @@ typeClassOf CTimestamp = TemporalClass
 typeClassOf CBool = BooleanClass
 typeClassOf CNull = NullClass
 typeClassOf (CDomain _ base) = typeClassOf base
+typeClassOf CRuntime{} = RuntimeClass
 
 -- | 同大类可赋值；日期/时间列接受字符串字面量
 assignable :: ColumnType -> ColumnType -> Bool
 assignable target source
     | source == CNull = True
     | target == source = True
+    | CRuntime tid <- target = Just (typeExpression tid) == scalarTypeExpression source
+    | typeClassOf target == RuntimeClass || typeClassOf source == RuntimeClass = False
     | typeClassOf target == typeClassOf source = True
     | typeClassOf target == TemporalClass && typeClassOf source == TextClass = True
     | otherwise = False
@@ -270,7 +282,9 @@ integerType _ = False
 
 -- | 比较用的类型族：同大类可比，日期时间与文本互比
 comparableTypes :: ColumnType -> ColumnType -> Bool
-comparableTypes a b = a == CNull || b == CNull || sameClass || crossTemporal
+comparableTypes a b
+    | typeClassOf a == RuntimeClass || typeClassOf b == RuntimeClass = False
+    | otherwise = a == CNull || b == CNull || sameClass || crossTemporal
   where
     -- | 两个类型同属一个大类
     sameClass = typeClassOf a == typeClassOf b
@@ -288,6 +302,10 @@ numericType t = typeClassOf t == NumericClass
 -- | 值能不能放进这一列（先不看可空）
 valueFits :: ColumnType -> Value -> Bool
 valueFits (CDomain _ base) value = valueFits base value
+valueFits (CRuntime expected) (VRuntime supplied value) = expected == supplied && validateValue builtinTypes expected value == Right ()
+valueFits (CRuntime expected) value = case scalarRuntimeValue value of
+    Just runtime -> validateValue builtinTypes expected runtime == Right ()
+    Nothing -> value == VNull
 valueFits _ VNull = True
 valueFits CInt (VInt _) = True
 valueFits CBigInt (VInt _) = True
@@ -326,6 +344,15 @@ coerceValue t v = case t of
     CBlob -> toText t v
     CNull -> Left "a NULL output cannot contain a non-NULL value"
     CDomain _ base -> coerceValue base v
+    CRuntime expected -> case v of
+        VRuntime supplied value | supplied == expected -> do
+            validateValue builtinTypes expected value
+            Right v
+        _ -> case scalarRuntimeValue v of
+            Just value -> do
+                validateValue builtinTypes expected value
+                Right (VRuntime expected value)
+            Nothing -> Left "runtime value type identity mismatch"
 
 -- | 整数收进整型列
 toInt :: ColumnType -> Value -> Either String Value
@@ -422,6 +449,7 @@ data Value
     | VFloat Double
     | VStr String
     | VBool Bool
+    | VRuntime TypeId RuntimeValue
     deriving (Show, Eq)
 
 -- | 值的比较关键字：整值浮点折成整数
@@ -450,6 +478,7 @@ compareValue a b = case (canonicalValue a, canonicalValue b) of
     (VFloat x, VFloat y) -> compare x y
     (VStr x, VStr y) -> compare x y
     (VBool x, VBool y) -> compare x y
+    (VRuntime tx x, VRuntime ty y) -> compare (encodeType tx, show (canonicalRuntime x)) (encodeType ty, show (canonicalRuntime y))
     (x, y) -> compare (valueRank x) (valueRank y)
 
 -- | 族的先后，只用来给异族值定序
@@ -459,6 +488,7 @@ valueRank (VInt _) = 1
 valueRank (VFloat _) = 1
 valueRank (VStr _) = 2
 valueRank (VBool _) = 3
+valueRank VRuntime{} = 4
 
 -- | 相等语义：比较关键字相同即相等，与 hashValue 配套
 valuesEqual :: Value -> Value -> Bool
@@ -472,6 +502,35 @@ hashValue v = case canonicalValue v of
     VFloat d -> hashWithSalt 1 d
     VStr t -> hashWithSalt 2 t
     VBool b -> hashWithSalt 3 b
+    VRuntime tid value -> hashWithSalt 4 (BS.unpack (encodeType tid), show (canonicalRuntime value))
+
+-- | 解析现有标量列的逻辑类型
+scalarTypeExpression :: ColumnType -> Maybe TypeExpr
+scalarTypeExpression (CDomain _ base) = scalarTypeExpression base
+scalarTypeExpression CInt = Just intType
+scalarTypeExpression CBigInt = Just intType
+scalarTypeExpression CSmallInt = Just intType
+scalarTypeExpression CDouble = Just doubleType
+scalarTypeExpression CFloat = Just doubleType
+scalarTypeExpression CBool = Just boolType
+scalarTypeExpression CStr = Just stringType
+scalarTypeExpression _ = Nothing
+
+-- | 转换现有标量值
+scalarRuntimeValue :: Value -> Maybe RuntimeValue
+scalarRuntimeValue (VInt n) = Just (RInt n)
+scalarRuntimeValue (VFloat n) = Just (RDouble n)
+scalarRuntimeValue (VBool b) = Just (RBool b)
+scalarRuntimeValue (VStr text) = Just (RString text)
+scalarRuntimeValue _ = Nothing
+
+-- | 统一复合值中的浮点零关键字
+canonicalRuntime :: RuntimeValue -> RuntimeValue
+canonicalRuntime (RDouble n) | n == 0 = RDouble 0
+canonicalRuntime (RList values) = RList (map canonicalRuntime values)
+canonicalRuntime (RMaybe value) = RMaybe (fmap canonicalRuntime value)
+canonicalRuntime (RTuple values) = RTuple (map canonicalRuntime values)
+canonicalRuntime value = value
 
 -- | 值按类型打散搅拌
 instance Hashable Value where

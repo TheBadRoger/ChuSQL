@@ -1,11 +1,10 @@
 module ChuSQL.Core.Engine (runStatement, runStatementM, rowsOf) where
 
-import ChuSQL.Core.Engine.Algebra.Eval (evalCondForRowM, evalExprM, evalRelOpM)
+import ChuSQL.Core.Engine.Algebra.Eval (evalCondForRowM, evalExprM)
 import ChuSQL.Core.Engine.Algebra.Expr (evalCondForRow, evalExpr)
-import ChuSQL.Core.Engine.Algebra.Optimize (optimize)
-import ChuSQL.Core.Engine.Algebra.Planner (translate)
+import ChuSQL.Core.Engine.Runtime.Query (bindQuery, executeQueryM)
 import ChuSQL.Core.Model
-import ChuSQL.Core.Engine.Semantic (prepare)
+import ChuSQL.Core.Engine.Semantic (prepare, prepareRowExpression)
 import ChuSQL.Core.Engine.Storage (MonadStorage (..))
 import ChuSQL.Core.Engine.Storage.Memory (MemoryStorage (runMemoryStorage))
 import ChuSQL.Core.Engine.Syntax.AST
@@ -41,13 +40,13 @@ runStatementM q = do
 -- | 按语句类型分发（已检查过）
 runStatementUncheckedM :: (MonadStorage m) => Database -> Statement -> m (Either String [Row])
 runStatementUncheckedM db q@Select{} =
-    case translate q of
+    case bindQuery db q of
         Left e -> pure (Left e)
-        Right relOp -> evalRelOpM db (optimize db relOp)
+        Right bound -> executeQueryM bound
 runStatementUncheckedM db q@SelectExpr{} =
-    case translate q of
+    case bindQuery db q of
         Left e -> pure (Left e)
-        Right relOp -> evalRelOpM db (optimize db relOp)
+        Right bound -> executeQueryM bound
 runStatementUncheckedM db (Insert tbl cols rows) =
     case lookupTable db tbl of
         Left e -> pure (Left e)
@@ -241,7 +240,9 @@ checkPlan table = mapM parse (mapMaybe checked (tableCols table))
     -- | 解析一列的 CHECK 文本
     parse (name, text) = case parseExpression text of
         Left err -> Left ("CHECK on " ++ name ++ ": " ++ firstLine err)
-        Right e -> Right (name, e)
+        Right e -> do
+            bound <- prepareRowExpression (tableCols table) e
+            Right (name, bound)
 
 -- | 执行解析好的 CHECK 条件
 runChecks :: CheckPlan -> Row -> Either String ()

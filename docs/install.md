@@ -33,6 +33,17 @@ ChuSQL 支持三种安装方式：
 
 完成系统目录初始化后，安装程序默认会启动 `chusql-server`；如不希望自动启动，可使用 `--no-start`（Windows 为 `-NoStart`）。
 
+Linux 默认注册 `chusql-server.service` 为当前操作系统用户的 systemd 服务，并启用 linger 和开机启动，无需登录即可运行，异常退出后自动重启。需要可用的 systemd 用户会话；若启用 linger 时权限不足，按安装提示执行 `sudo loginctl enable-linger "$(id -un)"` 后重试。数据库管理员 `--user` 与运行服务的操作系统用户是两个独立身份。
+
+`--no-start` 仅跳过本次启动，仍启用开机启动。非 systemd 环境可使用 `--no-service` 跳过服务注册，此时保留原有后台启动方式。
+
+```sh
+systemctl --user status chusql-server.service
+systemctl --user restart chusql-server.service
+systemctl --user stop chusql-server.service
+journalctl --user -u chusql-server.service
+```
+
 ## 包内安装
 
 解压发行包后，在包根目录执行：
@@ -56,6 +67,7 @@ Windows：
 | `--data-dir DIR` | `-DataDir` | 指定数据目录 |
 | `--user NAME` | `-RootUser` | 指定管理员账号名 |
 | `--no-start` | `-NoStart` | 安装后不自动启动服务 |
+| `--no-service` | — | 跳过 Linux 服务注册和开机启动 |
 | `--version TAG` | `-Version` | 指定发行版本 |
 | `--list-versions` | `-ListVersions` | 列出可安装版本 |
 | `--from-source` | — | 从源码构建并安装 |
@@ -108,3 +120,9 @@ Windows：
 ```
 
 如需保留数据，可使用 `--keep-data`（Windows 为 `-KeepData`）；如需保留配置，可使用 `--keep-config`（Windows 为 `-KeepConfig`）。
+
+Linux 卸载时会停止服务、取消开机启动并移除服务文件。用户的 linger 设置保留，其他用户服务仍可使用它。
+
+## 发布真实性与后续签名方案
+
+当前 SHA256 校验用于检测产物损坏，发布签名尚未实现。密钥管理、可信根、轮换、在线与离线验证的设计见[发布签名与验证](release-signing.md)；设计中的验证器和签名安装流程目前不可用。

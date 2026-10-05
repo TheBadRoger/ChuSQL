@@ -22,6 +22,12 @@ library
                       ChuSQL.Core.Engine.Error
                       ChuSQL.Core.Engine
                       ChuSQL.Core.Engine.Parallel
+                      ChuSQL.Core.Engine.Normalization
+                      ChuSQL.Core.Engine.Runtime.Types
+                      ChuSQL.Core.Engine.Runtime.Functions
+                      ChuSQL.Core.Engine.Runtime.Binding
+                      ChuSQL.Core.Engine.Runtime.SQL
+                      ChuSQL.Core.Engine.Runtime.Query
                       ChuSQL.Core.Engine.Semantic
                       ChuSQL.Core.Engine.Storage
                       ChuSQL.Core.Engine.Storage.FFI
@@ -39,6 +45,7 @@ library
                     , scientific
                     , text
                     , unordered-containers
+                    , vector
     extra-libraries:  chusql_core_storage
     -- 运行期找 libchusql_core_storage.so：$ORIGIN 让二进制与动态库同目录即可
     if os(linux)
@@ -51,6 +58,8 @@ library
 test-suite chusql-core-engine-test
     type:             exitcode-stdio-1.0
     main-is:          Spec.hs
+    other-modules:    NormalizationSpec
+                      RuntimeSpec
     hs-source-dirs:   test
     build-depends:    base
                     , chusql-core-engine
@@ -59,5 +68,7 @@ test-suite chusql-core-engine-test
                     , filepath
                     , hashable
                     , hspec
+                    , bytestring
+                    , aeson
     default-language: Haskell2010
     ghc-options:      -Wall -threaded

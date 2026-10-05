@@ -35,6 +35,9 @@ port = 7777
 max_message = 1048576
 # Maximum number of rows returned by a query through the database server.
 max_rows = 1000
+# Local elevated OS identity mapping; empty disables sudo authentication.
+# Requires ALLOW_SUDO_AUTH on the identity and an elevated server process.
+sudo_auth_user = ""
 
 [log]
 # Diagnostic verbosity: off, error, warn, info or debug.

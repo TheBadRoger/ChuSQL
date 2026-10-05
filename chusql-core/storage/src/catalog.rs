@@ -35,6 +35,8 @@ pub struct ColumnStat {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TableSchema {
     #[serde(default)]
+    pub object_id: u64,
+    #[serde(default)]
     pub system: bool,
     pub columns: Vec<SchemaColumn>,
     #[serde(default)]
@@ -52,6 +54,10 @@ pub struct TableSchema {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Catalog {
     #[serde(default)]
+    pub database_id: u64,
+    #[serde(default)]
+    pub object_high_water: u64,
+    #[serde(default)]
     pub identity_high_water: i64,
     tables: BTreeMap<String, TableSchema>,
     #[serde(skip)]
@@ -68,7 +74,36 @@ impl Catalog {
         if bytes.is_empty() {
             return Ok(Catalog::default());
         }
-        serde_json::from_slice(&bytes).map_err(io::Error::other)
+        let mut catalog: Self = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+        catalog.upgrade_object_ids()?;
+        Ok(catalog)
+    }
+
+    /// 补齐旧目录对象编号并校验唯一性
+    fn upgrade_object_ids(&mut self) -> io::Result<()> {
+        self.object_high_water = self.object_high_water.max(self.database_id);
+        let mut ids = BTreeSet::new();
+        for schema in self.tables.values() {
+            if schema.object_id != 0 && !ids.insert(schema.object_id) {
+                return Err(io::Error::other("duplicate catalog object id"));
+            }
+            self.object_high_water = self.object_high_water.max(schema.object_id);
+        }
+        for schema in self.tables.values_mut() {
+            if schema.object_id == 0 {
+                self.object_high_water = self.object_high_water.checked_add(1)
+                    .ok_or_else(|| io::Error::other("catalog object id exhausted"))?;
+                schema.object_id = self.object_high_water;
+            }
+        }
+        Ok(())
+    }
+
+    /// 分配不复用的对象编号
+    pub fn reserve_object_id(&mut self) -> io::Result<u64> {
+        self.object_high_water = self.object_high_water.checked_add(1)
+            .ok_or_else(|| io::Error::other("catalog object id exhausted"))?;
+        Ok(self.object_high_water)
     }
 
     /// 返回所有表的 (表名, schema)。
@@ -106,15 +141,28 @@ impl Catalog {
 
     /// 建表；已存在报错
     pub fn create_table(&mut self, table: &str, columns: Vec<SchemaColumn>) -> io::Result<()> {
+        self.create_table_with_id(table, columns, None)
+    }
+
+    /// 按日志中的编号建立表
+    pub fn create_table_with_id(&mut self, table: &str, columns: Vec<SchemaColumn>, object_id: Option<u64>) -> io::Result<()> {
         if self.tables.contains_key(table) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!("table already exists: {}", table),
             ));
         }
+        let object_id = match object_id {
+            Some(id) if id == 0 || self.tables.values().any(|schema| schema.object_id == id) => {
+                return Err(io::Error::other("invalid catalog object id"));
+            }
+            Some(id) => { self.object_high_water = self.object_high_water.max(id); id }
+            None => self.reserve_object_id()?,
+        };
         self.tables.insert(
             table.to_string(),
             TableSchema {
+                object_id,
                 system: false,
                 columns,
                 dropped_columns: BTreeSet::new(),
@@ -188,6 +236,18 @@ impl Catalog {
             let entry = self.tables.entry(table.to_string()).or_default();
             entry.stats.clear();
             entry.row_count = 0;
+            for row in rows {
+                for (name, value) in row {
+                    if let Some(x) = value.as_f64() {
+                        let stat = entry.stats.entry(name.clone()).or_default();
+                        stat.lo = Some(stat.lo.map_or(x, |lo| lo.min(x)));
+                        stat.hi = Some(stat.hi.map_or(x, |hi| hi.max(x)));
+                        if stat.hist.is_empty() {
+                            stat.hist = vec![0; HIST_BUCKETS];
+                        }
+                    }
+                }
+            }
         }
         let mut changed = false;
         for row in rows {

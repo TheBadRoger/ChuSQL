@@ -2,7 +2,7 @@
 set -eu
 
 # ChuSQL 安装脚本（Linux/macOS）：装 cli/web、写全局配置、
-# 改 PATH、跑 csql-bootstrap 建系统目录、最后拉起服务。
+# 改 PATH、初始化系统目录，Linux 注册开机启动服务。
 
 default_repo='TheBadRoger/ChuSQL'
 
@@ -42,6 +42,7 @@ usage: ./install.sh [--component web|cli|both] [options]
                           there is no terminal to ask on; shows up in the shell
                           history, so CHUSQL_ADMIN_PASSWORD is safer)
   --no-start              do not start the server after installing
+  --no-service            skip Linux systemd registration and boot autostart
 
 where the files come from:
   (default)               a package next to this script, else the newest GitHub release
@@ -71,6 +72,7 @@ root_user='root'
 keep_package='no'
 password_arg=''
 no_start='no'
+no_service='no'
 repo="$default_repo"
 version='latest'
 url_arg=''
@@ -90,6 +92,7 @@ while [ $# -gt 0 ]; do
         --keep-package) keep_package='yes'; shift ;;
         --password) password_arg="${2:-}"; shift 2 ;;
         --no-start) no_start='yes'; shift ;;
+        --no-service) no_service='yes'; shift ;;
         --url) url_arg="${2:-}"; shift 2 ;;
         --repo) repo="${2:-}"; shift 2 ;;
         --version) version="${2:-}"; shift 2 ;;
@@ -617,8 +620,23 @@ echo "  root user  $root_user (password asked above, kept out of settings.toml)"
 
 # ---- 释放文件 ----
 # 包是合在一起的（web 和 cli 都在），这里按这次的选择逐个释放：没选的组件不落地
+service_file="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/chusql-server.service"
+use_service='no'
+if [ "$(uname -s)" = 'Linux' ] && [ "$no_service" = 'no' ]; then
+    command -v systemctl >/dev/null 2>&1 || fail 'systemd is required; use --no-service to opt out'
+    command -v loginctl >/dev/null 2>&1 || fail 'loginctl is required for boot autostart'
+    systemctl --user show-environment >/dev/null || fail 'cannot connect to user systemd; run in a login session or use --no-service'
+    loginctl enable-linger "$(id -un)" || fail 'cannot enable boot autostart; run sudo loginctl enable-linger for this OS user and retry'
+    use_service='yes'
+    if [ -f "$service_file" ]; then
+        systemctl --user stop chusql-server.service || fail 'cannot stop the existing service'
+    fi
+fi
 step 'Installing files'
 mkdir -p "$install_dir/bin" "$log_dir" "$data_dir"
+install_dir=$(CDPATH= cd -- "$install_dir" && pwd)
+data_dir=$(CDPATH= cd -- "$data_dir" && pwd)
+log_dir=$(CDPATH= cd -- "$log_dir" && pwd)
 cp "$pack/bin/chusql-server" "$install_dir/bin/"
 cp "$pack/bin/csql-bootstrap" "$install_dir/bin/"
 for lib in "$pack/bin/"libchusql_core_storage.*; do
@@ -646,6 +664,8 @@ step 'Writing settings.toml'
 config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ChuSQL"
 config_file="$config_dir/settings.toml"
 mkdir -p "$config_dir"
+config_dir=$(CDPATH= cd -- "$config_dir" && pwd)
+config_file="$config_dir/settings.toml"
 sed -e "s|@DATA_DIR@|$(printf '%s' "$data_dir" | sed 's/[\&|]/\\&/g')|g" \
     -e "s|@LOG_DIR@|$(printf '%s' "$log_dir" | sed 's/[\&|]/\\&/g')|g" \
     "$pack/resources/settings.toml.linux" > "$config_file"
@@ -714,7 +734,46 @@ fi
 # ---- 拉起服务 ----
 server_bin="$install_dir/bin/chusql-server"
 server_pid=''
-if [ "$no_start" = 'yes' ]; then
+if [ "$use_service" = 'yes' ]; then
+    step 'Registering the systemd service and boot autostart'
+    for service_arg in "$install_dir" "$server_bin" "$config_file" "$root_user"; do
+        case "$service_arg" in
+            *"
+"*) fail 'service arguments must not contain newlines' ;;
+        esac
+    done
+    mkdir -p "$(dirname "$service_file")"
+    # 转义 systemd 双引号参数与变量符号。
+    unit_quote() {
+        printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g'
+    }
+    cat > "$service_file" <<EOF
+[Unit]
+Description=ChuSQL database server
+
+[Service]
+Type=simple
+WorkingDirectory="$(unit_quote "$install_dir")"
+ExecStart=:"$(unit_quote "$server_bin")" --config "$(unit_quote "$config_file")" --user "$(unit_quote "$root_user")"
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+EOF
+    systemctl --user daemon-reload || fail 'cannot reload systemd units'
+    systemctl --user enable chusql-server.service || fail 'cannot enable boot autostart'
+    if [ "$no_start" = 'yes' ]; then
+        note '--no-start: boot autostart enabled; the server was not started'
+    else
+        systemctl --user restart chusql-server.service || fail 'cannot start chusql-server.service'
+        sleep 1
+        systemctl --user is-active --quiet chusql-server.service || fail 'the server stopped; run journalctl --user -u chusql-server.service'
+        note 'server running under systemd'
+    fi
+elif [ "$no_start" = 'yes' ]; then
     note '--no-start: the server was not started'
 else
     step 'Starting the server'
@@ -739,7 +798,11 @@ if [ "$want_cli" = 'yes' ]; then
 fi
 echo "  start with   $start_with"
 echo "  tcp server   $server_bin (listens on [server] listen_host/port, defaults 127.0.0.1:7777)"
-if [ -n "$server_pid" ]; then
+if [ "$use_service" = 'yes' ]; then
+    echo '  service      chusql-server.service (boot autostart enabled)'
+    echo '  manage       systemctl --user status|start|stop|restart chusql-server.service'
+    echo '  logs         journalctl --user -u chusql-server.service'
+elif [ -n "$server_pid" ]; then
     echo "  running      pid $server_pid (stop it with: kill $server_pid)"
 else
     echo "  start it     $server_bin --config \"$config_file\" --user $root_user"

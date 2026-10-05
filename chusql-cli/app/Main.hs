@@ -8,12 +8,14 @@ import ChuSQL.CLI.Script (stripTerminator)
 import ChuSQL.Interface.Session (
     Session,
     authenticateSession,
+    authenticateSudoSession,
     isPlainIdentifier,
     newSession,
     switchDatabase,
  )
 import ChuSQL.Interface.Config (ServerConfig (..), loadServerConfigAt, loadWebConfigAt, rootUserName)
 import ChuSQL.Interface.Link (Client, closeClient, connectClient)
+import ChuSQL.Interface.Sudo (SudoCredential, readSudoCredential)
 import ChuSQL.Interface.TOML (resolveConfigPath)
 import Control.Exception (finally)
 import Control.Monad (unless)
@@ -38,6 +40,7 @@ data Options = Options
     , optExecute :: Maybe Text
     , optHistory :: Maybe FilePath
     , optConfig :: Maybe FilePath
+    , optSudo :: Bool
     }
 
 -- | 命令行参数解析器
@@ -66,6 +69,7 @@ optionsParser =
         <*> optional (T.pack <$> strOption (long "execute" <> short 'e' <> metavar "SQL" <> help "Run one statement and exit"))
         <*> optional (strOption (long "history" <> metavar "FILE" <> help "SQL history file (default ~/.chusql_history)"))
         <*> optional (strOption (long "config" <> metavar "FILE" <> help "Config file to read (default: the fixed settings.toml under the system config directory)"))
+        <*> switch (long "sudo" <> help "Authenticate using the local root or elevated administrator identity")
 
 -- | 把 --format 的取值解析成格式
 formatReader :: String -> Either String OutputFormat
@@ -91,20 +95,29 @@ main = do
     base <- loadWebConfigAt configPath
     config <- loadServerConfigAt configPath
     let rootName = rootUserName base
-        userName = fromMaybe rootName (optUser options)
-    password <- promptPassword userName
+        userName = fromMaybe (if optSudo options then scSudoUser config else rootName) (optUser options)
+    credential <- if optSudo options then do
+        if T.null userName then reportError "sudo_auth_user is not configured" >> exitFailure else pure ()
+        local <- readSudoCredential (scPort config)
+        case local of
+            Left message -> reportError message >> exitFailure
+            Right proof -> pure (Just proof)
+        else pure Nothing
+    password <- if optSudo options then pure "" else promptPassword userName
     connected <- connectClient (T.pack (scHost config)) (scPort config)
     case connected of
         Left message -> reportError message >> exitFailure
         Right client ->
-            connect options client userName password
+            connect options client userName password credential
                 `finally` closeClient client
 
 -- | 连 server、登录，之后转入会话
-connect :: Options -> Client -> Text -> Text -> IO ()
-connect options client userName password = do
+connect :: Options -> Client -> Text -> Text -> Maybe SudoCredential -> IO ()
+connect options client userName password credential = do
     session <- newSession client
-    signedIn <- authenticateSession session userName password
+    signedIn <- case credential of
+        Just proof -> authenticateSudoSession session proof userName
+        Nothing -> authenticateSession session userName password
     case signedIn of
         Left message -> reportError message >> exitFailure
         Right () -> runSession options session

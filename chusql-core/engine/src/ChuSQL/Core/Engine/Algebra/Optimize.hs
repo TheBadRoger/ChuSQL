@@ -139,6 +139,7 @@ foldNode e
         Right (VFloat d) -> LitFloat d
         Right (VStr s) -> LitStr s
         Right (VBool b) -> LitBool b
+        Right (VRuntime tid value) -> RuntimeLiteral tid value
         Left _ -> e
     | otherwise = e
 
@@ -149,6 +150,8 @@ foldConstants (Sub a b) = foldNode (Sub (foldConstants a) (foldConstants b))
 foldConstants (Mul a b) = foldNode (Mul (foldConstants a) (foldConstants b))
 foldConstants (Div a b) = foldNode (Div (foldConstants a) (foldConstants b))
 foldConstants (Neg a) = foldNode (Neg (foldConstants a))
+foldConstants (BoundConstruct tid arguments) = BoundConstruct tid (map foldConstants arguments)
+foldConstants (BoundFunction fid tid arguments) = foldNode (BoundFunction fid tid (map foldConstants arguments))
 foldConstants (Gt a b) = foldNode (Gt (foldConstants a) (foldConstants b))
 foldConstants (Lt a b) = foldNode (Lt (foldConstants a) (foldConstants b))
 foldConstants (Eq a b) = foldNode (Eq (foldConstants a) (foldConstants b))

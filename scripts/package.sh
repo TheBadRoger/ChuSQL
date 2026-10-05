@@ -119,10 +119,11 @@ verify_package() {
             rm -rf "$vtmp"
             Fail "$name: the archive does not unpack"
         fi
-        if ! ( cd "$vtmp/pkg" && HOME="$vtmp/home" CHUSQL_ADMIN_PASSWORD='verify-package' \
+        if ! ( cd "$vtmp/pkg" && HOME="$vtmp/home" XDG_CONFIG_HOME="$vtmp/home/.config" \
+                XDG_STATE_HOME="$vtmp/home/.local/state" CHUSQL_ADMIN_PASSWORD='verify-package' \
                 sh install.sh --component "$comp" \
                 --install-dir "$vtmp/opt" --data-dir "$vtmp/data" --user root \
-                --no-start ) \
+                --no-start --no-service ) \
                 >"$vtmp/log" 2>&1; then
             sed -n '1,120p' "$vtmp/log" >&2
             rm -rf "$vtmp"
@@ -188,8 +189,13 @@ Step "Packing $name"
 rm -rf "$out_dir/.stage"
 mkdir -p "$stage/bin" "$stage/resources"
 
-cp "$repo_root/chusql-core/storage/target/release/"libchusql_core_storage.* "$stage/bin/" \
-    || Fail "chusql-core/storage/target/release/libchusql_core_storage.* is not built (run without --no-build)"
+case "$platform" in
+    linux-*) storage_name=libchusql_core_storage.so ;;
+    macos-*) storage_name=libchusql_core_storage.dylib ;;
+    *) Fail "unsupported Unix platform: $platform" ;;
+esac
+cp "$repo_root/chusql-core/storage/target/release/$storage_name" "$stage/bin/" \
+    || Fail "$storage_name is not built (run without --no-build)"
 
 stack_root=$(cd "$repo_root/chusql-cli" && stack path --local-install-root | tail -n 1 | tr -d '\r')
 for front_name in chusql-web chusql-server csql; do

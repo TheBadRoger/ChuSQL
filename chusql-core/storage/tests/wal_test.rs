@@ -4,6 +4,29 @@ use serde_json::json;
 
 // WAL 测试：追加、读取、清空、截断尾巴、LSN 与提交标记。
 
+/// 建表编号完整往返且兼容旧载荷
+#[test]
+fn create_table_ids_round_trip_and_legacy_payloads_decode() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wal.log");
+    let wal = Wal::new(&path);
+    let op = WalOp::CreateTable { table: "t".into(), columns: vec![], object_id: Some(42) };
+    wal.append(&op).unwrap();
+    assert_eq!(wal.read_all().unwrap().records[0].1, op);
+    drop(wal);
+    let mut body = 1_u64.to_le_bytes().to_vec();
+    body.push(11);
+    body.extend_from_slice(&1_u16.to_le_bytes());
+    body.extend_from_slice(b"t");
+    body.extend_from_slice(br#"{"columns":[]}"#);
+    let mut frame = (body.len() as u32).to_le_bytes().to_vec();
+    frame.extend_from_slice(&body);
+    std::fs::write(&path, frame).unwrap();
+    let wal = Wal::new(&path);
+    assert_eq!(wal.read_all().unwrap().records[0].1,
+        WalOp::CreateTable { table: "t".into(), columns: vec![], object_id: None });
+}
+
 
 /// 用键值对构造一行
 fn row(pairs: &[(&str, serde_json::Value)]) -> Row {

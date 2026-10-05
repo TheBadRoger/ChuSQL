@@ -16,6 +16,7 @@ module ChuSQL.Core.Protocol (
 ) where
 
 import ChuSQL.Core.Model (Histogram (..), Row, Value (..))
+import ChuSQL.Core.Runtime (builtinTypes, runtimeToJSON, runtimeFromJSON)
 import Data.Aeson (FromJSON (..), ToJSON (..), object, withObject, (.:), (.:?), (.!=), (.=))
 import qualified Data.Aeson as A
 import qualified Data.Aeson.Key as K
@@ -78,7 +79,7 @@ data Request
     | ReqIdentityInitialize T.Text
     | ReqRoleCreate T.Text
     | ReqCatalogManage Request
-    | ReqIdentityAlter T.Text (Maybe Bool) (Maybe Bool) (Maybe Bool) (Maybe Bool)
+    | ReqIdentityAlter T.Text (Maybe Bool) (Maybe Bool) (Maybe Bool) (Maybe Bool) (Maybe Bool)
     | ReqAccountCreate T.Text T.Text
     | ReqAccountReset T.Text T.Text
     | ReqAccountLogin T.Text (Maybe T.Text)
@@ -142,8 +143,8 @@ instance ToJSON Request where
     toJSON ReqAccountsList = object ["method" .= ("accounts_list" :: T.Text)]
     toJSON (ReqIdentityInitialize u) = object ["method" .= ("identity_initialize" :: T.Text), "administrator" .= u]
     toJSON (ReqRoleCreate u) = object ["method" .= ("role_create" :: T.Text), "user" .= u]
-    toJSON (ReqIdentityAlter u login super enabled manager) = object ["method" .= ("identity_alter" :: T.Text), "user" .= u,
-        "can_login" .= login, "is_superuser" .= super, "enabled" .= enabled, "system_catalog_manager" .= manager]
+    toJSON (ReqIdentityAlter u login super enabled manager sudo) = object ["method" .= ("identity_alter" :: T.Text), "user" .= u,
+        "can_login" .= login, "is_superuser" .= super, "enabled" .= enabled, "system_catalog_manager" .= manager, "allow_sudo_auth" .= sudo]
     toJSON (ReqAccountCreate u h) = object ["method" .= ("account_create" :: T.Text), "user" .= u, "password_hash" .= h]
     toJSON (ReqAccountReset u h) = object ["method" .= ("account_reset" :: T.Text), "user" .= u, "password_hash" .= h]
     toJSON (ReqAccountLogin u at) = object ["method" .= ("account_login" :: T.Text), "user" .= u, "at" .= at]
@@ -316,6 +317,7 @@ data Account = Account
     , accountIsSuperuser :: Bool
     , accountEnabled :: Bool
     , accountSystemCatalogManager :: Bool
+    , accountAllowSudoAuth :: Bool
     } deriving (Eq)
 
 -- | 账号的展示：只露账号名与版本号
@@ -327,14 +329,14 @@ instance FromJSON Account where
     parseJSON = withObject "Account" $ \o -> Account <$> o .: "id" <*> o .: "user"
         <*> o .: "password_hash" <*> o .: "revision"
         <*> o .:? "registered_at" .!= "" <*> o .:? "last_login_at"
-        <*> o .:? "can_login" .!= True <*> o .:? "is_superuser" .!= False <*> o .:? "enabled" .!= True <*> o .:? "system_catalog_manager" .!= False
+        <*> o .:? "can_login" .!= True <*> o .:? "is_superuser" .!= False <*> o .:? "enabled" .!= True <*> o .:? "system_catalog_manager" .!= False <*> o .:? "allow_sudo_auth" .!= False
 
 -- | 账号编码成 JSON
 instance ToJSON Account where
     toJSON a = object ["id" .= accountId a, "user" .= accountUser a,
         "password_hash" .= accountHash a, "revision" .= accountRevision a,
         "registered_at" .= accountRegisteredAt a, "last_login_at" .= accountLastLoginAt a,
-        "can_login" .= accountCanLogin a, "is_superuser" .= accountIsSuperuser a, "enabled" .= accountEnabled a, "system_catalog_manager" .= accountSystemCatalogManager a]
+        "can_login" .= accountCanLogin a, "is_superuser" .= accountIsSuperuser a, "enabled" .= accountEnabled a, "system_catalog_manager" .= accountSystemCatalogManager a, "allow_sudo_auth" .= accountAllowSudoAuth a]
 
 -- | 存储层响应
 data Response
@@ -373,6 +375,7 @@ valueToJSON (VInt n) = A.Number (fromIntegral n)
 valueToJSON (VFloat d) = A.Number (fromFloatDigits d)
 valueToJSON (VStr s) = A.String (T.pack s)
 valueToJSON (VBool b) = A.Bool b
+valueToJSON (VRuntime tid value) = object ["__chusql_runtime_v1" .= runtimeToJSON tid value]
 
 -- | JSON 解回值
 valueFromJSON :: A.Value -> Parser Value
@@ -383,6 +386,9 @@ valueFromJSON (A.Number n) =
         Left d -> pure (VFloat d)
 valueFromJSON (A.String s) = pure (VStr (T.unpack s))
 valueFromJSON (A.Bool b) = pure (VBool b)
+valueFromJSON (A.Object fields)
+    | KM.size fields == 1, Just payload <- KM.lookup "__chusql_runtime_v1" fields =
+        either fail (pure . uncurry VRuntime) (runtimeFromJSON builtinTypes payload)
 valueFromJSON _ = fail "unsupported value type"
 
 -- | 一行编码成 JSON

@@ -4,7 +4,7 @@ module ChuSQL.Server.Accounts (
     Accounts, AccountError (..), Principal (..), PasswordPolicy (..), defaultPasswordPolicy,
     newAccounts, accountsPolicy, setAccountsPolicy, passwordAllowed,
     ensureRootAccount, administratorPasswordless, rootUserName, principalName, principalIsRoot, principalIsCatalogManager,
-    authenticate, currentPrincipal,
+    authenticate, authenticateSudo, currentPrincipal,
     listAccounts, findAccount, AccountCommand (..), accountCommand, runAccountCommand,
 ) where
 
@@ -153,7 +153,7 @@ ensureRootAccount backend name = do
             | otherwise -> do
                 created <- beAccounts backend (ReqAccountCreate (normalize name) "")
                 case created of
-                    Right _ -> storageResult <$> beAccounts backend (ReqIdentityAlter (normalize name) Nothing (Just True) Nothing Nothing)
+                    Right _ -> storageResult <$> beAccounts backend (ReqIdentityAlter (normalize name) Nothing (Just True) Nothing Nothing Nothing)
                     Left "account already exists" -> pure (Right ())
                     Left _ -> pure (Left storageFailure)
 
@@ -218,6 +218,21 @@ authenticate service user password = withMVar (acLock service) $ \_ -> do
         case written of
             Left _ -> pure (Left storageFailure)
             Right _ -> Right <$> createVersionedSession (acSessions service) (accountUser a) (Just (accountRevision a))
+
+-- 为已验证的本机身份创建独立登录会话。
+authenticateSudo :: Accounts -> Text -> IO (Either AccountError Text)
+authenticateSudo service user = withMVar (acLock service) $ \_ -> do
+    stored <- readAccounts (acBackend service)
+    case stored of
+        Left err -> pure (Left err)
+        Right accounts -> case filter ((== normalize user) . accountUser) accounts of
+            [a] | accountEnabled a && accountCanLogin a && accountAllowSudoAuth a -> do
+                stamp <- currentStamp
+                written <- beAccounts (acBackend service) (ReqAccountLogin (accountUser a) (Just stamp))
+                case written of
+                    Left _ -> pure (Left storageFailure)
+                    Right _ -> Right <$> createVersionedSession (acSessions service) (accountUser a) (Just (accountRevision a))
+            _ -> pure (Left unauthorized)
 
 -- | 系统表里的账号清单（含管理员）
 listAccounts :: Accounts -> IO (Either AccountError [Account])
@@ -295,7 +310,7 @@ runAccountCommand service principal command = withMVar (acLock service) $ \_ -> 
             case identities of
                 Left err -> pure (Left err)
                 Right accounts
-                    | any (\a -> accountUser a == normalize (target command) && (accountIsSuperuser a || accountSystemCatalogManager a)) accounts
+                    | any (\a -> accountUser a == normalize (target command) && (accountIsSuperuser a || accountSystemCatalogManager a || accountAllowSudoAuth a)) accounts
                         || privilegedChange command -> pure (Left (AccountError "forbidden" "superuser required to manage privileged identities"))
                     | otherwise -> execute
         | otherwise = execute
@@ -305,12 +320,13 @@ runAccountCommand service principal command = withMVar (acLock service) $ \_ -> 
     target (DropAccount name) = name
     target (AlterAccountAttributes name _) = name
     -- | 判断是否修改特权属性
-    privilegedChange (AlterAccountAttributes _ attributes) = any (\(key, _) -> key `elem` ["superuser", "system_catalog_manager"]) attributes
+    privilegedChange (AlterAccountAttributes _ attributes) = any (\(key, _) -> key `elem` ["superuser", "system_catalog_manager", "allow_sudo_auth"]) attributes
     privilegedChange _ = False
     -- | 执行已授权的身份命令
     execute = executeWith (if principalIsRoot principal then service else service{acBackend = (acBackend service){beAccounts = \request -> beAccounts (acBackend service) (ReqCatalogManage request)}})
     -- | 通过受限存储请求执行管理操作
     executeWith managed = case command of
+        CreateAccount name _ | normalize name == "public" -> pure (Left (AccountError "bad_request" "public is reserved for default privileges"))
         CreateAccount name password -> createUser managed name password
         ResetAccountPassword name password -> resetPassword managed name password
         DropAccount name -> dropUser managed name
@@ -318,4 +334,4 @@ runAccountCommand service principal command = withMVar (acLock service) $ \_ -> 
             | length (nub (map fst attributes)) /= length attributes -> pure (Left (AccountError "bad_request" "duplicate identity attribute"))
             | otherwise ->
                 storageResult <$> beAccounts (acBackend managed) (ReqIdentityAlter (normalize name)
-                    (lookup "login" attributes) (lookup "superuser" attributes) (lookup "enabled" attributes) (lookup "system_catalog_manager" attributes))
+                    (lookup "login" attributes) (lookup "superuser" attributes) (lookup "enabled" attributes) (lookup "system_catalog_manager" attributes) (lookup "allow_sudo_auth" attributes))

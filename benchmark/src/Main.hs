@@ -32,7 +32,7 @@ import System.Environment (getArgs)
 import System.Exit (ExitCode (..), exitFailure)
 import System.FilePath ((</>))
 import System.Info (os)
-import System.IO (Handle, hGetLine)
+import System.IO (Handle, hGetLine, hSetBuffering, BufferMode (LineBuffering), stdout)
 import System.Process (
     CreateProcess (std_err, std_out),
     ProcessHandle,
@@ -484,6 +484,7 @@ stopProcess process = do
 -- | 主入口
 main :: IO ()
 main = do
+    hSetBuffering stdout LineBuffering
     args <- getArgs
     unless (length args <= 2) (ioError (userError "usage: benchmark4csql [users=10000] [orders=50000]"))
     let values = take 2 (args ++ drop (length args) ["10000", "50000"])
@@ -588,9 +589,10 @@ pressureScenarios bench u o = do
     _ <- runSql bench "CREATE TABLE writes (id int, name str, age int)"
     _ <- batchInsert bench "200 individual durable INSERTs" 200 (\i -> printf "INSERT INTO writes (id,name,age) VALUES (%d,'w%d',%d)" i i i)
     (milliseconds, ()) <- measure $ do
-        _ <- runSql bench "BEGIN"
-        forM_ [201 .. 400 :: Int] $ \i -> runSql bench (printf "INSERT INTO writes (id,name,age) VALUES (%d,'w%d',%d)" i i i) >> pure ()
-        _ <- runSql bench "COMMIT"
+        (beginMs, _) <- measure (runSql bench "BEGIN")
+        (stagedMs, ()) <- measure $ forM_ [201 .. 400 :: Int] $ \i -> runSql bench (printf "INSERT INTO writes (id,name,age) VALUES (%d,'w%d',%d)" i i i) >> pure ()
+        (commitMs, _) <- measure (runSql bench "COMMIT")
+        printf "TXN_PHASE begin_ms=%.3f staged_ms=%.3f commit_ms=%.3f\n" beginMs stagedMs commitMs
         pure ()
     printf "WRITE transaction200 total_ms=%.3f rows_s=%.2f\n" milliseconds (200000 / milliseconds)
     checkCount bench "writes" 400

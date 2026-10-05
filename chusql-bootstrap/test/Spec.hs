@@ -81,7 +81,7 @@ ready = A.object ["status" A..= ("system" :: Text), "initialized" A..= True]
 
 -- | 带最高权限属性的身份响应
 identity :: Bool -> A.Value
-identity super = A.object ["status" A..= ("accounts" :: Text), "accounts" A..= [Account 1 "root" "existing-hash" 1 "" Nothing True super True False]]
+identity super = A.object ["status" A..= ("accounts" :: Text), "accounts" A..= [Account 1 "root" "existing-hash" 1 "" Nothing True super True False False]]
 
 -- | 已写入编号的类型响应
 installed :: A.Value

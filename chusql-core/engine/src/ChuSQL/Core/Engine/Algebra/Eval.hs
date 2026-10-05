@@ -36,6 +36,7 @@ valueLiteral (VInt n) = LitInt n
 valueLiteral (VFloat d) = LitFloat d
 valueLiteral (VStr s) = LitStr s
 valueLiteral (VBool b) = LitBool b
+valueLiteral (VRuntime tid value) = RuntimeLiteral tid value
 valueLiteral VNull = LitNull
 
 -- | 点查退化成扫描时用的条件
@@ -362,6 +363,18 @@ scalarResult rows = do
 -- | 把子查询求值成字面量；子查询的错直接往上传
 substSubqueries :: (MonadStorage m) => Database -> Expr -> Row -> m (Either String Expr)
 substSubqueries db e env = case e of
+    Construct tid arguments -> do
+        bound <- mapM (\argument -> substSubqueries db argument env) arguments
+        pure (Construct tid <$> sequence bound)
+    BoundConstruct tid arguments -> do
+        bound <- mapM (\argument -> substSubqueries db argument env) arguments
+        pure (BoundConstruct tid <$> sequence bound)
+    FunctionCall name arguments -> do
+        bound <- mapM (\argument -> substSubqueries db argument env) arguments
+        pure (FunctionCall name <$> sequence bound)
+    BoundFunction fid tid arguments -> do
+        bound <- mapM (\argument -> substSubqueries db argument env) arguments
+        pure (BoundFunction fid tid <$> sequence bound)
     ScalarSub sq -> scalarResult <$> runSubqueryRows db sq env
     InSub a sq negated -> do
         lhs <- substSubqueries db a env
