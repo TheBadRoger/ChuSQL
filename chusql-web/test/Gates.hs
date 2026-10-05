@@ -207,8 +207,8 @@ gateSpec = do
         it "the release pipeline publishes one archive per platform, tagged the way install.sh looks it up" $ do
             release <- readUtf8 (".." </> ".github" </> "workflows" </> "release.yml")
             release `shouldSatisfy` T.isInfixOf "linux-x86_64"
-            release `shouldSatisfy` T.isInfixOf "macos-arm64"
-            release `shouldSatisfy` T.isInfixOf "macos-x86_64"
+            release `shouldSatisfy` (not . T.isInfixOf "platform: macos")
+            T.count "platform:" release `shouldBe` 2
             release `shouldSatisfy` T.isInfixOf "windows-x86_64"
             release `shouldSatisfy` T.isInfixOf "cargo build --release"
             release `shouldSatisfy` T.isInfixOf "stack build --fast chusql-web:exe:chusql-web"
@@ -220,7 +220,7 @@ gateSpec = do
             release `shouldSatisfy` T.isInfixOf "scripts/install.sh"
             release `shouldSatisfy` T.isInfixOf "sha256"
             release `shouldSatisfy` T.isInfixOf "gh release upload"
-            -- 四个平台各一个包，名字里没有组件那一层：一个包里 web 与 cli 都有；
+            -- 两个平台各一个包，名字里没有组件那一层：一个包里 web 与 cli 都有；
             -- 矩阵里也不该再出现 web / cli 这一维（那样又会产出两个按组件命名的资产）
             release `shouldSatisfy` T.isInfixOf "name: ${{ matrix.platform }}"
             release `shouldSatisfy` T.isInfixOf "--platform '${{ matrix.platform }}'"

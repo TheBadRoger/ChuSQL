@@ -1,8 +1,7 @@
-# 发版流水线：打 tag（v*）时为四个平台各出一个发行包，附 sha256，挂到 Release。
+# 发版流水线：构建 Windows 与 Linux 安装包，验证后上传 Release。
 #
 # 资源命名（install.sh / install.ps1 按 <os>-<arch> 挑资源，见 scripts/install.sh）：
 #   chusql-linux-x86_64.tar.gz     chusql-windows-x86_64.zip
-#   chusql-macos-x86_64.tar.gz     chusql-macos-arm64.tar.gz
 #
 # 一个平台一个包，里面 Web 前端与命令行客户端两部分都在；装哪几个由包内的安装脚本
 # 当场问（非交互时用 --component / -Component 指定）。
@@ -13,8 +12,6 @@
 # 没有对应平台的资源时，同一个脚本可以退回本地编译：
 #   sh scripts/install.sh --component web --from-source
 #
-# 说明：macOS 两个 runner 会让总时长变长（每个 job 都要 cargo + stack 各编一遍）；
-# 不需要 Intel mac 的包就把 macos-15-intel 那两行删掉。
 name: release
 
 on:
@@ -52,8 +49,6 @@ jobs:
         include:
           - { os: ubuntu-latest, platform: linux-x86_64 }
           - { os: windows-latest, platform: windows-x86_64 }
-          - { os: macos-15-intel, platform: macos-x86_64 }
-          - { os: macos-15, platform: macos-arm64 }
     steps:
       - uses: actions/checkout@v4
         with:
