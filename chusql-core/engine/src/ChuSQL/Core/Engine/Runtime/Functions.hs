@@ -32,12 +32,7 @@ builtinFunctions types = do
 
 -- | 按名称和完整参数类型解析函数
 resolveFunction :: FunctionRegistry -> String -> [TypeId] -> Either String FunctionSignature
-resolveFunction (FunctionRegistry functions) name arguments =
-    case [sig | (sig, _) <- functions, map toLower (signatureName sig) == map toLower name
-              , signatureArguments sig == arguments] of
-        [sig] -> Right sig
-        [] -> Left ("no matching function signature: " ++ name)
-        _ -> Left ("ambiguous function signature: " ++ name)
+resolveFunction registry name arguments = resolveNullableFunction registry name (map Just arguments)
 
 -- | 按可空 SQL 参数解析确定签名
 resolveNullableFunction :: FunctionRegistry -> String -> [Maybe TypeId] -> Either String FunctionSignature

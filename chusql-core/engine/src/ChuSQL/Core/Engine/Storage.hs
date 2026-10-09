@@ -108,11 +108,11 @@ class (Monad m) => MonadStorage m where
     replaceSchema :: String -> [(String, Column)] -> [Row] -> m (Either String ())
 
     -- \| 取全库快照（表名 + 列 + 全部行）
-    snapshot :: m Database
+    snapshot :: m (Either String Database)
 
     -- \| 取全库结构：只要表名和列，不要行
-    schema :: m Database
-    schema = fmap (map withoutRows) snapshot
+    schema :: m (Either String Database)
+    schema = fmap (fmap (map withoutRows)) snapshot
       where
         -- | 表定义去掉所有行
         withoutRows (name, t) = (name, t {tableRows = []})

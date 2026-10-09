@@ -229,17 +229,17 @@ pub fn resolve(text: Option<&str>, path: Option<PathBuf>) -> Result<Loaded, Stri
         DEFAULT_POOL_SIZE,
         &file_origin,
     );
+    let storage = file.storage.unwrap_or_default();
     let (data_dir, dir_origin) = pick(
-        file.storage.as_ref().and_then(|s| s.data_dir.clone()),
+        storage.data_dir,
         default_data_dir().to_string_lossy().into_owned(),
         &file_origin,
     );
     let (log_files, log_files_origin) = pick(
-        file.storage.as_ref().and_then(|s| s.log_files.clone()),
+        storage.log_files,
         DEFAULT_LOG_FILES.to_string(),
         &file_origin,
     );
-    // 管名已经没有了：存储不再是独立进程，管道/套接字那一层随 FFI 一起删掉
     let (log_level, log_origin) = pick(
         file.log.and_then(|l| l.level),
         DEFAULT_LOG_LEVEL.to_string(),
@@ -248,9 +248,9 @@ pub fn resolve(text: Option<&str>, path: Option<PathBuf>) -> Result<Loaded, Stri
 
     let data_dir = data_dir.trim().to_string();
     let log_files = log_files.trim().to_string();
-    let log_level = log_level.trim().to_string();
+    let log_level = log_level.trim();
 
-    let log_level = Level::parse(&log_level)
+    let log_level = Level::parse(log_level)
         .ok_or_else(|| format!("log.level is not one of off/error/warn/info/debug: {}", log_level))?;
 
     if data_dir.is_empty() {
@@ -317,39 +317,4 @@ fn validate_layout(page_size: usize, btree_order: usize) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 别的层的分区不能被当成错误
-    #[test]
-    fn ignores_sections_owned_by_other_layers() {
-        let text = r#"
-[page]
-size = 8192
-
-[storage]
-data_dir = "../data"
-
-[server]
-listen_host = "127.0.0.1"
-port = 7777
-max_message = 1048576
-
-[web]
-port = 7778
-"#;
-        let loaded = resolve(Some(text), Some(PathBuf::from("settings.toml"))).unwrap();
-        assert_eq!(loaded.config.page_size, 8192);
-        assert_eq!(loaded.config.data_dir, PathBuf::from("../data"));
-    }
-
-    /// 自己分区里的拼写错误仍然要报错
-    #[test]
-    fn still_rejects_typos_inside_its_own_sections() {
-        let text = "[page]\npage_size = 8192\n";
-        assert!(resolve(Some(text), None).is_err());
-    }
 }

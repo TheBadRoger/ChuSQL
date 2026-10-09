@@ -32,10 +32,10 @@ runStatementM (DropDatabase name) = fmap (fmap (const [])) (dropDatabase name)
 runStatementM (UseDatabase name) = fmap (fmap (const [])) (useDatabase name)
 runStatementM ShowDatabases = fmap (fmap (map (\name -> [("database", VStr name)]))) listDatabases
 runStatementM q = do
-    db <- schema
-    case prepare db q of
+    result <- schema
+    case result >>= \db -> (,) db <$> prepare db q of
         Left err -> pure (Left err)
-        Right resolved -> runStatementUncheckedM db resolved
+        Right (db, resolved) -> runStatementUncheckedM db resolved
 
 -- | 按语句类型分发（已检查过）
 runStatementUncheckedM :: (MonadStorage m) => Database -> Statement -> m (Either String [Row])

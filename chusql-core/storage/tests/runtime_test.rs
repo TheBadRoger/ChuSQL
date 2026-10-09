@@ -5,6 +5,38 @@ use chusql_core_storage::runtime::Storage;
 
 // 进程内存储集成测试：协议请求、索引、账号与配置。
 
+/// 检查点损坏不冒充零 LSN且可恢复读取
+#[test]
+fn system_status_reports_checkpoint_read_errors() -> Result<(), Box<dyn std::error::Error>> {
+    let (_server, data) = start_server();
+    let mut connection = connect()?;
+    let checkpoint = data.path().join("system/wal.checkpoint");
+    let initial: serde_json::Value = serde_json::from_str(&send_raw(&mut connection, r#"{"method":"system_status"}"#))?;
+    assert_eq!(initial["last_lsn"], 0);
+    request_ok(&mut connection, serde_json::json!({"method":"object_acl_replace","expected":null,"payload":"{}"}))?;
+    let original = std::fs::read(&checkpoint)?;
+    let before: serde_json::Value = serde_json::from_str(&send_raw(&mut connection, r#"{"method":"system_status"}"#))?;
+    assert_eq!(before["status"], "system");
+    assert!(before["last_lsn"].as_u64().unwrap() > 0);
+    std::fs::write(&checkpoint, b"bad")?;
+    let broken: serde_json::Value = serde_json::from_str(&send_raw(&mut connection, r#"{"method":"system_status"}"#))?;
+    assert_eq!(broken["status"], "error");
+    assert!(broken["message"].as_str().unwrap().contains("invalid WAL checkpoint length"));
+    assert!(broken.get("last_lsn").is_none());
+    assert!(send_raw(&mut connection, r#"{"method":"ping"}"#).contains("pong"));
+    std::fs::write(&checkpoint, &original)?;
+    let restored: serde_json::Value = serde_json::from_str(&send_raw(&mut connection, r#"{"method":"system_status"}"#))?;
+    assert_eq!(restored, before);
+    std::fs::remove_file(&checkpoint)?;
+    std::fs::create_dir(&checkpoint)?;
+    let unreadable: serde_json::Value = serde_json::from_str(&send_raw(&mut connection, r#"{"method":"system_status"}"#))?;
+    assert_eq!(unreadable["status"], "error");
+    assert!(unreadable.get("last_lsn").is_none());
+    std::fs::remove_dir(&checkpoint)?;
+    std::fs::write(&checkpoint, original)?;
+    Ok(())
+}
+
 /// 权限快照支持跨页文本并拒绝旧版本覆盖
 #[test]
 fn object_acl_snapshots_are_private_and_compare_versions() -> Result<(), Box<dyn std::error::Error>> {

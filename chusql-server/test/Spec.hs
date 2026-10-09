@@ -51,7 +51,7 @@ import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, takeMVar)
 import System.Timeout (timeout)
 import Control.Exception (IOException, bracket, finally, try)
-import Control.Monad (void)
+import Control.Monad (replicateM_, void)
 import Data.List (sort)
 import Data.Aeson (decode)
 import qualified Data.Aeson as A
@@ -729,6 +729,24 @@ tcpServerSpec = do
                 withConnection handle $ \h -> do
                     reply <- tcpTalk h (BSC.pack ("{\"method\":\"query\",\"sql\":\"" ++ replicate 40 'a' ++ "\"}"))
                     asText (at "code" reply) `shouldBe` "too_large"
+        it "refuses oversized input before a newline and closes the connection" $
+            withTcpServer defaultServerConfig{scMaxMessage = 32} $ \_ handle ->
+                withConnection handle $ \h -> do
+                    BSC.hPutStr h (BSC.replicate 33 'a')
+                    hFlush h
+                    line <- timeout 1000000 (BSC.hGetLine h)
+                    case line of
+                        Nothing -> expectationFailure "oversized input waited for a newline"
+                        Just raw -> asText (at "code" (fromMaybe A.Null (decode (BL.fromStrict raw)))) `shouldBe` "too_large"
+                    tcpClosed h
+        it "accepts exact-limit CRLF frames and preserves pipelined requests" $
+            withTcpServer defaultServerConfig{scMaxMessage = 17} $ \_ handle ->
+                withConnection handle $ \h -> do
+                    BSC.hPutStr h "{\"method\":\"ping\"}\r\n{\"method\":\"ping\"}\n"
+                    hFlush h
+                    replicateM_ 2 $ do
+                        raw <- timeout 1000000 (BSC.hGetLine h)
+                        fmap (asText . at "status" . fromMaybe A.Null . decode . BL.fromStrict) raw `shouldBe` Just "pong"
         it "ping answers pong and quit closes the connection" $
             withTcpServer defaultServerConfig $ \_ handle ->
                 withConnection handle $ \h -> do
@@ -1530,6 +1548,22 @@ transactionSpec = describe "server transactions" $ do
         _ <- mustSql session "insert into fresh (id) values (1)"
         rows <- mustSql session "select * from fresh"
         qrRowCount rows `shouldBe` 1
+
+    it "does not start a transaction when its snapshot cannot be read" $ do
+        ref <- newMVar testDb
+        settings <- tempSettingsPath "snapshot-failure"
+        let base = memoryBackend testDatabaseName ref
+            -- | 保留测试后端并让快照读取失败
+            failing name = (beWithDatabase base name)
+                { beSnapshot = pure (Left "data page unreadable")
+                , beWithDatabase = failing
+                }
+        session <- newSession (failing testDatabaseName) (T.pack testDatabaseName) settings
+        void (mustSql session "USE test")
+        result <- runStatementCoded session "BEGIN"
+        failureMessage result `shouldBe` "data page unreadable"
+        late <- runStatementCoded session "COMMIT"
+        failureMessage late `shouldBe` "no transaction in progress"
 
     it "refuses nested BEGIN and COMMIT outside a transaction" $ withMemorySession $ \session -> do
         _ <- mustSql session "begin"

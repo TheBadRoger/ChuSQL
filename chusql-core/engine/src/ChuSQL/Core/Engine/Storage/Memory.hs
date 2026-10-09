@@ -73,10 +73,10 @@ instance MonadStorage MemoryStorage where
                             )
 
     -- \| 原样返回当前库
-    snapshot = MemoryStorage $ \db -> Right (db, db)
+    snapshot = MemoryStorage $ \db -> Right (Right db, db)
 
     -- \| 返回实时行数与去重统计的无数据结构
-    schema = MemoryStorage $ \db -> Right (map describe db, db)
+    schema = MemoryStorage $ \db -> Right (Right (map describe db), db)
       where
         -- | 将存储数据汇总为结构统计
         describe (name, table) =

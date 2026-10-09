@@ -26,22 +26,20 @@ spec = do
             fmap (map verdict . findings) (analyzeNormalization schema
                 (Declaration [["a", "b"]] [Dependency ["a"] ["c"]] True (Just True)))
                 `shouldBe` Right [Satisfied, Violated, Violated, Violated]
-        it "detects transitive dependencies" $ do
-            fmap (map verdict . findings) (analyzeNormalization schema
-                (Declaration [["a"]] [Dependency ["b"] ["c"]] True (Just True)))
+        it "detects transitive dependencies and a preserving split" $ do
+            let analysis = analyzeNormalization schema
+                    (Declaration [["a"]] [Dependency ["b"] ["c"]] True (Just True))
+            fmap (map verdict . findings) analysis
                 `shouldBe` Right [Satisfied, Satisfied, Violated, Violated]
-        it "distinguishes 3NF from BCNF using all candidate keys" $ do
-            fmap (map verdict . findings) (analyzeNormalization schema
-                (Declaration [["a", "b"]] [Dependency ["c"] ["b"]] True (Just True)))
-                `shouldBe` Right [Satisfied, Satisfied, Satisfied, Violated]
-        it "reports lossless decomposition that loses dependencies" $ do
-            fmap suggestions (analyzeNormalization schema
-                (Declaration [["a", "b"]] [Dependency ["c"] ["b"]] True (Just True)))
-                `shouldBe` Right [Decomposition [["b", "c"], ["a", "c"]] Satisfied Violated]
-        it "reports dependency preserving transitive split" $ do
-            fmap suggestions (analyzeNormalization schema
-                (Declaration [["a"]] [Dependency ["b"] ["c"]] True (Just True)))
+            fmap suggestions analysis
                 `shouldBe` Right [Decomposition [["b", "c"], ["a", "b"]] Satisfied Satisfied]
+        it "distinguishes 3NF from BCNF and detects dependency loss" $ do
+            let analysis = analyzeNormalization schema
+                    (Declaration [["a", "b"]] [Dependency ["c"] ["b"]] True (Just True))
+            fmap (map verdict . findings) analysis
+                `shouldBe` Right [Satisfied, Satisfied, Satisfied, Violated]
+            fmap suggestions analysis
+                `shouldBe` Right [Decomposition [["b", "c"], ["a", "c"]] Satisfied Violated]
         it "does not certify incomplete dependencies" $ do
             fmap (map verdict . findings) (analyzeNormalization schema
                 (Declaration [["a"]] [] False (Just True)))

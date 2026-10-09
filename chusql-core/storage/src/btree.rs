@@ -167,23 +167,47 @@ fn put_node(p: &mut Page, node: &Node) -> io::Result<()> {
 }
 
 /// 从一页读出节点
-fn get_node(p: &Page) -> Node {
+fn get_node(p: &Page) -> io::Result<Node> {
+    if p.data.len() < HEADER {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated index node header"));
+    }
     let kind = read_u8(p, OFF_KIND);
     let count = read_u16(p, OFF_COUNT) as usize;
+    let slots_end = HEADER + count * SLOT;
+    if !matches!(kind, NODE_LEAF | NODE_INTERNAL) || slots_end > p.data.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid index node kind or slot count"));
+    }
     let trailer = read_u64(p, OFF_NEXT);
     let mut keys = Vec::with_capacity(count);
     let mut values = Vec::with_capacity(count + 1);
+    let mut cell_end = p.data.len();
     for i in 0..count {
         let off = read_u16(p, HEADER + i * SLOT) as usize;
+        if off < slots_end || off + CELL_FIXED > p.data.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid index cell offset"));
+        }
         let klen = read_u16(p, off) as usize;
+        if klen > MAX_KEY_BYTES || off + CELL_FIXED + klen > p.data.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid index key length"));
+        }
+        if off + CELL_FIXED + klen > cell_end {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "overlapping index cells"));
+        }
+        cell_end = off;
         keys.push(p.data[off + 2..off + 2 + klen].to_vec());
         values.push(read_u64(p, off + 2 + klen));
     }
+    if keys.windows(2).any(|pair| pair[0] > pair[1]) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "index keys are not sorted"));
+    }
     if kind == NODE_INTERNAL {
         values.push(trailer);
-        Node { kind, next: 0, keys, values }
+        if values.contains(&META_PAGE) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid index child page"));
+        }
+        Ok(Node { kind, next: 0, keys, values })
     } else {
-        Node { kind, next: trailer, keys, values }
+        Ok(Node { kind, next: trailer, keys, values })
     }
 }
 
@@ -299,7 +323,7 @@ impl DiskBTree {
 
     /// 按页号读节点
     fn load(&mut self, id: PageId) -> io::Result<Node> {
-        self.file.with_page(id, get_node)
+        self.file.with_page(id, get_node)?
     }
 
     /// 按页号写节点
@@ -338,24 +362,9 @@ impl DiskBTree {
 
     /// 按 key 取全部位置（重复键按值升序）
     pub fn get_all(&mut self, key: &[u8]) -> io::Result<Vec<u64>> {
-        let Some(mut id) = self.root()? else {
-            return Ok(Vec::new());
-        };
-        loop {
-            let node = self.load(id)?;
-            if node.kind == NODE_LEAF {
-                let start = node.keys.partition_point(|k| k.as_slice() < key);
-                let mut out = Vec::new();
-                for i in start..node.keys.len() {
-                    if node.keys[i].as_slice() != key {
-                        break;
-                    }
-                    out.push(node.values[i]);
-                }
-                return Ok(out);
-            }
-            id = node.values[child_slot(&node.keys, key)];
-        }
+        let mut values: Vec<_> = self.scan(Some(key), Some(key))?.into_iter().map(|(_, value)| value).collect();
+        values.sort_unstable();
+        Ok(values)
     }
 
     /// 插入一个键值对（键可重复）
@@ -412,10 +421,9 @@ impl DiskBTree {
             self.store(id, &node)?;
             return Ok(None);
         }
-        let (sep, mut right) = split_node(&mut node);
+        let (sep, right) = split_node(&mut node);
         let right_id = self.alloc(&right)?;
         if node.kind == NODE_LEAF {
-            right.next = node.next;
             node.next = right_id;
         }
         self.store(id, &node)?;
@@ -443,8 +451,14 @@ impl DiskBTree {
             }
             return Ok(false);
         }
-        let child = node.values[child_slot(&node.keys, key)];
-        self.delete_rec(child, key, value)
+        let first = node.keys.partition_point(|k| k.as_slice() < key);
+        let last = child_slot(&node.keys, key);
+        for &child in &node.values[first..=last] {
+            if self.delete_rec(child, key, value)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// 叶子链上按顺序取全部 (键, 值)
@@ -475,7 +489,7 @@ impl DiskBTree {
             }
             id = match lo {
                 None => node.values[0],
-                Some(start) => node.values[child_slot(&node.keys, start)],
+                Some(start) => node.values[node.keys.partition_point(|k| k.as_slice() < start)],
             };
         }
         let mut out = Vec::new();

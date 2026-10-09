@@ -78,7 +78,9 @@ resources/chusql.ui.settings.json
 .\#*
 AGENTS.md
 agent-credientials
+skills-lock.json
 .dsh
+.agents
 # 注意：.zed/tasks.json 是本仓库共享的构建任务（stack build / run / test / repl），
 # 需要入库，所以这里不忽略 .zed/
 

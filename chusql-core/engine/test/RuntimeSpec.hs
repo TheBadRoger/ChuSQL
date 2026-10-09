@@ -29,7 +29,6 @@ spec = do
             parseTypeExpr "MaybeInt" `shouldSatisfy` isFailure
         it "restores stable nested identities from bootstrap metadata" $ do
             let ty = tupleType [listType intType, maybeType stringType]
-            resolveType builtinTypes ty `shouldBe` resolveType builtinTypes ty
             fmap descriptorPhysical (resolveType builtinTypes ty)
                 `shouldBe` Right (Product [Sequence SignedInteger, Optional Utf8])
         it "distinguishes logical String from List Int" $

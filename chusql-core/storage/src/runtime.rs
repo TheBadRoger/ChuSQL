@@ -1021,17 +1021,12 @@ impl Server {
         }
     }
 
-    /// 系统目录里账号表已登记
-    fn system_initialized(&self) -> bool {
-        self.catalog
-            .lock()
-            .map(|c| c.describe(USERS_TABLE).is_some_and(|schema| schema.system))
-            .unwrap_or(false)
-    }
-
-    /// 最近一次落盘的检查点 LSN
-    fn last_checkpoint(&self) -> u64 {
-        self.wal.read_checkpoint().ok().flatten().unwrap_or(0)
+    /// 读取系统初始化状态与检查点 LSN
+    fn system_status(&self) -> std::io::Result<Response> {
+        let initialized = self.catalog.lock().map_err(|_| std::io::Error::other("catalog lock poisoned"))?
+            .describe(USERS_TABLE).is_some_and(|schema| schema.system);
+        let last_lsn = self.wal.read_checkpoint()?.unwrap_or(0);
+        Ok(Response::System { initialized, last_lsn })
     }
 
     /// 读账号表；表没登记或数据文件缺失都算错
@@ -1346,12 +1341,12 @@ impl Server {
                 }
             }
             Request::BootstrapSystem { user, password_hash } => {
-                match self.bootstrap_system(user.as_deref(), password_hash.as_deref()) {
-                    Ok(_) => Response::System { initialized: true, last_lsn: self.last_checkpoint() },
+                match self.bootstrap_system(user.as_deref(), password_hash.as_deref()).and_then(|_| self.system_status()) {
+                    Ok(response) => response,
                     Err(e) => Response::Error { message: e.to_string() },
                 }
             }
-            Request::SystemStatus => Response::System { initialized: self.system_initialized(), last_lsn: self.last_checkpoint() },
+            Request::SystemStatus => self.system_status().unwrap_or_else(|e| Response::Error { message: e.to_string() }),
             Request::Ping => {
                 log_debug!(request, "ping");
                 Response::Pong

@@ -17,17 +17,23 @@ import ChuSQL.Core.Model
 import ChuSQL.Core.Engine.Semantic (prepare)
 import ChuSQL.Core.Engine.Storage (IndexResult (..), MonadStorage (..))
 import ChuSQL.Core.Engine.Storage.Memory (MemoryStorage (runMemoryStorage))
-import ChuSQL.Core.Engine.Storage.IPC (IPCStorage (..), closeConnection, defaultEnv, doListTables, envForDatabase, getDatabaseName, localStorageLink, runIPCStorage, setDatabaseName, setStorageLink)
+import ChuSQL.Core.Engine.Storage.FFI (closeStorage, maintainStorage, openStorage)
+import ChuSQL.Core.Engine.Storage.IPC (IPCStorage (..), StorageLink (..), closeConnection, defaultEnv, doListTables, envForDatabase, getDatabaseName, localStorageLink, runIPCStorage, sendRawRequest, setDatabaseName, setStorageLink)
 import ChuSQL.Core.Engine.Syntax.AST
 import ChuSQL.Core.Engine.Syntax.Parser
-import Control.Concurrent (threadDelay)
-import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar)
-import Control.Exception (ErrorCall, IOException, finally, try)
+import Control.Concurrent (forkFinally, forkIO, killThread, threadDelay)
+import Control.Concurrent.Chan (newChan, readChan, writeChan)
+import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, readMVar, takeMVar, tryPutMVar)
+import Control.Monad (replicateM_, void)
+import Control.Exception (ErrorCall, IOException, bracket_, finally, try)
 import Data.Hashable (hash)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BSC
 import Data.List (isInfixOf, sortOn)
 import Data.Unique (hashUnique, newUnique)
+import GHC.IO.Encoding (getForeignEncoding, latin1, setForeignEncoding)
 import System.CPUTime (getCPUTime)
-import System.Directory (createDirectoryIfMissing, getTemporaryDirectory, removePathForcibly)
+import System.Directory (createDirectoryIfMissing, getTemporaryDirectory, removePathForcibly, renameFile)
 import System.FilePath ((</>))
 import System.Timeout (timeout)
 import Test.Hspec
@@ -118,6 +124,81 @@ domainSql db (sql : rest) = do
 -- | 跑引擎层全部 hspec 用例
 main :: IO ()
 main = hspec $ do
+    describe "Storage read failures" $ do
+        it "propagates catalog failures through snapshot, schema and SQL" $ do
+            setStorageLink StorageLink
+                { slRequest = \_ -> pure (Right (BSC.pack "{\"status\":\"error\",\"message\":\"catalog unavailable\"}"))
+                , slClose = pure ()
+                }
+            flip finally closeConnection $ do
+                fmap (fmap (map fst)) (runIPCStorage snapshot) `shouldReturn` Left "catalog unavailable"
+                fmap (fmap (map fst)) (runIPCStorage schema) `shouldReturn` Left "catalog unavailable"
+                runIPCStorage (runStatementM (CreateTable "blocked" [("id", TInt)]))
+                    `shouldReturn` Left "catalog unavailable"
+
+        it "rejects the entire snapshot when a table scan fails" $ do
+            setStorageLink StorageLink
+                { slRequest = \payload -> pure $ Right $ BSC.pack $
+                    if BSC.pack "list_catalog" `BS.isInfixOf` payload
+                        then "{\"status\":\"catalog\",\"schemas\":[{\"table\":\"broken\",\"columns\":[],\"row_count\":1}]}"
+                        else "{\"status\":\"error\",\"message\":\"data page unreadable\"}"
+                , slClose = pure ()
+                }
+            (fmap (fmap (map fst)) (runIPCStorage snapshot) `shouldReturn` Left "data page unreadable") `finally` closeConnection
+
+    describe "Storage lifecycle and cancellation" $ do
+        it "waits for concurrent requests before closing the storage link" $ do
+            started <- newChan
+            release <- newEmptyMVar
+            finished <- newChan
+            closing <- newEmptyMVar
+            closed <- newEmptyMVar
+            setStorageLink StorageLink
+                { slRequest = \_ -> writeChan started () >> readMVar release >> pure (Right BS.empty)
+                , slClose = putMVar closed ()
+                }
+            flip finally (void (tryPutMVar release ()) >> closeConnection) $ do
+                replicateM_ 2 (void (forkIO (sendRawRequest BS.empty >>= writeChan finished)))
+                timeout 1000000 (replicateM_ 2 (readChan started)) `shouldReturn` Just ()
+                void (forkIO (putMVar closing () >> closeConnection))
+                takeMVar closing
+                timeout 100000 (readMVar closed) `shouldReturn` Nothing
+                putMVar release ()
+                replicateM_ 2 (timeout 1000000 (readChan finished) `shouldReturn` Just (Right BS.empty))
+                timeout 1000000 (readMVar closed) `shouldReturn` Just ()
+                sendRawRequest BS.empty `shouldReturn` Left "storage not configured"
+                closeConnection
+
+        it "keeps the pool usable after cancellation while all workers are busy" $ do
+            pool <- workerPool 4
+            started <- newChan
+            release <- newEmptyMVar
+            finished <- newEmptyMVar
+            void (forkIO (poolRun pool (replicate 4 (writeChan started () >> readMVar release)) >> putMVar finished ()))
+            flip finally (void (tryPutMVar release ())) $ do
+                timeout 1000000 (replicateM_ 4 (readChan started)) `shouldReturn` Just ()
+                replicateM_ 2 (timeout 100000 (poolRun pool (replicate 3 (pure ()))) `shouldReturn` Nothing)
+                putMVar release ()
+                timeout 1000000 (takeMVar finished) `shouldReturn` Just ()
+                timeout 1000000 (poolRun pool [pure ()]) `shouldReturn` Just [()]
+
+        it "releases the storage link when an in-flight request is cancelled" $ do
+            started <- newEmptyMVar
+            release <- newEmptyMVar
+            finished <- newEmptyMVar
+            closed <- newEmptyMVar
+            setStorageLink StorageLink
+                { slRequest = \_ -> putMVar started () >> takeMVar release >> pure (Right BS.empty)
+                , slClose = putMVar closed ()
+                }
+            thread <- forkFinally (sendRawRequest BS.empty) (const (putMVar finished ()))
+            flip finally (killThread thread >> closeConnection) $ do
+                timeout 1000000 (takeMVar started) `shouldReturn` Just ()
+                killThread thread
+                timeout 1000000 (takeMVar finished) `shouldReturn` Just ()
+                timeout 1000000 closeConnection `shouldReturn` Just ()
+                readMVar closed `shouldReturn` ()
+
     NormalizationSpec.spec
     RuntimeSpec.spec
     describe "identity syntax" $ do
@@ -1772,9 +1853,10 @@ main = hspec $ do
             sameResultAsUnoptimized "SELECT d.name FROM (SELECT name, age FROM users) d WHERE d.age > 20 ORDER BY d.name"
 
         it "supplies memory schema statistics without exposing rows" $ do
-            case runMemoryStorage (schema :: MemoryStorage Database) testDB of
+            case runMemoryStorage schema testDB of
                 Left err -> expectationFailure err
-                Right (structures, _) -> do
+                Right (Left err, _) -> expectationFailure err
+                Right (Right structures, _) -> do
                     map (tableRows . snd) structures `shouldBe` [[], []]
                     fmap (fmap metaRowCount . tableMeta) (lookup "users" structures) `shouldBe` Just (Just 3)
 
@@ -2094,6 +2176,51 @@ main = hspec $ do
                                    ]
 
     describe "ChuSQL.Core.Engine.Storage.IPC" $ do
+        it "uses UTF-8 config paths regardless of the foreign string encoding" $ do
+            tmp <- getTemporaryDirectory
+            stamp <- uniqueStamp
+            let dir = tmp </> ("chusql-utf8-" ++ stamp)
+                config = dir </> "settings-é.toml"
+            createDirectoryIfMissing True dir
+            flip finally (cleanSessionDir dir) $ do
+                original <- writeSessionConfig dir
+                renameFile original config
+                encoding <- getForeignEncoding
+                bracket_ (setForeignEncoding latin1) (setForeignEncoding encoding) $ do
+                    opened <- openStorage (Just config)
+                    case opened of
+                        Left err -> expectationFailure err
+                        Right handle -> closeStorage handle
+                    maintainStorage config (BSC.pack "{\"mode\":\"unknown\"}") `shouldReturn` Left "invalid maintenance mode"
+
+        it "preserves each worker's storage open error" $ do
+            tmp <- getTemporaryDirectory
+            stamp <- uniqueStamp
+            pool <- workerPool 4
+            let paths = [tmp </> ("missing-ffi-" ++ stamp ++ "-" ++ show n) | n <- [1 .. 16 :: Int]]
+                -- | 检查打开失败并归还意外成功的句柄
+                checkOpen path = do
+                    opened <- openStorage (Just path)
+                    case opened of
+                        Left err -> do
+                            err `shouldContain` "config file not found"
+                            err `shouldContain` path
+                        Right handle -> closeStorage handle >> expectationFailure "expected missing config error"
+            poolRun pool (map checkOpen paths) >> pure ()
+
+        it "returns FFI input errors from workers and remains usable" $ do
+            withTestSession $ \srv -> do
+                pool <- workerPool 4
+                -- | 检查无效 UTF-8 的请求与维护错误
+                let checkErrors = do
+                        requested <- sendRawRequest (BS.pack [255])
+                        requested `shouldSatisfy` either (isInfixOf "request is not valid UTF-8") (const False)
+                        maintained <- maintainStorage (dataDir srv ++ ".toml") (BS.pack [255])
+                        maintained `shouldSatisfy` either (isInfixOf "invalid utf-8") (const False)
+                poolRun pool (replicate 16 checkErrors) >> pure ()
+                sendRawRequest (BSC.pack "{\"method\":\"ping\"}")
+                    `shouldReturn` Right (BSC.pack "{\"status\":\"pong\"}")
+
         it "persists runtime type identities and nested values across restart" $ do
             withTestSession $ \srv -> do
                 -- | 解析并通过真实存储执行 SQL
@@ -2143,42 +2270,21 @@ main = hspec $ do
                 query "SELECT secret FROM reused" `shouldReturn` Right [[("secret", VStr "new")]]
                 query "SELECT secret FROM reused WHERE id = 1" `shouldReturn` Right [[("secret", VStr "new")]]
 
-        it "scan returns rows with all three value types after insert" $ do
+        it "scans stored value types and reports missing tables" $ do
             withTestSession $ \srv -> withServerEnv srv $ do
                 let row = [("id", VInt 7), ("name", VStr "Alice"), ("flag", VBool True)]
                 runIPCStorage (insert "users" row) `shouldReturn` Right ()
                 rows <- runIPCStorage (scan "users")
                 (map sortRow <$> rows) `shouldBe` Right [sortRow row]
-
-        it "scan on a missing table returns Left" $ do
-            withTestSession $ \srv -> withServerEnv srv $ do
                 result <- runIPCStorage (scan "no_such_table")
                 result `shouldSatisfy` isLeft
 
         it "scan returns all 20 inserted rows in order" $ do
             withTestSession $ \srv -> withServerEnv srv $ do
-                mapM_ (\i -> runIPCStorage (insert "many" [("id", VInt i)])) [1 .. 20 :: Int]
+                runIPCStorage (insertMany "many" [[("id", VInt i)] | i <- [1 .. 20 :: Int]]) `shouldReturn` Right ()
                 rows <- runIPCStorage (scan "many")
                 fmap length rows `shouldBe` Right 20
-                fmap (sortOn show . map (lookup "id")) rows
-                    `shouldBe` Right (sortOn show (map (Just . VInt) [1 .. 20]))
-
-        it "replaceAll leaves only the new rows" $ do
-            withTestSession $ \srv -> withServerEnv srv $ do
-                runIPCStorage (insert "t" [("id", VInt 1)]) `shouldReturn` Right ()
-                runIPCStorage (replaceAll "t" [[("id", VInt 9)], [("id", VInt 8)]]) `shouldReturn` Right ()
-                rows <- runIPCStorage (scan "t")
-                fmap (sortOn show . map (lookup "id")) rows
-                    `shouldBe` Right (sortOn show [Just (VInt 9), Just (VInt 8)])
-
-        it "lookupByColumn finds a row inserted with an id" $ do
-            withTestSession $ \srv -> withServerEnv srv $ do
-                let row = [("id", VInt 7), ("name", VStr "Zoe")]
-                runIPCStorage (insert "keyed" row) `shouldReturn` Right ()
-                found <- runIPCStorage (lookupByColumn "keyed" "id" (VInt 7))
-                fmap sortRow (indexRow found) `shouldBe` Just (sortRow row)
-                missing <- runIPCStorage (lookupByColumn "keyed" "id" (VInt 8))
-                missing `shouldBe` Right (IndexRows [])
+                fmap (map (lookup "id")) rows `shouldBe` Right (map (Just . VInt) [1 .. 20])
 
         it "looks up a string index" $ do
             withTestSession $ \srv -> withServerEnv srv $ do
@@ -2202,21 +2308,27 @@ main = hspec $ do
                 fmap (fmap (map (lookup "id"))) open `shouldBe` Right (Just [Just (VInt 3)])
                 runIPCStorage (scanRange "rng" "nope" Nothing Nothing) `shouldReturn` Right Nothing
 
-        it "replaceAll rebuilds the index" $ do
+        it "looks up inserted ids and replaces rows with rebuilt indexes" $ do
             withTestSession $ \srv -> withServerEnv srv $ do
-                runIPCStorage (insert "rb" [("id", VInt 1)]) `shouldReturn` Right ()
-                runIPCStorage (replaceAll "rb" [[("id", VInt 9), ("name", VStr "Zoe")]]) `shouldReturn` Right ()
+                let original = [("id", VInt 1), ("name", VStr "Alice")]
+                    replacement = [("id", VInt 9), ("name", VStr "Zoe")]
+                runIPCStorage (insert "rb" original) `shouldReturn` Right ()
+                found <- runIPCStorage (lookupByColumn "rb" "id" (VInt 1))
+                fmap sortRow (indexRow found) `shouldBe` Just (sortRow original)
+                runIPCStorage (lookupByColumn "rb" "id" (VInt 8)) `shouldReturn` Right (IndexRows [])
+                runIPCStorage (replaceAll "rb" [replacement, [("id", VInt 8)]]) `shouldReturn` Right ()
+                rows <- runIPCStorage (scan "rb")
+                fmap (map sortRow) rows `shouldBe` Right [sortRow replacement, [("id", VInt 8)]]
                 old <- runIPCStorage (lookupByColumn "rb" "id" (VInt 1))
                 old `shouldBe` Right (IndexRows [])
                 new <- runIPCStorage (lookupByColumn "rb" "id" (VInt 9))
-                fmap sortRow (indexRow new)
-                    `shouldBe` Just (sortRow [("id", VInt 9), ("name", VStr "Zoe")])
+                fmap sortRow (indexRow new) `shouldBe` Just (sortRow replacement)
 
         it "snapshot lists tables and scans each one to build the database" $ do
             withTestSession $ \srv -> withServerEnv srv $ do
                 runIPCStorage (insert "a" [("id", VInt 1)]) `shouldReturn` Right ()
                 runIPCStorage (insert "b" [("id", VInt 2)]) `shouldReturn` Right ()
-                db <- runIPCStorage snapshot
+                Right db <- runIPCStorage snapshot
                 map fst db `shouldBe` ["a", "b"]
                 map (length . tableRows . snd) db `shouldBe` [1, 1]
                 map (map (lookup "id") . tableRows . snd) db `shouldBe` [[Just (VInt 1)], [Just (VInt 2)]]
@@ -2346,7 +2458,7 @@ main = hspec $ do
                             (Insert "meta_t" ["id", "code"] [[LitInt 1, LitInt 500], [LitInt 2, LitInt 501]])
                         )
                 _ <- runIPCStorage (runStatementM (CreateIndex "meta_t" "code"))
-                db <- runIPCStorage schema
+                Right db <- runIPCStorage schema
                 case lookup "meta_t" db of
                     Nothing -> expectationFailure "meta_t missing from schema"
                     Just t -> do
@@ -2857,6 +2969,19 @@ main = hspec $ do
             errorCategory "unsupported protocol version" `shouldBe` ProtocolError
             errorCategory "something else" `shouldBe` UnknownError
 
+    describe "Worker pool capacity" $ do
+        it "grows the existing queue so old references use the additional workers" $ do
+            original <- workerPool 4
+            _ <- workerPool 8
+            started <- newChan
+            release <- newEmptyMVar
+            finished <- newEmptyMVar
+            void (forkIO (poolRun original (replicate 8 (writeChan started () >> readMVar release)) >> putMVar finished ()))
+            flip finally (void (tryPutMVar release ())) $ do
+                timeout 1000000 (replicateM_ 8 (readChan started)) `shouldReturn` Just ()
+                putMVar release ()
+                timeout 1000000 (takeMVar finished) `shouldReturn` Just ()
+
 -- | 每个测试表都清空行后的库
 emptyDB :: Database
 emptyDB = [(n, t{tableRows = []}) | (n, t) <- testDB]
@@ -2912,7 +3037,7 @@ cleanSessionDir dir = do
     _ <- try (removePathForcibly (dir ++ ".toml")) :: IO (Either IOException ())
     pure ()
 
--- | 一个用例一份干净数据目录；动态库打不开则 pending
+-- | 每例独立目录，存储打开失败则测试失败
 withTestSession :: (StorageSession -> IO ()) -> IO ()
 withTestSession act = do
     tmp <- getTemporaryDirectory
@@ -2921,7 +3046,7 @@ withTestSession act = do
     createDirectoryIfMissing True dir
     opened <- openSessionAt dir
     case opened of
-        Left err -> cleanSessionDir dir >> pendingWith err
+        Left err -> cleanSessionDir dir >> expectationFailure err
         Right session -> act session `finally` (closeConnection >> cleanSessionDir dir)
 
 -- | 语句不带库名，先建好测试库再切进去
@@ -3050,7 +3175,7 @@ instance MonadStorage ProbeStorage where
     dropTable _ = ProbeStorage (\_ -> pure (Left "probe: dropTable is not supported"))
     dropColumn _ _ = ProbeStorage (\_ -> pure (Left "probe: dropColumn is not supported"))
     replaceSchema _ _ _ = ProbeStorage (\_ -> pure (Left "probe: replaceSchema is not supported"))
-    snapshot = ProbeStorage (\_ -> pure [])
+    snapshot = ProbeStorage (\_ -> pure (Right []))
 
 -- | 判断 Either 是 Right
 isRight :: Either a b -> Bool
@@ -3271,7 +3396,7 @@ instance MonadStorage Counting where
     -- \| 换结构：走内存实现
     replaceSchema name cols rows = memory (memReplaceSchema name cols rows)
     -- \| 快照：把当前库原样交出去
-    snapshot = Counting $ \db -> Right (db, db, [])
+    snapshot = Counting $ \db -> Right (Right db, db, [])
 
 -- | 解析一条 SQL 并在计数存储上跑，返回结果与扫描过的表
 countedRun :: String -> (Either String [Row], [String])
