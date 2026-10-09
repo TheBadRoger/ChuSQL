@@ -6,8 +6,10 @@ module ChuSQL.Core.Engine.Parallel (
 ) where
 
 import Control.Concurrent (forkIO)
-import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, takeMVar)
+import Control.Concurrent.Chan (Chan, newChan, readChan, writeChan)
+import Control.Concurrent.MVar (MVar, modifyMVar, newEmptyMVar, newMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, throwIO, try)
+import Control.Monad (forever)
 import System.IO.Unsafe (unsafePerformIO)
 
 -- 并行执行：常驻工作线程池，结果按提交顺序收回。
@@ -16,11 +18,8 @@ import System.IO.Unsafe (unsafePerformIO)
 parallelShardLimit :: Int
 parallelShardLimit = 8
 
--- | 池：待办队列与唤醒信号
-data Pool = Pool
-    { poolJobs :: MVar [IO ()]
-    , poolReady :: MVar ()
-    }
+-- | 池：工作线程共享的待办队列
+newtype Pool = Pool (Chan (IO ()))
 
 {-# NOINLINE poolRef #-}
 -- | 进程全局的池，按容量复用
@@ -31,11 +30,14 @@ poolRef = unsafePerformIO (newMVar Nothing)
 workerPool :: Int -> IO Pool
 workerPool size = modifyMVar poolRef reuse
   where
-    -- | 现有池够大就留着，否则换新的
+    -- | 复用队列并按需补充工作线程
     reuse current = case current of
-        Just (capacity, pool)
+        Just (capacity, pool@(Pool jobs))
             | capacity >= wanted -> pure (current, pool)
-        _ -> do
+            | otherwise -> do
+                sequence_ [forkIO (worker jobs) | _ <- [capacity + 1 .. wanted]]
+                pure (Just (wanted, pool), pool)
+        Nothing -> do
             pool <- startPool wanted
             pure (Just (wanted, pool), pool)
 
@@ -44,29 +46,17 @@ workerPool size = modifyMVar poolRef reuse
 
     -- | 起 wanted 个常驻线程吃队列
     startPool n = do
-        jobs <- newMVar []
-        ready <- newMVar ()
-        sequence_ [forkIO (worker jobs ready) | _ <- [1 .. n]]
-        pure (Pool jobs ready)
+        jobs <- newChan
+        sequence_ [forkIO (worker jobs) | _ <- [1 .. n]]
+        pure (Pool jobs)
 
--- | 一个工作线程：被唤醒一次就取一个待办
-worker :: MVar [IO ()] -> MVar () -> IO ()
-worker jobs ready = do
-    takeMVar ready
-    job <- modifyMVar jobs pick
-    case job of
-        Nothing -> worker jobs ready
-        Just act -> act >> worker jobs ready
-  where
-    -- | 取队首，空队列就回 Nothing
-    pick [] = pure ([], Nothing)
-    pick (j : js) = pure (js, Just j)
+-- | 一个工作线程：等待并执行队首待办
+worker :: Chan (IO ()) -> IO ()
+worker jobs = forever (readChan jobs >>= id)
 
 -- | 往池里丢一个待办
 submit :: Pool -> IO () -> IO ()
-submit pool job = do
-    modifyMVar_ (poolJobs pool) (pure . (++ [job]))
-    putMVar (poolReady pool) ()
+submit (Pool jobs) = writeChan jobs
 
 -- | 跑一个动作，结果或异常都填进格子
 fillCell :: MVar (Either SomeException a) -> IO a -> IO ()

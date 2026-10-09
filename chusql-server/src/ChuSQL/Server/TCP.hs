@@ -59,8 +59,8 @@ import Network.Socket (
     socket,
     socketToHandle,
   )
-import System.IO (BufferMode (LineBuffering), IOMode (ReadWriteMode), hClose, hFlush, hPutStrLn, hSetBuffering, hSetNewlineMode, noNewlineTranslation, stderr)
-import System.IO.Error (isEOFError)
+import System.IO (BufferMode (LineBuffering), Handle, IOMode (ReadWriteMode), hClose, hFlush, hPutStrLn, hSetBuffering, hSetNewlineMode, noNewlineTranslation, stderr)
+import System.IO.Error (eofErrorType, isEOFError, mkIOError)
 
 -- TCP 服务器：监听端口，一连接一会话，按一行一 JSON 收发协议消息。
 
@@ -255,20 +255,19 @@ serveConnection env conn = do
     entry <- newLiveEntry (isLocalPeer peer)
     unregister <- registerConnection (srvLive env) entry
     session <- newSessionWith (srvBackend env) (srvRootName env) (srvSettingsFile env) (\names -> void (dropConnectionsOf (srvLive env) names))
-    outcome <- try (loop h session entry `finally` unregister) :: IO (Either IOException ())
+    outcome <- try (loop h session entry BSC.empty `finally` unregister) :: IO (Either IOException ())
     case outcome of
         Left err | not (isEOFError err) -> hPutStrLn stderr ("connection error: " ++ show err)
         _ -> pure ()
     void (try (hClose h) :: IO (Either IOException ()))
   where
     -- | 逐行读请求并应答
-    loop h session entry = do
-        line <- BSC.hGetLine h
-        let cleaned = BSC.dropWhileEnd (== '\r') line
-        if BSC.length cleaned > scMaxMessage (srvConfig env)
-            then send h (RespError "too_large" "request line too large") >> loop h session entry
-            else case decodeRequest cleaned of
-                Left message -> send h (RespError "bad_request" message) >> loop h session entry
+    loop h session entry pending = do
+        frame <- readRequestLine h (scMaxMessage (srvConfig env)) pending
+        case frame of
+            Nothing -> send h (RespError "too_large" "request line too large")
+            Just (cleaned, remaining) -> case decodeRequest cleaned of
+                Left message -> send h (RespError "bad_request" message) >> loop h session entry remaining
                 Right request -> do
                     expired <- readIORef (leDropped entry)
                     if expired
@@ -276,12 +275,35 @@ serveConnection env conn = do
                         else do
                             (response, keepGoing) <- dispatch env session entry request
                             send h response
-                            if keepGoing then loop h session entry else pure ()
+                            if keepGoing then loop h session entry remaining else pure ()
     -- | 发一条响应并冲缓冲
     send h response = do
         BLC.hPutStr h (encodeResponse response)
         BLC.hPutStr h "\n"
         hFlush h
+
+-- | 限长读取一行并保留后续帧
+readRequestLine :: Handle -> Int -> BSC.ByteString -> IO (Maybe (BSC.ByteString, BSC.ByteString))
+readRequestLine handle limit = collect [] 0
+  where
+    -- | 按块读取至换行、超限或 EOF
+    collect parts total bytes = case BSC.elemIndex '\n' bytes of
+        Just offset -> finish (BSC.take offset bytes : parts) (BSC.drop (offset + 1) bytes)
+        Nothing
+            | used > limit && (used - limit > 1 || BSC.null bytes || BSC.last bytes /= '\r') -> pure Nothing
+            | otherwise -> do
+                next <- BSC.hGetSome handle (max 1 (min 4094 (limit - used) + 2))
+                if BSC.null next
+                    then if used == 0
+                        then ioError (mkIOError eofErrorType "read request" (Just handle) Nothing)
+                        else finish (bytes : parts) BSC.empty
+                    else collect (bytes : parts) used next
+          where
+            used = total + BSC.length bytes
+    -- | 合并并校验一行的有效长度
+    finish parts remaining = do
+        let line = BSC.dropWhileEnd (== '\r') (BSC.concat (reverse parts))
+        pure (if BSC.length line > limit then Nothing else Just (line, remaining))
 
 -- | 一条请求一条响应，quit 后停连接
 dispatch :: ServerEnv -> Session -> LiveEntry -> ClientRequest -> IO (ServerResponse, Bool)

@@ -117,7 +117,7 @@ TCP 连接在下一次请求时返回 unauthorized 并关闭；空闲连接不�
 
 ## 查询引擎扩展设计（尚未实现）
 
-按 bound IR → 子查询物化 / 递归 CTE 推进；DOMAIN 约束见[类型文档](types.md#domain-约束设计尚未实现)。以下设计尚未实施，当前能力见前文；实施状态以 project-plan.txt 为准。
+按 bound IR → 子查询物化 / 递归 CTE 推进；DOMAIN 约束见[类型文档](types.md#domain-约束设计尚未实现)。以下设计尚未实施，当前能力见前文；实施状态以 agent-credientials/progress.txt 为准。
 
 ### bound IR
 

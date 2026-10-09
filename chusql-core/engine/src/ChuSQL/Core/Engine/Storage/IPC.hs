@@ -36,7 +36,8 @@ import ChuSQL.Core.Engine.Parallel (parallelShardLimit, poolRun, workerPool)
 import ChuSQL.Core.Engine.Storage
 import ChuSQL.Core.Engine.Storage.FFI (closeStorage, openStorage, storageRequest)
 import Control.Concurrent (getNumCapabilities)
-import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar)
+import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, putMVar, readMVar, takeMVar, withMVar)
+import Control.Exception (bracket, mask_)
 import Data.Aeson (eitherDecodeStrict, encode)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
@@ -89,9 +90,33 @@ data StorageLink = StorageLink
 linkRef :: MVar (Maybe StorageLink)
 linkRef = unsafePerformIO (newMVar Nothing)
 
+{-# NOINLINE linkUsers #-}
+-- | 在途请求计数与空闲信号
+linkUsers :: (MVar Int, MVar ())
+linkUsers = unsafePerformIO $ (,) <$> newMVar 0 <*> newMVar ()
+
+-- | 登记请求并在结束时释放链路占用
+withStorageLink :: (Maybe StorageLink -> IO a) -> IO a
+withStorageLink = bracket enter leave
+  where
+    (users, idle) = linkUsers
+    -- | 登记当前链路的在途请求
+    enter = withMVar linkRef $ \current -> do
+        case current of
+            Nothing -> pure ()
+            Just _ -> modifyMVar_ users $ \count -> do
+                if count == 0 then takeMVar idle else pure ()
+                pure (count + 1)
+        pure current
+    -- | 最后一个请求结束后发出空闲信号
+    leave Nothing = pure ()
+    leave (Just _) = mask_ $ modifyMVar_ users $ \count -> do
+        if count == 1 then putMVar idle () else pure ()
+        pure (count - 1)
+
 -- | 装入一条链路；一个进程只装一次
 setStorageLink :: StorageLink -> IO ()
-setStorageLink link = modifyMVar_ linkRef (const (pure (Just link)))
+setStorageLink link = modifyMVar_ linkRef $ \_ -> withMVar (snd linkUsers) (const (pure (Just link)))
 
 -- | 打开本地的存储动态库，得到一条链路
 localStorageLink :: Maybe FilePath -> IO (Either String StorageLink)
@@ -106,7 +131,7 @@ localStorageLink path = fmap (fmap toLink) (openStorage path)
 
 -- | 关掉当前链路（进程退出前调用）；没有链路就什么都不做
 closeConnection :: IO ()
-closeConnection = modifyMVar_ linkRef $ \current -> do
+closeConnection = modifyMVar_ linkRef $ \current -> withMVar (snd linkUsers) $ \_ -> do
     case current of
         Nothing -> pure ()
         Just link -> slClose link
@@ -114,22 +139,19 @@ closeConnection = modifyMVar_ linkRef $ \current -> do
 
 -- | 发一条请求并解码应答；链路没装就报错，不崩
 sendRequest :: Request -> IO Response
-sendRequest req = do
-    current <- readMVar linkRef
-    case current of
-        Nothing -> pure (RespError "storage not configured")
-        Just link -> do
-            raw <- slRequest link (BL.toStrict (encode req))
-            case raw of
-                Left e -> pure (RespError ("storage error: " ++ e))
-                Right bytes -> case eitherDecodeStrict (BS.dropWhileEnd (== 13) bytes) of
-                    Left e -> pure (RespError ("decode error: " ++ e))
-                    Right resp -> pure resp
+sendRequest req = withStorageLink $ \current -> case current of
+    Nothing -> pure (RespError "storage not configured")
+    Just link -> do
+        raw <- slRequest link (BL.toStrict (encode req))
+        case raw of
+            Left e -> pure (RespError ("storage error: " ++ e))
+            Right bytes -> case eitherDecodeStrict (BS.dropWhileEnd (== 13) bytes) of
+                Left e -> pure (RespError ("decode error: " ++ e))
+                Right resp -> pure resp
 
 -- | 原样转发一条载荷给存储库
 sendRawRequest :: BS.ByteString -> IO (Either String BS.ByteString)
-sendRawRequest payload = do
-    current <- readMVar linkRef
+sendRawRequest payload = withStorageLink $ \current -> do
     case current of
         Nothing -> pure (Left "storage not configured")
         Just link -> slRequest link payload
@@ -212,10 +234,6 @@ doInsertMany env t rs = ask env "insert_batch" (ReqInsertBatch t rs) okOnly
 doDeleteKeys :: Env -> String -> [Int] -> IO (Either String ())
 doDeleteKeys env t ks = ask env "delete_keys" (ReqDeleteKeys t ks) okOnly
 
--- | 发 ReplaceAll
-doReplaceAll :: Env -> String -> [Row] -> IO (Either String ())
-doReplaceAll env t rs = ask env "replace_all" (ReqReplaceAll t rs) okOnly
-
 -- | 发 ListTables
 doListTables :: Env -> IO (Either String [String])
 doListTables env = ask env "list_tables" ReqListTables $ \resp -> case resp of
@@ -253,26 +271,6 @@ doDescribeTable :: Env -> String -> IO (Either String TableInfo)
 doDescribeTable env t = ask env "describe_table" (ReqDescribeTable t) $ \resp -> case resp of
     RespSchema info -> Just info
     _ -> Nothing
-
--- | 给某一列建索引
-doCreateIndex :: Env -> String -> String -> IO (Either String ())
-doCreateIndex env t c = ask env "create_index" (ReqCreateIndex t c) okOnly
-
--- | 去掉某一列的索引
-doDropIndex :: Env -> String -> String -> IO (Either String ())
-doDropIndex env t c = ask env "drop_index" (ReqDropIndex t c) okOnly
-
--- | 删一列（列定义、这一列上的索引、每行里的那一格一起没）
-doDropColumn :: Env -> String -> String -> IO (Either String ())
-doDropColumn env t c = ask env "drop_column" (ReqDropColumn t c) okOnly
-
--- | 发 ReplaceSchema（ALTER 用）
-doReplaceSchema :: Env -> String -> [SchemaColumn] -> [Row] -> IO (Either String ())
-doReplaceSchema env t cols rs = ask env "replace_schema" (ReqReplaceSchema t cols rs) okOnly
-
--- | 发 CreateTable
-doCreateTable :: Env -> String -> [SchemaColumn] -> IO (Either String ())
-doCreateTable env t cols = ask env "create_table" (ReqCreateTable t cols) okOnly
 
 -- | 发 DropTable
 doDropTable :: Env -> String -> IO (Either String ())
@@ -350,7 +348,7 @@ instance MonadStorage IPCStorage where
     deleteKeys t ks = IPCStorage (\env -> doDeleteKeys env t ks)
 
     -- \| 发 ReplaceAll
-    replaceAll t rs = IPCStorage (\env -> doReplaceAll env t rs)
+    replaceAll t rs = IPCStorage $ \env -> ask env "replace_all" (ReqReplaceAll t rs) okOnly
 
     -- \| 按某一列的索引取一行（没有索引就回 NoIndex）
     lookupByColumn t c k = IPCStorage (\env -> doLookupByColumn env t c k)
@@ -359,45 +357,44 @@ instance MonadStorage IPCStorage where
     scanRange t c lo hi = IPCStorage (\env -> doScanRange env t c lo hi)
 
     -- \| 发 CreateTable
-    createTable name cols = IPCStorage (\env -> doCreateTable env name (map toWire cols))
+    createTable name cols = IPCStorage $ \env -> ask env "create_table" (ReqCreateTable name (map toWire cols)) okOnly
 
     -- \| ALTER：整表换列定义与全部行
-    replaceSchema name cols rows = IPCStorage (\env -> doReplaceSchema env name (map toWire cols) rows)
+    replaceSchema name cols rows = IPCStorage $ \env -> ask env "replace_schema" (ReqReplaceSchema name (map toWire cols) rows) okOnly
 
     -- \| 发 DropTable
     dropTable name = IPCStorage (\env -> doDropTable env name)
 
     -- \| 建索引
-    createIndex t c = IPCStorage (\env -> doCreateIndex env t c)
+    createIndex t c = IPCStorage $ \env -> ask env "create_index" (ReqCreateIndex t c) okOnly
 
     -- \| 删索引
-    dropIndex t c = IPCStorage (\env -> doDropIndex env t c)
+    dropIndex t c = IPCStorage $ \env -> ask env "drop_index" (ReqDropIndex t c) okOnly
 
     -- \| 删一列
-    dropColumn t c = IPCStorage (\env -> doDropColumn env t c)
+    dropColumn t c = IPCStorage $ \env -> ask env "drop_column" (ReqDropColumn t c) okOnly
 
     -- \| 列表 + 逐表扫描拼库
     snapshot = IPCStorage $ \env -> do
         result <- doListCatalog env
         case result of
-            Left _ -> pure []
-            Right xs -> mapM (loadEntry env) xs
+            Left err -> pure (Left err)
+            Right xs -> fmap sequence (mapM (loadEntry env) xs)
       where
+        -- | 读取表数据并保留扫描错误
         loadEntry env info = do
             rows <- doScan env (tiTable info)
-            pure
+            pure $ fmap (\rs ->
                 ( tiTable info
-                , Table (tiTable info) (schemaToColumns (tiColumns info)) (either (const []) id rows) (Just (metaOf info))
-                )
+                , Table (tiTable info) (schemaToColumns (tiColumns info)) rs (Just (metaOf info))
+                )) rows
 
     -- \| 只问数据字典要结构，设了当前库只留它的表
     schema = IPCStorage $ \env -> do
         result <- ask env "all_catalogs" ReqAllCatalog $ \resp -> case resp of
             RespCatalog infos -> Just infos
             _ -> Nothing
-        pure $ case result of
-            Left _ -> []
-            Right xs -> concatMap (visibleTables (envDatabase env)) xs
+        pure (fmap (concatMap (visibleTables (envDatabase env))) result)
 
 -- | 线上表信息转引擎侧统计
 metaOf :: TableInfo -> TableMeta

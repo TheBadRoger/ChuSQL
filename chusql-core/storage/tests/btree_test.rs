@@ -1,8 +1,44 @@
 use chusql_core_storage::btree::{fits_in_page, DiskBTree, MAX_KEY_BYTES};
 use chusql_core_storage::config::{DEFAULT_BTREE_ORDER, DEFAULT_PAGE_SIZE};
 use chusql_core_storage::page::DEFAULT_POOL_SIZE;
+use std::io::{ErrorKind, Seek, SeekFrom, Write};
 
 // B+ 树测试：字节键、重复键、范围扫描、重开与配置校验。
+
+/// 损坏节点返回数据错误且重复读取不 panic
+#[test]
+fn malformed_node_fields_return_invalid_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("corrupt.idx");
+    {
+        let mut tree = open(dir.path(), "corrupt.idx");
+        tree.insert(b"x", 1).unwrap();
+        tree.insert(b"y", 2).unwrap();
+    }
+    let original = std::fs::read(&path).unwrap();
+    let cell = u16::from_le_bytes([original[DEFAULT_PAGE_SIZE + 11], original[DEFAULT_PAGE_SIZE + 12]]) as usize;
+    for (name, offset, bytes) in [
+        ("slot count", 1, vec![255, 255]),
+        ("node kind", 0, vec![2]),
+        ("cell overlaps slots", 11, vec![0, 0]),
+        ("cell beyond page", 11, vec![255, 15]),
+        ("overlapping cells", 13, (cell as u16).to_le_bytes().to_vec()),
+        ("key length", cell, vec![255, 255]),
+        ("key order", cell + 2, vec![b'z']),
+        ("zero child", 0, vec![1]),
+    ] {
+        std::fs::write(&path, &original).unwrap();
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start((DEFAULT_PAGE_SIZE + offset) as u64)).unwrap();
+        file.write_all(&bytes).unwrap();
+        drop(file);
+        let mut tree = open(dir.path(), "corrupt.idx");
+        for _ in 0..2 {
+            let error = tree.get(b"x").unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidData, "{name}: {error}");
+        }
+    }
+}
 
 /// 按默认参数打开指定索引文件
 fn open(dir: &std::path::Path, name: &str) -> DiskBTree {
@@ -12,6 +48,29 @@ fn open(dir: &std::path::Path, name: &str) -> DiskBTree {
 /// 整数键编码成保序的 8 字节（与堆表一致）
 fn key(n: i64) -> [u8; 8] {
     (n as u64 ^ (1u64 << 63)).to_be_bytes()
+}
+
+/// 重复键跨页后仍能完整查找和删除
+#[test]
+fn duplicate_keys_across_splits() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("split-duplicates.idx");
+    let mut tree = DiskBTree::open(&path, DEFAULT_PAGE_SIZE, 4, DEFAULT_POOL_SIZE).unwrap();
+    for value in (0..100).rev() {
+        tree.insert(b"same", value).unwrap();
+    }
+    drop(tree);
+    let mut tree = DiskBTree::open(&path, DEFAULT_PAGE_SIZE, 4, DEFAULT_POOL_SIZE).unwrap();
+    assert_eq!(tree.get(b"same").unwrap(), Some(0));
+    assert_eq!(tree.get_all(b"same").unwrap(), (0..100).collect::<Vec<_>>());
+    assert_eq!(tree.scan(Some(b"same"), Some(b"same")).unwrap().len(), 100);
+    for value in 0..100 {
+        assert!(tree.delete(b"same", value).unwrap());
+    }
+    assert!(!tree.delete(b"same", 0).unwrap());
+    drop(tree);
+    let mut tree = DiskBTree::open(&path, DEFAULT_PAGE_SIZE, 4, DEFAULT_POOL_SIZE).unwrap();
+    assert!(tree.get_all(b"same").unwrap().is_empty());
 }
 
 /// 空树查不到，遍历为空

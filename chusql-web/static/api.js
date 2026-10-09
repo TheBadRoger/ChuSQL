@@ -11,6 +11,12 @@ function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+// 校验结果列名及每行的列数。
+function hasValidRows(body) {
+  return isObject(body) && Array.isArray(body.columns) && body.columns.every((column) => typeof column === 'string')
+    && Array.isArray(body.rows) && body.rows.every((row) => Array.isArray(row) && row.length === body.columns.length);
+}
+
 // 发一次请求并处理错误。
 async function request(url, init, database) {
   const headers = new Headers(init && init.headers ? init.headers : undefined);
@@ -114,21 +120,13 @@ export async function useDatabase(name, database) {
 
 // ---------------------------------------------------------------- 表结构
 
-// 取类型基名（去掉参数）。
-function columnKind(type) {
-  return String(type).split('(')[0].trim().toLowerCase();
-}
-
-const knownTypes = ['int', 'bigint', 'smallint', 'str', 'text', 'varchar', 'char', 'float', 'double', 'decimal', 'numeric', 'bool', 'date', 'timestamp', 'blob'];
-
 // 校验并规整列描述。
 function asColumns(value) {
   if (!Array.isArray(value)) throw new Error('服务器返回的列清单无法识别。');
   return value.map((entry) => {
-    if (!isObject(entry) || typeof entry.name !== 'string' || typeof entry.type !== 'string') {
+    if (!isObject(entry) || typeof entry.name !== 'string' || typeof entry.type !== 'string' || !entry.type.trim()) {
       throw new Error('服务器返回的列描述无法识别。');
     }
-    if (!knownTypes.includes(columnKind(entry.type))) throw new Error(`不支持的列类型：${entry.type}`);
     return { ...entry, name: entry.name, type: entry.type };
   });
 }
@@ -197,13 +195,11 @@ export async function fetchRows({ database, table, limit, offset, sort, dir, fil
     params.set('filter', JSON.stringify(filters.map((f) => ({ column: f.column, value: f.expression }))));
   }
   const body = await request(`/api/tables/${encodeURIComponent(table)}/rows?${params}`, undefined, database);
-  if (!isObject(body) || !Array.isArray(body.columns) || !body.columns.every((c) => typeof c === 'string')
-      || !Array.isArray(body.rows) || typeof body.total !== 'number') {
+  if (!hasValidRows(body) || !Number.isSafeInteger(body.total) || body.total < 0) {
     throw new Error('服务器返回的分页数据无法识别。');
   }
   const columns = body.columns;
   const rows = body.rows.map((raw) => {
-    if (!Array.isArray(raw)) throw new Error('服务器返回的行数据无法识别。');
     return Object.fromEntries(columns.map((column, index) => [column, raw[index]]));
   });
   return { columns, rows, total: body.total };
@@ -281,7 +277,7 @@ export async function query(sql, database, tabId) {
     const init = jsonInit('POST', { sql });
     init.headers['X-ChuSQL-Console'] = console;
     const body = await request('/api/query', init, database);
-    if (!isObject(body) || !Array.isArray(body.columns) || !Array.isArray(body.rows)) {
+    if (!hasValidRows(body)) {
       throw new Error('服务器返回的查询结果无法识别。');
     }
     const durationMs = performance.now() - started;

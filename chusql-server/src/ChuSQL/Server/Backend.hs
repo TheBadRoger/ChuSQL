@@ -108,7 +108,7 @@ ipcBackend = do
                     RespError err -> Left err
                     _ -> Left "unexpected database response"
             , beStorage = \payload -> runRaw payload
-            , beSnapshot = Right <$> runIPCStorageIn (snapshot :: IPCStorage Database) (sessionEnv current)
+            , beSnapshot = runIPCStorageIn snapshot (sessionEnv current)
             , beApplyTransaction = \ops -> do
                 response <- sendRequest (ReqInDatabase current (ReqApplyTransaction ops))
                 pure $ case response of
@@ -148,10 +148,10 @@ ipcBackend = do
                 Right rows -> do
                     cols <- case rows of
                         [] -> do
-                            db <- runIPCStorageIn (schema :: IPCStorage Database) env
-                            pure (columnsFromStatement db stmt)
-                        (r : _) -> pure (map fst r)
-                    pure (Right (StatementResult cols rows))
+                            db <- runIPCStorageIn schema env
+                            pure (fmap (\structures -> columnsFromStatement structures stmt) db)
+                        (r : _) -> pure (Right (map fst r))
+                    pure (fmap (\names -> StatementResult names rows) cols)
 
 -- | 测试用内存后端，状态是一个 Database
 memoryBackend :: String -> MVar Database -> Backend

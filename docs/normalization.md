@@ -92,7 +92,7 @@ schema 类型不证明业务意义上的原子性。不满足 1NF 时更高范�
 
 ## 后续入口设计（尚未实现）
 
-以下 TCP、CLI 和 Web 接口尚未实现，拟议命令与端点目前不可用。实施状态以 project-plan.txt 为准。
+以下 TCP、CLI 和 Web 接口尚未实现，拟议命令与端点目前不可用。实施状态以 agent-credientials/progress.txt 为准。
 
 ### 协议与鉴权
 

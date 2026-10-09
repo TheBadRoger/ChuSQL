@@ -187,13 +187,14 @@ fn load_without_explicit_path_uses_builtin_defaults() {
     }
 }
 
-/// [server] 分区归别的层管；本层拼写错误要报错
+/// 忽略其他层分区并拒绝存储配置拼写错误
 #[test]
 fn server_section_belongs_to_another_layer() {
     let _guard = env_guard();
-    let db_server = "[server]\nlisten_host = \"0.0.0.0\"\nport = 7778\nmax_rows = 10\n";
+    let db_server = "[page]\nsize = 8192\n[storage]\ndata_dir = \"../data\"\n[server]\nlisten_host = \"0.0.0.0\"\nport = 7778\nmax_rows = 10\n[web]\nport = 7778\n";
     let loaded = config::resolve(Some(db_server), None).unwrap();
-    assert_eq!(loaded.config.data_dir, config::default_data_dir());
+    assert_eq!(loaded.config.page_size, 8192);
+    assert_eq!(loaded.config.data_dir, PathBuf::from("../data"));
 
     let typo = "[storage]\ndata_dirs = \"oops\"\n";
     assert!(config::resolve(Some(typo), None).is_err());
