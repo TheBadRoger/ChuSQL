@@ -16,6 +16,7 @@ library
                       ChuSQL.Interface.Actions
                       ChuSQL.Interface.Auth
                       ChuSQL.Interface.Config
+                      ChuSQL.Interface.Normalization
                       ChuSQL.Interface.Link
                       ChuSQL.Interface.Policy
                       ChuSQL.Interface.Protocol

@@ -15,16 +15,18 @@ module ChuSQL.Core.Protocol (
     queryResultJson,
 ) where
 
-import ChuSQL.Core.Model (Histogram (..), Row, Value (..))
+import ChuSQL.Core.Model (Histogram (..), Row, Value (..), TableIdentity (..))
 import ChuSQL.Core.Runtime (builtinTypes, runtimeToJSON, runtimeFromJSON)
 import Data.Aeson (FromJSON (..), ToJSON (..), object, withObject, (.:), (.:?), (.!=), (.=))
 import qualified Data.Aeson as A
 import qualified Data.Aeson.Key as K
 import qualified Data.Aeson.KeyMap as KM
 import Data.Aeson.Types (Parser)
-import Data.Scientific (floatingOrInteger, fromFloatDigits)
+import Data.Scientific (floatingOrInteger, fromFloatDigits, base10Exponent)
 import qualified Data.Text as T
 import Data.Text (Text)
+import Data.Word (Word64)
+import Text.Read (readMaybe)
 
 -- 线上协议类型：存储层请求/响应与查询结果集。
 
@@ -255,6 +257,8 @@ data TableInfo = TableInfo
     , tiIndexes :: [String]
     , tiStats :: [(String, Int, Bool)]
     , tiHistograms :: [(String, Histogram)]
+    , tiIdentity :: Maybe TableIdentity
+    , tiSchemaVersion :: Maybe Word64
     }
     deriving (Show, Eq)
 
@@ -267,6 +271,9 @@ instance ToJSON TableInfo where
             , "row_count" .= tiRows info
             , "indexes" .= map (\name -> object ["column" .= name]) (tiIndexes info)
             , "stats" .= map (statJson (tiHistograms info)) (tiStats info)
+            , "database_id" .= fmap (\(TableIdentity database _) -> show database) (tiIdentity info)
+            , "object_id" .= fmap (\(TableIdentity _ table) -> show table) (tiIdentity info)
+            , "schema_version" .= fmap show (tiSchemaVersion info)
             ]
       where
         statJson hists (name, distinct, capped) =
@@ -275,6 +282,16 @@ instance ToJSON TableInfo where
             statFields = ["name" .= name, "distinct" .= distinct, "capped" .= capped]
             histFields Nothing = []
             histFields (Just h) = ["lo" .= histLow h, "hi" .= histHigh h, "hist" .= histBuckets h]
+
+-- | 解码精确且有界的对象编号
+parseObjectNumber :: A.Value -> Parser Word64
+parseObjectNumber (A.String value)
+    | not (T.null value), T.length value <= 20, T.all (\c -> c >= '0' && c <= '9') value
+    , Just number <- (readMaybe (T.unpack value) :: Maybe Integer)
+    , number <= toInteger (maxBound :: Word64) = pure (fromInteger number)
+parseObjectNumber value@(A.Number number)
+    | base10Exponent number >= -20, base10Exponent number <= 20 = A.parseJSON value
+parseObjectNumber _ = fail "invalid table object identity"
 
 -- | 线上直方图还原；区间或桶缺了就当作没有
 histogramFromWire :: Maybe Double -> Maybe Double -> [Int] -> Maybe Histogram
@@ -292,9 +309,18 @@ instance FromJSON TableInfo where
         stats <- o .:? "stats" .!= []
         indexColumns <- mapM (\v -> withObject "IndexWire" (.: "column") v) (indexes :: [A.Value])
         parsed <- mapM parseStat (stats :: [A.Value])
+        database <- o .:? "database_id" >>= traverse parseObjectNumber
+        tableId <- o .:? "object_id" >>= traverse parseObjectNumber
+        version <- o .:? "schema_version" >>= traverse parseObjectNumber
+        identity <- case (database, tableId) of
+            (Nothing, Nothing) -> pure Nothing
+            (Just _, Just 0) -> pure Nothing
+            (Just databaseId, Just objectId) | objectId > 0 -> pure (Just (TableIdentity databaseId objectId))
+            _ -> fail ("incomplete table object identity: " ++ show (database, tableId))
         let parsedStats = [(name, distinct, capped) | (name, distinct, capped, _) <- parsed]
             parsedHistograms = [(name, h) | (name, _, _, Just h) <- parsed]
-        pure (TableInfo table columns count indexColumns parsedStats parsedHistograms)
+        pure (TableInfo table columns count indexColumns parsedStats parsedHistograms identity
+            (version >>= \v -> if v == 0 then Nothing else Just v))
       where
         parseStat = withObject "ColumnStat" $ \o -> do
             name <- o .: "name"

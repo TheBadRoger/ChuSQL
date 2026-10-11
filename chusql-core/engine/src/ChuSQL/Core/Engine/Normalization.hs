@@ -14,23 +14,27 @@ data Declaration = Declaration
     , dependencies :: [Dependency]
     , dependenciesComplete :: Bool
     , atomicAttributes :: Maybe Bool
-    } deriving (Eq, Show)
+    }
+    deriving (Eq, Show)
 data Finding = Finding
     { normalForm :: NormalForm
     , verdict :: Verdict
     , witnesses :: [Dependency]
     , condition :: String
-    } deriving (Eq, Show)
+    }
+    deriving (Eq, Show)
 data Decomposition = Decomposition
     { relations :: [Attributes]
     , losslessJoin :: Verdict
     , dependencyPreserving :: Verdict
-    } deriving (Eq, Show)
+    }
+    deriving (Eq, Show)
 data Analysis = Analysis
     { candidateKeys :: [Attributes]
     , findings :: [Finding]
     , suggestions :: [Decomposition]
-    } deriving (Eq, Show)
+    }
+    deriving (Eq, Show)
 
 -- 规范化属性集合。
 canonical :: Attributes -> Attributes
@@ -45,8 +49,9 @@ attributeClosure :: [Dependency] -> Attributes -> Attributes
 attributeClosure f seed = fixed (canonical seed)
   where
     -- 迭代加入已蕴含的属性。
-    fixed xs = let ys = canonical (xs ++ concat [b | Dependency a b <- f, subset a xs])
-               in if xs == ys then xs else fixed ys
+    fixed xs =
+        let ys = canonical (xs ++ concat [b | Dependency a b <- f, subset a xs])
+         in if xs == ys then xs else fixed ys
 
 -- 判断声明是否蕴含依赖。
 implies :: [Dependency] -> Dependency -> Bool
@@ -54,8 +59,12 @@ implies f (Dependency a b) = subset b (attributeClosure f a)
 
 -- 枚举最小超键。
 keysOf :: Attributes -> [Dependency] -> [Attributes]
-keysOf attrs f = [x | x <- subsequences attrs, super x,
-                     all (not . super) [x \\ [a] | a <- x]]
+keysOf attrs f =
+    [ x
+    | x <- subsequences attrs
+    , super x
+    , all (not . super) [x \\ [a] | a <- x]
+    ]
   where
     -- 判断闭包是否覆盖关系。
     super x = subset attrs (attributeClosure f x)
@@ -63,8 +72,12 @@ keysOf attrs f = [x | x <- subsequences attrs, super x,
 -- 投影关系上的全部非平凡依赖。
 projectDependencies :: [Dependency] -> Attributes -> [Dependency]
 projectDependencies f attrs =
-    [Dependency x [a] | x <- subsequences attrs,
-                       a <- attributeClosure f x, a `elem` attrs, a `notElem` x]
+    [ Dependency x [a]
+    | x <- subsequences attrs
+    , a <- attributeClosure f x
+    , a `elem` attrs
+    , a `notElem` x
+    ]
 
 -- 验证声明并生成只读范式报告。
 analyzeNormalization :: [(String, Column)] -> Declaration -> Either String Analysis
@@ -90,14 +103,26 @@ analyzeNormalization schema declaration
         Just False -> Violated
         Nothing -> Insufficient
     allFDs = projectDependencies f attrs
-    partial = [d | d@(Dependency x [a]) <- allFDs, a `notElem` prime,
-                   any (\k -> x /= k && subset x k) keys]
-    third = [d | d@(Dependency x [a]) <- allFDs, a `notElem` prime,
-                 not (subset attrs (attributeClosure f x))]
-    boyce = [d | d@(Dependency x _) <- allFDs,
-                 not (subset attrs (attributeClosure f x))]
-    results = Finding NF1 atomic [] "attributes must have atomic domains; requires an explicit declaration" :
-        [classify NF2 partial, classify NF3 third, classify BCNF boyce]
+    partial =
+        [ d
+        | d@(Dependency x [a]) <- allFDs
+        , a `notElem` prime
+        , any (\k -> x /= k && subset x k) keys
+        ]
+    third =
+        [ d
+        | d@(Dependency x [a]) <- allFDs
+        , a `notElem` prime
+        , not (subset attrs (attributeClosure f x))
+        ]
+    boyce =
+        [ d
+        | d@(Dependency x _) <- allFDs
+        , not (subset attrs (attributeClosure f x))
+        ]
+    results =
+        Finding NF1 atomic [] "attributes must have atomic domains; requires an explicit declaration"
+            : [classify NF2 partial, classify NF3 third, classify BCNF boyce]
     decompositions = [split d | d <- take 1 boyce, complete, atomic == Satisfied]
     -- 校验字段集合。
     valid xs = length xs == length (canonical xs) && subset xs attrs
@@ -108,10 +133,11 @@ analyzeNormalization schema declaration
     -- 结合声明完整性判定范式。
     classify nf ds = Finding nf status (if complete then ds else []) (rule nf)
       where
-        status | atomic == Violated = Violated
-               | atomic == Insufficient || not complete = Insufficient
-               | null ds = Satisfied
-               | otherwise = Violated
+        status
+            | atomic == Violated = Violated
+            | atomic == Insufficient || not complete = Insufficient
+            | null ds = Satisfied
+            | otherwise = Violated
     -- 说明各范式的必要条件。
     rule NF1 = "attributes must have atomic domains"
     rule NF2 = "no nonprime attribute depends on a proper subset of any candidate key"

@@ -6,6 +6,7 @@ module Repl
     , reportError
     ) where
 
+import ChuSQL.CLI.Normalization (runNormalizationOnce)
 import ChuSQL.CLI.Format (OutputFormat, formatName, renderResult, renderRows)
 import ChuSQL.CLI.History (historySettings, rememberStatement)
 import ChuSQL.CLI.Script (Meta (..), errorHint, metaHelp, parseMeta, takeStatement)
@@ -106,6 +107,7 @@ runMeta session formatRef meta = case meta of
     MetaDatabases -> listDatabases session >> pure True
     MetaTables -> listTables session >> pure True
     MetaDescribe name -> describeTable session name >> pure True
+    MetaNormalize table file jsonOutput -> liftIO (runNormalizationOnce session table file jsonOutput) >> pure True
     MetaRoles -> listRoles session >> pure True
     MetaConnect name -> do
         switched <- liftIO (switchDatabase session name)

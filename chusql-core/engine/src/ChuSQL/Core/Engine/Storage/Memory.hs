@@ -1,8 +1,9 @@
 module ChuSQL.Core.Engine.Storage.Memory (MemoryStorage (runMemoryStorage)) where
 
-import ChuSQL.Core.Model
 import ChuSQL.Core.Engine.Storage
-import qualified Data.HashSet as HS
+import ChuSQL.Core.Model
+import Data.HashSet qualified as HS
+import Data.Word (Word64)
 
 -- 内存实现：Database 上的状态，错误通道是 Either String。
 
@@ -26,6 +27,9 @@ instance Monad MemoryStorage where
         runMemoryStorage (k a) db'
 
 instance MonadStorage MemoryStorage where
+    -- \| 纯状态视图在求值期间不受外部修改
+    withSchemaGuard _ action = action
+
     -- \| 全表扫描
     scan t = MemoryStorage $ \db -> do
         tbl <- lookupTable db t
@@ -45,7 +49,7 @@ instance MonadStorage MemoryStorage where
     createTable name cols = MemoryStorage $ \db ->
         if any ((== name) . fst) db
             then Right (Left ("table already exists: " ++ name), db)
-            else Right (Right (), db ++ [(name, Table name cols [] Nothing)])
+            else Right (Right (), db ++ [(name, Table name cols [] Nothing Nothing (Just 1))])
 
     -- \| 删表；不存在报错
     dropTable name = MemoryStorage $ \db ->
@@ -60,7 +64,8 @@ instance MonadStorage MemoryStorage where
             Just tbl ->
                 if col `notElem` map fst (tableCols tbl)
                     then Right (Left ("unknown column: " ++ col), db)
-                    else
+                    else do
+                        version <- nextSchemaVersion tbl
                         Right
                             ( Right ()
                             , replaceTable
@@ -68,6 +73,7 @@ instance MonadStorage MemoryStorage where
                                 tbl
                                     { tableCols = filter ((/= col) . fst) (tableCols tbl)
                                     , tableRows = map (filter ((/= col) . fst)) (tableRows tbl)
+                                    , tableSchemaVersion = Just version
                                     }
                                 db
                             )
@@ -78,9 +84,9 @@ instance MonadStorage MemoryStorage where
     -- \| 返回实时行数与去重统计的无数据结构
     schema = MemoryStorage $ \db -> Right (Right (map describe db), db)
       where
-        -- | 将存储数据汇总为结构统计
+        -- \| 将存储数据汇总为结构统计
         describe (name, table) =
-            (name, table {tableRows = [], tableMeta = Just metadata})
+            (name, table{tableRows = [], tableMeta = Just metadata})
           where
             metadata = TableMeta (length (tableRows table)) distinct [] []
             distinct = [columnStatistics column (tableRows table) | (column, _) <- tableCols table]
@@ -88,13 +94,25 @@ instance MonadStorage MemoryStorage where
     -- \| 改表结构：列定义与行一起换
     replaceSchema name cols rows = MemoryStorage $ \db -> case lookup name db of
         Nothing -> Right (Left ("unknown table: " ++ name), db)
-        Just tbl -> Right (Right (), replaceTable name tbl{tableCols = cols, tableRows = rows} db)
+        Just tbl -> do
+            version <-
+                if tableCols tbl == cols
+                    then Right (tableSchemaVersion tbl)
+                    else Just <$> nextSchemaVersion tbl
+            Right (Right (), replaceTable name tbl{tableCols = cols, tableRows = rows, tableSchemaVersion = version} db)
+
+-- | 递增结构版本并拒绝耗尽
+nextSchemaVersion :: Table -> Either String Word64
+nextSchemaVersion table = case tableSchemaVersion table of
+    Just version | version == maxBound -> Left "catalog schema version exhausted"
+    Just version -> Right (version + 1)
+    Nothing -> Right 1
 
 -- | 对列值去重并限制统计内存
 columnStatistics :: String -> [Row] -> (String, Int, Bool)
 columnStatistics column rows = go rows HS.empty
   where
-    -- | 累积规范化值，达到上限后停止
+    -- \| 累积规范化值，达到上限后停止
     go remaining values
         | HS.size values >= 4096 = (column, 4096, True)
         | otherwise = case remaining of
@@ -105,4 +123,3 @@ columnStatistics column rows = go rows HS.empty
 replaceTable :: String -> Table -> Database -> Database
 replaceTable name table =
     map (\(n, t) -> if n == name then (n, table) else (n, t))
-

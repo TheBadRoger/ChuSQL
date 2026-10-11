@@ -29,7 +29,7 @@ const OP_DROP_INDEX: u8 = 14;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum WalOp {
-    HideColumn { table: String, column: String },
+    HideColumn { table: String, column: String, schema_version: Option<u64> },
     Compact { table: String, rows: Vec<Row> },
     Accounts { accounts: Vec<Account>, removed: Vec<String>, migrate_roles: bool },
     Insert {
@@ -51,11 +51,13 @@ pub enum WalOp {
     DropColumn {
         table: String,
         column: String,
+        schema_version: Option<u64>,
         rows: Vec<Row>,
     },
     ReplaceSchema {
         table: String,
         columns: Vec<SchemaColumn>,
+        schema_version: Option<u64>,
         rows: Vec<Row>,
     },
     CreateTable {
@@ -79,14 +81,25 @@ pub enum WalOp {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct HideColumnPayload {
+    column: String,
+    #[serde(default)]
+    schema_version: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct DropColumnPayload {
     column: String,
+    #[serde(default)]
+    schema_version: Option<u64>,
     rows: Vec<Row>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ReplaceSchemaPayload {
     columns: Vec<SchemaColumn>,
+    #[serde(default)]
+    schema_version: Option<u64>,
     rows: Vec<Row>,
 }
 
@@ -379,8 +392,8 @@ fn truncate(f: &mut File) -> io::Result<()> {
 /// 把操作编成字节
 fn encode(op: &WalOp, lsn: u64) -> io::Result<Vec<u8>> {
     let (op_type, table, payload) = match op {
-        WalOp::HideColumn { table, column } => (OP_HIDE_COLUMN, table.clone(),
-            serde_json::to_vec(column).map_err(io::Error::other)?),
+        WalOp::HideColumn { table, column, schema_version } => (OP_HIDE_COLUMN, table.clone(),
+            serde_json::to_vec(&serde_json::json!({"column":column,"schema_version":schema_version})).map_err(io::Error::other)?),
         WalOp::Compact { table, rows } => {
             let p = serde_json::to_vec(rows).map_err(io::Error::other)?;
             (OP_COMPACT, table.clone(), p)
@@ -403,17 +416,19 @@ fn encode(op: &WalOp, lsn: u64) -> io::Result<Vec<u8>> {
             let p = serde_json::to_vec(rows).map_err(io::Error::other)?;
             (OP_REPLACE_ALL, table.clone(), p)
         }
-        WalOp::DropColumn { table, column, rows } => {
+        WalOp::DropColumn { table, column, rows, schema_version } => {
             let p = serde_json::to_vec(&DropColumnPayload {
                 column: column.clone(),
+                schema_version: *schema_version,
                 rows: rows.clone(),
             })
             .map_err(io::Error::other)?;
             (OP_DROP_COLUMN, table.clone(), p)
         }
-        WalOp::ReplaceSchema { table, columns, rows } => {
+        WalOp::ReplaceSchema { table, columns, rows, schema_version } => {
             let p = serde_json::to_vec(&ReplaceSchemaPayload {
                 columns: columns.clone(),
+                schema_version: *schema_version,
                 rows: rows.clone(),
             })
             .map_err(io::Error::other)?;
@@ -474,9 +489,16 @@ fn decode_body(body: &[u8]) -> Result<(u64, WalOp), String> {
     let op = match op_type {
         OP_COMMIT => WalOp::Commit,
         OP_HIDE_COLUMN => {
-            let column = serde_json::from_slice(payload)
+            let value: serde_json::Value = serde_json::from_slice(payload)
                 .map_err(|e| format!("bad hide_column payload: {e}"))?;
-            WalOp::HideColumn { table, column }
+            let (column, schema_version) = if let Some(column) = value.as_str() {
+                (column.to_string(), None)
+            } else {
+                let p: HideColumnPayload = serde_json::from_value(value)
+                    .map_err(|e| format!("bad hide_column payload: {e}"))?;
+                (p.column, p.schema_version)
+            };
+            WalOp::HideColumn { table, column, schema_version }
         }
         OP_COMPACT => {
             let rows: Vec<Row> = serde_json::from_slice(payload)
@@ -521,6 +543,7 @@ fn decode_body(body: &[u8]) -> Result<(u64, WalOp), String> {
             WalOp::DropColumn {
                 table,
                 column: p.column,
+                schema_version: p.schema_version,
                 rows: p.rows,
             }
         }
@@ -530,6 +553,7 @@ fn decode_body(body: &[u8]) -> Result<(u64, WalOp), String> {
             WalOp::ReplaceSchema {
                 table,
                 columns: p.columns,
+                schema_version: p.schema_version,
                 rows: p.rows,
             }
         }

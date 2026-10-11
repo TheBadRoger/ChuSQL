@@ -28,14 +28,13 @@ usage: ./install.sh [--component web|cli|both] [options]
                           asks (English, y/n), command line client first:
                             command line client (csql)?   default yes [Y/n]
                             web front end (browser UI)?   default no  [y/N]
-                          it then asks whether to give the administrator account a
-                          password (default no); that password goes straight into the
+                          it then asks for the administrator password; it goes into the
                           system catalog and is never written to settings.toml
 
   --interactive           ask even when there is no terminal; the answers are
                           read from stdin (one per line)
   --install-dir DIR       where to install   (default: $HOME/.local/share/chusql)
-  --data-dir DIR          where to keep data (default: <install-dir>/data)
+  --data-dir DIR          where to keep data (default: XDG data directory)
   --user NAME             administrator name (default: root)
   --keep-package          do not delete the downloaded/extracted package
   --password VALUE        password of the administrator account (required when
@@ -132,6 +131,19 @@ case "$self" in
 esac
 
 [ -n "$install_dir" ] || install_dir="$HOME/.local/share/chusql"
+config_file="${XDG_CONFIG_HOME:-$HOME/.config}/ChuSQL/settings.toml"
+if [ "$list_versions" = 'no' ] && [ -f "$config_file" ]; then
+    requested_data_dir=$data_dir
+    data_dir=$(awk '/^[[:space:]]*\[storage\]/ { storage=1; next } /^[[:space:]]*\[/ { storage=0 } storage && /^[[:space:]]*data_dir[[:space:]]*=[[:space:]]*"[^"\\]*"[[:space:]]*(#.*)?$/ { sub(/^[^=]*=[[:space:]]*"/, ""); sub(/"[[:space:]]*(#.*)?$/, ""); print; exit }' "$config_file")
+    [ -n "$data_dir" ] || fail 'existing settings.toml needs an explicit double-quoted storage.data_dir without escapes'
+    case "$data_dir" in /*) ;; *) data_dir="$install_dir/$data_dir" ;; esac
+    if [ -n "$requested_data_dir" ]; then
+        requested_data_dir=$(CDPATH= cd -- "$requested_data_dir" && pwd -P) || fail 'requested data directory does not exist'
+        existing_data_dir=$(CDPATH= cd -- "$data_dir" && pwd -P) || fail 'configured data directory does not exist'
+        [ "$requested_data_dir" = "$existing_data_dir" ] ||
+            fail 'existing settings.toml: edit its data_dir instead of passing a different --data-dir'
+    fi
+fi
 [ -n "$data_dir" ] || data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/chusql/data"
 log_dir="${XDG_STATE_HOME:-$HOME/.local/state}/chusql/logs"
 
@@ -213,7 +225,7 @@ if [ "$list_versions" = 'no' ]; then
     if [ -n "$password_arg" ]; then
         admin_password="$password_arg"
     fi
-    if [ "$can_prompt" = 'yes' ]; then
+    if [ "$can_prompt" = 'yes' ] && [ -z "$admin_password" ]; then
         echo
         echo "The administrator account is $root_user."
         while :; do
@@ -511,7 +523,7 @@ if [ "$from_source" = 'yes' ]; then
     mkdir -p "$pack/bin" "$pack/resources"
     cp "$storage_lib" "$pack/bin/"
     cp "$src/resources/settings.toml.linux" "$pack/resources/"
-    cp "$src/scripts/install.sh" "$pack/"
+    cp "$src/scripts/install.sh" "$src/scripts/uninstall.sh" "$pack/"
     for comp in $wanted; do
         if [ "$comp" = 'web' ]; then
             comp_dir='chusql-web'; front_name='chusql-web'
@@ -626,15 +638,37 @@ if [ "$(uname -s)" = 'Linux' ] && [ "$no_service" = 'no' ]; then
     command -v systemctl >/dev/null 2>&1 || fail 'systemd is required; use --no-service to opt out'
     command -v loginctl >/dev/null 2>&1 || fail 'loginctl is required for boot autostart'
     systemctl --user show-environment >/dev/null || fail 'cannot connect to user systemd; run in a login session or use --no-service'
-    loginctl enable-linger "$(id -un)" || fail 'cannot enable boot autostart; run sudo loginctl enable-linger for this OS user and retry'
+    os_user=$(id -un)
+    linger=$(loginctl show-user "$os_user" -p Linger --value) || fail 'cannot query boot autostart for this OS user'
+    if [ "$linger" != 'yes' ]; then
+        loginctl enable-linger "$os_user" || fail 'cannot enable boot autostart; run sudo loginctl enable-linger for this OS user and retry'
+    fi
     use_service='yes'
     if [ -f "$service_file" ]; then
         systemctl --user stop chusql-server.service || fail 'cannot stop the existing service'
     fi
 fi
+# 停止安装目录中的进程，避免更新运行中的文件。
+stop_installed() {
+    for executable in chusql-web chusql-server; do
+        for process in /proc/[0-9]*/exe; do
+            target=$(readlink "$process" 2>/dev/null) || continue
+            [ "$target" = "$install_dir/bin/$executable" ] || continue
+            pid=${process#/proc/}; pid=${pid%/exe}
+            kill "$pid" || fail "cannot stop $executable ($pid)"
+            attempts=0
+            while [ -e "$process" ]; do
+                attempts=$((attempts + 1))
+                [ "$attempts" -lt 100 ] || fail "timed out stopping $executable ($pid)"
+                sleep 0.1
+            done
+        done
+    done
+}
 step 'Installing files'
 mkdir -p "$install_dir/bin" "$log_dir" "$data_dir"
-install_dir=$(CDPATH= cd -- "$install_dir" && pwd)
+install_dir=$(CDPATH= cd -- "$install_dir" && pwd -P)
+if [ "$(uname -s)" = Linux ]; then stop_installed; fi
 data_dir=$(CDPATH= cd -- "$data_dir" && pwd)
 log_dir=$(CDPATH= cd -- "$log_dir" && pwd)
 cp "$pack/bin/chusql-server" "$install_dir/bin/"
@@ -657,7 +691,11 @@ if [ "$want_web" = 'yes' ]; then
         chmod +x "$install_dir/csql-web.sh"
     fi
 fi
-chmod +x "$install_dir/bin/"* 2>/dev/null || true
+chmod +x "$install_dir/bin/"*
+if [ -f "$pack/uninstall.sh" ]; then
+    cp "$pack/uninstall.sh" "$install_dir/"
+    chmod +x "$install_dir/uninstall.sh"
+fi
 
 # ---- 写全局配置 ----
 step 'Writing settings.toml'
@@ -666,9 +704,11 @@ config_file="$config_dir/settings.toml"
 mkdir -p "$config_dir"
 config_dir=$(CDPATH= cd -- "$config_dir" && pwd)
 config_file="$config_dir/settings.toml"
-sed -e "s|@DATA_DIR@|$(printf '%s' "$data_dir" | sed 's/[\&|]/\\&/g')|g" \
-    -e "s|@LOG_DIR@|$(printf '%s' "$log_dir" | sed 's/[\&|]/\\&/g')|g" \
-    "$pack/resources/settings.toml.linux" > "$config_file"
+if [ ! -f "$config_file" ]; then
+    sed -e "s|@DATA_DIR@|$(printf '%s' "$data_dir" | sed 's/[\&|]/\\&/g')|g" \
+        -e "s|@LOG_DIR@|$(printf '%s' "$log_dir" | sed 's/[\&|]/\\&/g')|g" \
+        "$pack/resources/settings.toml.linux" > "$config_file"
+fi
 echo "  config file  $config_file"
 
 # ---- 引导系统目录 ----
@@ -676,7 +716,7 @@ echo "  config file  $config_file"
 step 'Initializing the administrator identity and preinstalled types'
 bootstrap="$install_dir/bin/csql-bootstrap"
 [ -n "$admin_password" ] || fail 'the administrator password is required'
-printf '%s\n' "$admin_password" | "$bootstrap" --config "$config_file" --user "$root_user" --password-stdin ||
+( cd "$install_dir" && printf '%s\n' "$admin_password" | "$bootstrap" --config "$config_file" --user "$root_user" --password-stdin ) ||
     fail 'the bootstrap program failed; identities or preinstalled types are not ready'
 
 # ---- 命令入口 ----
@@ -700,17 +740,17 @@ fi
 step 'Updating PATH'
 profile="$HOME/.profile"
 marker='# ChuSQL'
-if [ -f "$profile" ] && grep -q "^$marker" "$profile"; then
-    echo "PATH entry already present in $profile"
-else
-    {
-        echo ''
-        echo "$marker"
-        echo "PATH=\"\$PATH:$install_dir\""
-        echo "export PATH"
-    } >> "$profile"
-    echo "added $install_dir to PATH in $profile (login again or: . \"$profile\")"
+if [ -f "$profile" ] && grep -q "^$marker$" "$profile"; then
+    awk -v m="$marker" 'skip > 0 { skip--; next } $0 == m { skip=2; next } { print }' "$profile" > "$profile.chusql-install"
+    mv "$profile.chusql-install" "$profile"
 fi
+{
+    echo ''
+    echo "$marker"
+    echo "PATH=\"\$PATH:$install_dir:$install_dir/bin\""
+    echo "export PATH"
+} >> "$profile"
+echo "added $install_dir to PATH in $profile (login again or: . \"$profile\")"
 
 # ---- 删掉安装包 ----
 if [ "$keep_package" = 'no' ]; then
@@ -753,7 +793,7 @@ Description=ChuSQL database server
 
 [Service]
 Type=simple
-WorkingDirectory="$(unit_quote "$install_dir")"
+WorkingDirectory=$(printf '%s' "$install_dir" | sed 's/%/%%/g')
 ExecStart=:"$(unit_quote "$server_bin")" --config "$(unit_quote "$config_file")" --user "$(unit_quote "$root_user")"
 Restart=on-failure
 RestartSec=5
@@ -778,7 +818,7 @@ elif [ "$no_start" = 'yes' ]; then
 else
     step 'Starting the server'
     mkdir -p "$log_dir"
-    nohup "$server_bin" --config "$config_file" --user "$root_user" > "$log_dir/server.log" 2> "$log_dir/server.err.log" &
+    ( cd "$install_dir" && exec nohup "$server_bin" --config "$config_file" --user "$root_user" ) > "$log_dir/server.log" 2> "$log_dir/server.err.log" &
     server_pid=$!
     sleep 1
     if ! kill -0 "$server_pid" 2>/dev/null; then

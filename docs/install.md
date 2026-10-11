@@ -105,6 +105,28 @@ csql-web
 
 管理员使用安装时设置的口令登录。
 
+## 更新
+
+重新运行安装脚本，指定相同的安装目录和组件即可更新，也可用 `--version TAG` 选择版本：
+
+```sh
+./install.sh --component both --install-dir "$HOME/.local/share/chusql" --version <tag>
+```
+
+Linux 更新会先停止该安装目录中的 Web 和数据库进程，保留已有 `settings.toml`、数据库和管理员口令，再引导检查系统目录。修改数据位置须编辑配置并自行迁移数据；更新时不能用不同的 `--data-dir` 覆盖现有配置。安装默认重启数据库服务，Web 管理端需重新运行 `csql-web`。
+
+Linux 安装目录中保留 `uninstall.sh`。卸载时指定安装目录，数据目录默认读取现有配置。
+
+已构建的 Linux 包可用隔离验证脚本测试，不修改正常安装的配置或数据：
+
+```sh
+python3 scripts/test-linux-lifecycle.py releases/chusql-linux-x86_64.tar.gz
+```
+
+该验证需要 Python 3，使用真实数据库程序，覆盖安装、运行中更新、配置与 SQL 数据保留、保留数据卸载、重装和完全卸载；基础验证通过 `--no-service` 隔离 systemd 服务。
+
+添加 `--systemd` 可验证真实用户服务的注册、启动、更新及卸载。此选项要求不存在已有的 `chusql-server.service`，并且当前用户能够启用 linger（或已由管理员启用）；临时单元链接会在测试后清理。本机 HTTP 发行站夹具用于验证在线安装流程，不依赖 GitHub 上已有 Release。
+
 ## 卸载
 
 Linux / macOS：

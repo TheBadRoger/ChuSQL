@@ -14,6 +14,7 @@ library
     exposed-modules:  ChuSQL.Server.Accounts
                       ChuSQL.Server.Backend
                       ChuSQL.Server.Catalog
+                      ChuSQL.Server.Normalization
                       ChuSQL.Server.Policy
                       ChuSQL.Server.Privileges
                       ChuSQL.Server.ObjectACL

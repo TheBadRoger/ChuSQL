@@ -1,0 +1,47 @@
+# 为 HLS 指定各源码目录的 Stack 组件，使用现有构建配置解析本地包。
+cradle:
+    multi:
+        - path: "./benchmark"
+          config:
+              cradle:
+                  stack:
+                      stackYaml: "./benchmark/stack.yaml"
+                      component: "benchmark4csql:exe:benchmark4csql"
+        - path: "./"
+          config:
+              cradle:
+                  stack:
+                      stackYaml: "./chusql-cli/stack.yaml"
+                      components:
+                          - path: "./chusql-core/model/src"
+                            component: "chusql-core-model:lib"
+                          - path: "./chusql-core/engine/src"
+                            component: "chusql-core-engine:lib"
+                          - path: "./chusql-core/engine/test"
+                            component: "chusql-core-engine:test:chusql-core-engine-test"
+                          - path: "./chusql-interface/src"
+                            component: "chusql-interface:lib"
+                          - path: "./chusql-server/src"
+                            component: "chusql-server:lib"
+                          - path: "./chusql-server/app"
+                            component: "chusql-server:exe:chusql-server"
+                          - path: "./chusql-server/test"
+                            component: "chusql-server:test:chusql-server-test"
+                          - path: "./chusql-bootstrap/src"
+                            component: "chusql-bootstrap:lib"
+                          - path: "./chusql-bootstrap/app"
+                            component: "chusql-bootstrap:exe:csql-bootstrap"
+                          - path: "./chusql-bootstrap/test"
+                            component: "chusql-bootstrap:test:chusql-bootstrap-test"
+                          - path: "./chusql-web/src"
+                            component: "chusql-web:lib"
+                          - path: "./chusql-web/app"
+                            component: "chusql-web:exe:chusql-web"
+                          - path: "./chusql-web/test"
+                            component: "chusql-web:test:chusql-web-test"
+                          - path: "./chusql-cli/src"
+                            component: "chusql-cli:lib"
+                          - path: "./chusql-cli/app"
+                            component: "chusql-cli:exe:csql"
+                          - path: "./chusql-cli/test"
+                            component: "chusql-cli:test:chusql-cli-test"

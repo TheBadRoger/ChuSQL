@@ -2,6 +2,8 @@
 
 module Main (main) where
 
+import ChuSQL.CLI.Normalization
+import ChuSQL.Interface.Normalization
 import ChuSQL.CLI.Format (OutputFormat (..), parseFormat, renderCsv, renderJson, renderTable, displayValue)
 import ChuSQL.CLI.History (historySettings, rememberStatement)
 import ChuSQL.CLI.Password (readPasswordInput)
@@ -31,6 +33,7 @@ main = hspec spec
 -- | 全部测试用例
 spec :: Spec
 spec = do
+    normalizationSpec
     it "renders typed compound values without losing their wire identity" $ do
         case resolveType builtinTypes (listType intType) of
             Left err -> expectationFailure err
@@ -188,3 +191,26 @@ sampleResult =
         , qrTruncated = False
         , qrDatabase = Nothing
         }
+
+
+-- 范式元命令、严格文件与显示格式回归。
+normalizationSpec :: Spec
+normalizationSpec = describe "CLI: normalization" $ do
+    it "parses quoted paths without interpreting Windows backslashes" $ do
+        normalizationArguments "users --declaration \"C:\\My Data\\fd.json\" --format json" `shouldBe` Right ("users", "C:\\My Data\\fd.json", True)
+        parseMeta "\\normalize users --declaration deps.json --format text" `shouldBe` Just (MetaNormalize "users" "deps.json" False)
+        normalizationArguments "users --declaration deps.json --format csv" `shouldSatisfy` either (const True) (const False)
+    it "keeps the same report fields in text and JSON output" $ do
+        let report = A.object ["candidate_keys" A..= ([["id"]] :: [[T.Text]]), "conditional" A..= True, "findings" A..= [A.object ["normal_form" A..= ("bcnf" :: T.Text), "verdict" A..= ("insufficient" :: T.Text)]]]
+        A.eitherDecodeStrict (encodeUtf8 (renderNormalization True report)) `shouldBe` Right report
+        renderNormalization False report `shouldSatisfy` T.isInfixOf "candidate_keys"
+        renderNormalization False report `shouldSatisfy` T.isInfixOf "insufficient"
+    it "loads defaults and refuses duplicate JSON fields in declaration files" $ do
+        directory <- getTemporaryDirectory
+        bracket (openTempFile directory "normalization-declaration") (\(path, _) -> removeFile path) $ \(path, handle) -> do
+            hPutStr handle "{}"
+            hClose handle
+            loadNormalizationDeclaration path `shouldReturn` Right (NormalizationDeclaration [] [] False Nothing)
+            BL.writeFile path "{\"atomic_attributes\":true,\"atomic_attributes\":false}"
+            result <- loadNormalizationDeclaration path
+            result `shouldSatisfy` either (T.isInfixOf "duplicate") (const False)

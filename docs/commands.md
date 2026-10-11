@@ -44,6 +44,8 @@ csql [options]
 | `-d, --database DB` | 登录后选择数据库 |
 | `-f, --format FORMAT` | 输出格式：`table`、`json` 或 `csv` |
 | `-e, --execute SQL` | 执行一条 SQL 后退出 |
+| `--normalize TABLE` | 只读分析表的范式；与 `--execute` 互斥，需 `--declaration` |
+| `--declaration FILE` | UTF-8 JSON 业务依赖声明；范式输出使用 `--format text` 或 `json` |
 | `--history FILE` | 指定历史记录文件 |
 | `--sudo` | 使用本机 root / 提升管理员身份认证；需配置映射并启用身份属性，见 [用户与角色](users-and-roles.md#本机-sudo-认证) |
 | `--config FILE` | 指定配置文件 |

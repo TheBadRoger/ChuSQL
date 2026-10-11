@@ -169,7 +169,7 @@ if (-not $Component) {
 # CHUSQL_ADMIN_PASSWORD。口令只经 stdin 传给 csql-bootstrap，不落 settings.toml。
 $adminPassword = "$env:CHUSQL_ADMIN_PASSWORD"
 if ($Password) { $adminPassword = $Password }
-if ($canPrompt) {
+if ($canPrompt -and $adminPassword.Length -eq 0) {
     Write-Host ''
     Write-Host ('The administrator account is "{0}".' -f $RootUser)
     while ($true) {

@@ -15,6 +15,7 @@ reorderJoins db = pass db False
 
 -- | 往下带“行序是否不可观察”，可观察时不动内连接
 pass :: Database -> Bool -> RelOp -> RelOp
+pass db free (Distinct x) = Distinct (pass db free x)
 pass db _ (Sort spec x) = Sort spec (pass db True x)
 pass db _ (Limit n x) = Limit n (pass db False x)
 pass db _ (Aggregate keys aggs x) = Aggregate keys aggs (pass db False x)

@@ -74,14 +74,19 @@ pub unsafe extern "C" fn chusql_storage_close(handle: *mut Storage) {
 /// 离线维护系统目录并返回 JSON
 ///
 /// # Safety
-/// 输入为有效字符串；输出指针可写，响应使用 free 释放。
+/// `config_path` 为 NULL 或有效 NUL 结尾字符串；请求字节在调用期间有效。
+/// 输出指针可写且不与输入重叠；响应使用 free 释放。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn chusql_storage_maintenance(
     config_path: *const c_char, request: *const u8, request_len: usize,
     out: *mut *mut u8, out_len: *mut usize,
 ) -> i32 {
-    if request.is_null() || out.is_null() || out_len.is_null() { set_error("invalid maintenance argument"); return ERR; }
-    unsafe { *out = ptr::null_mut(); *out_len = 0; }
+    if !out.is_null() { unsafe { *out = ptr::null_mut(); } }
+    if !out_len.is_null() { unsafe { *out_len = 0; } }
+    if request.is_null() || out.is_null() || out_len.is_null() || request_len > isize::MAX as usize {
+        set_error("invalid maintenance argument");
+        return ERR;
+    }
     let result = catch_unwind(AssertUnwindSafe(|| {
         let path = if config_path.is_null() { None } else { Some(unsafe { CStr::from_ptr(config_path) }.to_str().map_err(|e| e.to_string())?) };
         let text = std::str::from_utf8(unsafe { slice::from_raw_parts(request, request_len) }).map_err(|e| e.to_string())?;
@@ -92,16 +97,16 @@ pub unsafe extern "C" fn chusql_storage_maintenance(
         Ok(Err(err)) => { set_error(err); return ERR; }
         Err(_) => { set_error("panic in system maintenance"); return ERR; }
     };
-    let mut buffer = response.into_bytes().into_boxed_slice();
-    unsafe { *out = buffer.as_mut_ptr(); *out_len = buffer.len(); }
-    std::mem::forget(buffer);
+    let buffer = response.into_bytes().into_boxed_slice();
+    unsafe { *out_len = buffer.len(); *out = Box::into_raw(buffer) as *mut u8; }
     OK
 }
 
 /// 处理一条请求，响应缓冲须归还
 ///
 /// # Safety
-/// `handle` 必须是有效句柄；`request` 指向 `request_len` 个字节；`out`/`out_len` 可写。
+/// `handle` 在调用期间有效且不能并发关闭；请求字节在调用期间有效。
+/// `out`/`out_len` 可写且不与输入重叠；响应使用 free 释放。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn chusql_storage_request(
     handle: *const Storage,
@@ -116,7 +121,7 @@ pub unsafe extern "C" fn chusql_storage_request(
     if !out_len.is_null() {
         unsafe { *out_len = 0 };
     }
-    if handle.is_null() || request.is_null() || out.is_null() || out_len.is_null() {
+    if handle.is_null() || request.is_null() || out.is_null() || out_len.is_null() || request_len > isize::MAX as usize {
         set_error("invalid argument");
         return ERR;
     }
@@ -139,13 +144,10 @@ pub unsafe extern "C" fn chusql_storage_request(
         }
     };
 
-    let mut buffer = response.into_bytes().into_boxed_slice();
-    let ptr = buffer.as_mut_ptr();
-    let len = buffer.len();
-    std::mem::forget(buffer);
+    let buffer = response.into_bytes().into_boxed_slice();
     unsafe {
-        *out = ptr;
-        *out_len = len;
+        *out_len = buffer.len();
+        *out = Box::into_raw(buffer) as *mut u8;
     }
     OK
 }
@@ -153,7 +155,7 @@ pub unsafe extern "C" fn chusql_storage_request(
 /// 归还响应缓冲
 ///
 /// # Safety
-/// `data`/`len` 必须是 chusql_storage_request 原样返回且未被释放过的一对值。
+/// `data`/`len` 为 request 或 maintenance 原样返回且未释放的一对值。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn chusql_storage_free(data: *mut u8, len: usize) {
     if data.is_null() {
@@ -168,7 +170,7 @@ pub unsafe extern "C" fn chusql_storage_free(data: *mut u8, len: usize) {
 /// 取本线程最近的失败信息
 ///
 /// # Safety
-/// `out_len` 可写，或为 NULL。
+/// `out_len` 可写，或为 NULL；返回字节仅在本线程下次设置错误前有效，不能释放。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn chusql_storage_last_error(out_len: *mut usize) -> *const u8 {
     LAST_ERROR.with(|slot| {

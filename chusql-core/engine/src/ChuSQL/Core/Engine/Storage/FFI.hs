@@ -65,7 +65,7 @@ openStorage path = onStorageThread $ mask_ $ do
             | ptr == nullPtr -> Left <$> lastError
             | otherwise -> pure (Right (StorageHandle ptr))
   where
-    -- | 没有路径就传空指针，否则转成 C 字符串
+    -- \| 没有路径就传空指针，否则转成 C 字符串
     withCStringOrNull Nothing f = f nullPtr
     withCStringOrNull (Just s) f = BS.useAsCString (TE.encodeUtf8 (T.pack s)) f
 
@@ -78,18 +78,24 @@ storageRequest :: StorageHandle -> BS.ByteString -> IO (Either String BS.ByteStr
 storageRequest (StorageHandle handle) = callStorage (cStorageRequest handle)
 
 -- | 调用存储并复制和归还响应缓冲
-callStorage :: (Ptr CChar -> CSize -> Ptr (Ptr CChar) -> Ptr CSize -> IO CInt)
-    -> BS.ByteString -> IO (Either String BS.ByteString)
-callStorage call payload = onStorageThread $ mask_ $
-    BS.useAsCStringLen payload $ \(input, size) ->
-        alloca $ \outRef -> alloca $ \lenRef -> do
-            code <- call input (fromIntegral size) outRef lenRef
-            if code /= 0 then Left <$> lastError else do
-                output <- peek outRef
-                len <- peek lenRef
-                bytes <- BS.packCStringLen (output, fromIntegral len)
-                    `finally` cStorageFree output len
-                pure (Right bytes)
+callStorage ::
+    (Ptr CChar -> CSize -> Ptr (Ptr CChar) -> Ptr CSize -> IO CInt) ->
+    BS.ByteString ->
+    IO (Either String BS.ByteString)
+callStorage call payload = onStorageThread $
+    mask_ $
+        BS.useAsCStringLen payload $ \(input, size) ->
+            alloca $ \outRef -> alloca $ \lenRef -> do
+                code <- call input (fromIntegral size) outRef lenRef
+                if code /= 0
+                    then Left <$> lastError
+                    else do
+                        output <- peek outRef
+                        len <- peek lenRef
+                        bytes <-
+                            BS.packCStringLen (output, fromIntegral len)
+                                `finally` cStorageFree output len
+                        pure (Right bytes)
 
 -- | 多线程运行时绑定存储调用线程
 onStorageThread :: IO a -> IO a

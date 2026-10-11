@@ -1,4 +1,4 @@
-module ChuSQL.Core.Engine.Syntax.AST (Statement (..), FromClause (..), JoinKind (..), Expr (..), Subquery (..), Quantifier (..), CompareOp (..), SortDir (..), makeSelect) where
+module ChuSQL.Core.Engine.Syntax.AST (Statement (..), FromClause (..), JoinKind (..), Expr (..), Subquery (..), Quantifier (..), CompareOp (..), SortDir (..), makeSelect, distinctOrdering) where
 
 import ChuSQL.Core.Model (Column (..), ColumnType, Value (..))
 import ChuSQL.Core.Engine.Runtime.Types (TypeId, TypeExpr, RuntimeValue)
@@ -23,6 +23,7 @@ data Statement
         , selectOrderBy :: [(String, SortDir)]
         , selectLimit :: Maybe Int
         }
+    | SelectDistinct Statement
     | Insert String [String] [[Expr]]
     | Delete String (Maybe Expr)
     | Update String [(String, Expr)] (Maybe Expr)
@@ -42,6 +43,7 @@ data Statement
     | CreateUser String String
     | AlterUser String String
     | AlterIdentity String [(String, Bool)]
+    | ShowGrants
     | ShowRoles
     | DropUser String
     -- | 新角色：权限的载体，用户靠成员资格继承它的权限
@@ -52,6 +54,7 @@ data Statement
     | GrantPrivileges [String] String String Bool
     -- | REVOKE 权限 ON 表 FROM 角色
     | RevokePrivileges [String] String String
+    | RevokeGrantOption [String] String String
     -- | GRANT 角色 TO 用户：给用户加角色
     | GrantRole String [String]
     -- | REVOKE <角色> FROM <用户>[, ...]
@@ -114,6 +117,8 @@ data CompareOp
 -- | 条件表达式：列、字面量、算术、比较、逻辑、聚合与子查询
 data Expr
     = Col String
+    | ColumnSlot Int String
+    | OuterColumnSlot Int Int String
     | FunctionCall String [Expr]
     | BoundFunction FunctionId TypeId [Expr]
     | Construct TypeExpr [Expr]
@@ -172,3 +177,23 @@ makeSelect cols tbl w =
         , selectOrderBy = []
         , selectLimit = Nothing
         }
+
+-- | 将去重排序映射到输出列
+distinctOrdering :: Statement -> Either String [(String, SortDir)]
+distinctOrdering q@Select{} = resolveDistinctOrdering q
+distinctOrdering q@SelectExpr{} = resolveDistinctOrdering q
+distinctOrdering _ = Left "DISTINCT requires SELECT"
+
+-- | 解析去重输出的排序列
+resolveDistinctOrdering :: Statement -> Either String [(String, SortDir)]
+resolveDistinctOrdering q = mapM resolve (selectOrderBy q)
+  where
+    items = case q of
+        Select { selectCols = cols } -> [(c, Col c) | c <- cols]
+        SelectExpr { selectItems = projected } -> projected
+        _ -> []
+    -- | 排序键必须出现在去重结果中
+    resolve (column, direction) = case [label | (label, e) <- items, label == column || e == Col column] of
+        [label] -> Right (label, direction)
+        [] -> Left "DISTINCT: ORDER BY column must appear in the select list"
+        _ -> Left "DISTINCT: ambiguous ORDER BY column"

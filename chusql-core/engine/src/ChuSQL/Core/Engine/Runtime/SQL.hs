@@ -1,7 +1,7 @@
 module ChuSQL.Core.Engine.Runtime.SQL (resolveSQLFunction, sqlResultType, invokeSQLFunction, sqlType, constructSQLValue) where
 
-import ChuSQL.Core.Engine.Runtime.Types
 import ChuSQL.Core.Engine.Runtime.Functions
+import ChuSQL.Core.Engine.Runtime.Types
 import ChuSQL.Core.Model (ColumnType (..), Value (..))
 
 -- SQL 现有标量表示与已解析运行时函数之间的类型边界。
@@ -46,16 +46,21 @@ invokeSQLFunction :: FunctionId -> TypeId -> [Value] -> Either String Value
 invokeSQLFunction fid expected values = do
     functions <- builtinFunctions builtinTypes
     sig <- functionSignature functions fid
-    if signatureResult sig /= expected then Left "bound function result identity mismatch"
-        else if length values /= length (signatureArguments sig) then Left "function argument count mismatch"
-        else do
-            sequence_ (zipWith validateArgument (signatureArguments sig) values)
-            if VNull `elem` values then Right VNull else do
-                arguments <- mapM runtimeValue values
-                result <- invokeFunction builtinTypes functions fid arguments
-                sqlValue result
+    if signatureResult sig /= expected
+        then Left "bound function result identity mismatch"
+        else
+            if length values /= length (signatureArguments sig)
+                then Left "function argument count mismatch"
+                else do
+                    sequence_ (zipWith validateArgument (signatureArguments sig) values)
+                    if VNull `elem` values
+                        then Right VNull
+                        else do
+                            arguments <- mapM runtimeValue values
+                            result <- invokeFunction builtinTypes functions fid arguments
+                            sqlValue result
   where
-    -- | 校验具体参数并保留 SQL NULL
+    -- \| 校验具体参数并保留 SQL NULL
     validateArgument _ VNull = Right ()
     validateArgument tid value = runtimeValue value >>= validateValue builtinTypes tid
 

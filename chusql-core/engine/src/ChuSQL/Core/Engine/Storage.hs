@@ -13,15 +13,22 @@ data IndexResult
     deriving (Show, Eq)
 
 class (Monad m) => MonadStorage m where
+    -- \| 在稳定存储视图中执行绑定读取
+    withSchemaGuard :: Database -> m (Either String a) -> m (Either String a)
+    withSchemaGuard _ _ = pure (Left "bound schema guards are unavailable in this storage")
+
     -- \| 建一个库
     createDatabase :: String -> m (Either String ())
     createDatabase _ = pure (Left "database management is unavailable in this storage")
+
     -- \| 删一个库
     dropDatabase :: String -> m (Either String ())
     dropDatabase _ = pure (Left "database management is unavailable in this storage")
+
     -- \| 切当前库
     useDatabase :: String -> m (Either String ())
     useDatabase _ = pure (Left "database selection is unavailable in this storage")
+
     -- \| 列出现有库
     listDatabases :: m (Either String [String])
     listDatabases = pure (Right [])
@@ -50,7 +57,7 @@ class (Monad m) => MonadStorage m where
     insertMany :: String -> [Row] -> m (Either String ())
     insertMany t = go
       where
-        -- | 逐行插入，出错就停
+        -- \| 逐行插入，出错就停
         go [] = pure (Right ())
         go (r : rs) = do
             x <- insert t r
@@ -66,7 +73,7 @@ class (Monad m) => MonadStorage m where
             Left e -> pure (Left e)
             Right rs -> replaceAll t [r | r <- rs, not (doomed r)]
       where
-        -- | 这一行要不要删
+        -- \| 这一行要不要删
         doomed r = case lookup "id" r of
             Just (VInt k) -> k `elem` ks
             _ -> False
@@ -114,5 +121,5 @@ class (Monad m) => MonadStorage m where
     schema :: m (Either String Database)
     schema = fmap (fmap (map withoutRows)) snapshot
       where
-        -- | 表定义去掉所有行
-        withoutRows (name, t) = (name, t {tableRows = []})
+        -- \| 表定义去掉所有行
+        withoutRows (name, t) = (name, t{tableRows = []})

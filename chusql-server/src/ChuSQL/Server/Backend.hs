@@ -41,7 +41,7 @@ import ChuSQL.Core.Engine.Syntax.AST
 import ChuSQL.Core.Engine.Syntax.Parser (parseStatement)
 import ChuSQL.Core.Protocol (TxnOp (..))
 import Control.Concurrent.MVar (MVar, modifyMVar, readMVar)
-import Data.List (nub)
+import Data.List (nub, isPrefixOf)
 import Data.Text (Text)
 import Data.Time (getCurrentTime)
 import Data.Time.Format (defaultTimeLocale, formatTime)
@@ -75,6 +75,7 @@ data Backend = Backend
 -- | 按给定列名取列，固定列顺序
 columnsFromStatement :: Database -> Statement -> [String]
 columnsFromStatement db stmt = case prepare db stmt of
+    Right (SelectDistinct q) -> columnsFromStatement db q
     Right (Select cols _ _ _ _ _) -> cols
     Right (SelectExpr items _ _ _ _ _) -> map fst items
     Right ShowDomains -> ["domain", "base_type"]
@@ -173,9 +174,9 @@ memoryBackendWith trusted name ref =
                 Right (db', rows)
                     | any (\(key, _) -> hidden key && not (domainKey key)) db' -> pure (db, Left "reserved system table")
                     | otherwise -> pure (syncMemoryObjects name (mergeScoped db db'), Right (StatementResult (colsOf (scoped db) stmt rows) rows))
-        , beCatalog = do
-            db <- readMVar ref
-            pure (Right (map tableInfoOf (filter (not . internalTable . fst) (scoped db))))
+        , beCatalog = modifyMVar ref $ \original -> do
+            let db = syncMemoryObjects name original
+            pure (db, Right (map tableInfoOf (filter (not . internalTable . fst) (scoped db))))
         , bePing = pure True
         , beAccounts = \req -> do
             stamp <- currentStamp
@@ -187,7 +188,9 @@ memoryBackendWith trusted name ref =
         , beWithDatabase = withDatabase
         , beDatabases = pure (Right (nub [name, systemDatabaseName]))
         , beStorage = memorySecurityRequest name ref
-        , beSnapshot = Right . scoped <$> readMVar ref
+        , beSnapshot = modifyMVar ref $ \original -> do
+            let db = syncMemoryObjects name original
+            pure (db, Right (scoped db))
         , beApplyTransaction = \ops -> modifyMVar ref $ \db -> case applyTransactionMemory ops (scoped db) of
             Left err -> pure (db, Left err)
             Right db' -> pure (mergeScoped db db', Right ())
@@ -226,7 +229,8 @@ memoryBackendWith trusted name ref =
 
 -- 更新内存夹具的稳定表编号。
 syncMemoryObjects :: String -> Database -> Database
-syncMemoryObjects database db = (registry, Table registry [("name", TStr), ("id", TInt)] records Nothing) : filter ((/= registry) . fst) db
+syncMemoryObjects database db = (registry, Table registry [("name", TStr), ("id", TInt)] records Nothing Nothing Nothing)
+    : map identify (filter ((/= registry) . fst) db)
   where
     registry = "__system_object_ids"
     previous = [(key, identifier) | row <- maybe [] tableRows (lookup registry db), Just (VStr key) <- [lookup "name" row], Just (VInt identifier) <- [lookup "id" row]]
@@ -234,6 +238,11 @@ syncMemoryObjects database db = (registry, Table registry [("name", TStr), ("id"
     retained = [(key, identifier) | (key, identifier) <- previous, key `elem` keys]
     high = maximum (0 : map snd previous)
     added = zip [key | key <- keys, key `notElem` map fst retained] [high + 1 ..]
+    -- | 将稳定目录编号附到表定义
+    identify (key, table) = case lookup (if '.' `elem` key then key else database ++ "." ++ key) (retained ++ added) of
+        Just identifier -> (key, table {tableIdentity = Just (TableIdentity
+            (if "system." `isPrefixOf` key || ('.' `notElem` key && database == "system") then 2 else 1) (fromIntegral identifier))})
+        Nothing -> (key, table)
     records = [[("name", VStr key), ("id", VInt identifier)] | (key, identifier) <- ("__high_water", high + length added) : retained ++ added]
 
 -- 执行内存夹具的权限快照协议。
@@ -266,7 +275,7 @@ memorySecurityRequest database ref payload = modifyMVar ref $ \original -> do
             let previous = case lookup acl db of Nothing -> Nothing; Just table -> case tableRows table of [[("payload", VStr value)]] -> Just (T.pack value); _ -> Just "invalid ACL"
             if previous /= field "expected" then Left "object ACL changed concurrently" else do
                 value <- maybe (Left "missing ACL payload") Right (field "payload")
-                Right ((acl, Table acl [("payload", TStr)] [[("payload", VStr (T.unpack value))]] Nothing) : filter ((/= acl) . fst) db, A.object ["status" A..= ("ok" :: Text)])
+                Right ((acl, Table acl [("payload", TStr)] [[("payload", VStr (T.unpack value))]] Nothing Nothing Nothing) : filter ((/= acl) . fst) db, A.object ["status" A..= ("ok" :: Text)])
         _ -> Left "storage is not available in this backend"
     acl = "__system_object_acl"
 
@@ -320,6 +329,7 @@ applyTransactionMemory ops db = foldl step (Right db) ops
 -- | 语句里出现的表
 statementTables :: Statement -> [Text]
 statementTables stmt = nub (case stmt of
+    SelectDistinct q -> statementTables q
     Select{} ->
         tableRefsOf (selectFrom stmt)
             ++ concatMap exprTables (maybe [] (: []) (selectWhere stmt) ++ map Col (selectCols stmt ++ selectGroupBy stmt ++ map fst (selectOrderBy stmt)))
@@ -440,6 +450,8 @@ tableInfoOf (name, tbl) =
         , tiRows = length (tableRows tbl)
         , tiIndexes = []
         , tiStats = [(c, distinctOf c, False) | (c, _) <- tableCols tbl]
+        , tiIdentity = tableIdentity tbl
+        , tiSchemaVersion = tableSchemaVersion tbl
         , tiHistograms = [(c, h) | (c, _) <- tableCols tbl, Just h <- [histogramOf (columnValues c)]]
         }
   where
@@ -594,9 +606,9 @@ memoryAccounts db stamp req = do
 -- | 分开保存内存身份与口令并清理授权
 storeMemoryIdentities :: Database -> [Account] -> [Account] -> Database
 storeMemoryIdentities db previous accounts =
-    (usersTable, Table usersTable [("id", TInt), ("password_hash", TStr)] credentials Nothing) :
-    ("__system_identities", Table "__system_identities" [("account", TStr)] identities Nothing) :
-    ("__system_identity_sequence", Table "__system_identity_sequence" [("id", TInt)] [[("id", VInt highWater)]] Nothing) :
+    (usersTable, Table usersTable [("id", TInt), ("password_hash", TStr)] credentials Nothing Nothing Nothing) :
+    ("__system_identities", Table "__system_identities" [("account", TStr)] identities Nothing Nothing Nothing) :
+    ("__system_identity_sequence", Table "__system_identity_sequence" [("id", TInt)] [[("id", VInt highWater)]] Nothing Nothing Nothing) :
     [(name, clean name table) | (name, table) <- db, name `notElem` [usersTable, "__system_identities", "__system_identity_sequence"]]
   where
     -- | 保存口令与身份编号

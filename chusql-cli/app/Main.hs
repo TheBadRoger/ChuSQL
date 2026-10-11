@@ -2,6 +2,7 @@
 
 module Main (main) where
 
+import ChuSQL.CLI.Normalization (runNormalizationOnce)
 import ChuSQL.CLI.Format (OutputFormat (..), formatName, parseFormat)
 import ChuSQL.CLI.Password (readPasswordInput)
 import ChuSQL.CLI.Script (stripTerminator)
@@ -19,7 +20,7 @@ import ChuSQL.Interface.Sudo (SudoCredential, readSudoCredential)
 import ChuSQL.Interface.TOML (resolveConfigPath)
 import Control.Exception (finally)
 import Control.Monad (unless)
-import Data.IORef (newIORef)
+import Data.IORef (IORef, newIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -40,6 +41,8 @@ data Options = Options
     , optExecute :: Maybe Text
     , optHistory :: Maybe FilePath
     , optConfig :: Maybe FilePath
+    , optNormalize :: Maybe Text
+    , optDeclaration :: Maybe FilePath
     , optSudo :: Bool
     }
 
@@ -64,16 +67,19 @@ optionsParser =
                 <> metavar "FORMAT"
                 <> value FormatTable
                 <> showDefaultWith (T.unpack . formatName)
-                <> help "Output format: table, json or csv"
+                <> help "Output format: table (or text), json or csv"
             )
         <*> optional (T.pack <$> strOption (long "execute" <> short 'e' <> metavar "SQL" <> help "Run one statement and exit"))
         <*> optional (strOption (long "history" <> metavar "FILE" <> help "SQL history file (default ~/.chusql_history)"))
         <*> optional (strOption (long "config" <> metavar "FILE" <> help "Config file to read (default: the fixed settings.toml under the system config directory)"))
+        <*> optional (T.pack <$> strOption (long "normalize" <> metavar "TABLE" <> help "Analyze normalization using explicit declarations"))
+        <*> optional (strOption (long "declaration" <> metavar "FILE" <> help "UTF-8 JSON normalization declaration"))
         <*> switch (long "sudo" <> help "Authenticate using the local root or elevated administrator identity")
 
 -- | 把 --format 的取值解析成格式
 formatReader :: String -> Either String OutputFormat
-formatReader raw = maybe (Left "format must be table, json or csv") Right (parseFormat (T.pack raw))
+formatReader "text" = Right FormatTable
+formatReader raw = maybe (Left "format must be table, text, json or csv") Right (parseFormat (T.pack raw))
 
 -- | 命令行界面与帮助
 parserInfo :: ParserInfo Options
@@ -91,6 +97,10 @@ main = do
     hSetEncoding stdout utf8
     hSetEncoding stderr utf8
     options <- execParser parserInfo
+    case (optNormalize options, optDeclaration options, optExecute options, optFormat options) of
+        (Nothing, Nothing, _, _) -> pure ()
+        (Just _, Just _, Nothing, format) | format /= FormatCsv -> pure ()
+        _ -> reportError "--normalize requires --declaration, text/json format and cannot be combined with --execute" >> exitFailure
     configPath <- resolveConfigPath (optConfig options)
     base <- loadWebConfigAt configPath
     config <- loadServerConfigAt configPath
@@ -129,13 +139,19 @@ runSession options session = do
     ready <- selectDatabase session (T.strip (optDatabase options))
     if not ready
         then exitFailure
-        else case optExecute options of
-            Just sql -> do
-                ok <- runStatementOnce session (optFormat options) (stripTerminator sql)
-                unless ok exitFailure
-            Nothing -> do
-                historyFile <- resolveHistory (optHistory options)
-                runRepl session formatRef historyFile
+        else case (optNormalize options, optDeclaration options) of
+            (Just table, Just file) -> runNormalizationOnce session table file (optFormat options == FormatJson) >>= \ok -> unless ok exitFailure
+            _ -> runSqlSession options session formatRef
+
+-- 执行 SQL 或进入交互循环。
+runSqlSession :: Options -> Session -> IORef OutputFormat -> IO ()
+runSqlSession options session formatRef = case optExecute options of
+    Just sql -> do
+        ok <- runStatementOnce session (optFormat options) (stripTerminator sql)
+        unless ok exitFailure
+    Nothing -> do
+        historyFile <- resolveHistory (optHistory options)
+        runRepl session formatRef historyFile
 
 -- | -d 指定了库才切，否则保持未选库
 selectDatabase :: Session -> Text -> IO Bool

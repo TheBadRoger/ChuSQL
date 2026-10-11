@@ -22,6 +22,7 @@ parallelShardLimit = 8
 newtype Pool = Pool (Chan (IO ()))
 
 {-# NOINLINE poolRef #-}
+
 -- | 进程全局的池，按容量复用
 poolRef :: MVar (Maybe (Int, Pool))
 poolRef = unsafePerformIO (newMVar Nothing)
@@ -30,7 +31,7 @@ poolRef = unsafePerformIO (newMVar Nothing)
 workerPool :: Int -> IO Pool
 workerPool size = modifyMVar poolRef reuse
   where
-    -- | 复用队列并按需补充工作线程
+    -- \| 复用队列并按需补充工作线程
     reuse current = case current of
         Just (capacity, pool@(Pool jobs))
             | capacity >= wanted -> pure (current, pool)
@@ -41,10 +42,10 @@ workerPool size = modifyMVar poolRef reuse
             pool <- startPool wanted
             pure (Just (wanted, pool), pool)
 
-    -- | 池的线程数至少一个
+    -- \| 池的线程数至少一个
     wanted = max 1 size
 
-    -- | 起 wanted 个常驻线程吃队列
+    -- \| 起 wanted 个常驻线程吃队列
     startPool n = do
         jobs <- newChan
         sequence_ [forkIO (worker jobs) | _ <- [1 .. n]]

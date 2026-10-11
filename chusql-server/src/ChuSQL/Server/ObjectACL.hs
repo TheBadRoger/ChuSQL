@@ -2,8 +2,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 module ChuSQL.Server.ObjectACL
-    ( objectAuthorize, objectGrant, objectRevoke, objectViews, objectClaim
-    , objectReconcile, objectAffected, objectOwner, objectConnect, objectPrepareCreate, objectUsers
+    ( objectAuthorize, objectGrant, objectRevoke, objectRevokeGrantOption, objectViews, objectClaim
+    , objectSelfViews, objectReconcile, objectAffected, objectOwner, objectConnect, objectPrepareCreate, objectUsers
     ) where
 
 import ChuSQL.Core.Protocol (Account (..), TableInfo (..))
@@ -315,19 +315,28 @@ objectGrant backend catalog principal database names object role option = do
 
 -- 撤销授权并收敛失去来源的下游授权。
 objectRevoke :: Backend -> Catalog -> Principal -> Text -> [Text] -> Text -> Text -> IO (Either String ())
-objectRevoke backend catalog principal database names object role = do
+objectRevoke = revokeObject False
+
+-- 仅撤销转授权能力并清理失效来源。
+objectRevokeGrantOption :: Backend -> Catalog -> Principal -> Text -> [Text] -> Text -> Text -> IO (Either String ())
+objectRevokeGrantOption = revokeObject True
+
+-- 按授予来源撤销权限或转授权能力。
+revokeObject :: Bool -> Backend -> Catalog -> Principal -> Text -> [Text] -> Text -> Text -> IO (Either String ())
+revokeObject optionOnly backend catalog principal database names object role = do
     loaded <- load backend catalog
     resolved <- resolve backend database object
     case (,) <$> loaded <*> resolved of
         Left err -> pure (Left err)
-        Right ((env, previous, acl), target) -> case (,) <$> roleId env role <*> privileges target names of
+        Right ((env, previous, acl), target) -> case (,,) <$> roleId env role <*> privileges target names <*> (if principalIsRoot principal then Right "0" else roleId env (principalName principal)) of
             Left err -> pure (Left err)
-            Right (recipient, items) -> do
-                let grantor = either (const "") id (roleId env (principalName principal))
-                    manager = principalIsRoot principal || owns env acl grantor target
+            Right (recipient, items, grantor) -> do
+                let manager = principalIsRoot principal || owns env acl grantor target
                     -- 选择本次可撤销的授予来源。
                     matches edge = edgeRole edge == recipient && edgeTarget edge == target && edgePrivilege edge `elem` items && (manager || edgeGrantor edge == grantor)
-                    next = acl{aclEdges = filter (not . matches) (aclEdges acl), aclClosed = if recipient == "public" && "connect" `elem` items then nub (targetDatabase target : aclClosed acl) else aclClosed acl}
+                    next = acl{aclEdges = if optionOnly then map removeOption (aclEdges acl) else filter (not . matches) (aclEdges acl), aclClosed = if not optionOnly && recipient == "public" && "connect" `elem` items then nub (targetDatabase target : aclClosed acl) else aclClosed acl}
+                    -- 保留基础权限并移除匹配来源的转授权。
+                    removeOption edge = if matches edge then edge{edgeOption = False} else edge
                 if recipient == "public" && "connect" `elem` items && not manager then pure (Left "administrator required")
                     else writeACL backend previous (effective env next)
 
@@ -340,6 +349,21 @@ objectViews backend catalog role = do
         identity <- roleId env role
         let mine = [edge | edge <- aclEdges acl, edgeRole edge == identity]
         Right (nub [Grant role (edgePrivilege edge) (targetName (edgeTarget edge)) (any (\other -> edgeTarget other == edgeTarget edge && edgePrivilege other == edgePrivilege edge && edgeOption other) mine) | edge <- mine])
+
+-- 列出当前身份实际拥有的对象权限。
+objectSelfViews :: Backend -> Catalog -> Principal -> IO (Either String [Grant])
+objectSelfViews backend catalog principal = do
+    loaded <- load backend catalog
+    pure $ do
+        (env, _, acl) <- loaded
+        identity <- roleId env (principalName principal)
+        if active env identity then Right () else Left "permission denied: disabled identity"
+        -- 使用当前权限闭包判断普通及转授权权限。
+        let permitted target privilege option = principalIsRoot principal || allowed env acl identity target privilege option
+        Right [Grant (principalName principal) privilege (targetName target) (permitted target privilege True)
+            | target <- contextTargets env
+            , privilege <- if targetKind target == "database" then ["connect", "create"] else ["select", "insert", "update", "delete"]
+            , permitted target privilege False]
 
 -- 登记新对象的创建者为所有者。
 objectClaim :: Backend -> Catalog -> Principal -> Text -> Text -> IO (Either String ())

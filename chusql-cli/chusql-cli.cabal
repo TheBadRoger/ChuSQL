@@ -12,6 +12,7 @@ build-type:     Simple
 library
     hs-source-dirs:   src
     exposed-modules:  ChuSQL.CLI.Format
+                      ChuSQL.CLI.Normalization
                       ChuSQL.CLI.History
                       ChuSQL.CLI.Password
                       ChuSQL.CLI.Script
@@ -55,6 +56,7 @@ test-suite chusql-cli-test
                     , directory
                     , aeson
                     , bytestring
+                    , chusql-interface
                     , chusql-cli
                     , chusql-core-model
                     , hspec

@@ -236,9 +236,9 @@ impl Server {
     fn apply_op(&self, op: &WalOp) -> std::io::Result<()> {
         match op {
             WalOp::Commit => Ok(()),
-            WalOp::HideColumn { table, column } => {
+            WalOp::HideColumn { table, column, schema_version } => {
                 let mut c = self.catalog.lock().map_err(|_| std::io::Error::other("catalog lock poisoned"))?;
-                c.remove_column(table, column)?;
+                c.remove_column_version(table, column, *schema_version)?;
                 c.save(self.catalog_path())?;
                 drop(c);
                 if let Some(handle) = self.tables.lock().map_err(|_| std::io::Error::other("table lock poisoned"))?.get(table) {
@@ -257,7 +257,7 @@ impl Server {
                 })?;
                 let mut c = self.catalog.lock().unwrap();
                 c.mark_compacted(table)?;
-                c.rebuild_stats(table, rows);
+                c.rebuild_stats(table, rows)?;
                 c.save(self.catalog_path())
             }
             WalOp::Accounts { accounts, removed, migrate_roles } => {
@@ -287,20 +287,20 @@ impl Server {
                 }
                 let mut c = self.catalog.lock().map_err(|_| std::io::Error::other("catalog lock poisoned"))?;
                 declare_system_schema(&mut c, &rows)?;
-                c.rebuild_stats(IDENTITIES_TABLE, &identities);
+                c.rebuild_stats(IDENTITIES_TABLE, &identities)?;
                 c.set_columns(IDENTITIES_TABLE, identity_columns())?;
-                c.rebuild_stats(IDENTITIES_TABLE, &identities);
+                c.rebuild_stats(IDENTITIES_TABLE, &identities)?;
                 c.mark_system(IDENTITIES_TABLE)?;
                 c.add_index(IDENTITIES_TABLE, "user")?;
                 c.identity_high_water = c.identity_high_water.max(accounts.iter().map(|a| a.id).max().unwrap_or(0));
-                if has_roles && *migrate_roles { c.rebuild_stats(legacy_roles, &[]); }
-                for (table, records) in cleaned { c.rebuild_stats(table, &records); }
+                if has_roles && *migrate_roles { c.rebuild_stats(legacy_roles, &[])?; }
+                for (table, records) in cleaned { c.rebuild_stats(table, &records)?; }
                 c.save(self.catalog_path())
             }
             WalOp::Insert { table, row } => {
                 self.with_table(table, |t| t.insert_row(row))?;
                 let mut c = self.catalog.lock().unwrap();
-                if c.record_insert(table, row) {
+                if c.record_insert(table, row)? {
                     c.save(self.catalog_path())?;
                 }
                 Ok(())
@@ -310,7 +310,7 @@ impl Server {
                 let mut c = self.catalog.lock().unwrap();
                 let mut changed = false;
                 for r in rows {
-                    if c.record_insert(table, r) {
+                    if c.record_insert(table, r)? {
                         changed = true;
                     }
                 }
@@ -328,17 +328,17 @@ impl Server {
             WalOp::ReplaceAll { table, rows } => {
                 self.with_table(table, |t| t.replace_all(rows))?;
                 let mut c = self.catalog.lock().unwrap();
-                c.rebuild_stats(table, rows);
+                c.rebuild_stats(table, rows)?;
                 c.save(self.catalog_path())
             }
-            WalOp::DropColumn { table, column, rows } => {
+            WalOp::DropColumn { table, column, rows, schema_version } => {
                 self.with_table(table, |t| {
                     t.detach_index(column);
                     t.replace_all(rows)
                 })?;
                 let mut c = self.catalog.lock().unwrap();
-                c.remove_column(table, column)?;
-                c.rebuild_stats(table, rows);
+                c.remove_column_version(table, column, *schema_version)?;
+                c.rebuild_stats(table, rows)?;
                 c.save(self.catalog_path())?;
                 drop(c);
                 let _ = std::fs::remove_file(self.index_path(table, column));
@@ -374,7 +374,7 @@ impl Server {
             }
             WalOp::CreateIndex { table, column } => self.apply_create_index(table, column),
             WalOp::DropIndex { table, column } => self.apply_drop_index(table, column),
-            WalOp::ReplaceSchema { table, columns, rows } => {
+            WalOp::ReplaceSchema { table, columns, rows, schema_version } => {
                 let old_indexes: Vec<String> = {
                     let c = self.catalog.lock().map_err(|_| std::io::Error::other("catalog lock poisoned"))?;
                     c.describe(table)
@@ -389,8 +389,8 @@ impl Server {
                     t.replace_all(rows)
                 })?;
                 let mut c = self.catalog.lock().unwrap();
-                c.set_columns(table, columns.clone())?;
-                c.rebuild_stats(table, rows);
+                c.set_columns_version(table, columns.clone(), *schema_version)?;
+                c.rebuild_stats(table, rows)?;
                 c.save(self.catalog_path())?;
                 drop(c);
                 for col in old_indexes {
@@ -483,7 +483,7 @@ impl Server {
         match op {
             WalOp::Insert { table, row } => validate(table, std::slice::from_ref(row))?,
             WalOp::InsertBatch { table, rows } | WalOp::ReplaceAll { table, rows } => validate(table, rows)?,
-            WalOp::HideColumn { table, column }
+            WalOp::HideColumn { table, column, .. }
                 if !c.describe(table).is_some_and(|s| s.columns.iter().any(|col| &col.name == column)) =>
             {
                 return Err(std::io::Error::other(format!("unknown column: {column}")));
@@ -551,6 +551,29 @@ impl Server {
                 if let WalOp::CreateTable { object_id, .. } = op
                     && object_id.is_none() {
                     *object_id = Some(catalog.reserve_object_id()?);
+                }
+            }
+        }
+        if ops.iter().any(|op| matches!(op, WalOp::HideColumn { .. } | WalOp::DropColumn { .. } | WalOp::ReplaceSchema { .. })) {
+            let mut preview = self.catalog.lock().map_err(|_| std::io::Error::other("catalog lock poisoned"))?.clone();
+            for op in ops.to_mut() {
+                match op {
+                    WalOp::HideColumn { table, column, schema_version }
+                    | WalOp::DropColumn { table, column, schema_version, .. } => {
+                        preview.remove_column(table, column)?;
+                        *schema_version = Some(preview.describe(table).ok_or_else(|| std::io::Error::other("missing schema version"))?.schema_version.max(1));
+                    }
+                    WalOp::ReplaceSchema { table, columns, schema_version, .. } => {
+                        preview.set_columns(table, columns.clone())?;
+                        *schema_version = Some(preview.describe(table).ok_or_else(|| std::io::Error::other("missing schema version"))?.schema_version.max(1));
+                    }
+                    WalOp::CreateTable { table, columns, object_id } => preview.create_table_with_id(table, columns.clone(), *object_id)?,
+                    WalOp::DropTable { table } => preview.drop_table(table)?,
+                    WalOp::Insert { table, row } => preview.ensure_columns(table, row)?,
+                    WalOp::InsertBatch { table, rows } | WalOp::ReplaceAll { table, rows } => {
+                        for row in rows { preview.ensure_columns(table, row)?; }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -683,9 +706,10 @@ impl Server {
                 });
                 Ok(!present)
             }
-            WalOp::HideColumn { table, column } => {
+            WalOp::HideColumn { table, column, schema_version } => {
                 let c = self.catalog.lock().unwrap();
-                Ok(c.describe(table).is_some_and(|s| !s.columns.iter().any(|col| &col.name == column)))
+                Ok(c.describe(table).is_some_and(|s| !s.columns.iter().any(|col| &col.name == column)
+                    && schema_version.is_none_or(|version| s.schema_version == version)))
             }
             WalOp::CreateTable { table, object_id, .. } => {
                 let catalog = self.catalog.lock().map_err(|_| std::io::Error::other("catalog lock poisoned"))?;
@@ -739,7 +763,7 @@ impl Server {
             }
             let rows = self.with_table(&table, |t| t.scan())?;
             let mut c = self.catalog.lock().unwrap();
-            c.rebuild_stats(&table, &rows);
+            c.rebuild_stats(&table, &rows)?;
             touched = true;
         }
         if touched {
@@ -791,7 +815,7 @@ impl Server {
             .catalog
             .lock()
             .map_err(|_| std::io::Error::other("catalog lock poisoned"))?;
-        if catalog.normalize_types() {
+        if catalog.normalize_types()? {
             catalog.save(self.catalog_path())?;
         }
         Ok(())
@@ -954,6 +978,7 @@ impl Server {
         let op = WalOp::HideColumn {
             table: table.to_string(),
             column: column.to_string(),
+            schema_version: None,
         };
         self.write_via_wal(&op)
     }
@@ -1310,6 +1335,32 @@ impl Server {
         }
     }
 
+    /// 持读门时复查绑定身份、版本和列定义
+    fn validate_bound_schema(&self, table: &str, expected: &crate::protocol::BoundSchema) -> std::io::Result<()> {
+        use std::io::Error;
+        if self.recovery_required.load(Ordering::Acquire) { return Err(Error::other("storage recovery required")); }
+        if blocked_table(table) { return Err(Error::other("reserved system table")); }
+        let catalog = self.catalog.lock().map_err(|_| Error::other("catalog lock poisoned"))?;
+        let actual = catalog.describe(table).ok_or_else(|| Error::other(format!("bound query schema changed: {}", expected.table)))?;
+        match (&expected.database_id, &expected.object_id) {
+            (Some(database), Some(object)) => {
+                if parse_bound_number(database)? != catalog.database_id || parse_bound_number(object)? != actual.object_id {
+                    return Err(Error::other(format!("bound query object changed: {}", expected.table)));
+                }
+            }
+            (None, None) => {}
+            _ => return Err(Error::other("incomplete bound object identity")),
+        }
+        if let Some(version) = &expected.schema_version
+            && parse_bound_number(version)? != actual.schema_version {
+            return Err(Error::other(format!("bound query schema changed: {}", expected.table)));
+        }
+        if expected.columns != actual.columns {
+            return Err(Error::other(format!("bound query schema changed: {}", expected.table)));
+        }
+        Ok(())
+    }
+
     /// 持门后分发一条请求
     fn dispatch(&self, req: Request) -> Response {
         if self.recovery_required.load(Ordering::Acquire) && !matches!(req, Request::Ping) {
@@ -1558,6 +1609,7 @@ impl Server {
                         table: name.to_string(),
                         database_id: c.database_id,
                         object_id: ts.object_id,
+                        schema_version: ts.schema_version,
                         columns: ts.columns.clone(),
                         row_count: ts.row_count,
                         indexes: index_wires(ts),
@@ -1571,6 +1623,7 @@ impl Server {
                 log_debug!(request, "describe_table table={}", table);
                 match self.describe_table(&table) {
                     Ok((cols, count, indexes, stats)) => Response::Schema {
+                        schema_version: self.catalog.lock().unwrap().describe(&table).map_or(0, |s| s.schema_version),
                         table,
                         columns: cols,
                         row_count: count,
@@ -1713,7 +1766,7 @@ impl Server {
             Request::ReplaceSchema { table, columns, rows } => {
                 log_debug!(request, "replace_schema table={} cols={}", table, columns.len());
                 let tname = table.clone();
-                let op = WalOp::ReplaceSchema { table, columns, rows };
+                let op = WalOp::ReplaceSchema { table, columns, rows, schema_version: None };
                 match self.write_via_wal(&op) {
                     Ok(()) => Response::Ok,
                     Err(e) => {
@@ -1838,9 +1891,9 @@ fn identity_columns() -> Vec<SchemaColumn> {
 
 /// 把系统表写进字典
 fn declare_system_schema(catalog: &mut Catalog, rows: &[Row]) -> std::io::Result<()> {
-    catalog.rebuild_stats(USERS_TABLE, rows);
+    catalog.rebuild_stats(USERS_TABLE, rows)?;
     catalog.set_columns(USERS_TABLE, users_columns())?;
-    catalog.rebuild_stats(USERS_TABLE, rows);
+    catalog.rebuild_stats(USERS_TABLE, rows)?;
     catalog.mark_system(USERS_TABLE)?;
     Ok(())
 }
@@ -2137,6 +2190,10 @@ impl Databases {
     fn request(&self, mut value: serde_json::Value) -> std::io::Result<Response> {
         use std::io::Error;
         let method = value.get("method").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if value.get("schema_guard").is_some()
+            && !matches!(method.as_str(), "scan" | "scan_shard" | "lookup_by_index" | "range_by_index") {
+            return Err(Error::other("schema guard requires a table read"));
+        }
         let name = match value.get("database") {
             None => String::new(),
             Some(serde_json::Value::String(s)) => s.to_ascii_lowercase(),
@@ -2258,6 +2315,8 @@ impl Databases {
             selected = database.to_ascii_lowercase();
             value["table"] = serde_json::Value::String(table.to_string());
         }
+        let guard: Option<Vec<crate::protocol::BoundSchema>> = value.get("schema_guard")
+            .map(|guard| serde_json::from_value(guard.clone()).map_err(Error::other)).transpose()?;
         let request: Request = serde_json::from_value(value).map_err(Error::other)?;
         let global = matches!(request, Request::AccountsList | Request::CatalogManage { .. } | Request::AccountCreate { .. }
             | Request::IdentityInitialize { .. } | Request::RoleCreate { .. } | Request::IdentityAlter { .. }
@@ -2268,9 +2327,41 @@ impl Databases {
         if !global && selected.is_empty() { return Err(Error::other("no database selected")); }
         let server = if global || selected == SYSTEM_DATABASE { Arc::clone(&self.system) }
             else { Arc::clone(named.get(&selected).ok_or_else(|| Error::other("unknown database"))?) };
+        if let Some(bindings) = guard {
+            if !concurrent_read(&request) { return Err(Error::other("schema guard requires a table read")); }
+            let mut servers = std::collections::BTreeMap::from([(selected.clone(), Arc::clone(&server))]);
+            let mut dependencies = Vec::new();
+            for binding in bindings {
+                let (database, table) = binding.table.split_once('.').unwrap_or((&selected, &binding.table));
+                let database = database.to_ascii_lowercase();
+                if !valid_database(&database) { return Err(Error::other("invalid bound database name")); }
+                let dependency = if database == SYSTEM_DATABASE { Arc::clone(&self.system) }
+                    else { Arc::clone(named.get(&database).ok_or_else(|| Error::other("bound query database changed"))?) };
+                servers.insert(database.clone(), dependency);
+                dependencies.push((database, table.to_owned(), binding));
+            }
+            if !dependencies.iter().any(|(database, table, _)| database == &selected && Some(table.as_str()) == request.table()) {
+                return Err(Error::other("bound read table has no schema guard"));
+            }
+            drop(named);
+            let _gates = servers.values().map(|server| server.gate.read()
+                .map_err(|_| Error::other("storage read gate poisoned"))).collect::<std::io::Result<Vec<_>>>()?;
+            for (database, table, binding) in &dependencies {
+                servers[database].validate_bound_schema(table, binding)?;
+            }
+            return Ok(Response::Guarded { response: Box::new(server.dispatch(request)) });
+        }
         drop(named);
         Ok(server.handle_request(request))
     }
+}
+
+/// 读取守卫中的精确十进制编号
+fn parse_bound_number(value: &str) -> std::io::Result<u64> {
+    if value.is_empty() || value.len() > 20 || !value.bytes().all(|c| c.is_ascii_digit()) {
+        return Err(std::io::Error::other("invalid bound catalog number"));
+    }
+    value.parse().map_err(std::io::Error::other)
 }
 
 /// 只读表页的请求可与其它读并发，其余独占

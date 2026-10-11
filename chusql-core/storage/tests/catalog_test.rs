@@ -4,6 +4,68 @@ use serde_json::json;
 
 // 数据字典测试：补列、去重、未知表。
 
+/// 结构变化递增版本，数据及重复应用不变
+#[test]
+fn schema_versions_track_structure_and_survive_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.json");
+    let mut c = Catalog::default();
+    c.create_table("t", vec![]).unwrap();
+    assert_eq!(c.describe("t").unwrap().schema_version, 1);
+    let values = row(&[("id", json!(1)), ("name", json!("a"))]);
+    c.record_insert("t", &values).unwrap();
+    assert_eq!(c.describe("t").unwrap().schema_version, 2);
+    c.rebuild_stats("t", &[values]).unwrap();
+    let columns = c.describe("t").unwrap().columns.clone();
+    c.set_columns("t", columns).unwrap();
+    assert_eq!(c.describe("t").unwrap().schema_version, 2);
+    c.remove_column("t", "name").unwrap();
+    c.remove_column("t", "name").unwrap();
+    assert_eq!(c.describe("t").unwrap().schema_version, 3);
+    c.rename_table("t", "renamed").unwrap();
+    c.save(&path).unwrap();
+    let c = Catalog::load(&path).unwrap();
+    assert_eq!(c.describe("renamed").unwrap().schema_version, 4);
+}
+
+/// 旧目录版本未知，首个结构变更才递增
+#[test]
+fn legacy_schema_version_remains_unknown_until_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.json");
+    std::fs::write(&path, json!({"tables": {
+        "t": {"object_id": 42, "columns": []}
+    }}).to_string()).unwrap();
+    let mut c = Catalog::load(&path).unwrap();
+    assert_eq!(c.describe("t").unwrap().schema_version, 0);
+    c.save(&path).unwrap();
+    c = Catalog::load(&path).unwrap();
+    assert_eq!(c.describe("t").unwrap().schema_version, 0);
+    c.ensure_columns("t", &row(&[("id", json!(1))])).unwrap();
+    assert_eq!(c.describe("t").unwrap().schema_version, 1);
+    assert_eq!(c.describe("t").unwrap().object_id, 42);
+}
+
+/// 版本耗尽拒绝结构变更并保留原定义
+#[test]
+fn exhausted_schema_version_preserves_structure() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.json");
+    std::fs::write(&path, json!({"tables": {
+        "t": {"object_id": 42, "schema_version": u64::MAX,
+            "columns": [{"name": "id", "ty": "int"}]}
+    }}).to_string()).unwrap();
+    let mut c = Catalog::load(&path).unwrap();
+    assert!(c.remove_column("t", "id").is_err());
+    assert!(c.set_columns("t", vec![]).is_err());
+    assert!(c.rename_table("t", "other").is_err());
+    assert!(c.ensure_columns("t", &row(&[("new", json!(1))])).is_err());
+    assert_eq!(c.describe("t").unwrap().columns.len(), 1);
+    assert_eq!(c.describe("t").unwrap().schema_version, u64::MAX);
+    assert!(c.describe("other").is_none());
+    c.record_insert("t", &row(&[("id", json!(1))])).unwrap();
+}
+
 /// 表删除重建和重载均保留编号规则
 #[test]
 fn object_ids_survive_reload_and_are_not_reused() {
@@ -80,7 +142,7 @@ fn ensure_then_describe() {
     let path = dir.path().join("catalog.json");
 
     let mut c = Catalog::load(&path).unwrap();
-    c.ensure_columns("users", &row(&[("id", json!(1)), ("name", json!("Alice"))]));
+    c.ensure_columns("users", &row(&[("id", json!(1)), ("name", json!("Alice"))])).unwrap();
     c.save(&path).unwrap();
 
     let c2 = Catalog::load(&path).unwrap();
@@ -102,8 +164,8 @@ fn second_insert_does_not_duplicate_columns() {
     let path = dir.path().join("catalog.json");
 
     let mut c = Catalog::load(&path).unwrap();
-    c.ensure_columns("users", &row(&[("id", json!(1))]));
-    c.ensure_columns("users", &row(&[("id", json!(2))]));
+    c.ensure_columns("users", &row(&[("id", json!(1))])).unwrap();
+    c.ensure_columns("users", &row(&[("id", json!(2))])).unwrap();
     assert_eq!(c.describe("users").unwrap().columns.len(), 1);
 }
 
@@ -114,9 +176,9 @@ fn remove_column_drops_definition_stats_and_index() {
     let path = dir.path().join("catalog.json");
 
     let mut c = Catalog::load(&path).unwrap();
-    c.ensure_columns("t", &row(&[("id", json!(1)), ("code", json!(5))]));
+    c.ensure_columns("t", &row(&[("id", json!(1)), ("code", json!(5))])).unwrap();
     c.add_index("t", "code").unwrap();
-    c.rebuild_stats("t", &[row(&[("id", json!(1)), ("code", json!(5))])]);
+    c.rebuild_stats("t", &[row(&[("id", json!(1)), ("code", json!(5))])]).unwrap();
 
     let removed = c.remove_column("t", "code").unwrap();
     assert!(removed, "first remove should hit the column");
@@ -142,7 +204,7 @@ fn stats_track_a_histogram_for_numeric_columns() {
     let rows: Vec<Row> = (0..100)
         .map(|n| row(&[("id", json!(n)), ("name", json!(format!("u{}", n)))]))
         .collect();
-    c.rebuild_stats("t", &rows);
+    c.rebuild_stats("t", &rows).unwrap();
 
     let s = c.describe("t").unwrap();
     let id = s.stats.get("id").unwrap();
@@ -155,7 +217,7 @@ fn stats_track_a_histogram_for_numeric_columns() {
     assert!(name.hist.is_empty(), "字符串列不进直方图");
     assert_eq!(name.lo, None);
 
-    c.record_insert("t", &row(&[("id", json!(1000)), ("name", json!("x"))]));
+    c.record_insert("t", &row(&[("id", json!(1000)), ("name", json!("x"))])).unwrap();
     let s = c.describe("t").unwrap();
     let id = s.stats.get("id").unwrap();
     assert_eq!(id.lo, Some(0.0));
@@ -178,7 +240,7 @@ fn stats_track_a_histogram_for_numeric_columns() {
 fn duplicate_deletion_keeps_distinct_until_last_occurrence() {
     let mut catalog = Catalog::default();
     let duplicate = row(&[("id", json!(1)), ("v", json!(7))]);
-    catalog.rebuild_stats("t", &[duplicate.clone(), duplicate.clone()]);
+    catalog.rebuild_stats("t", &[duplicate.clone(), duplicate.clone()]).unwrap();
     catalog.record_delete("t", std::slice::from_ref(&duplicate));
     assert_eq!(catalog.describe("t").unwrap().stats["v"].distinct, 1);
     catalog.record_delete("t", &[duplicate]);
@@ -190,7 +252,7 @@ fn duplicate_deletion_keeps_distinct_until_last_occurrence() {
 fn capped_distinct_keeps_histogram_and_other_columns_accurate() {
     let mut catalog = Catalog::default();
     let rows: Vec<Row> = (0..5000).map(|n| row(&[("id", json!(n)), ("v", json!(n % 2))])).collect();
-    catalog.rebuild_stats("t", &rows);
+    catalog.rebuild_stats("t", &rows).unwrap();
     let schema = catalog.describe("t").unwrap();
     assert!(schema.stats["id"].capped);
     assert_eq!(schema.stats["id"].hist.iter().sum::<u64>(), 5000);
@@ -199,7 +261,7 @@ fn capped_distinct_keeps_histogram_and_other_columns_accurate() {
     let schema = catalog.describe("t").unwrap();
     assert_eq!(schema.stats["id"].hist.iter().sum::<u64>(), 4000);
     assert_eq!(schema.stats["v"].distinct, 2);
-    catalog.rebuild_stats("t", &rows[1000..]);
+    catalog.rebuild_stats("t", &rows[1000..]).unwrap();
     assert_eq!(catalog.describe("t").unwrap().stats["id"].distinct, 4000);
 }
 
@@ -208,16 +270,16 @@ fn capped_distinct_keeps_histogram_and_other_columns_accurate() {
 fn rebuilt_histogram_has_exact_buckets_in_any_order() {
     let rows: Vec<Row> = (0..160).map(|n| row(&[("v", json!(n))])).collect();
     let mut forward = Catalog::default();
-    forward.rebuild_stats("t", &rows);
+    forward.rebuild_stats("t", &rows).unwrap();
     let mut reverse = Catalog::default();
     let reversed: Vec<Row> = rows.iter().rev().cloned().collect();
-    reverse.rebuild_stats("t", &reversed);
+    reverse.rebuild_stats("t", &reversed).unwrap();
     let stat = &forward.describe("t").unwrap().stats["v"];
     assert_eq!(stat.hist, vec![10; 16]);
     assert_eq!(stat.hist, reverse.describe("t").unwrap().stats["v"].hist);
-    forward.record_insert("t", &row(&[("v", json!(10000))]));
+    forward.record_insert("t", &row(&[("v", json!(10000))])).unwrap();
     forward.record_delete("t", &[row(&[("v", json!(10000))])]);
-    forward.rebuild_stats("t", &rows[80..]);
+    forward.rebuild_stats("t", &rows[80..]).unwrap();
     let repaired = &forward.describe("t").unwrap().stats["v"];
     assert_eq!(repaired.lo, Some(80.0));
     assert_eq!(repaired.hi, Some(159.0));
@@ -253,8 +315,8 @@ fn legacy_catalog_loads_and_normalizes() {
     let s = c.describe("legacy").unwrap();
     assert_eq!(s.columns.len(), 2);
     assert!(s.columns[0].nullable, "老列默认可空");
-    assert!(c.normalize_types());
+    assert!(c.normalize_types().unwrap());
     let types: Vec<&str> = c.describe("legacy").unwrap().columns.iter().map(|col| col.ty.as_str()).collect();
     assert_eq!(types, vec!["int", "str"]);
-    assert!(!c.normalize_types(), "第二次没有可改的");
+    assert!(!c.normalize_types().unwrap(), "第二次没有可改的");
 }

@@ -37,6 +37,9 @@ pub struct TableSchema {
     #[serde(default)]
     pub object_id: u64,
     #[serde(default)]
+    // 0 表示旧目录尚无可验证的结构版本。
+    pub schema_version: u64,
+    #[serde(default)]
     pub system: bool,
     pub columns: Vec<SchemaColumn>,
     #[serde(default)]
@@ -51,7 +54,7 @@ pub struct TableSchema {
     pub stats: BTreeMap<String, ColumnStat>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Catalog {
     #[serde(default)]
     pub database_id: u64,
@@ -134,9 +137,10 @@ impl Catalog {
     }
 
     /// 按一行数据补列
-    pub fn ensure_columns(&mut self, table: &str, row: &Row) {
+    pub fn ensure_columns(&mut self, table: &str, row: &Row) -> io::Result<()> {
         let entry = self.tables.entry(table.to_string()).or_default();
-        add_missing_columns(entry, row);
+        add_missing_columns(entry, row)?;
+        Ok(())
     }
 
     /// 建表；已存在报错
@@ -163,6 +167,7 @@ impl Catalog {
             table.to_string(),
             TableSchema {
                 object_id,
+                schema_version: 1,
                 system: false,
                 columns,
                 dropped_columns: BTreeSet::new(),
@@ -184,15 +189,15 @@ impl Catalog {
     }
 
     /// 记一次插入，返回列有没有变化
-    pub fn record_insert(&mut self, table: &str, row: &Row) -> bool {
+    pub fn record_insert(&mut self, table: &str, row: &Row) -> io::Result<bool> {
         let changed = {
             let entry = self.tables.entry(table.to_string()).or_default();
-            let changed = add_missing_columns(entry, row);
+            let changed = add_missing_columns(entry, row)?;
             entry.row_count += 1;
             changed
         };
         self.count_values(table, row);
-        changed
+        Ok(changed)
     }
 
     /// 记一次删除：行数减少 + 更新列统计
@@ -230,7 +235,7 @@ impl Catalog {
     }
 
     /// 重数一遍统计与行数
-    pub fn rebuild_stats(&mut self, table: &str, rows: &[Row]) -> bool {
+    pub fn rebuild_stats(&mut self, table: &str, rows: &[Row]) -> io::Result<bool> {
         self.seen.remove(table);
         {
             let entry = self.tables.entry(table.to_string()).or_default();
@@ -251,9 +256,9 @@ impl Catalog {
         }
         let mut changed = false;
         for row in rows {
-            changed = self.record_insert(table, row) || changed;
+            changed = self.record_insert(table, row)? || changed;
         }
-        changed
+        Ok(changed)
     }
 
     /// 这一列第一次见到这个值就加一
@@ -291,16 +296,18 @@ impl Catalog {
 
     /// 表改名到指定名字
     pub fn rename_table(&mut self, from: &str, to: &str) -> io::Result<bool> {
-        let Some(entry) = self.tables.remove(from) else {
+        let Some(entry) = self.tables.get(from) else {
             return Ok(false);
         };
         if self.tables.contains_key(to) {
-            self.tables.insert(from.to_string(), entry);
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!("table already exists: {}", to),
             ));
         }
+        let version = next_schema_version(entry)?;
+        let mut entry = self.tables.remove(from).ok_or_else(|| io::Error::other("missing rename source"))?;
+        entry.schema_version = version;
         self.seen.remove(from);
         self.tables.insert(to.to_string(), entry);
         Ok(true)
@@ -308,10 +315,21 @@ impl Catalog {
 
     /// ALTER：整列定义换成新的，并清掉二级索引与统计
     pub fn set_columns(&mut self, table: &str, columns: Vec<SchemaColumn>) -> io::Result<()> {
+        self.set_columns_version(table, columns, None)
+    }
+
+    /// 用日志中的目标版本替换列定义
+    pub fn set_columns_version(&mut self, table: &str, columns: Vec<SchemaColumn>, version: Option<u64>) -> io::Result<()> {
         let entry = self
             .tables
             .get_mut(table)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("unknown table: {}", table)))?;
+        if let Some(version) = version {
+            if version == 0 { return Err(io::Error::other("invalid WAL schema version")); }
+            entry.schema_version = version;
+        } else if entry.columns != columns {
+            entry.schema_version = next_schema_version(entry)?;
+        }
         entry.columns = columns;
         entry.dropped_columns.clear();
         entry.indexes.clear();
@@ -321,9 +339,12 @@ impl Catalog {
     }
 
     /// 老数据的列类型名规范化；返回有没有改动
-    pub fn normalize_types(&mut self) -> bool {
+    pub fn normalize_types(&mut self) -> io::Result<bool> {
         let mut changed = false;
         for entry in self.tables.values_mut() {
+            if entry.columns.iter().any(|column| normalize_type(&column.ty) != column.ty) {
+                entry.schema_version = next_schema_version(entry)?;
+            }
             for column in entry.columns.iter_mut() {
                 let fixed = normalize_type(&column.ty);
                 if fixed != column.ty {
@@ -332,15 +353,26 @@ impl Catalog {
                 }
             }
         }
-        changed
+        Ok(changed)
     }
 
     /// 删一列；之前没有也返回成功（重放幂等）
     pub fn remove_column(&mut self, table: &str, column: &str) -> io::Result<bool> {
+        self.remove_column_version(table, column, None)
+    }
+
+    /// 用日志目标版本删除列定义
+    pub fn remove_column_version(&mut self, table: &str, column: &str, version: Option<u64>) -> io::Result<bool> {
         let entry = self
             .tables
             .get_mut(table)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("unknown table: {}", table)))?;
+        if let Some(version) = version {
+            if version == 0 { return Err(io::Error::other("invalid WAL schema version")); }
+            entry.schema_version = version;
+        } else if entry.columns.iter().any(|c| c.name == column) {
+            entry.schema_version = next_schema_version(entry)?;
+        }
         let had_column = {
             let before = entry.columns.len();
             entry.columns.retain(|c| c.name != column);
@@ -417,22 +449,24 @@ impl Catalog {
 }
 
 /// 把行里"字典还不知道的列"补进来；返回有没有变化
-fn add_missing_columns(entry: &mut TableSchema, row: &Row) -> bool {
-    let mut changed = false;
-    for (k, v) in row {
-        if entry.dropped_columns.contains(k) || entry.columns.iter().any(|c| &c.name == k) {
-            continue;
-        }
-        if let Some(ty) = infer_type(v) {
-            entry.columns.push(SchemaColumn {
-                name: k.clone(),
-                ty,
-                ..Default::default()
-            });
-            changed = true;
-        }
+fn add_missing_columns(entry: &mut TableSchema, row: &Row) -> io::Result<bool> {
+    let additions: Vec<_> = row.iter().filter(|(name, _)|
+        !entry.dropped_columns.contains(*name) && !entry.columns.iter().any(|c| &c.name == *name))
+        .filter_map(|(name, value)| infer_type(value).map(|ty| SchemaColumn {
+            name: name.clone(), ty, ..Default::default()
+        })).collect();
+    if additions.is_empty() {
+        return Ok(false);
     }
-    changed
+    entry.schema_version = next_schema_version(entry)?;
+    entry.columns.extend(additions);
+    Ok(true)
+}
+
+/// 递增结构版本，耗尽时拒绝变更
+fn next_schema_version(entry: &TableSchema) -> io::Result<u64> {
+    entry.schema_version.checked_add(1)
+        .ok_or_else(|| io::Error::other("catalog schema version exhausted"))
 }
 
 /// 由 JSON 值猜列类型

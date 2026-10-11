@@ -42,4 +42,4 @@ Web 步骤会先显式刷新该工程里的 model、engine、interface 与 serve
 ## 约定
 
 - 门禁由项目所有者手动运行；agent 只跑模块级测试，不跑全量门禁。
-- 计数、验收状态与主线进度以 `agent-credientials/progress.txt` 为准。
+- 计数、验收状态与主线进度以 `.agents/context/progress.txt` 为准。

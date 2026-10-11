@@ -82,6 +82,13 @@ limited orderBy mLimit op = case mLimit of
 -- | 翻成：过滤 -> 分组 -> 排序 -> 截断 -> 取列
 translate :: Statement -> Either String RelOp
 translate q = case q of
+    SelectDistinct inner -> do
+        ordering <- distinctOrdering inner
+        plan <- case inner of
+            s@Select{} -> translate s { selectOrderBy = [], selectLimit = Nothing }
+            s@SelectExpr{} -> translate s { selectOrderBy = [], selectLimit = Nothing }
+            _ -> Left "DISTINCT requires SELECT"
+        Right (limited ordering (selectLimit inner) (Distinct plan))
     Select
         { selectCols = cols
         , selectFrom = fromC

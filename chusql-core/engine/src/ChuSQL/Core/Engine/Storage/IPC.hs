@@ -30,15 +30,17 @@ module ChuSQL.Core.Engine.Storage.IPC (
     doListCatalog,
 ) where
 
-import ChuSQL.Core.Model
-import ChuSQL.Core.Protocol (Account (..), Request (..), Response (..), SchemaColumn (..), TableInfo (..))
 import ChuSQL.Core.Engine.Parallel (parallelShardLimit, poolRun, workerPool)
 import ChuSQL.Core.Engine.Storage
 import ChuSQL.Core.Engine.Storage.FFI (closeStorage, openStorage, storageRequest)
+import ChuSQL.Core.Model
+import ChuSQL.Core.Protocol (Account (..), Request (..), Response (..), SchemaColumn (..), TableInfo (..))
 import Control.Concurrent (getNumCapabilities)
 import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, putMVar, readMVar, takeMVar, withMVar)
 import Control.Exception (bracket, mask_)
 import Data.Aeson (eitherDecodeStrict, encode)
+import Data.Aeson qualified as A
+import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.Maybe (fromMaybe)
@@ -49,6 +51,7 @@ import System.IO.Unsafe (unsafePerformIO)
 -- | 一条会话的存储环境：当前库名随会话走，不共享
 data Env = Env
     { envDatabase :: Maybe String
+    , envSchemaGuard :: Maybe Database
     }
 
 newtype IPCStorage a = IPCStorage
@@ -57,11 +60,11 @@ newtype IPCStorage a = IPCStorage
 
 -- | 按库名造一个会话环境
 envForDatabase :: Maybe String -> Env
-envForDatabase = Env
+envForDatabase name = Env name Nothing
 
 -- | 进程默认环境：读全局库名，给测试与 CLI 用
 defaultEnv :: IO Env
-defaultEnv = Env <$> readMVar databaseRef
+defaultEnv = envForDatabase <$> readMVar databaseRef
 
 -- | 用进程默认环境跑（兼容既有调用点）
 runIPCStorage :: IPCStorage a -> IO a
@@ -86,11 +89,13 @@ data StorageLink = StorageLink
     }
 
 {-# NOINLINE linkRef #-}
+
 -- | 进程全局的存储链路
 linkRef :: MVar (Maybe StorageLink)
 linkRef = unsafePerformIO (newMVar Nothing)
 
 {-# NOINLINE linkUsers #-}
+
 -- | 在途请求计数与空闲信号
 linkUsers :: (MVar Int, MVar ())
 linkUsers = unsafePerformIO $ (,) <$> newMVar 0 <*> newMVar ()
@@ -100,7 +105,7 @@ withStorageLink :: (Maybe StorageLink -> IO a) -> IO a
 withStorageLink = bracket enter leave
   where
     (users, idle) = linkUsers
-    -- | 登记当前链路的在途请求
+    -- \| 登记当前链路的在途请求
     enter = withMVar linkRef $ \current -> do
         case current of
             Nothing -> pure ()
@@ -108,7 +113,7 @@ withStorageLink = bracket enter leave
                 if count == 0 then takeMVar idle else pure ()
                 pure (count + 1)
         pure current
-    -- | 最后一个请求结束后发出空闲信号
+    -- \| 最后一个请求结束后发出空闲信号
     leave Nothing = pure ()
     leave (Just _) = mask_ $ modifyMVar_ users $ \count -> do
         if count == 1 then putMVar idle () else pure ()
@@ -122,7 +127,7 @@ setStorageLink link = modifyMVar_ linkRef $ \_ -> withMVar (snd linkUsers) (cons
 localStorageLink :: Maybe FilePath -> IO (Either String StorageLink)
 localStorageLink path = fmap (fmap toLink) (openStorage path)
   where
-    -- | 把句柄包成一条链路
+    -- \| 把句柄包成一条链路
     toLink handle =
         StorageLink
             { slRequest = storageRequest handle
@@ -157,6 +162,7 @@ sendRawRequest payload = withStorageLink $ \current -> do
         Just link -> slRequest link payload
 
 {-# NOINLINE databaseRef #-}
+
 -- | 进程全局的当前库名
 databaseRef :: MVar (Maybe String)
 databaseRef = unsafePerformIO (newMVar Nothing)
@@ -168,7 +174,6 @@ setDatabaseName name = modifyMVar_ databaseRef (const (pure name))
 -- | 当前库名
 getDatabaseName :: IO (Maybe String)
 getDatabaseName = readMVar databaseRef
-
 
 -- | 给语句类请求盖上当前库名
 stampDatabase :: Maybe String -> Request -> Request
@@ -192,12 +197,42 @@ globalRequest _ = False
 -- | 发请求并把响应翻成 Either
 ask :: Env -> String -> Request -> (Response -> Maybe a) -> IO (Either String a)
 ask env what req recognize = do
-    resp <- sendRequest (stampDatabase (envDatabase env) req)
+    resp <- case envSchemaGuard env of
+        Nothing -> sendRequest (stampDatabase (envDatabase env) req)
+        Just dependencies -> guardedRequest env dependencies req
     pure $ case resp of
         RespError e -> Left e
         other -> case recognize other of
             Just a -> Right a
             Nothing -> Left ("unexpected response to " ++ what)
+
+-- | 发送依赖守卫并要求存储确认执行
+guardedRequest :: Env -> Database -> Request -> IO Response
+guardedRequest env dependencies req = do
+    let payload = case A.toJSON (stampDatabase (envDatabase env) req) of
+            A.Object fields -> A.Object (KM.insert "schema_guard" (A.toJSON (map guardOf dependencies)) fields)
+            other -> other
+    result <- sendRawRequest (BL.toStrict (encode payload))
+    pure $ case result >>= eitherDecodeStrict of
+        Left err -> RespError err
+        Right (A.Object fields)
+            | KM.lookup "status" fields == Just (A.String "guarded")
+            , Just response <- KM.lookup "response" fields -> case A.fromJSON response of
+                A.Success decoded -> decoded
+                A.Error err -> RespError ("decode error: " ++ err)
+        Right value -> case A.fromJSON value of
+            A.Success (RespError err) -> RespError err
+            _ -> RespError "storage did not confirm bound schema guard"
+  where
+    -- \| 编码依赖身份、版本与完整列定义
+    guardOf (name, table) =
+        A.object
+            [ "table" A..= name
+            , "database_id" A..= fmap (\(TableIdentity database _) -> show database) (tableIdentity table)
+            , "object_id" A..= fmap (\(TableIdentity _ object) -> show object) (tableIdentity table)
+            , "schema_version" A..= fmap show (tableSchemaVersion table)
+            , "columns" A..= map toWire (tableCols table)
+            ]
 
 -- | 只认"成了"（多数写操作都这样）
 okOnly :: Response -> Maybe ()
@@ -310,18 +345,27 @@ toWire (n, c) =
         }
 
 instance MonadStorage IPCStorage where
+    -- \| 将依赖守卫限定于本次执行环境
+    withSchemaGuard dependencies action = IPCStorage $ \env ->
+        runIPCStorageIn action env{envSchemaGuard = Just dependencies}
+
     -- \| 建一个库
     createDatabase name = IPCStorage $ \env -> ask env "create_database" (ReqDatabase "create_database" name) okOnly
+
     -- \| 删一个库
     dropDatabase name = IPCStorage $ \env -> ask env "drop_database" (ReqDatabase "drop_database" name) okOnly
+
     -- \| 切当前库
     useDatabase name = IPCStorage $ \env -> ask env "use_database" (ReqDatabase "use_database" name) okOnly
+
     -- \| 列出现有库
     listDatabases = IPCStorage $ \env -> ask env "list_databases" (ReqDatabase "list_databases" "") $ \resp -> case resp of
         RespTables names -> Just names
         _ -> Nothing
+
     -- \| 发 Scan
     scan t = IPCStorage (\env -> doScan env t)
+
     -- \| 只取指定列
     scanColumns t cols = IPCStorage (\env -> doScanColumns env t cols)
 
@@ -381,13 +425,17 @@ instance MonadStorage IPCStorage where
             Left err -> pure (Left err)
             Right xs -> fmap sequence (mapM (loadEntry env) xs)
       where
-        -- | 读取表数据并保留扫描错误
+        -- \| 读取表数据并保留扫描错误
         loadEntry env info = do
             rows <- doScan env (tiTable info)
-            pure $ fmap (\rs ->
-                ( tiTable info
-                , Table (tiTable info) (schemaToColumns (tiColumns info)) rs (Just (metaOf info))
-                )) rows
+            pure $
+                fmap
+                    ( \rs ->
+                        ( tiTable info
+                        , Table (tiTable info) (schemaToColumns (tiColumns info)) rs (Just (metaOf info)) (tiIdentity info) (tiSchemaVersion info)
+                        )
+                    )
+                    rows
 
     -- \| 只问数据字典要结构，设了当前库只留它的表
     schema = IPCStorage $ \env -> do
@@ -409,6 +457,6 @@ visibleTables current info
             else []
     | otherwise = [bare info]
   where
-    named = info {tiTable = unqualify current (tiTable info)}
-    -- | 组装成不带行的表
-    bare i = (tiTable i, Table (tiTable i) (schemaToColumns (tiColumns i)) [] (Just (metaOf i)))
+    named = info{tiTable = unqualify current (tiTable info)}
+    -- \| 组装成不带行的表
+    bare i = (tiTable i, Table (tiTable i) (schemaToColumns (tiColumns i)) [] (Just (metaOf i)) (tiIdentity i) (tiSchemaVersion i))
