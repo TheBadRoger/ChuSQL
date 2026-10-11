@@ -76,11 +76,7 @@ resources/chusql.ui.settings.json
 *~
 \#*\#
 .\#*
-AGENTS.md
-agent-credientials
-skills-lock.json
 .dsh
-.agents
 # 注意：.zed/tasks.json 是本仓库共享的构建任务（stack build / run / test / repl），
 # 需要入库，所以这里不忽略 .zed/
 
@@ -97,3 +93,13 @@ plandocs/
 Thumbs.db
 ehthumbs.db
 desktop.ini
+
+learning
+
+# 通用技能和安装状态仅供本机；只跟踪项目专用技能
+/.agents/skills/*
+!/.agents/skills/chusql-boundary-contracts/
+!/.agents/skills/chusql-storage-integrity/
+!/.agents/skills/chusql-type-system/
+/.agents/context/prompt.txt
+/skills-lock.json

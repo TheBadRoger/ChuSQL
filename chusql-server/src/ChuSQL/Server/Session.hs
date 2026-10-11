@@ -18,6 +18,7 @@ module ChuSQL.Server.Session
     , runStatement
     , runStatementCoded
     , runStorageCoded
+    , analyzeNormalizationCoded
     , catalog
     , accounts
     , roleViews
@@ -27,7 +28,12 @@ module ChuSQL.Server.Session
     , queryResultJson
     ) where
 
-import ChuSQL.Core.Model (Database, Row, Table (..), Value (..))
+import ChuSQL.Core.Model (Database, Row, Table (..), Value (..), Column (..), typeName)
+import ChuSQL.Core.Protocol (SchemaColumn (..))
+import ChuSQL.Interface.Normalization
+import ChuSQL.Server.Normalization (normalizationBudget, normalizationReport)
+import Data.Aeson.Types (parseEither)
+import qualified Data.ByteString.Lazy as BL
 import ChuSQL.Core.Protocol (Account (..), Request (..), QueryResult (..), TxnOp (..), queryResultJson)
 import ChuSQL.Core.Engine.Storage.IPC (TableInfo (..))
 import qualified ChuSQL.Core.Engine as Engine
@@ -39,7 +45,7 @@ import ChuSQL.Interface.Auth (defaultSessionPolicy, newSessionStore)
 import ChuSQL.Server.Accounts
 import ChuSQL.Server.Backend (Backend (..), StatementResult (..), columnsFromStatement, scopeDdl)
 import ChuSQL.Server.Policy (configurePasswordPolicy)
-import ChuSQL.Server.Privileges (PrivilegeCommand (..), PrivilegeError (..), Privileges, RoleView, affectedAccounts, affectedObject, authorize, authorizeConnect, claimObject, prepareObject, reconcileObjects, filterTables, listRoleViews, newPrivileges, privilegeCommand, runPrivilegeCommand)
+import ChuSQL.Server.Privileges (PrivilegeCommand (..), PrivilegeError (..), Privileges, RoleView, Grant (..), affectedAccounts, affectedObject, authorize, authorizeTables, authorizeConnect, claimObject, prepareObject, reconcileObjects, filterTables, listRoleViews, listSelfGrants, newPrivileges, privilegeCommand, runPrivilegeCommand)
 import ChuSQL.Server.Security (readSecurity, writeSecurity)
 import Control.Exception (IOException, try)
 import Data.Bifunctor (first)
@@ -280,6 +286,7 @@ runStatementUnlocked session sql = case parseStatement (T.unpack sql) of
     Right (Savepoint name) -> savepointTransaction session (T.pack name)
     Right (RollbackToSavepoint name) -> rollbackToSavepoint session (T.pack name)
     Right (ReleaseSavepoint name) -> releaseSavepoint session (T.pack name)
+    Right ShowGrants -> showSelfGrants session
     Right ShowRoles -> showIdentities session
     Right statement
         | Just command <- accountCommand statement -> runAccount session command
@@ -319,6 +326,7 @@ transactionDdl statement = case statement of
 -- | 事务里只有数据语句走快照
 transactionData :: Statement -> Bool
 transactionData statement = case statement of
+    SelectDistinct q -> transactionData q
     Select{} -> True
     SelectExpr{} -> True
     Insert{} -> True
@@ -840,3 +848,72 @@ resultOf result =
     -- | 按列名取单元格
     cellOf row name = maybe VNull id (lookup name row)
 
+
+-- 展示当前登录身份自己的有效权限。
+showSelfGrants :: Session -> IO (Either SessionError QueryResult)
+showSelfGrants session = do
+    who <- readIORef (ssPrincipal session)
+    case who of
+        Nothing -> pure (Left (SessionError "unauthorized" "sign in first"))
+        Just principal -> do
+            grants <- listSelfGrants (ssPrivileges session) principal
+            pure $ case grants of
+                Left err -> Left (privilegeErrorOf err)
+                Right rows -> Right (QueryResult ["identity", "privilege", "object", "grant_option"]
+                    [[VStr (T.unpack (grantRole grant)), VStr (T.unpack (grantPrivilege grant)), VStr (T.unpack (grantObject grant)), VBool (grantable grant)] | grant <- rows]
+                    (length rows) False Nothing)
+
+
+-- 在连接视图及权限稳定期间分析范式。
+analyzeNormalizationCoded :: Session -> NormalizationRequest -> IO (Either SessionError A.Value)
+analyzeNormalizationCoded session payload = do
+    result <- normalizationBudget $ readSecurity $ do
+        valid <- validatePrincipal session
+        current <- readIORef (ssCurrent session)
+        who <- readIORef (ssPrincipal session)
+        let table = last (T.splitOn "." (nrTable payload))
+        case (valid, who, A.fromJSON (A.toJSON payload) :: A.Result NormalizationRequest) of
+            (Left err, _, _) -> pure (Left (sessCode err, sessMessage err))
+            (_, Nothing, _) -> pure (Left ("unauthorized", "sign in first"))
+            (_, _, A.Error message) -> pure (Left ("bad_request", T.pack message))
+            (_, Just principal, A.Success _)
+                | BL.length (A.encode payload) > 65000 -> pure (Left ("too_large", "normalization request exceeds transport budget"))
+                | current /= nrDatabase payload -> pure (Left ("bad_request", "normalization database differs from the selected database"))
+                | current == "system" || "__system_" `T.isPrefixOf` table -> pure (Left ("forbidden", "normalization does not expose system objects"))
+                | otherwise -> do
+                    allowed <- authorizeTables (ssPrivileges session) principal current [(table, "select")]
+                    case allowed of
+                        Left (PrivilegeError code message) -> pure (Left (code, message))
+                        Right () -> normalizationView session table payload
+    pure (either (Left . uncurry SessionError) Right result)
+
+-- 读取目录结构或当前连接的事务 schema。
+normalizationView :: Session -> Text -> NormalizationRequest -> IO (Either (Text, Text) A.Value)
+normalizationView session table payload = do
+    live <- snapshotObjectIds session [T.unpack table]
+    transaction <- readIORef (ssTransaction session)
+    case live >>= maybe (Left (SessionError "not_found" "unknown table")) Right . lookup (T.unpack table) of
+        Left err -> pure (Left (sessCode err, sessMessage err))
+        Right object -> case objectIdentity object of
+            Left message -> pure (Left ("storage_error", message))
+            Right identity -> case transaction of
+                Just tx -> case (lookup (T.unpack table) (txStaged tx), lookup (T.unpack table) (txObjects tx)) of
+                    (Just relation, Just oldObject) | objectIdentity oldObject == Right identity ->
+                        pure (normalizationReport identity (map normalizationColumn (tableCols relation)) "transaction_snapshot" payload)
+                    _ -> pure (Left ("conflict", "normalization snapshot object has changed"))
+                Nothing -> do
+                    backend <- currentBackend session
+                    infos <- beCatalog backend
+                    pure $ case infos of
+                        Left message -> Left ("storage_error", T.pack message)
+                        Right relations -> case [tiColumns info | info <- relations, tiTable info == T.unpack table] of
+                            [columns] -> normalizationReport identity columns "live_schema" payload
+                            _ -> Left ("not_found", "unknown table")
+
+-- 从目录响应中只取稳定编号。
+objectIdentity :: A.Value -> Either Text ObjectIdentity
+objectIdentity = first T.pack . parseEither (A.withObject "catalog object" $ \o -> ObjectIdentity <$> o A..: "database_id" <*> o A..: "object_id")
+
+-- 将事务 schema 转成同一线上列结构。
+normalizationColumn :: (String, Column) -> SchemaColumn
+normalizationColumn (name, c) = SchemaColumn name (typeName (columnType c)) (columnNullable c) (columnDefault c) (columnAutoIncrement c) (columnPrimaryKey c) (columnUnique c) (columnCheck c)

@@ -16,7 +16,7 @@ data Expression = Literal TypeExpr RuntimeValue | Reference String | Apply Strin
     | TupleLiteral [Expression] deriving (Show, Eq)
 
 -- | 保存绑定后的表达式节点
-data ExpressionNode = Constant RuntimeValue | BoundReference String | BoundApply FunctionId [TypedExpression]
+data ExpressionNode = Constant RuntimeValue | BoundReference Int String | BoundApply FunctionId [TypedExpression]
     | BoundList [TypedExpression] | BoundNothing | BoundJust TypedExpression | BoundTuple [TypedExpression]
     deriving (Show, Eq)
 
@@ -34,8 +34,8 @@ bindExpression types functions env expression = case expression of
         tid <- descriptorId <$> resolveType types ty
         validateValue types tid value
         Right (TypedExpression tid (Constant value))
-    Reference name -> case [tid | (key, tid) <- env, key == name] of
-        [tid] -> describeType types tid >> Right (TypedExpression tid (BoundReference name))
+    Reference name -> case [(slot, tid) | (slot, (key, tid)) <- zip [0 ..] env, key == name] of
+        [(slot, tid)] -> describeType types tid >> Right (TypedExpression tid (BoundReference slot name))
         [] -> Left ("unknown column: " ++ name)
         _ -> Left ("ambiguous column: " ++ name)
     Apply name arguments -> do
@@ -68,10 +68,10 @@ evaluateExpression :: TypeRegistry -> FunctionRegistry -> [(String, RuntimeValue
 evaluateExpression types functions row (TypedExpression tid node) = do
     value <- case node of
         Constant v -> Right v
-        BoundReference name -> case [v | (key, v) <- row, key == name] of
-            [v] -> Right v
+        BoundReference slot name -> case drop slot row of
+            (key, value) : _ | key == name -> Right value
             [] -> Left ("missing bound column: " ++ name)
-            _ -> Left ("duplicate bound column: " ++ name)
+            _ -> Left ("bound column position mismatch: " ++ name)
         BoundApply fid arguments -> mapM evaluate arguments >>= invokeFunction types functions fid
         BoundList arguments -> RList <$> mapM evaluate arguments
         BoundNothing -> Right (RMaybe Nothing)

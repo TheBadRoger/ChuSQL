@@ -6,6 +6,7 @@ module ChuSQL.Interface.Link (
     closeClient,
     clientLogin,
     clientSudoLogin,
+    clientNormalization,
     clientQuery,
     clientPing,
     clientCatalog,
@@ -16,6 +17,8 @@ module ChuSQL.Interface.Link (
     clientReloadPolicy,
 ) where
 
+import ChuSQL.Interface.Normalization (NormalizationRequest)
+import qualified Data.Aeson as A
 import ChuSQL.Interface.Sudo (SudoCredential, sudoProof, isLocalPeer)
 import ChuSQL.Core.Protocol (Account, QueryResult (..), TableInfo (..))
 import ChuSQL.Interface.Protocol (
@@ -244,3 +247,12 @@ describe :: IOException -> String
 describe err
     | isEOFError err = "the server closed the connection"
     | otherwise = show err
+
+-- 请求服务端执行只读范式分析。
+clientNormalization :: Client -> NormalizationRequest -> IO (Either Text A.Value)
+clientNormalization client payload = do
+    answer <- request client (ReqNormalization payload)
+    pure $ case answer of
+        Left message -> Left message
+        Right (RespNormalization value) -> Right value
+        Right other -> failed "normalization" other

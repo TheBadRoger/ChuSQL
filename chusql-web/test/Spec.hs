@@ -946,6 +946,102 @@ roleSpec env = describe "roles and grants" $ do
 querySpec :: AppEnv -> Spec
 querySpec env = describe "the SQL console" $ do
     withApp (webApp env) $ do
+        it "analyzes explicit declarations for SELECT users and rejects stale schemas" $ do
+            admin <- adminHeaders
+            ensureDatabase admin testDatabaseName
+            ensureAccount admin "normalization_web_reader" "Reader-Secret-1234"
+            created <- testSql admin "CREATE TABLE normalization_web (id INT, course INT, name TEXT)"
+            expectStatusWith "normalization table" created 200
+            let declaration = object ["declared_keys" .= ([["id", "course"]] :: [[Text]]),
+                    "dependencies" .= [object ["lhs" .= (["id"] :: [Text]), "rhs" .= (["name"] :: [Text])]],
+                    "dependencies_complete" .= True, "atomic_attributes" .= True]
+                payload = object ["api_version" .= (1 :: Int), "database" .= testDatabaseName,
+                    "table" .= ("normalization_web" :: Text), "declaration" .= declaration]
+            unauthorized <- postAs (withDb testDatabaseName []) "/api/normalization/analyze" (encode payload)
+            expectStatusWith "anonymous normalization" unauthorized 401
+            reader <- ordinaryHeaders "normalization_web_reader" "Reader-Secret-1234"
+            denied <- postAs (withDb testDatabaseName reader) "/api/normalization/analyze" (encode payload)
+            expectStatusWith "SELECT required" denied 403
+            granted <- testSql admin "GRANT SELECT ON normalization_web TO normalization_web_reader"
+            expectStatusWith "normalization SELECT" granted 200
+            readerAgain <- ordinaryHeaders "normalization_web_reader" "Reader-Secret-1234"
+            report <- postAs (withDb testDatabaseName readerAgain) "/api/normalization/analyze" (encode payload)
+            expectStatusWith "conditional report" report 200
+            check (at "conditional" (jsonBody report) `shouldBe` A.Bool True)
+            check (map (asText . at "verdict") (items (at "findings" (jsonBody report))) `shouldBe` ["satisfied", "violated", "violated", "violated"])
+            changed <- testSql admin "ALTER TABLE normalization_web ADD COLUMN extra INT"
+            expectStatusWith "change normalization schema" changed 200
+            let stale = object ["api_version" .= (1 :: Int), "database" .= testDatabaseName,
+                    "table" .= ("normalization_web" :: Text), "declaration" .= declaration,
+                    "expected_object" .= at "object" (jsonBody report), "expected_schema_fingerprint" .= at "schema_fingerprint" (jsonBody report)]
+            conflicted <- postAs (withDb testDatabaseName readerAgain) "/api/normalization/analyze" (encode stale)
+            expectStatusWith "schema changed" conflicted 409
+        it "uses a matching editing snapshot without creating a second transaction" $ do
+            admin <- adminHeaders
+            ensureDatabase admin testDatabaseName
+            created <- testSql admin "CREATE TABLE normalization_edit (id INT, value INT)"
+            expectStatusWith "normalization snapshot table" created 200
+            begun <- editRequest admin "/api/edit/begin" "normalization-owner" []
+            expectStatusWith "normalization edit begins" begun 200
+            changed <- testSql admin "ALTER TABLE normalization_edit ADD COLUMN extra INT"
+            expectStatusWith "live schema changes" changed 200
+            let payload = object ["api_version" .= (1 :: Int), "database" .= testDatabaseName,
+                    "table" .= ("normalization_edit" :: Text), "declaration" .= object []]
+            snapshot <- postAs (("X-ChuSQL-Edit", "normalization-owner") : withDb testDatabaseName admin) "/api/normalization/analyze" (encode payload)
+            expectStatusWith "analysis on edit connection" snapshot 200
+            check (at "view" (jsonBody snapshot) `shouldBe` A.String "transaction_snapshot")
+            check (length (items (at "schema" (jsonBody snapshot))) `shouldBe` 2)
+            forged <- postAs (("X-ChuSQL-Edit", "another-page") : withDb testDatabaseName admin) "/api/normalization/analyze" (encode payload)
+            expectStatusWith "page identity mismatch" forged 409
+            rolledBack <- editRequest admin "/api/edit/rollback" "normalization-owner" []
+            expectStatusWith "release edit snapshot" rolledBack 200
+        it "binds normalization to the owning SQL console transaction" $ do
+            admin <- adminHeaders
+            ensureDatabase admin testDatabaseName
+            created <- testSql admin "CREATE TABLE normalization_console (id INT)"
+            expectStatusWith "console normalization table" created 200
+            let owner = ("X-ChuSQL-Console", "normalization-console") : admin
+                payload = object ["api_version" .= (1 :: Int), "database" .= testDatabaseName,
+                    "table" .= ("normalization_console" :: Text), "declaration" .= object []]
+            begun <- testSql owner "BEGIN"
+            expectStatusWith "console begins" begun 200
+            snapshot <- postAs (withDb testDatabaseName owner) "/api/normalization/analyze" (encode payload)
+            expectStatusWith "owner console normalization" snapshot 200
+            check (at "view" (jsonBody snapshot) `shouldBe` A.String "transaction_snapshot")
+            denied <- postAs (withDb testDatabaseName admin) "/api/normalization/analyze" (encode payload)
+            expectStatusWith "unrelated console refused" denied 409
+            rolledBack <- testSql owner "ROLLBACK"
+            expectStatusWith "console ends" rolledBack 200
+        it "rejects duplicate declarations and oversized normalization bodies" $ do
+            admin <- adminHeaders
+            ensureDatabase admin testDatabaseName
+            duplicate <- postAs (withDb testDatabaseName admin) "/api/normalization/analyze"
+                "{\"api_version\":1,\"database\":\"test\",\"table\":\"users\",\"declaration\":{\"atomic_attributes\":true,\"atomic_attributes\":false}}"
+            expectStatusWith "duplicate declaration fields" duplicate 400
+            oversized <- postAs (withDb testDatabaseName admin) "/api/normalization/analyze" (BL.replicate 65537 32)
+            expectStatusWith "normalization request bound" oversized 413
+
+        it "exposes DISTINCT and self grants after grant option revocation" $ do
+            admin <- adminHeaders
+            ensureDatabase admin testDatabaseName
+            ensureAccount admin "http_option_reader" "Reader-Secret-1234"
+            created <- testSql admin "CREATE TABLE http_distinct_probe (id INT, value INT)"
+            expectStatusWith "distinct table" created 200
+            inserted <- testSql admin "INSERT INTO http_distinct_probe (id,value) VALUES (1,7),(2,7),(3,8)"
+            expectStatusWith "distinct rows" inserted 200
+            granted <- testSql admin "GRANT SELECT ON http_distinct_probe TO http_option_reader WITH GRANT OPTION"
+            expectStatusWith "grant option" granted 200
+            revoked <- testSql admin "REVOKE GRANT OPTION FOR SELECT ON http_distinct_probe FROM http_option_reader"
+            expectStatusWith "revoke only grant option" revoked 200
+            reader <- ordinaryHeaders "http_option_reader" "Reader-Secret-1234"
+            result <- testSql reader "SELECT DISTINCT value FROM http_distinct_probe ORDER BY 1 DESC LIMIT 2"
+            expectStatusWith "distinct output" result 200
+            check (at "rows" (jsonBody result) `shouldBe` A.toJSON ([[8], [7]] :: [[Int]]))
+            grants <- testSql reader "SHOW GRANTS"
+            expectStatusWith "own grants" grants 200
+            check (at "columns" (jsonBody grants) `shouldBe` A.toJSON (["identity", "privilege", "object", "grant_option"] :: [Text]))
+            denied <- testSql reader "GRANT SELECT ON http_distinct_probe TO admin"
+            expectStatusWith "no delegation" denied 403
         it "returns typed compound values through HTTP and TCP" $ do
             hs <- adminHeaders
             ensureDatabase hs testDatabaseName

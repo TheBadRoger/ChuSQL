@@ -1,25 +1,25 @@
-module ChuSQL.Core.Engine.Builtin
-    ( Builtin (..)
-    , builtinNames
-    , resolveBuiltin
-    , builtinName
-    , invokeBuiltin
-    , builtinOfExpr
-    , builtinNode
-    , aggregateArg
-    , unsupportedAggregate
-    , Operator (..)
-    , operatorOfExpr
-    , operatorSymbol
-    , operatorOfCompare
-    , compareNode
-    , executeOperator
-    , threeValuedNot
-    , inValues
-    ) where
+module ChuSQL.Core.Engine.Builtin (
+    Builtin (..),
+    builtinNames,
+    resolveBuiltin,
+    builtinName,
+    invokeBuiltin,
+    builtinOfExpr,
+    builtinNode,
+    aggregateArg,
+    unsupportedAggregate,
+    Operator (..),
+    operatorOfExpr,
+    operatorSymbol,
+    operatorOfCompare,
+    compareNode,
+    executeOperator,
+    threeValuedNot,
+    inValues,
+) where
 
-import ChuSQL.Core.Model (Value (..), compareValue)
 import ChuSQL.Core.Engine.Syntax.AST (CompareOp (..), Expr (..))
+import ChuSQL.Core.Model (Value (..), compareValue)
 import Control.Monad (foldM)
 import Data.Char (toLower)
 
@@ -246,12 +246,12 @@ evalArith ops x y = case (asDouble x, asDouble y) of
 divArith :: Arith
 divArith = Arith intDiv floatDiv
   where
-    -- | 整数除法：除零与溢出都报错
+    -- \| 整数除法：除零与溢出都报错
     intDiv _ 0 = Left "division by zero"
     intDiv x y
         | x == minBound && y == -1 = Left "integer division overflow"
         | otherwise = Right (x `quot` y)
-    -- | 浮点除法：不能除以零
+    -- \| 浮点除法：不能除以零
     floatDiv _ 0 = Left "division by zero"
     floatDiv x y = Right (x / y)
 

@@ -10,15 +10,19 @@ module ChuSQL.Interface.Session (
     authenticateSudoSession,
     switchDatabase,
     runStatement,
+    analyzeNormalization,
     catalog,
     databases,
     roleViews,
     accounts,
 ) where
 
+import ChuSQL.Interface.Normalization
+import qualified Data.Aeson as A
 import ChuSQL.Core.Protocol (Account, QueryResult (..), TableInfo)
 import ChuSQL.Interface.Link (
     Client,
+    clientNormalization,
     clientAccounts,
     clientCatalog,
     clientDatabases,
@@ -119,3 +123,10 @@ roleViews session = clientRoles (ssClient session)
 -- | 账号清单（\\du 与管理页用）
 accounts :: Session -> IO (Either Text [Account])
 accounts session = clientAccounts (ssClient session)
+
+-- 使用当前连接及工作库请求范式分析。
+analyzeNormalization :: Session -> NormalizationRequest -> IO (Either Text A.Value)
+analyzeNormalization session payload = do
+    current <- sessionDatabase session
+    if current /= nrDatabase payload then pure (Left "bad_request: normalization database differs from the selected database")
+        else clientNormalization (ssClient session) payload

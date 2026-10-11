@@ -12,6 +12,7 @@ module ChuSQL.Core.Model
     , TableMeta (..)
     , Histogram (..)
     , Table (..)
+    , TableIdentity (..)
     , Database
     , histogramOf
     , histogramFor
@@ -48,6 +49,7 @@ import Data.Char (isDigit, isSpace, toLower)
 import Data.Hashable (Hashable (..))
 import Data.List (isPrefixOf, isSuffixOf, stripPrefix)
 import Data.Maybe (fromMaybe, mapMaybe)
+import Data.Word (Word64)
 import ChuSQL.Core.Runtime
 import qualified Data.ByteString.Lazy.Char8 as BS
 
@@ -556,12 +558,17 @@ data TableMeta = TableMeta
     }
     deriving (Show)
 
--- | 一张表：名字、列定义与全部行；meta 为存储层统计，拿不到是 Nothing
+-- | 保存持久化数据库与表编号
+data TableIdentity = TableIdentity Word64 Word64 deriving (Show, Eq)
+
+-- | 一张表：列、行、统计与独立对象身份
 data Table = Table
     { tableName :: String
     , tableCols :: [(String, Column)]
     , tableRows :: [Row]
     , tableMeta :: Maybe TableMeta
+    , tableIdentity :: Maybe TableIdentity
+    , tableSchemaVersion :: Maybe Word64
     }
     deriving (Show)
 

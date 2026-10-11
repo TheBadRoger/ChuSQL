@@ -262,7 +262,7 @@ literalValue =
 -- | 一个排序列
 orderItem :: Parser (String, SortDir)
 orderItem = do
-    col <- qualifiedName
+    col <- qualifiedName <|> (("$position" ++) . show <$> integer)
     dir <- sortDir
     return (col, dir)
 
@@ -590,14 +590,15 @@ grantStatement = do
 revokeStatement :: Parser Statement
 revokeStatement = do
     keyword "revoke"
+    optionOnly <- fromMaybe False <$> optional (True <$ (keyword "grant" *> keyword "option" *> keyword "for"))
     choice
         [ try $ do
             privs <- sepBy1 privilegeName (symbol ",")
             keyword "on"
             obj <- grantObject
             keyword "from"
-            RevokePrivileges privs obj <$> userName
-        , RevokeRole <$> userName <*> (keyword "from" *> sepBy1 userName (symbol ","))
+            (if optionOnly then RevokeGrantOption else RevokePrivileges) privs obj <$> userName
+        , if optionOnly then fail "GRANT OPTION FOR requires object privileges" else RevokeRole <$> userName <*> (keyword "from" *> sepBy1 userName (symbol ","))
         ]
 
 -- | 建表时的一列：类型后面跟若干约束
@@ -689,13 +690,14 @@ decimalArgs = do
 selectStatement :: Parser Statement
 selectStatement = do
     keyword "select"
+    distinct <- fromMaybe False <$> optional ((True <$ keyword "distinct") <|> (False <$ keyword "all"))
     cols <- selectList
     fromC <- fromMaybe FromUnit <$> optional (keyword "from" *> fromClause)
     mWhere <- optional (keyword "where" *> expr)
     groupBy <- fromMaybe [] <$> optional groupByClause
     orderBy <- fromMaybe [] <$> optional orderByClause
     mLimit <- optional limitClause
-    pure $ if all (\(name, e) -> e == Col name) cols
+    pure $ (if distinct then SelectDistinct else id) $ if all (\(name, e) -> e == Col name) cols
         then Select (map fst cols) fromC mWhere groupBy orderBy mLimit
         else SelectExpr cols fromC mWhere groupBy orderBy mLimit
 
@@ -738,6 +740,7 @@ cteKey = map toLower
 -- | CTE 带列清单时改本体的输出名
 renameColumns :: String -> [String] -> Statement -> Either String Statement
 renameColumns _ [] q = Right q
+renameColumns name cols (SelectDistinct q) = SelectDistinct <$> renameColumns name cols q
 renameColumns name cols q@Select { selectCols = names } = do
     checkCteArity name cols names
     Right
@@ -770,6 +773,7 @@ checkCteArity name cols out
 -- | 把语句里对 CTE 的引用换成派生表
 expandStatement :: [(String, Statement)] -> Statement -> Either String Statement
 expandStatement env stmt = case stmt of
+    SelectDistinct q -> SelectDistinct <$> expandStatement env q
     q@Select { selectFrom = fromC, selectWhere = mWhere } -> do
         fromC' <- expandClause env fromC
         w <- traverse (expandExpr env) mWhere
@@ -909,6 +913,7 @@ parseStatement input =
             <|> try createUserStatement
             <|> try alterUserStatement
             <|> try alterRoleStatement
+            <|> try (ShowGrants <$ (keyword "show" *> keyword "grants"))
             <|> try (ShowRoles <$ (keyword "show" *> keyword "roles"))
             <|> try dropUserStatement
             <|> try createRoleStatement

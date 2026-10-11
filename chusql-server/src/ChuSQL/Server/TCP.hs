@@ -23,7 +23,7 @@ import ChuSQL.Interface.RateLimit (RateLimiter, rateLimitBlock, rateLimitClear, 
 import qualified ChuSQL.Core.Engine.Error as E
 import ChuSQL.Core.Protocol (Account (..), Request (ReqIdentityInitialize))
 import ChuSQL.Server.Backend (Backend (..))
-import ChuSQL.Server.Session (QueryResult (..), Session, SessionError (..), accounts, authenticateSessionCoded, authenticateSudoSessionCoded, isPlainIdentifier, catalog, databases, newSessionWith, policyOf, reloadPolicy, roleViews, runStatementCoded, runStorageCoded, sessionIsAdmin, sessionUser)
+import ChuSQL.Server.Session (QueryResult (..), Session, SessionError (..), accounts, authenticateSessionCoded, authenticateSudoSessionCoded, isPlainIdentifier, catalog, databases, newSessionWith, policyOf, reloadPolicy, roleViews, analyzeNormalizationCoded, runStatementCoded, runStorageCoded, sessionIsAdmin, sessionUser)
 import ChuSQL.Server.Security (writeSecurity)
 import ChuSQL.Server.Privileges (newPrivileges, reconcileObjects)
 import Control.Concurrent (forkIO)
@@ -331,6 +331,9 @@ dispatch env session entry request = case request of
     ReqSudoLogin user proof -> do
         response <- sudoLogin env session entry user proof
         pure (response, True)
+    ReqNormalization payload -> do
+        result <- analyzeNormalizationCoded session payload
+        pure (either (\err -> RespError (sessCode err) (sessMessage err)) RespNormalization result, True)
     ReqQuery sql -> do
         who <- sessionUser session
         response <- case who of

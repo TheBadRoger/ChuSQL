@@ -5,7 +5,8 @@ import ChuSQL.Core.Engine.Algebra.Expr (evalCondForRow, evalExpr, hasSubquery, q
 import ChuSQL.Core.Engine.Algebra.Optimize (optimize)
 import ChuSQL.Core.Engine.Algebra.Op
 import ChuSQL.Core.Engine.Algebra.Planner (translate)
-import ChuSQL.Core.Engine.Algebra.Sort (sortRows)
+import ChuSQL.Core.Engine.Algebra.Sort (sortRows, sortBoundRows)
+import ChuSQL.Core.Engine.Runtime.Relation (bindRelOpColumns)
 import ChuSQL.Core.Engine.Builtin (aggregateArg, builtinOfExpr, invokeBuiltin, unsupportedAggregate)
 import ChuSQL.Core.Model
 import ChuSQL.Core.Engine.Storage (IndexResult (..), MonadStorage (..))
@@ -14,6 +15,7 @@ import ChuSQL.Core.Engine.Syntax.AST (Expr (..), JoinKind (..), Subquery (..))
 import Control.Monad (filterM)
 import Data.List (nub)
 import qualified Data.HashMap.Strict as HM
+import qualified Data.HashSet as HS
 
 -- 执行：按算子树算出结果行，外层行供相关子查询引用。
 
@@ -79,10 +81,29 @@ data EquiKeys = EquiKeys
 
 -- | 认出 a = b 这种两列等值条件，并且能分清谁在左谁在右
 equiKeys :: [String] -> [String] -> Expr -> Maybe EquiKeys
-equiKeys lcols rcols (Eq (Col a) (Col b))
-    | a /= b, a `elem` lcols, b `elem` rcols = Just (EquiKeys a b)
-    | a /= b, b `elem` lcols, a `elem` rcols = Just (EquiKeys b a)
+equiKeys lcols rcols (Eq left right)
+    | Just a <- columnName left, Just b <- columnName right
+    , a /= b, a `elem` lcols, b `elem` rcols = Just (EquiKeys a b)
+    | Just a <- columnName left, Just b <- columnName right
+    , a /= b, b `elem` lcols, a `elem` rcols = Just (EquiKeys b a)
 equiKeys _ _ _ = Nothing
+
+-- | 提取执行列的诊断名称
+columnName :: Expr -> Maybe String
+columnName (Col name) = Just name
+columnName (ColumnSlot _ name) = Just name
+columnName _ = Nothing
+
+-- | 在存储边界按输入布局排列行
+orderedRows :: [String] -> [Row] -> Either String [Row]
+orderedRows columns = mapM order
+  where
+    -- | 按列布局排列一行
+    order row = mapM (column row) columns
+    -- | 缺少物理列时明确报错
+    column row name = case lookup name row of
+        Just value -> Right (name, value)
+        Nothing -> Left ("missing bound column: " ++ name)
 
 -- | 连接两批行：等值键走哈希，否则嵌套循环
 joinRowsIn ::
@@ -188,8 +209,9 @@ probeIndexJoin db outer kind mAlias t ks rcols cond l = case lookup (ekLeft ks) 
                 Left e -> pure (Left e)
                 Right NoIndex -> pure (Right Nothing)
                 Right (IndexRows rows) -> do
-                    pairs <- joinRowsIn db outer kind rcols cond [l] (prefixRows mAlias rows)
-                    pure (fmap Just pairs)
+                    case orderedRows rcols (prefixRows mAlias rows) of
+                        Left err -> pure (Left err)
+                        Right ordered -> fmap (fmap Just) (joinRowsIn db outer kind rcols cond [l] ordered)
 
 -- | 列与键都不是浮点时才敢用索引
 indexSafe :: Database -> String -> String -> Value -> Bool
@@ -213,20 +235,17 @@ floatValue (VFloat _) = True
 floatValue _ = False
 
 -- | 分组键的值
-groupKey :: [String] -> Row -> Either String [Value]
-groupKey keys row = mapM get keys
-  where
-    -- | 取这一列的分组值
-    get c = maybe (Left ("unknown column: " ++ c)) Right (lookup c row)
+groupKey :: Row -> [Expr] -> Row -> Either String [Value]
+groupKey outer keys row = mapM (\key -> evalExpr key (row ++ outer)) keys
 
 -- | 按分组键把行分组，保留分组首次出现的顺序
-groupRows :: [String] -> [Row] -> Either String [([Value], [Row])]
-groupRows keys rows = go rows (HM.empty, [])
+groupRows :: Row -> [Expr] -> [Row] -> Either String [([Value], [Row])]
+groupRows outer keys rows = go rows (HM.empty, [])
   where
     -- | 逐行塞进对应分组，并记住分组首次出现的顺序
     go [] (acc, order) = Right [(k, reverse (HM.lookupDefault [] k acc)) | k <- reverse order]
     go (r : rs) (acc, order) = do
-        k <- groupKey keys r
+        k <- groupKey outer keys r
         let order' = if HM.member k acc then order else k : order
         go rs (HM.insertWith (++) k [r] acc, order')
 
@@ -249,11 +268,11 @@ oneGroup outer keys aggs (keyValues, rows) = do
     Right (zip keys keyValues ++ zip (map fst aggs) values)
 
 -- | 分组求值：没有分组列时，即使没有行也要出一行
-evalAggregate :: Row -> [String] -> [(String, Expr)] -> [Row] -> Either String [Row]
+evalAggregate :: Row -> [(String, Expr)] -> [(String, Expr)] -> [Row] -> Either String [Row]
 evalAggregate outer keys aggs rows = do
-    groups <- groupRows keys rows
+    groups <- groupRows outer (map snd keys) rows
     let top = if null keys && null groups then [([], [])] else groups
-    mapM (oneGroup outer keys aggs) top
+    mapM (oneGroup outer (map fst keys) aggs) top
 
 -- | 绑定键：子查询引用的外层列在这一行上的取值
 bindingKey :: [String] -> Row -> String
@@ -443,7 +462,9 @@ runSubqueryRows db sq outer = case translate (subqueryStatement sq) of
     Left e -> pure (Left e)
     Right op -> case mapM bind (subqueryRefs sq) of
         Left err -> pure (Left err)
-        Right bindings -> evalRelOpIn db (bindings ++ outer) (optimize db op)
+        Right bindings -> case bindRelOpColumns db (map fst (bindings ++ outer)) (optimize db op) of
+            Left err -> pure (Left err)
+            Right bound -> evalRelOpIn db (bindings ++ outer) bound
   where
     -- | 给外层物理列补回已解析的限定名
     bind column = case bindingValue column outer of
@@ -482,22 +503,25 @@ evalRelOpIn db outer (Compute items op) = do
         mapM (\(label, e) -> (,) label <$> evalExpr e (r ++ outer)) (zip (map fst items) es)
 evalRelOpIn db outer (Aggregate keys aggs op) = do
     rows <- evalRelOpIn db outer op
+    pure (rows >>= evalAggregate outer [(name, Col name) | name <- keys] aggs)
+evalRelOpIn db outer (BoundAggregate keys aggs op) = do
+    rows <- evalRelOpIn db outer op
     pure (rows >>= evalAggregate outer keys aggs)
 evalRelOpIn db _ (Scan mAlias tbl cols) = do
     res <- scanTable db tbl cols
-    pure (fmap (prefixRows mAlias) res)
+    pure (res >>= orderedRows (relOpCols db (Scan mAlias tbl cols)) . prefixRows mAlias)
 evalRelOpIn db outer (Lookup mAlias tbl col k) = do
     res <- lookupByColumn tbl col k
     case res of
         Left e -> pure (Left e)
         Right NoIndex -> scanFiltered db outer mAlias tbl (lookupCondition mAlias col k)
-        Right (IndexRows rows) -> pure (Right (prefixRows mAlias rows))
+        Right (IndexRows rows) -> pure (orderedRows (relOpCols db (Lookup mAlias tbl col k)) (prefixRows mAlias rows))
 evalRelOpIn db outer (Range mAlias tbl col lo hi) = do
     res <- scanRange tbl col lo hi
     case res of
         Left e -> pure (Left e)
         Right Nothing -> scanFiltered db outer mAlias tbl (rangeCondition mAlias col lo hi)
-        Right (Just rows) -> pure (Right (prefixRows mAlias rows))
+        Right (Just rows) -> pure (orderedRows (relOpCols db (Range mAlias tbl col lo hi)) (prefixRows mAlias rows))
 evalRelOpIn db outer (Filter e op) = do
     rows <- evalRelOpIn db outer op
     case rows of
@@ -516,9 +540,15 @@ evalRelOpIn db outer (Filter e op) = do
 evalRelOpIn db outer (Project cols op) = do
     rows <- evalRelOpIn db outer op
     pure (fmap (map (project cols)) rows)
+evalRelOpIn db outer (Distinct op) = do
+    rows <- evalRelOpIn db outer op
+    pure (distinctRows <$> rows)
 evalRelOpIn db outer (Sort spec op) = do
     rows <- evalRelOpIn db outer op
     pure (fmap (sortRows spec) rows)
+evalRelOpIn db outer (BoundSort spec op) = do
+    rows <- evalRelOpIn db outer op
+    pure (rows >>= sortBoundRows spec outer)
 evalRelOpIn db outer (Limit n op) = do
     rows <- evalRelOpIn db outer op
     pure (fmap (take n) rows)
@@ -557,8 +587,8 @@ scanFiltered ::
 scanFiltered db outer mAlias tbl cond = do
     res <- scanTable db tbl Nothing
     pure $ do
-        rows <- res
-        filterM (evalCondForRow cond . (++ outer)) (prefixRows mAlias rows)
+        rows <- res >>= orderedRows (relOpCols db (Scan mAlias tbl Nothing)) . prefixRows mAlias
+        filterM (evalCondForRow cond . (++ outer)) rows
 
 -- | 行数到阈值才值得并行分片
 parallelRowThreshold :: Int
@@ -574,3 +604,15 @@ scanTable db tbl cols = do
   where
     -- | 统计里的行数，没有统计算 0
     rows = maybe 0 metaRowCount (tableMetaOf db tbl)
+
+-- | 按输出值去重并保留首次行序
+distinctRows :: [Row] -> [Row]
+distinctRows = go HS.empty
+  where
+    -- | 只输出尚未遇到的值组合
+    go _ [] = []
+    go seen (row : rows)
+        | HS.member key seen = go seen rows
+        | otherwise = row : go (HS.insert key seen) rows
+      where
+        key = map (canonicalValue . snd) row

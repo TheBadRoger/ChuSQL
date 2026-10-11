@@ -283,12 +283,15 @@ fn default_id_column() -> String {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Response {
+    Guarded { response: Box<Response> },
     Accounts { accounts: Vec<Account> },
     Pong,
     Rows { rows: Vec<Row> },
     Tables { tables: Vec<String> },
     Schema {
         table: String,
+        #[serde(default, serialize_with = "serialize_version", deserialize_with = "deserialize_version")]
+        schema_version: u64,
         columns: Vec<SchemaColumn>,
         #[serde(default)]
         row_count: u64,
@@ -310,6 +313,15 @@ pub enum Response {
     Object { database_id: u64, object_id: Option<u64> },
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BoundSchema {
+    pub table: String,
+    pub database_id: Option<String>,
+    pub object_id: Option<String>,
+    pub schema_version: Option<String>,
+    pub columns: Vec<SchemaColumn>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableSchemaWire {
     pub table: String,
@@ -317,6 +329,8 @@ pub struct TableSchemaWire {
     pub database_id: u64,
     #[serde(default)]
     pub object_id: u64,
+    #[serde(default, serialize_with = "serialize_version", deserialize_with = "deserialize_version")]
+    pub schema_version: u64,
     pub columns: Vec<SchemaColumn>,
     #[serde(default)]
     pub row_count: u64,
@@ -324,4 +338,20 @@ pub struct TableSchemaWire {
     pub indexes: Vec<IndexWire>,
     #[serde(default)]
     pub stats: Vec<ColumnStatWire>,
+}
+
+/// 将结构版本编码成精确十进制字符串
+fn serialize_version<S: serde::Serializer>(version: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&version.to_string())
+}
+
+/// 读取精确版本并兼容旧数值载荷
+fn deserialize_version<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::String(s) if !s.is_empty() && s.len() <= 20 && s.bytes().all(|c| c.is_ascii_digit()) =>
+            s.parse().map_err(serde::de::Error::custom),
+        serde_json::Value::Number(n) => n.as_u64().ok_or_else(|| serde::de::Error::custom("invalid schema version")),
+        _ => Err(serde::de::Error::custom("invalid schema version")),
+    }
 }

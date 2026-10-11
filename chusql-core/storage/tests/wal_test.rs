@@ -4,6 +4,33 @@ use serde_json::json;
 
 // WAL 测试：追加、读取、清空、截断尾巴、LSN 与提交标记。
 
+/// 结构版本往返且旧隐藏列载荷可读
+#[test]
+fn schema_versions_round_trip_and_legacy_hide_decodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wal.log");
+    let wal = Wal::new(&path);
+    let ops = [
+        WalOp::HideColumn { table: "t".into(), column: "name".into(), schema_version: Some(u64::MAX) },
+        WalOp::DropColumn { table: "t".into(), column: "name".into(), rows: vec![], schema_version: Some(3) },
+        WalOp::ReplaceSchema { table: "t".into(), columns: vec![], rows: vec![], schema_version: Some(4) },
+    ];
+    wal.append_group(&ops).unwrap();
+    assert_eq!(committed_ops(&wal.read_all().unwrap().records).into_iter().map(|(_, op)| op).collect::<Vec<_>>(), ops);
+    drop(wal);
+    let mut body = 1_u64.to_le_bytes().to_vec();
+    body.push(8);
+    body.extend_from_slice(&1_u16.to_le_bytes());
+    body.extend_from_slice(b"t");
+    body.extend_from_slice(br#""name""#);
+    let mut frame = (body.len() as u32).to_le_bytes().to_vec();
+    frame.extend_from_slice(&body);
+    std::fs::write(&path, frame).unwrap();
+    assert_eq!(Wal::new(&path).read().unwrap(), Some(WalOp::HideColumn {
+        table: "t".into(), column: "name".into(), schema_version: None,
+    }));
+}
+
 /// 建表编号完整往返且兼容旧载荷
 #[test]
 fn create_table_ids_round_trip_and_legacy_payloads_decode() {
@@ -58,6 +85,7 @@ fn append_and_read_round_trips() {
         WalOp::DropColumn {
             table: "users".into(),
             column: "age".into(),
+            schema_version: None,
             rows: vec![
                 row(&[("id", json!(1)), ("name", json!("Alice"))]),
                 row(&[("id", json!(2)), ("name", json!("Bob"))]),

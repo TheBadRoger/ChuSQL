@@ -13,6 +13,8 @@ module ChuSQL.Interface.Protocol (
     RoleView (..),
 ) where
 
+import ChuSQL.Interface.Normalization
+import Data.Aeson.Types (parseEither)
 import ChuSQL.Core.Protocol (Account (..), QueryResult (..), TableInfo (..), queryResultJson)
 import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withObject, (.:), (.:?), (.!=), (.=))
 import qualified Data.Aeson as A
@@ -93,6 +95,7 @@ data ClientRequest
     | ReqLogin Text Text
     | ReqSudoChallenge
     | ReqSudoLogin Text Text
+    | ReqNormalization NormalizationRequest
     | ReqQuery Text
     | ReqPing
     | ReqQuit
@@ -141,6 +144,9 @@ decodeRequest raw = case A.eitherDecodeStrict raw of
         "sudo_login" -> case (wrUser wire, wrProof wire) of
             (Just user, Just proof) -> Right (ReqSudoLogin user proof)
             _ -> Left "sudo_login needs both user and proof"
+        "normalization_analyze" -> do
+            value <- decodeNormalizationJSON (BL.fromStrict raw)
+            either (Left . T.pack) Right $ parseEither (withObject "normalization envelope" $ \o -> onlyFields ["method", "request"] o >> ReqNormalization <$> o .: "request") value
         "query" -> maybe (Left "query needs sql") (Right . ReqQuery) (wrSql wire)
         "storage" -> maybe (Left "storage needs request") (Right . ReqStorage) (wrRequest wire)
         "catalog" -> Right ReqCatalog
@@ -164,6 +170,7 @@ requestJson request = case request of
     ReqLogin user password -> object ["method" .= ("login" :: Text), "user" .= user, "password" .= password]
     ReqSudoChallenge -> object ["method" .= ("sudo_challenge" :: Text)]
     ReqSudoLogin user proof -> object ["method" .= ("sudo_login" :: Text), "user" .= user, "proof" .= proof]
+    ReqNormalization payload -> object ["method" .= ("normalization_analyze" :: Text), "request" .= payload]
     ReqQuery sql -> object ["method" .= ("query" :: Text), "sql" .= sql]
     ReqPing -> object ["method" .= ("ping" :: Text)]
     ReqQuit -> object ["method" .= ("quit" :: Text)]
@@ -184,6 +191,7 @@ data ServerResponse
     | RespPong
     | RespBye
     | RespError Text Text
+    | RespNormalization Value
     | RespStorage Value
     | RespCatalog [TableInfo]
     | RespDatabases [Text]
@@ -205,6 +213,7 @@ responseJson response = case response of
     RespPong -> object ["status" .= ("pong" :: Text)]
     RespBye -> object ["status" .= ("bye" :: Text)]
     RespError code message -> object ["status" .= ("error" :: Text), "code" .= code, "message" .= message]
+    RespNormalization value -> object ["status" .= ("normalization" :: Text), "analysis" .= value]
     RespStorage value -> object ["status" .= ("storage" :: Text), "response" .= value]
     RespCatalog infos -> object ["status" .= ("catalog" :: Text), "schemas" .= infos]
     RespDatabases names -> object ["status" .= ("databases" :: Text), "databases" .= names]
@@ -238,6 +247,9 @@ decodeResponse raw = case A.eitherDecode raw of
         "result" -> case A.fromJSON (A.Object fields) of
             A.Success result -> Right (RespResult result)
             A.Error message -> Left (T.pack message)
+        "normalization" -> case KM.lookup "analysis" fields of
+            Nothing -> Left "normalization response is missing analysis"
+            Just value -> either (Left . T.pack) (Right . RespNormalization) (parseEither parseNormalizationReport value)
         "catalog" -> fromField "schemas" RespCatalog fields
         "databases" -> fromField "databases" RespDatabases fields
         "roles" -> fromField "roles" RespRoles fields

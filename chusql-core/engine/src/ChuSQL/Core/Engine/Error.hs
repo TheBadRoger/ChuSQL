@@ -1,12 +1,12 @@
-module ChuSQL.Core.Engine.Error
-    ( ErrorCategory (..)
-    , ErrorRule (..)
-    , errorRules
-    , errorCategory
-    , errorCode
-    , errorLike
-    , accountErrorCode
-    ) where
+module ChuSQL.Core.Engine.Error (
+    ErrorCategory (..),
+    ErrorRule (..),
+    errorRules,
+    errorCategory,
+    errorCode,
+    errorLike,
+    accountErrorCode,
+) where
 
 import Data.List (isInfixOf)
 
@@ -35,6 +35,8 @@ errorRules :: [ErrorRule]
 errorRules =
     [ ErrorRule "no database selected" NoDatabaseError "no_database"
     , ErrorRule "administrator required" PermissionError "forbidden"
+    , ErrorRule "bound query object changed" CatalogError "serialization_failure"
+    , ErrorRule "bound query schema changed" CatalogError "serialization_failure"
     , ErrorRule "unknown table" CatalogError "not_found"
     , ErrorRule "unknown domain" CatalogError "not_found"
     , ErrorRule "domain is still used" CatalogError "query_error"

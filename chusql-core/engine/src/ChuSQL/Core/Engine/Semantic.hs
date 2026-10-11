@@ -1,12 +1,12 @@
 module ChuSQL.Core.Engine.Semantic (check, prepare, prepareRowExpression, querySchema) where
 
 import ChuSQL.Core.Engine.Algebra.Expr (bareColumns, colsInExpr, hasAggregate)
-import ChuSQL.Core.Model
-import ChuSQL.Core.Engine.Syntax.AST
-import ChuSQL.Core.Engine.Syntax.Parser (parseExpression)
 import ChuSQL.Core.Engine.Runtime.Functions (FunctionSignature (..), builtinFunctions, functionSignature)
 import ChuSQL.Core.Engine.Runtime.SQL (resolveSQLFunction, sqlResultType, sqlType)
 import ChuSQL.Core.Engine.Runtime.Types
+import ChuSQL.Core.Engine.Syntax.AST
+import ChuSQL.Core.Engine.Syntax.Parser (parseExpression)
+import ChuSQL.Core.Model
 import Data.Char (isAlphaNum, isAscii, toLower)
 import Data.List (intercalate, isInfixOf, isPrefixOf, isSuffixOf, nub)
 
@@ -115,7 +115,7 @@ checkGrouping env keys items
         mapM_ (checkRuntimeColumn "GROUP BY" env) keys
         mapM_ okCol (nub (concatMap (bareColumns . snd) items))
   where
-    -- | 这一列能不能出现在分组查询里
+    -- \| 这一列能不能出现在分组查询里
     okCol c
         | c == allColumns = Left "SELECT: * cannot be selected together with GROUP BY"
         | c `elem` keys = Right ()
@@ -129,6 +129,8 @@ renderType (InferType t) = typeLabel t
 -- | 推导表达式的类型（子查询也在这里整条查一遍）
 inferExpr :: Database -> String -> Scope -> Expr -> Either String InferredType
 inferExpr _ place env (Col c) = inferredColumnType . columnType . snd <$> scopeAt place env c
+inferExpr _ _ _ ColumnSlot{} = Left "execution column cannot be used in semantic input"
+inferExpr _ _ _ OuterColumnSlot{} = Left "execution column cannot be used in semantic input"
 inferExpr _ _ _ LitNull = Right InferNull
 inferExpr _ _ _ (LitInt _) = Right (InferType CInt)
 inferExpr _ _ _ (LitFloat _) = Right (InferType CFloat)
@@ -231,18 +233,23 @@ itemType place want got
 -- | 推导子查询的输出列与类型
 inferSubqueryOutput :: Database -> Scope -> Subquery -> Either String [(String, InferredType)]
 inferSubqueryOutput db outerScope sq = case subqueryStatement sq of
-    q@Select { selectCols = cols } -> do
+    SelectDistinct q -> do
+        columns <- inferSubqueryOutput db outerScope sq{subqueryStatement = q}
+        mapM_ (requireOrdering "DISTINCT" . snd) columns
+        _ <- distinctOrdering q
+        Right columns
+    q@Select{selectCols = cols} -> do
         env <- checkFrom db enclosing (selectFrom q)
         checkResolvedWith db enclosing q
         mapM (columnTypeOf env) cols
-    q@SelectExpr { selectItems = items } -> do
+    q@SelectExpr{selectItems = items} -> do
         env <- checkFrom db enclosing (selectFrom q)
         checkResolvedWith db enclosing q
         mapM (\(l, e) -> (\t -> (l, t)) <$> inferExpr db "SELECT" (Scope env enclosing) e) items
     _ -> Left "subquery must be a SELECT"
   where
     enclosing = scopeFlat outerScope
-    -- | 查这一列的推导类型
+    -- \| 查这一列的推导类型
     columnTypeOf env c = do
         (_, col) <- scopeAt "SELECT" (Scope env enclosing) c
         Right (c, inferredColumnType (columnType col))
@@ -278,7 +285,7 @@ arithmetic db place env a b = do
     mapM_ (numericOperand place (InferType want) (InferType want)) [ta, tb]
     Right (arithResult ta tb)
   where
-    -- | 是不是浮点类型
+    -- \| 是不是浮点类型
     isFloatSide (InferType x) = numericType x && not (integerType x)
     isFloatSide _ = False
 
@@ -312,7 +319,7 @@ boolean db place env a b = do
     mapM_ (boolOperand place ta) [ta, tb]
     Right (InferType CBool)
   where
-    -- | 挨个查操作数是不是布尔
+    -- \| 挨个查操作数是不是布尔
     boolOperand _ _ InferNull = Right ()
     boolOperand _ _ (InferType ty) | typeClassOf ty == BooleanClass = Right ()
     boolOperand p other t = Left (p ++ ": operator needs TBool on both sides, got " ++ renderType other ++ " and " ++ renderType t)
@@ -419,13 +426,13 @@ resolveDomainTypes db statement = case statement of
     AlterColumnType name col ty -> AlterColumnType name col <$> resolveDomainType ty
     _ -> Right statement
   where
-    -- | 解析一列的类型
+    -- \| 解析一列的类型
     resolveColumnType (name, col) = do
         ty <- resolveDomainType (columnType col)
-        Right (name, col {columnType = ty})
-    -- | 从类型目录取基础类型
+        Right (name, col{columnType = ty})
+    -- \| 从类型目录取基础类型
     resolveDomainType = resolveWith []
-    -- | 递归解析类型并拒绝循环定义
+    -- \| 递归解析类型并拒绝循环定义
     resolveWith seen (CDomain name _)
         | map toLower name `elem` seen = Left ("cyclic domain definition: " ++ name)
         | otherwise = do
@@ -442,6 +449,7 @@ checkResolved db = checkResolvedWith db []
 -- | 检查已解析的语句；outer 是相关子查询能看见的外层列
 checkResolvedWith :: Database -> [(String, Column)] -> Statement -> Either String ()
 checkResolvedWith db outer q = case q of
+    SelectDistinct inner -> () <$ inferSubqueryOutput db (Scope [] outer) (Subquery (SelectDistinct inner) [])
     Select
         { selectCols = cols
         , selectFrom = fromC
@@ -552,6 +560,7 @@ checkResolvedWith db outer q = case q of
         if length (nub (map fst attributes)) == length attributes
             then Right ()
             else Left "duplicate identity attribute"
+    ShowGrants -> Right ()
     ShowRoles -> Right ()
     DropUser name -> checkUserName name
     CreateRole name -> checkRoleName name
@@ -560,6 +569,7 @@ checkResolvedWith db outer q = case q of
         mapM_ checkPrivilege privs
         checkGrantObject obj
         checkRoleName role
+    RevokeGrantOption privs obj role -> checkResolvedWith db outer (RevokePrivileges privs obj role)
     RevokePrivileges privs obj role -> do
         mapM_ checkPrivilege privs
         checkGrantObject obj
@@ -577,11 +587,11 @@ checkResolvedWith db outer q = case q of
     CreateDomain{} -> Right ()
     DropDomain{} -> Right ()
     ShowDomains -> Right ()
-    -- | 事务控制由会话层执行，语义层不做列检查
+    -- \| 事务控制由会话层执行，语义层不做列检查
     BeginTransaction -> Right ()
     CommitTransaction -> Right ()
     RollbackTransaction -> Right ()
-    -- | 保存点名字只是会话层的记号，不做列检查
+    -- \| 保存点名字只是会话层的记号，不做列检查
     Savepoint _ -> Right ()
     RollbackToSavepoint _ -> Right ()
     ReleaseSavepoint _ -> Right ()
@@ -615,10 +625,11 @@ checkColumnDefs names cols = do
         else Right ()
     checkChecks names cols
   where
-    -- | 拒绝缺少能力实现的运行时键
+    -- \| 拒绝缺少能力实现的运行时键
     checkRuntimeKey (_, column)
         | typeClassOf (columnType column) == RuntimeClass
-        , columnUnique column || columnPrimaryKey column = Left "runtime type key capability is not registered"
+        , columnUnique column || columnPrimaryKey column =
+            Left "runtime type key capability is not registered"
         | otherwise = Right ()
 
 -- | 校验列类型的长度和精度参数
@@ -649,13 +660,13 @@ checkDefault c v
 checkChecks :: [String] -> [(String, Column)] -> Either String ()
 checkChecks names = mapM_ checkOne
   where
-    -- | 查这一列的 CHECK
+    -- \| 查这一列的 CHECK
     checkOne (_, c) = case columnCheck c of
         Nothing -> Right ()
         Just text -> case parseExpression text of
             Left err -> Left ("CHECK: " ++ firstLine err)
             Right e -> mapM_ (known e) (colsInExpr e)
-    -- | 这个列名在不在定义里
+    -- \| 这个列名在不在定义里
     known _ col
         | col `elem` names = Right ()
         | otherwise = Left ("CHECK: unknown column: " ++ col)
@@ -683,7 +694,7 @@ checkUserName name
     | not (all allowed name) = Left "USER: account name may only contain ASCII letters, digits, dot, dash or underscore"
     | otherwise = Right ()
   where
-    -- | 账号名字符规则
+    -- \| 账号名字符规则
     allowed c = isAscii c && (isAlphaNum c || c `elem` ("_.-" :: String))
 
 -- | 建号 / 改口令：名字合法且口令不空
@@ -706,7 +717,7 @@ checkRoleName name
     | map toLower name `elem` privilegeNames = Left "ROLE: role name must not be a privilege keyword"
     | otherwise = Right ()
   where
-    -- | 角色名字符规则
+    -- \| 角色名字符规则
     allowed c = isAscii c && (isAlphaNum c || c `elem` ("_.-" :: String))
 
 -- | 权限关键字（小写，只用于比较）
@@ -728,12 +739,13 @@ checkGrantObject obj
     | not (all allowed obj) = Left "GRANT: object name may only contain ASCII letters, digits, dot, dash or underscore"
     | otherwise = Right ()
   where
-    -- | 授权对象字符规则
+    -- \| 授权对象字符规则
     allowed c = isAscii c && (isAlphaNum c || c `elem` ("_.-" :: String))
 
 -- | 内置 id 列名
 idColumn :: String
 idColumn = "id"
+
 -- | 把列引用统一为执行期名字（子查询一起解析）
 resolveExpr ::
     Database ->
@@ -783,7 +795,7 @@ resolveExpr db env outer f e = case e of
     QuantCmp op a sq q -> QuantCmp op <$> resolveExpr db env outer f a <*> resolveSubquery db (env ++ outer) sq <*> pure q
     _ -> Right e
   where
-    -- | 递归处理两个子表达式
+    -- \| 递归处理两个子表达式
     binary ctor a b = ctor <$> resolveExpr db env outer f a <*> resolveExpr db env outer f b
 
 -- | 校验具体构造器和参数逻辑类型
@@ -800,7 +812,7 @@ inferConstruction db place env ty@(TypeApply cid parameters) arguments = do
     required <- mapM (fmap descriptorId . resolveType builtinTypes) expected
     if supplied == required then Right (descriptorId descriptor) else Left "composite constructor argument type mismatch"
   where
-    -- | 解析非空参数的逻辑类型身份
+    -- \| 解析非空参数的逻辑类型身份
     argumentIdentity InferNull = Left "SQL NULL needs Maybe construction inside a runtime value"
     argumentIdentity (InferType column) = sqlType column
 
@@ -829,7 +841,7 @@ outerRefsOf db stmt = nub [c | c <- statementColumns stmt, not (inInner c)]
     inner = case checkFrom db [] (statementFrom stmt) of
         Right env -> env
         Left _ -> []
-    -- | 这一列能不能在内层解析到
+    -- \| 这一列能不能在内层解析到
     inInner c = case resolveColumn c inner of
         Right _ -> True
         Left _ -> False
@@ -837,13 +849,14 @@ outerRefsOf db stmt = nub [c | c <- statementColumns stmt, not (inInner c)]
 -- | 一条语句里出现的所有列引用
 statementColumns :: Statement -> [String]
 statementColumns stmt = case stmt of
+    SelectDistinct q -> statementColumns q
     Select cols fromC mWhere groupBy orderBy _ ->
         cols ++ fromColumns fromC ++ concatMap colsInExpr mWhere ++ groupBy ++ map fst orderBy
     SelectExpr items fromC mWhere groupBy orderBy _ ->
         concatMap (colsInExpr . snd) items ++ fromColumns fromC ++ concatMap colsInExpr mWhere ++ groupBy ++ map fst orderBy
     _ -> []
   where
-    -- | 取 FROM 里出现的列
+    -- \| 取 FROM 里出现的列
     fromColumns FromUnit = []
     fromColumns (FromTable _ _) = []
     fromColumns (FromSubquery _ _) = []
@@ -851,12 +864,14 @@ statementColumns stmt = case stmt of
 
 -- | 取语句的 FROM 子句，没有就是 FromUnit
 statementFrom :: Statement -> FromClause
-statementFrom Select { selectFrom = fromC } = fromC
-statementFrom SelectExpr { selectFrom = fromC } = fromC
+statementFrom (SelectDistinct q) = statementFrom q
+statementFrom Select{selectFrom = fromC} = fromC
+statementFrom SelectExpr{selectFrom = fromC} = fromC
 statementFrom _ = FromUnit
 
 -- | 解析子查询里的 SELECT
 resolveSubqueryStatement :: Database -> [(String, Column)] -> Statement -> Either String Statement
+resolveSubqueryStatement db outer (SelectDistinct q) = SelectDistinct <$> resolveSubqueryStatement db outer q
 resolveSubqueryStatement db outer q@Select{} = resolveQuery db outer q (map (\c -> (c, Col c)) (selectCols q))
 resolveSubqueryStatement db outer q@SelectExpr{} = resolveQuery db outer q (selectItems q)
 resolveSubqueryStatement _ _ _ = Left "subquery must be a SELECT"
@@ -864,6 +879,7 @@ resolveSubqueryStatement _ _ _ = Left "subquery must be a SELECT"
 -- | 列名解析入口：查询走连接解析，改数据的语句按本表列解析
 resolveStatement :: Database -> Statement -> Either String Statement
 resolveStatement db q = case q of
+    SelectDistinct inner -> SelectDistinct <$> resolveStatement db inner
     Select{} -> resolveSelect db q
     SelectExpr{} -> resolveSelect db q
     Update tbl assigns mWhere -> do
@@ -923,37 +939,45 @@ resolveQuery :: Database -> [(String, Column)] -> Statement -> [(String, Expr)] 
 resolveQuery db outer q items = do
     source <- resolveSource db outer (selectFrom q)
     env <- checkFrom db outer source
-    -- | 单表无别名时把裸列名换成物理列名；带别名时表头保留别名限定名
+    -- \| 单表无别名时把裸列名换成物理列名；带别名时表头保留别名限定名
     let physical c = case selectFrom q of
             FromTable Nothing tbl -> unqualify (Just (deriveQualifier Nothing tbl)) c
             _ -> c
-        -- | 查一列并换算成物理名
+        -- \| 查一列并换算成物理名
         name place c
             | length (filter (== '.') c) == 2, not (qualifiedReference c) = Left (missingColumn place c env)
             | otherwise = physical . fst <$> scopedColumnAt place env outer c
-        -- | 库限定列只引用来源中的真实表名
-        qualifiedReference c = qualifiedReferenceIn db (selectFrom q) c
-            || (any (\(key, _) -> length (filter (== '.') key) == 1 && ("." ++ key) `isSuffixOf` c) outer
-                && (not (any (elem '.' . fst) db) || any (\(table, _) -> (table ++ ".") `isPrefixOf` c) db))
-        -- | 换算一个投影项：带别名时保留别名做输出列名
+        -- \| 库限定列只引用来源中的真实表名
+        qualifiedReference c =
+            qualifiedReferenceIn db (selectFrom q) c
+                || ( any (\(key, _) -> length (filter (== '.') key) == 1 && ("." ++ key) `isSuffixOf` c) outer
+                        && (not (any (elem '.' . fst) db) || any (\(table, _) -> (table ++ ".") `isPrefixOf` c) db)
+                   )
+        -- \| 换算一个投影项：带别名时保留别名做输出列名
         output (label, Col c) = do
             k <- name "SELECT" c
             pure (if label == c then (k, Col k) else (label, Col k))
         output (label, e) = do
             e' <- resolveExpr db env outer (name "SELECT") e
             pure (label, e')
-    projected <- if items == [("*", Col "*")]
-        then if null env && selectFrom q == FromUnit
-            then Left "SELECT: * requires FROM"
-            else Right [(physical c, Col (physical c)) | (c, _) <- env]
-        else mapM output items
+    projected <-
+        if items == [("*", Col "*")]
+            then
+                if null env && selectFrom q == FromUnit
+                    then Left "SELECT: * requires FROM"
+                    else Right [(physical c, Col (physical c)) | (c, _) <- env]
+            else mapM output items
     condition <- mapM (resolveExpr db env outer (name "WHERE")) (selectWhere q)
     grouping <- mapM (name "GROUP BY") (selectGroupBy q)
-    -- | 优先解析唯一投影别名，再查来源列
-    let orderName c = case [label | (label, _) <- projected, label == c, qIsExpression] of
-            [] -> name "ORDER BY" c
-            [label] -> Right label
-            _ -> Left ("ORDER BY: ambiguous projection alias: " ++ c)
+    -- \| 优先解析唯一投影别名，再查来源列
+    let orderName c
+            | "$position" `isPrefixOf` c = case reads (drop 9 c) of
+                [(n, "")] | n > 0, n <= length projected -> Right (fst (projected !! (n - 1)))
+                _ -> Left "ORDER BY: position is outside the select list"
+            | otherwise = case [label | (label, _) <- projected, label == c, qIsExpression] of
+                [] -> name "ORDER BY" c
+                [label] -> Right label
+                _ -> Left ("ORDER BY: ambiguous projection alias: " ++ c)
         qIsExpression = case q of SelectExpr{} -> True; _ -> False
     ordering <- mapM (\(c, d) -> (\k -> (k, d)) <$> orderName c) (selectOrderBy q)
     pure $ case q of
@@ -994,7 +1018,7 @@ resolveFrom db outer (FromJoin kind left right cond) = do
     l <- resolveFrom db outer left
     r <- resolveFrom db outer right
     env <- checkFrom db outer (FromJoin kind l r cond)
-    -- | 连接条件也拒绝不存在的库前缀
+    -- \| 连接条件也拒绝不存在的库前缀
     let joinName column
             | length (filter (== '.') column) == 2, not (qualifiedReferenceIn db (FromJoin kind left right cond) column) = Left (missingColumn "ON" column env)
             | otherwise = fst <$> columnAt "ON" env column
@@ -1003,7 +1027,8 @@ resolveFrom db outer (FromJoin kind left right cond) = do
 
 -- | 派生表的输出列名：列取裸名，表达式保留原标签
 nameDerivedColumns :: Statement -> Either String Statement
-nameDerivedColumns q@Select { selectCols = cols, selectFrom = fromC } = do
+nameDerivedColumns (SelectDistinct q) = SelectDistinct <$> nameDerivedColumns q
+nameDerivedColumns q@Select{selectCols = cols, selectFrom = fromC} = do
     let names = map lastTablePart cols
     checkDerivedNames names
     Right
@@ -1015,10 +1040,10 @@ nameDerivedColumns q@Select { selectCols = cols, selectFrom = fromC } = do
             (selectOrderBy q)
             (selectLimit q)
         )
-nameDerivedColumns q@SelectExpr { selectItems = items } = do
+nameDerivedColumns q@SelectExpr{selectItems = items} = do
     let names = map derivedItemName items
     checkDerivedNames names
-    Right q { selectItems = zip names (map snd items) }
+    Right q{selectItems = zip names (map snd items)}
 nameDerivedColumns _ = Left "FROM: subquery must be a SELECT"
 
 -- | 派生表里一个投影项的输出名：没写别名的列取裸名
@@ -1032,7 +1057,7 @@ derivedItemName (label, _) = label
 checkDerivedNames :: [String] -> Either String ()
 checkDerivedNames = go []
   where
-    -- | 逐个查有没有见过
+    -- \| 逐个查有没有见过
     go _ [] = Right ()
     go seen (n : ns)
         | n `elem` seen = Left ("FROM: duplicate column name in subquery: " ++ n)

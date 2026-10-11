@@ -12,11 +12,14 @@ import ChuSQL.Core.Engine.Storage.IPC (
     setStorageLink,
  )
 import ChuSQL.Core.Engine.Syntax.AST (Statement)
+import ChuSQL.Interface.Normalization
+import ChuSQL.Server.Normalization (normalizationBudget, normalizationReport, schemaFingerprint)
+import ChuSQL.Core.Protocol (SchemaColumn (..))
 import Data.IORef (newIORef, readIORef, writeIORef)
 import ChuSQL.Core.Engine.Syntax.Parser (parseStatement)
-import ChuSQL.Core.Model (Database, Histogram (..), Row, Table (..), Value (..), pattern TInt, pattern TStr)
+import ChuSQL.Core.Model (Database, Histogram (..), Row, Table (..), TableIdentity (..), Value (..), pattern TInt, pattern TStr)
 import ChuSQL.Interface.Auth (hashPasswordWith)
-import ChuSQL.Interface.Protocol (ClientRequest (..), Grant (..), RoleView (..), ServerResponse (..), decodeRequest, encodeResponse)
+import ChuSQL.Interface.Protocol (ClientRequest (..), Grant (..), RoleView (..), ServerResponse (..), decodeRequest, encodeResponse, encodeRequest, decodeResponse)
 import ChuSQL.Interface.RateLimit (newRateLimiter)
 import ChuSQL.Interface.Link (connectClient, closeClient, clientSudoLogin, clientQuery)
 import ChuSQL.Interface.Sudo (SudoCredential, newSudoCredential, sudoProof, verifySudoProof, validSudoChallenge,
@@ -33,6 +36,7 @@ import ChuSQL.Server.Privileges (
     claimObject,
     prepareObject,
     listRoleViews,
+    listSelfGrants,
     newPrivileges,
     runPrivilegeCommand,
  )
@@ -47,7 +51,7 @@ import ChuSQL.Server.TCP (
     startServer,
     isLocalPeer,
  )
-import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent (forkIO, forkFinally, killThread, threadDelay)
 import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, takeMVar)
 import System.Timeout (timeout)
 import Control.Exception (IOException, bracket, finally, try)
@@ -64,7 +68,7 @@ import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Vector as V
-import Data.Time.Clock (addUTCTime, getCurrentTime)
+import Data.Time.Clock (addUTCTime, diffUTCTime, getCurrentTime)
 import Network.Socket (
     AddrInfo (..),
     SockAddr (..),
@@ -105,6 +109,7 @@ main = hspec spec
 -- | 全部用例
 spec :: Spec
 spec = do
+    normalizationSpec
     describe "sudo authentication" $ do
         it "defaults to disabled and rejects unconfigured TCP authentication" $
             withTcpServer defaultServerConfig $ \_ handle -> withConnection handle $ \client -> do
@@ -380,14 +385,14 @@ testDb =
             [ [("id", VInt i), ("name", VStr ("user" ++ show i)), ("age", VInt (20 + i))]
             | i <- [1 .. 5]
             ]
-            Nothing
+            Nothing Nothing Nothing
       )
     , ( "orders"
       , Table
             "orders"
             [("id", TInt), ("user_id", TInt)]
             [[("id", VInt 1), ("user_id", VInt 1)]]
-            Nothing
+            Nothing Nothing Nothing
       )
     ]
 
@@ -1125,6 +1130,44 @@ withObjectPrivileges body = do
 -- 验证对象作用域、授权来源和外部入口。
 objectPrivilegeSpec :: Spec
 objectPrivilegeSpec = describe "stable object privileges" $ do
+    it "lists only the caller's effective grants including roles and PUBLIC" $ withObjectPrivileges $ \backend service root -> do
+        runPrivilegeCommand service root testDatabase (CreateRoleCommand "self_reader") `shouldReturn` Right ()
+        runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "self_reader" True) `shouldReturn` Right ()
+        runPrivilegeCommand service root testDatabase (GrantRoleCommand "self_reader" ["alice"]) `shouldReturn` Right ()
+        grants <- listSelfGrants service (Ordinary testAccount)
+        grants `shouldSatisfy` either (const False) (elem (Grant "alice" "select" "test.users" True))
+        grants `shouldSatisfy` either (const False) (elem (Grant "alice" "connect" "database:test" False))
+        grants `shouldSatisfy` either (const False) (all ((== "alice") . grantRole))
+        runPrivilegeCommand service root testDatabase (RevokePrivilegesCommand ["select"] "users" "self_reader") `shouldReturn` Right ()
+        after <- listSelfGrants service (Ordinary testAccount)
+        after `shouldSatisfy` either (const False) (not . any ((== "test.users") . grantObject))
+        _ <- beAccounts backend (ReqAccountReset "alice" (testPasswordHash "Alice-Secret-1234"))
+        _ <- beAccounts backend (ReqAccountCreate testRootName (testPasswordHash testRootPassword))
+        _ <- beAccounts backend (ReqIdentityAlter testRootName Nothing (Just True) Nothing Nothing Nothing)
+        settings <- tempSettingsPath "self-grants"
+        session <- newSession backend testRootName settings
+        authenticateSessionCoded session "alice" "Alice-Secret-1234" `shouldReturn` Right ()
+        result <- mustSql session "SHOW GRANTS"
+        qrColumns result `shouldBe` ["identity", "privilege", "object", "grant_option"]
+        qrRows result `shouldSatisfy` all (\row -> take 1 row == [VStr "alice"])
+        rejected <- runStatementCoded session "SHOW GRANTS FOR admin"
+        rejected `shouldSatisfy` either (const True) (const False)
+    it "includes ownership permissions and excludes ungranted tables" $ withObjectPrivileges $ \backend service _ -> do
+        mustRun (beStatement (beWithDatabase backend "test") "CREATE TABLE personal_owned (id INT)")
+        claimObject service (Ordinary testAccount) testDatabase "personal_owned" `shouldReturn` Right ()
+        grants <- listSelfGrants service (Ordinary testAccount)
+        fmap (filter ((== "test.personal_owned") . grantObject)) grants `shouldBe` Right
+            [Grant "alice" privilege "test.personal_owned" True | privilege <- ["select", "insert", "update", "delete"]]
+        grants `shouldSatisfy` either (const False) (not . any ((== "test.users") . grantObject))
+
+    it "checks DISTINCT table reads and nested subqueries" $ withObjectPrivileges $ \_ service root -> do
+        authorizeSql service (Ordinary testAccount) "SELECT DISTINCT age FROM users"
+            `shouldReturn` Left (PrivilegeError "forbidden" "permission denied: SELECT ON users")
+        authorizeSql service (Ordinary testAccount) "SELECT DISTINCT d.age FROM (SELECT DISTINCT age FROM users) d"
+            `shouldReturn` Left (PrivilegeError "forbidden" "permission denied: SELECT ON users")
+        runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "alice" False) `shouldReturn` Right ()
+        authorizeSql service (Ordinary testAccount) "SELECT DISTINCT age FROM users" `shouldReturn` Right ()
+
     it "migrates old table grants once and ignores later legacy writes" $ withObjectPrivileges $ \backend service _ -> do
         let system = beWithDatabase backend "system"
         mustRun (beStatement system "CREATE TABLE __system_grants (role VARCHAR(64), privilege VARCHAR(16), object VARCHAR(128))")
@@ -1204,6 +1247,41 @@ objectPrivilegeSpec = describe "stable object privileges" $ do
         authorizeSql service (Ordinary testAccount) "DROP DATABASE test" `shouldReturn` Left (PrivilegeError "forbidden" "object owner required")
         runPrivilegeCommand service root testDatabase (RevokePrivilegesCommand ["select"] "users" "alice") `shouldReturn` Right ()
         authorizeSql service (Ordinary testAccount) "SELECT * FROM users" `shouldReturn` Right ()
+    it "executes grant option revocation over TCP and keeps SELECT" $
+        withTcpServer defaultServerConfig $ \_ handle -> withConnection handle $ \admin -> do
+            _ <- tcpLogin admin "admin" "s3cret"
+            _ <- tcpQuery admin "USE test"
+            _ <- tcpQuery admin "CREATE USER option_reader IDENTIFIED BY 'Option-Reader-1234'"
+            tcpQuery admin "GRANT SELECT ON users TO option_reader WITH GRANT OPTION" >>= \reply -> at "status" reply `shouldBe` A.String "result"
+            tcpQuery admin "REVOKE GRANT OPTION FOR SELECT ON users FROM option_reader" >>= \reply -> at "status" reply `shouldBe` A.String "result"
+            withConnection handle $ \reader -> do
+                _ <- tcpLogin reader "option_reader" "Option-Reader-1234"
+                _ <- tcpQuery reader "USE test"
+                tcpQuery reader "SELECT DISTINCT age FROM users ORDER BY 1" >>= \reply -> at "status" reply `shouldBe` A.String "result"
+                tcpQuery reader "SHOW GRANTS" >>= \reply -> at "status" reply `shouldBe` A.String "result"
+                tcpQuery reader "GRANT SELECT ON users TO admin" >>= \reply -> at "code" reply `shouldBe` A.String "forbidden"
+    it "revokes grant option while preserving data access and independent sources" $ withObjectPrivileges $ \_ service root -> do
+        runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "alice" True) `shouldReturn` Right ()
+        runPrivilegeCommand service (Ordinary testAccount) testDatabase (GrantPrivilegesCommand ["select"] "users" "bob" True) `shouldReturn` Right ()
+        runPrivilegeCommand service (Ordinary testAccount{accountUser = "bob"}) testDatabase (GrantPrivilegesCommand ["select"] "users" "carol" False) `shouldReturn` Right ()
+        runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "carol" False) `shouldReturn` Right ()
+        affectedAccounts service (RevokeGrantOptionCommand ["select"] "users" "alice") `shouldReturn` Right ["alice", "bob", "carol"]
+        runPrivilegeCommand service root testDatabase (RevokeGrantOptionCommand ["select"] "users" "alice") `shouldReturn` Right ()
+        authorizeSql service (Ordinary testAccount) "SELECT * FROM users" `shouldReturn` Right ()
+        grants <- listSelfGrants service (Ordinary testAccount)
+        grants `shouldSatisfy` either (const False) (elem (Grant "alice" "select" "test.users" False))
+        authorizeSql service (Ordinary testAccount{accountUser = "bob"}) "SELECT * FROM users"
+            `shouldReturn` Left (PrivilegeError "forbidden" "permission denied: SELECT ON users")
+        authorizeSql service (Ordinary testAccount{accountUser = "carol"}) "SELECT * FROM users" `shouldReturn` Right ()
+        runPrivilegeCommand service (Ordinary testAccount) testDatabase (GrantPrivilegesCommand ["select"] "users" "bob" False)
+            `shouldReturn` Left (PrivilegeError "forbidden" "grant option required: SELECT ON users")
+    it "revokes only the caller's grant option source" $ withObjectPrivileges $ \_ service root -> do
+        runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "alice" True) `shouldReturn` Right ()
+        runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "bob" True) `shouldReturn` Right ()
+        runPrivilegeCommand service (Ordinary testAccount) testDatabase (GrantPrivilegesCommand ["select"] "users" "bob" True) `shouldReturn` Right ()
+        runPrivilegeCommand service (Ordinary testAccount) testDatabase (RevokeGrantOptionCommand ["select"] "users" "bob") `shouldReturn` Right ()
+        grants <- listSelfGrants service (Ordinary testAccount{accountUser = "bob"})
+        grants `shouldSatisfy` either (const False) (elem (Grant "bob" "select" "test.users" True))
     it "cascades multihop delegations after the source grant is revoked" $ withObjectPrivileges $ \_ service root -> do
         runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "alice" True) `shouldReturn` Right ()
         runPrivilegeCommand service (Ordinary testAccount) testDatabase (GrantPrivilegesCommand ["select"] "users" "bob" True) `shouldReturn` Right ()
@@ -1436,6 +1514,17 @@ intValues rows = [n | row <- rows, Just (VInt n) <- [nth 0 row]]
 -- | 显式事务用例
 transactionSpec :: Spec
 transactionSpec = describe "server transactions" $ do
+    it "executes DISTINCT against the connection snapshot with output columns" $ withMemorySession $ \session -> do
+        _ <- mustSql session "CREATE TABLE distinct_values (id INT, value INT)"
+        _ <- mustSql session "INSERT INTO distinct_values (id,value) VALUES (1,7),(2,7),(3,8)"
+        _ <- mustSql session "BEGIN"
+        _ <- mustSql session "UPDATE distinct_values SET value = 9 WHERE id = 3"
+        result <- mustSql session "SELECT DISTINCT value FROM distinct_values ORDER BY 1"
+        qrColumns result `shouldBe` ["value"]
+        qrRows result `shouldBe` [[VInt 7], [VInt 9]]
+        _ <- mustSql session "ROLLBACK"
+        pure ()
+
     it "preserves concurrent changes in a large untouched table" $ withTwoSessions $ \first second -> do
         _ <- mustSql first "CREATE TABLE untouched (id INT, value INT)"
         let values = T.intercalate "," [T.pack ("(" ++ show key ++ ",0)") | key <- [1 .. 5000 :: Int]]
@@ -1458,8 +1547,8 @@ transactionSpec = describe "server transactions" $ do
         qrRows result `shouldBe` [[VInt 7], [VInt (-3)], [VInt 4]]
 
     it "filters qualified memory tables and preserves other databases on writes" $ do
-        let local = Table "users" [("id", TInt)] [[("id", VInt 1)]] Nothing
-            otherTable = Table "users" [("id", TInt)] [[("id", VInt 2)]] Nothing
+        let local = Table "users" [("id", TInt)] [[("id", VInt 1)]] Nothing Nothing Nothing
+            otherTable = Table "users" [("id", TInt)] [[("id", VInt 2)]] Nothing Nothing Nothing
         ref <- newMVar [("test.users", local), ("other.users", otherTable)]
         let backend = memoryBackend "test" ref
         selected <- beStatement backend "SELECT id FROM users"
@@ -1470,11 +1559,36 @@ transactionSpec = describe "server transactions" $ do
         fmap (const ()) updated `shouldBe` Right ()
         snapshot <- beSnapshot (memoryBackend "other" ref)
         fmap (map (tableRows . snd)) snapshot `shouldBe` Right [[[ ("id", VInt 2) ]]]
+    it "keeps catalog and snapshot identities stable across system views and replacements" $ do
+        ref <- newMVar [("test.users", Table "users" [("id", TInt)] [] Nothing Nothing Nothing)]
+        let backend = memoryBackend "test" ref
+        first <- beCatalog backend
+        fmap (map tiIdentity) first `shouldBe` Right [Just (TableIdentity 1 1)]
+        _ <- beSnapshot (beWithDatabase backend "system")
+        saved <- beSnapshot backend
+        fmap (map (tableIdentity . snd)) saved `shouldBe` Right [Just (TableIdentity 1 1)]
+        mustRun (beStatement backend "DROP TABLE users")
+        mustRun (beStatement backend "CREATE TABLE users (id INT)")
+        replaced <- beCatalog backend
+        fmap (map tiIdentity) replaced `shouldBe` Right [Just (TableIdentity 1 2)]
+    it "preserves memory schema versions in catalogs and snapshots" $ do
+        ref <- newMVar []
+        let backend = memoryBackend "test" ref
+        fmap (const ()) <$> beStatement backend "CREATE TABLE versioned (id INT)" `shouldReturn` Right ()
+        first <- beCatalog backend
+        fmap (map tiSchemaVersion) first `shouldBe` Right [Just 1]
+        fmap (const ()) <$> beStatement backend "ALTER TABLE versioned ADD COLUMN extra TEXT" `shouldReturn` Right ()
+        fmap (const ()) <$> beStatement backend "ALTER TABLE versioned DROP COLUMN extra" `shouldReturn` Right ()
+        current <- beCatalog backend
+        snapshot <- beSnapshot backend
+        fmap (map tiSchemaVersion) current `shouldBe` Right [Just 3]
+        fmap (map (tableSchemaVersion . snd)) snapshot `shouldBe` Right [Just 3]
     it "rejects cross-database reads and writes including nested queries" $ withMemorySession $ \session -> do
         mapM_ (\query -> do
             result <- runStatementCoded session query
             failureMessage result `shouldSatisfy` T.isInfixOf "outside the current database")
-            [ "SELECT * FROM other.users"
+            [ "SELECT DISTINCT age FROM other.users"
+            , "SELECT * FROM other.users"
             , "UPDATE other.users SET age = 1"
             , "DELETE FROM other.users"
             , "INSERT INTO other.users (id) VALUES (99)"
@@ -1962,3 +2076,122 @@ checkSudoDisabled admin handle credential sql = do
 isRightResult :: Either a b -> Bool
 isRightResult (Right _) = True
 isRightResult _ = False
+
+
+-- 专用范式协议、权限、快照与预算回归。
+normalizationSpec :: Spec
+normalizationSpec = describe "normalization endpoint" $ do
+    it "round-trips versioned requests and rejects unknown and duplicate fields" $ do
+        decodeRequest (BL.toStrict (encodeRequest (ReqNormalization normalizationPayload))) `shouldBe` Right (ReqNormalization normalizationPayload)
+        let large = ObjectIdentity 9007199254740993 18446744073709551615
+        A.fromJSON (A.toJSON large) `shouldBe` A.Success large
+        case A.eitherDecode "{\"database_id\":1e1000000000,\"object_id\":2}" :: Either String A.Value of
+            Left message -> expectationFailure message
+            Right value -> (A.fromJSON value :: A.Result ObjectIdentity) `shouldSatisfy` isJSONFailure
+
+        report <- either (fail . show) pure (normalizationReport (ObjectIdentity 1 2) [SchemaColumn name "int" True Nothing False False False Nothing | name <- ["id", "name", "age"]] "live_schema" normalizationPayload)
+        let response = RespNormalization report
+        decodeResponse (encodeResponse response) `shouldBe` Right response
+        decodeResponse (encodeResponse (RespNormalization (A.object ["conditional" A..= True]))) `shouldSatisfy` either (const True) (const False)
+        mapM_ (\raw -> decodeNormalizationJSON raw `shouldSatisfy` either (T.isInfixOf "duplicate") (const False))
+            [ "{\"a\":1,\"a\":2}", "{\"a\":1,\"\\u0061\":2}", "{\"a\":[{\"b\":1,\"b\":2}]}" ]
+        let unknown = A.object ["api_version" A..= (1 :: Int), "database" A..= ("test" :: Text), "table" A..= ("users" :: Text), "declaration" A..= nrDeclaration normalizationPayload, "ignored" A..= True]
+        (A.fromJSON unknown :: A.Result NormalizationRequest) `shouldSatisfy` isJSONFailure
+        decodeRequest (BL.toStrict (encodeRequest (ReqNormalization normalizationPayload{nrVersion = 2}))) `shouldSatisfy` either (const True) (const False)
+        decodeRequest (BL.toStrict (encodeRequest (ReqNormalization normalizationPayload{nrTable = "other.users"}))) `shouldSatisfy` either (const True) (const False)
+    it "does not infer completeness or atomicity and validates declaration budgets" $ do
+        (A.fromJSON (A.object []) :: A.Result NormalizationDeclaration) `shouldBe` A.Success (NormalizationDeclaration [] [] False Nothing)
+        let many = NormalizationDeclaration (replicate 257 ["id"]) [] True (Just True)
+        (A.fromJSON (A.toJSON many) :: A.Result NormalizationDeclaration) `shouldSatisfy` isJSONFailure
+        decodeNormalizationJSON (BL.replicate 65537 32) `shouldSatisfy` either (const True) (const False)
+        (A.fromJSON (A.object ["dependencies" A..= [A.object ["lhs" A..= (["id"] :: [Text]), "rhs" A..= ([] :: [Text])]]]) :: A.Result NormalizationDeclaration) `shouldSatisfy` isJSONFailure
+    it "authorizes ordinary SELECT users and refuses anonymous or system requests" $
+        withTcpServer defaultServerConfig $ \_ handle -> withConnection handle $ \admin -> do
+            anonymous <- tcpTalk admin (BL.toStrict (encodeRequest (ReqNormalization normalizationPayload)))
+            at "code" anonymous `shouldBe` A.String "unauthorized"
+            _ <- tcpLogin admin "admin" "s3cret"
+            _ <- tcpQuery admin "USE test"
+            _ <- tcpQuery admin "CREATE USER normalization_reader IDENTIFIED BY 'Reader-Secret-1234'"
+            withConnection handle $ \reader -> do
+                _ <- tcpLogin reader "normalization_reader" "Reader-Secret-1234"
+                _ <- tcpQuery reader "USE test"
+                denied <- tcpTalk reader (BL.toStrict (encodeRequest (ReqNormalization normalizationPayload)))
+                at "code" denied `shouldBe` A.String "forbidden"
+            _ <- tcpQuery admin "GRANT SELECT ON users TO normalization_reader"
+            withConnection handle $ \reader -> do
+                _ <- tcpLogin reader "normalization_reader" "Reader-Secret-1234"
+                _ <- tcpQuery reader "USE test"
+                reply <- tcpTalk reader (BL.toStrict (encodeRequest (ReqNormalization normalizationPayload)))
+                at "status" reply `shouldBe` A.String "normalization"
+                at "conditional" (at "analysis" reply) `shouldBe` A.Bool True
+                length (items (at "findings" (at "analysis" reply))) `shouldBe` 4
+                denied <- tcpTalk reader (BL.toStrict (encodeRequest (ReqNormalization normalizationPayload{nrTable = "__system_domain_secret"})))
+                at "code" denied `shouldBe` A.String "forbidden"
+    it "uses only the caller snapshot and refuses stable object replacement" $
+        withTcpServer defaultServerConfig $ \_ handle -> withConnection handle $ \first -> withConnection handle $ \second -> do
+            _ <- tcpLogin first "admin" "s3cret"
+            _ <- tcpLogin second "admin" "s3cret"
+            _ <- tcpQuery first "USE test"
+            _ <- tcpQuery second "USE test"
+            _ <- tcpQuery first "CREATE TABLE normalization_snapshot (id INT, value INT)"
+            _ <- tcpQuery first "BEGIN"
+            _ <- tcpQuery second "ALTER TABLE normalization_snapshot ADD COLUMN added INT"
+            let payload = normalizationPayload{nrTable = "normalization_snapshot", nrDeclaration = NormalizationDeclaration [] [] False Nothing}
+            old <- tcpTalk first (BL.toStrict (encodeRequest (ReqNormalization payload)))
+            current <- tcpTalk second (BL.toStrict (encodeRequest (ReqNormalization payload)))
+            at "view" (at "analysis" old) `shouldBe` A.String "transaction_snapshot"
+            length (items (at "schema" (at "analysis" old))) `shouldBe` 2
+            length (items (at "schema" (at "analysis" current))) `shouldBe` 3
+            at "schema_fingerprint" (at "analysis" old) `shouldNotBe` at "schema_fingerprint" (at "analysis" current)
+            _ <- tcpQuery second "DROP TABLE normalization_snapshot"
+            _ <- tcpQuery second "CREATE TABLE normalization_snapshot (id INT, value INT)"
+            stale <- tcpTalk first (BL.toStrict (encodeRequest (ReqNormalization payload)))
+            at "code" stale `shouldBe` A.String "conflict"
+            _ <- tcpQuery first "ROLLBACK"
+            pure ()
+    it "checks expected schema fingerprints and budgets the complete output" $ do
+        let columns = [SchemaColumn ("c" ++ show n) "int" True Nothing False False False Nothing | n <- [0 .. 9 :: Int]]
+            payload = normalizationPayload{nrDeclaration = NormalizationDeclaration [] [NormalizationDependency [] ["c9"]] True (Just True)}
+        schemaFingerprint (ObjectIdentity 1 2) columns `shouldNotBe` schemaFingerprint (ObjectIdentity 1 3) columns
+        normalizationReport (ObjectIdentity 1 2) columns "live_schema" payload{nrExpectedSchema = Just "outdated"}
+            `shouldBe` Left ("conflict", "normalization object or schema has changed")
+        result <- normalizationBudget (pure (normalizationReport (ObjectIdentity 1 2) columns "live_schema" payload))
+        result `shouldSatisfy` either ((== "too_large") . fst) (const False)
+    it "bounds the largest schema with maximum declared dependencies" $ do
+        let columns = [SchemaColumn ("c" ++ show n) "int" True Nothing False False False Nothing | n <- [0 .. 11 :: Int]]
+            payload = normalizationPayload{nrDeclaration = NormalizationDeclaration [] (replicate 256 (NormalizationDependency [] ["c11"])) True (Just True)}
+        started <- getCurrentTime
+        result <- normalizationBudget (pure (normalizationReport (ObjectIdentity 1 2) columns "live_schema" payload))
+        ended <- getCurrentTime
+        putStrLn ("normalization maximum input seconds: " ++ show (ended `diffUTCTime` started))
+        result `shouldSatisfy` either ((`elem` ["too_large", "timeout"]) . fst) (const False)
+        normalizationBudget (pure (Right A.Null)) `shouldReturn` Right A.Null
+    it "releases admission and execution slots after cancellation" $ do
+        started <- newEmptyMVar
+        blocker <- newEmptyMVar
+        done <- newEmptyMVar
+        worker <- forkFinally (normalizationBudget (putMVar started () >> takeMVar blocker >> pure (Right A.Null))) (putMVar done)
+        takeMVar started
+        killThread worker
+        takeMVar done >>= either (const (pure ())) (const (expectationFailure "cancelled analysis completed"))
+        ready <- newEmptyMVar
+        release <- newEmptyMVar
+        finished <- newEmptyMVar
+        replicateM_ 2 (void (forkFinally (normalizationBudget (putMVar ready () >> takeMVar release >> pure (Right A.Null))) (putMVar finished)))
+        mapM_ (\_ -> timeout 1000000 (takeMVar ready) >>= (`shouldBe` Just ())) [1, 2 :: Int]
+        replicateM_ 2 (putMVar release ())
+        replicateM_ 2 (takeMVar finished >>= either (expectationFailure . show) (`shouldBe` Right A.Null))
+    it "times out work and leaves the service usable" $ do
+        result <- normalizationBudget (threadDelay 6000000 >> pure (Right A.Null))
+        result `shouldSatisfy` either ((== "timeout") . fst) (const False)
+        normalizationBudget (pure (Right A.Null)) `shouldReturn` Right A.Null
+
+-- 共用明确声明的用户表请求。
+normalizationPayload :: NormalizationRequest
+normalizationPayload = NormalizationRequest 1 "test" "users"
+    (NormalizationDeclaration [["id"]] [NormalizationDependency ["id"] ["name", "age"]] True (Just True)) Nothing Nothing
+
+-- 判断 JSON 类型校验失败。
+isJSONFailure :: A.Result a -> Bool
+isJSONFailure (A.Error _) = True
+isJSONFailure _ = False

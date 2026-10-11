@@ -171,6 +171,131 @@ fn object_id_survives_committed_create_recovery() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+/// 读取复查跨库依赖而非只复查扫描表
+#[test]
+fn bound_reads_recheck_dependencies_in_other_databases() -> Result<(), Box<dyn std::error::Error>> {
+    let (_server, _data) = start_server();
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"create_table","table":"source","columns":[]}))?;
+    request_ok(&mut c, serde_json::json!({"method":"create_database","database":"dependency"}))?;
+    request_ok(&mut c, serde_json::json!({"method":"create_table","database":"dependency","table":"related","columns":[]}))?;
+    let catalog: serde_json::Value = serde_json::from_str(&send_raw(&mut c, r#"{"method":"all_catalogs"}"#))?;
+    let bindings: Vec<_> = catalog["schemas"].as_array().unwrap().iter().filter(|entry|
+        entry["table"] == "main.source" || entry["table"] == "dependency.related").map(|entry| {
+            let mut binding = entry.clone();
+            binding["database_id"] = binding["database_id"].as_u64().unwrap().to_string().into();
+            binding["object_id"] = binding["object_id"].as_u64().unwrap().to_string().into();
+            binding
+        }).collect();
+    assert_eq!(bindings.len(), 2);
+    let request = serde_json::json!({"method":"scan","table":"source","schema_guard":bindings});
+    let valid: serde_json::Value = serde_json::from_str(&send(&mut c, &request.to_string()))?;
+    assert_eq!(valid["status"], "guarded");
+    request_ok(&mut c, serde_json::json!({"method":"replace_schema","database":"dependency","table":"related","columns":[{"name":"new","ty":"int"}],"rows":[]}))?;
+    let invalid: serde_json::Value = serde_json::from_str(&send(&mut c, &request.to_string()))?;
+    assert_eq!(invalid["status"], "error");
+    assert!(invalid["message"].as_str().unwrap().contains("bound query schema changed: dependency.related"));
+    Ok(())
+}
+
+/// 每种读取都复查守卫，拒绝旧版本和写入
+#[test]
+fn bound_reads_validate_dependencies_and_acknowledge_guards() -> Result<(), Box<dyn std::error::Error>> {
+    let (_server, _data) = start_server();
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"create_table","table":"guarded","columns":[{"name":"id","ty":"int"}]}))?;
+    request_ok(&mut c, serde_json::json!({"method":"insert","table":"guarded","row":{"id":7}}))?;
+    let catalog: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"list_catalog"}"#))?;
+    let mut binding = catalog["schemas"][0].clone();
+    binding["database_id"] = binding["database_id"].as_u64().unwrap().to_string().into();
+    binding["object_id"] = binding["object_id"].as_u64().unwrap().to_string().into();
+    for mut request in [
+        serde_json::json!({"method":"scan","table":"guarded"}),
+        serde_json::json!({"method":"scan_shard","table":"guarded","shard":0,"shards":1}),
+        serde_json::json!({"method":"lookup_by_index","table":"guarded","column":"id","key":7}),
+        serde_json::json!({"method":"range_by_index","table":"guarded","column":"id","lo":null,"hi":null}),
+    ] {
+        request["schema_guard"] = serde_json::json!([binding]);
+        let response: serde_json::Value = serde_json::from_str(&send(&mut c, &request.to_string()))?;
+        assert_eq!(response["status"], "guarded", "{response}");
+        assert!(response["response"]["status"] == "rows" || response["response"]["status"] == "no_index", "{response}");
+    }
+    request_ok(&mut c, serde_json::json!({"method":"replace_schema","table":"guarded","columns":[{"name":"id","ty":"int"},{"name":"extra","ty":"str"}],"rows":[{"id":7,"extra":"x"}]}))?;
+    let stale: serde_json::Value = serde_json::from_str(&send(&mut c, &serde_json::json!({"method":"scan","table":"guarded","schema_guard":[binding]}).to_string()))?;
+    assert_eq!(stale["status"], "error");
+    assert!(stale["message"].as_str().unwrap().contains("bound query schema changed"));
+    let write: serde_json::Value = serde_json::from_str(&send(&mut c, &serde_json::json!({"method":"insert","table":"guarded","row":{"id":9},"schema_guard":[binding]}).to_string()))?;
+    assert_eq!(write["status"], "error");
+    let management: serde_json::Value = serde_json::from_str(&send_raw(&mut c, &serde_json::json!({"method":"create_database","database":"blocked","schema_guard":[]}).to_string()))?;
+    assert_eq!(management["status"], "error");
+    let databases: serde_json::Value = serde_json::from_str(&send_raw(&mut c, r#"{"method":"list_databases"}"#))?;
+    assert!(!databases["tables"].as_array().unwrap().iter().any(|database| database == "blocked"));
+    let rows: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"scan","table":"guarded"}"#))?;
+    assert_eq!(rows["rows"].as_array().unwrap().len(), 1);
+    Ok(())
+}
+
+/// 描述与目录均透传精确版本字符串
+#[test]
+fn catalog_schema_versions_are_exact_and_validated() -> Result<(), Box<dyn std::error::Error>> {
+    use chusql_core_storage::protocol::TableSchemaWire;
+    let (_server, _data) = start_server();
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"create_table","table":"versioned","columns":[{"name":"id","ty":"int"}]}))?;
+    let describe: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"describe_table","table":"versioned"}"#))?;
+    assert_eq!(describe["schema_version"], "1");
+    let catalog: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"list_catalog"}"#))?;
+    assert_eq!(catalog["schemas"][0]["schema_version"], "1");
+    let wire: TableSchemaWire = serde_json::from_value(serde_json::json!({"table":"t","columns":[],"schema_version":u64::MAX.to_string()}))?;
+    assert_eq!(wire.schema_version, u64::MAX);
+    assert_eq!(serde_json::to_value(wire)?["schema_version"], u64::MAX.to_string());
+    for version in [serde_json::json!(-1), serde_json::json!(1.5), serde_json::json!("18446744073709551616"), serde_json::json!("+1")] {
+        assert!(serde_json::from_value::<TableSchemaWire>(serde_json::json!({"table":"t","columns":[],"schema_version":version})).is_err());
+    }
+    Ok(())
+}
+
+/// 检查点失败及反复恢复保留结构版本
+#[test]
+fn schema_versions_survive_checkpoint_failure_and_repeated_recovery() -> Result<(), Box<dyn std::error::Error>> {
+    use chusql_core_storage::catalog::Catalog;
+    use chusql_core_storage::wal::{Wal, WalOp};
+    let (server, data) = start_server();
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"create_table","table":"versioned","columns":[{"name":"id","ty":"int"}]}))?;
+    let directory = data.path().join("databases/main");
+    let pending = directory.join("wal.checkpoint.pending");
+    std::fs::create_dir(&pending)?;
+    let response = send(&mut c, r#"{"method":"replace_schema","table":"versioned","columns":[{"name":"id","ty":"int"},{"name":"tag","ty":"str"}],"rows":[]}"#);
+    assert!(response.contains("error"), "{response}");
+    let catalog = Catalog::load(directory.join("catalog.json"))?;
+    let version = catalog.describe("versioned").unwrap().schema_version;
+    assert_eq!(version, 2);
+    let wal = Wal::new(directory.join("wal.log"));
+    let records = wal.read_all()?.records;
+    assert!(records.iter().any(|(_, op)| matches!(op, WalOp::ReplaceSchema { schema_version: Some(2), .. })));
+    let columns = catalog.describe("versioned").unwrap().columns.clone();
+    drop(wal);
+    drop(c);
+    drop(server);
+    std::fs::remove_dir(pending)?;
+    for _ in 0..2 {
+        let wal = Wal::new(directory.join("wal.log"));
+        wal.append_group(&[
+            WalOp::ReplaceSchema { table: "versioned".into(), columns: vec![], rows: vec![], schema_version: Some(1) },
+            WalOp::ReplaceSchema { table: "versioned".into(), columns: columns.clone(), rows: vec![], schema_version: Some(version) },
+        ])?;
+        drop(wal);
+        let restarted = restart_at(data.path())?;
+        let catalog = Catalog::load(directory.join("catalog.json"))?;
+        assert_eq!(catalog.describe("versioned").unwrap().schema_version, version);
+        assert_eq!(catalog.describe("versioned").unwrap().columns, columns);
+        assert_eq!(std::fs::metadata(directory.join("wal.log"))?.len(), 0);
+        drop(restarted);
+    }
+    Ok(())
+}
+
 /// 并发建表分配互不重复的编号
 #[test]
 fn concurrent_table_creation_allocates_distinct_object_ids() -> Result<(), Box<dyn std::error::Error>> {
@@ -1026,7 +1151,7 @@ fn hidden_column_wal_replays_twice_without_touching_heap() -> Result<(), Box<dyn
     let mut compacted: Option<Vec<u8>> = None;
     for round in 0..2 {
         let wal = Wal::new(data.path().join("databases/main/wal.log"));
-        let op = WalOp::HideColumn { table: "items".into(), column: "secret".into() };
+        let op = WalOp::HideColumn { table: "items".into(), column: "secret".into(), schema_version: None };
         wal.truncate()?;
         wal.append(&op)?;
         assert_eq!(wal.read()?, Some(op));

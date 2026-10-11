@@ -12,6 +12,7 @@ import ChuSQL.Core.Engine.Algebra.Sort (sortRows)
 import ChuSQL.Core.Engine.Builtin
 import ChuSQL.Core.Engine.Error
 import ChuSQL.Core.Engine
+import qualified ChuSQL.Core.Engine.Runtime.Query as Bound
 import ChuSQL.Core.Engine.Parallel (poolRun, workerPool)
 import ChuSQL.Core.Model
 import ChuSQL.Core.Engine.Semantic (prepare)
@@ -46,7 +47,9 @@ import qualified RuntimeSpec
 users :: Table
 users =
     Table
-        { tableName = "users"
+        { tableSchemaVersion = Nothing
+        , tableIdentity = Nothing
+        , tableName = "users"
         , tableCols = [("id", TInt), ("name", TStr), ("age", TInt)]
         , tableRows =
             [ [("id", VInt 1), ("name", VStr "Alice"), ("age", VInt 25)]
@@ -60,7 +63,9 @@ users =
 orders :: Table
 orders =
     Table
-        { tableName = "orders"
+        { tableSchemaVersion = Nothing
+        , tableIdentity = Nothing
+        , tableName = "orders"
         , tableCols = [("id", TInt), ("user_id", TInt), ("product", TStr)]
         , tableRows =
             [ [("id", VInt 1), ("user_id", VInt 1), ("product", VStr "Book")]
@@ -78,7 +83,9 @@ testDB = [("users", users), ("orders", orders)]
 chainA :: Table
 chainA =
     Table
-        { tableName = "a"
+        { tableSchemaVersion = Nothing
+        , tableIdentity = Nothing
+        , tableName = "a"
         , tableCols = [("id", TInt), ("name", TStr)]
         , tableRows = [[("id", VInt n), ("name", VStr ("a" ++ show n))] | n <- [1 .. 6]]
         , tableMeta = Just (TableMeta 6 [("id", 6, False)] [] ["id"])
@@ -88,7 +95,9 @@ chainA =
 chainB :: Table
 chainB =
     Table
-        { tableName = "b"
+        { tableSchemaVersion = Nothing
+        , tableIdentity = Nothing
+        , tableName = "b"
         , tableCols = [("id", TInt), ("a_id", TInt)]
         , tableRows = [[("id", VInt n), ("a_id", VInt n)] | n <- [1 .. 4]]
         , tableMeta = Just (TableMeta 4 [("id", 4, False), ("a_id", 4, False)] [] ["id"])
@@ -98,7 +107,9 @@ chainB =
 chainC :: Table
 chainC =
     Table
-        { tableName = "c"
+        { tableSchemaVersion = Nothing
+        , tableIdentity = Nothing
+        , tableName = "c"
         , tableCols = [("id", TInt), ("b_id", TInt)]
         , tableRows = [[("id", VInt n), ("b_id", VInt n)] | n <- [1, 2]]
         , tableMeta = Just (TableMeta 2 [("id", 2, False), ("b_id", 2, False)] [] ["id"])
@@ -124,7 +135,64 @@ domainSql db (sql : rest) = do
 -- | 跑引擎层全部 hspec 用例
 main :: IO ()
 main = hspec $ do
+    describe "REVOKE GRANT OPTION FOR" $ do
+        it "parses object privileges and rejects membership options" $ do
+            parseStatement "REVOKE GRANT OPTION FOR SELECT, UPDATE ON users FROM alice"
+                `shouldBe` Right (RevokeGrantOption ["SELECT", "UPDATE"] "users" "alice")
+            parseStatement "REVOKE GRANT OPTION FOR reader FROM alice" `shouldSatisfy` either (const True) (const False)
+    describe "ORDER BY positions" $ do
+        it "resolves positions after wildcard expansion and before limiting" $ do
+            rowsOf (parseStatement "SELECT * FROM orders ORDER BY 2 DESC, 1 DESC LIMIT 2" >>= runStatement testDB)
+                `shouldBe` Right [tableRows orders !! 1, tableRows orders !! 2]
+            rowsOf (parseStatement "SELECT DISTINCT user_id + 1 AS k FROM orders ORDER BY 1 DESC" >>= runStatement testDB)
+                `shouldBe` Right [[("k", VInt 3)], [("k", VInt 2)]]
+        it "rejects zero and positions beyond the output" $ do
+            mapM_ (\sql -> (parseStatement sql >>= runStatement testDB) `shouldSatisfy` either (isInfixOf "outside the select list") (const False))
+                ["SELECT id FROM users ORDER BY 0", "SELECT id FROM users ORDER BY 2"]
+    describe "SELECT DISTINCT" $ do
+        it "deduplicates projected values before ordering and limiting" $ do
+            let db = [("orders", orders { tableRows = tableRows orders ++ tableRows orders })]
+            rowsOf (parseStatement "SELECT DISTINCT user_id FROM orders ORDER BY user_id DESC LIMIT 2" >>= runStatement db)
+                `shouldBe` Right [[("user_id", VInt 2)], [("user_id", VInt 1)]]
+            rowsOf (parseStatement "SELECT DISTINCT user_id + 1 AS k FROM orders ORDER BY k LIMIT 2" >>= runStatement db)
+                `shouldBe` Right [[("k", VInt 2)], [("k", VInt 3)]]
+            rowsOf (parseStatement "SELECT ALL user_id FROM orders" >>= runStatement db)
+                `shouldBe` Right (map (filter ((== "user_id") . fst)) (tableRows orders ++ tableRows orders))
+        it "merges NULL and equal numeric values while retaining first rows" $ do
+            evalRelOp [] (Distinct Unit) `shouldBe` Right [[]]
+            let t = users { tableRows = [[("id", v), ("name", VStr "a"), ("age", VInt 1)] | v <- [VNull, VNull, VInt 1, VFloat 1, VInt 2]] }
+            evalRelOp [("users", t)] (Distinct (Project ["id"] (Scan Nothing "users" Nothing)))
+                `shouldBe` Right [[("id", VNull)], [("id", VInt 1)], [("id", VInt 2)]]
+        it "keeps all distinct columns when an outer query projects fewer" $ do
+            rowsOf (parseStatement "SELECT d.user_id FROM (SELECT DISTINCT user_id, product FROM orders) AS d" >>= runStatement testDB)
+                `shouldBe` Right [[("d.user_id", VInt 1)], [("d.user_id", VInt 2)], [("d.user_id", VInt 1)]]
+            rowsOf (parseStatement "WITH d(k) AS (SELECT DISTINCT user_id FROM orders) SELECT k FROM d" >>= runStatement testDB)
+                `shouldBe` Right [[("d.k", VInt 1)], [("d.k", VInt 2)]]
+        it "supports aggregates, empty inputs and output aliases" $ do
+            rowsOf (parseStatement "SELECT DISTINCT COUNT(*) AS n FROM orders" >>= runStatement testDB)
+                `shouldBe` Right [[("n", VInt 3)]]
+            rowsOf (parseStatement "SELECT DISTINCT user_id FROM orders WHERE user_id = 99" >>= runStatement testDB)
+                `shouldBe` Right []
+            rowsOf (parseStatement "SELECT DISTINCT user_id AS k FROM orders ORDER BY user_id" >>= runStatement testDB)
+                `shouldBe` Right [[("k", VInt 1)], [("k", VInt 2)]]
+        it "rejects composite values without equality capability" $ do
+            (parseStatement "SELECT DISTINCT LIST<Int>(1) AS xs" >>= runStatement [])
+                `shouldSatisfy` either (isInfixOf "capability is not registered") (const False)
+        it "evaluates correlated DISTINCT subqueries with the outer binding" $ do
+            rowsOf (parseStatement "SELECT u.id FROM users u WHERE u.id IN (SELECT DISTINCT o.user_id FROM orders o WHERE o.user_id = u.id)" >>= runStatement testDB)
+                `shouldBe` Right [[("u.id", VInt 1)], [("u.id", VInt 2)]]
+        it "rejects sorting by values excluded from the distinct output" $ do
+            let result = parseStatement "SELECT DISTINCT user_id FROM orders ORDER BY product" >>= runStatement testDB
+            result `shouldSatisfy` either (isInfixOf "must appear in the select list") (const False)
+
     describe "Storage read failures" $ do
+        it "rejects storage that silently ignores a bound read guard" $ do
+            setStorageLink StorageLink
+                { slRequest = \_ -> pure (Right (BSC.pack "{\"status\":\"rows\",\"rows\":[]}"))
+                , slClose = pure ()
+                }
+            (runIPCStorage (withSchemaGuard [] (scan "ignored"))
+                `shouldReturn` Left "storage did not confirm bound schema guard") `finally` closeConnection
         it "propagates catalog failures through snapshot, schema and SQL" $ do
             setStorageLink StorageLink
                 { slRequest = \_ -> pure (Right (BSC.pack "{\"status\":\"error\",\"message\":\"catalog unavailable\"}"))
@@ -729,7 +797,7 @@ main = hspec $ do
 
         it "rewrites >= and <= into an inclusive index range" $ do
             let stat rows distinct indexes = TableMeta rows [(c, d, False) | (c, d) <- distinct] [] indexes
-                dbWith m = [("users", Table "users" [("id", TInt), ("name", TStr)] [] (Just m))]
+                dbWith m = [("users", Table "users" [("id", TInt), ("name", TStr)] [] (Just m) Nothing Nothing)]
                 indexed = dbWith (stat 10000 [("id", 10000)] ["id"])
                 low = Filter (GtE (Col "id") (LitInt 2)) (Scan Nothing "users" Nothing)
                 both = Filter (And (GtE (Col "id") (LitInt 1)) (LtE (Col "id") (LitInt 3))) (Scan Nothing "users" Nothing)
@@ -1798,7 +1866,7 @@ main = hspec $ do
             let buckets = replicate 8 63 ++ replicate 8 62
                 withHist = TableMeta 1000 [("id", 1000, False)] [("id", Histogram 0 1600 buckets)] ["id"]
                 plain = TableMeta 1000 [("id", 1000, False)] [] ["id"]
-                dbWith m = [("users", Table "users" [("id", TInt), ("name", TStr)] [] (Just m))]
+                dbWith m = [("users", Table "users" [("id", TInt), ("name", TStr)] [] (Just m) Nothing Nothing)]
                 narrow = Filter (And (GtE (Col "id") (LitInt 10)) (LtE (Col "id") (LitInt 20))) (Scan Nothing "users" Nothing)
                 wide = Filter (Gt (Col "id") (LitInt 0)) (Scan Nothing "users" Nothing)
             -- 直方图说这个窄范围只命中十几行：改写
@@ -1884,8 +1952,8 @@ main = hspec $ do
 
         it "picks the index only when the statistics make it cheaper" $ do
             let stat rows distinct indexes = TableMeta rows [(c, d, False) | (c, d) <- distinct] [] indexes
-                dbWith m = [("users", Table "users" [("id", TInt), ("name", TStr)] [] (Just m))]
-                unknown = [("users", Table "users" [("id", TInt), ("name", TStr)] [] Nothing)]
+                dbWith m = [("users", Table "users" [("id", TInt), ("name", TStr)] [] (Just m) Nothing Nothing)]
+                unknown = [("users", Table "users" [("id", TInt), ("name", TStr)] [] Nothing Nothing Nothing)]
                 point = Filter (Eq (Col "id") (LitInt 1)) (Scan Nothing "users" Nothing)
                 range = Filter (Gt (Col "id") (LitInt 5)) (Scan Nothing "users" Nothing)
             -- 索引在、点查命中一行：改写
@@ -2332,6 +2400,51 @@ main = hspec $ do
                 map fst db `shouldBe` ["a", "b"]
                 map (length . tableRows . snd) db `shouldBe` [1, 1]
                 map (map (lookup "id") . tableRows . snd) db `shouldBe` [[Just (VInt 1)], [Just (VInt 2)]]
+        it "rejects a bound query after a same-schema persistent table recreation" $ do
+            withTestSession $ \srv -> withServerEnv srv $ do
+                runIPCStorage (createTable "rebuilt" [("id", TInt)]) `shouldReturn` Right ()
+                Right catalog <- runIPCStorage schema
+                let bound = parseStatement "SELECT id FROM rebuilt" >>= Bound.bindQuery catalog
+                case bound of
+                    Left err -> expectationFailure err
+                    Right query -> do
+                        runIPCStorage (Bound.executeQueryM query) `shouldReturn` Right []
+                        runIPCStorage (dropTable "rebuilt") `shouldReturn` Right ()
+                        runIPCStorage (createTable "rebuilt" [("id", TInt)]) `shouldReturn` Right ()
+                        changed <- runIPCStorage (Bound.executeQueryM query)
+                        changed `shouldSatisfy` either (isInfixOf "bound query object changed") (const False)
+        it "preserves persistent versions in snapshots and rejects restored schema" $ do
+            withTestSession $ \srv -> withServerEnv srv $ do
+                runIPCStorage (createTable "versioned" [("id", TInt)]) `shouldReturn` Right ()
+                Right catalog <- runIPCStorage schema
+                Right contents <- runIPCStorage snapshot
+                fmap tableSchemaVersion (lookup "versioned" catalog) `shouldBe` Just (Just 1)
+                fmap tableSchemaVersion (lookup "versioned" contents) `shouldBe` Just (Just 1)
+                case parseStatement "SELECT id FROM versioned" >>= Bound.bindQuery catalog of
+                    Left err -> expectationFailure err
+                    Right query -> do
+                        runIPCStorage (replaceSchema "versioned" [("id", TInt), ("extra", TStr)] []) `shouldReturn` Right ()
+                        runIPCStorage (replaceSchema "versioned" [("id", TInt)] []) `shouldReturn` Right ()
+                        changed <- runIPCStorage (Bound.executeQueryM query)
+                        changed `shouldSatisfy` either (isInfixOf "bound query schema changed") (const False)
+        it "rejects a DDL race between schema validation and the actual read" $ do
+            withTestSession $ \srv -> withServerEnv srv $ do
+                runIPCStorage (createTable "raced" [("id", TInt)]) `shouldReturn` Right ()
+                Right catalog <- runIPCStorage schema
+                closeConnection
+                Right link <- localStorageLink (Just (dataDir srv ++ ".toml"))
+                setStorageLink link {slRequest = \payload -> do
+                    if BSC.pack "schema_guard" `BS.isInfixOf` payload
+                        then do
+                            changed <- slRequest link (BSC.pack "{\"method\":\"replace_schema\",\"database\":\"ipctest\",\"table\":\"raced\",\"columns\":[{\"name\":\"id\",\"ty\":\"int\"},{\"name\":\"extra\",\"ty\":\"str\"}],\"rows\":[]}")
+                            changed `shouldSatisfy` either (const False) (BS.isInfixOf (BSC.pack "ok"))
+                        else pure ()
+                    slRequest link payload}
+                case parseStatement "SELECT id FROM raced" >>= Bound.bindQuery catalog of
+                    Left err -> expectationFailure err
+                    Right query -> do
+                        result <- runIPCStorage (Bound.executeQueryM query)
+                        result `shouldSatisfy` either (isInfixOf "bound query schema changed") (const False)
 
         it "doListTables returns the tables that exist" $ do
             withTestSession $ \srv -> withServerEnv srv $ do
@@ -2529,7 +2642,7 @@ main = hspec $ do
                 `shouldBe` Right (makeSelect ["*"] "t" (Just (Eq (Col "flag") (LitBool True))))
 
         it "inserts and reads back a boolean column end-to-end" $ do
-            let db = [("t", Table "t" [("id", TInt), ("flag", TBool)] [] Nothing)]
+            let db = [("t", Table "t" [("id", TInt), ("flag", TBool)] [] Nothing Nothing Nothing)]
             case runStatement db (Insert "t" ["id", "flag"] [[LitInt 1, LitBool True]]) of
                 Left e -> expectationFailure e
                 Right (db', _) ->
@@ -3154,6 +3267,8 @@ instance Monad ProbeStorage where
         ProbeStorage (\probe -> act probe >>= \value -> runProbeStorage (next value) probe)
 
 instance MonadStorage ProbeStorage where
+    -- \| 测试视图不支持并发结构变更
+    withSchemaGuard _ action = action
     scan table = ProbeStorage $ \probe -> do
         recordCall probe ("scan:" ++ table)
         pure (Right (tableRows (probeTable probe)))
@@ -3227,7 +3342,10 @@ planTables op = case op of
     Project _ x -> planTables x
     Compute _ x -> planTables x
     Aggregate _ _ x -> planTables x
+    BoundAggregate _ _ x -> planTables x
+    Distinct x -> planTables x
     Sort _ x -> planTables x
+    BoundSort _ x -> planTables x
     Limit _ x -> planTables x
     Join _ l r _ -> planTables l ++ planTables r
     Derived _ x -> planTables x
@@ -3239,8 +3357,11 @@ leftJoinKinds (Join kind l r _) = (kind == LeftJoin) : (leftJoinKinds l ++ leftJ
 leftJoinKinds (Project _ x) = leftJoinKinds x
 leftJoinKinds (Compute _ x) = leftJoinKinds x
 leftJoinKinds (Aggregate _ _ x) = leftJoinKinds x
+leftJoinKinds (BoundAggregate _ _ x) = leftJoinKinds x
 leftJoinKinds (Filter _ x) = leftJoinKinds x
+leftJoinKinds (Distinct x) = leftJoinKinds x
 leftJoinKinds (Sort _ x) = leftJoinKinds x
+leftJoinKinds (BoundSort _ x) = leftJoinKinds x
 leftJoinKinds (Limit _ x) = leftJoinKinds x
 leftJoinKinds (Derived _ x) = leftJoinKinds x
 leftJoinKinds _ = []
@@ -3251,8 +3372,11 @@ firstFilterCond (Filter p _) = Just p
 firstFilterCond (Project _ x) = firstFilterCond x
 firstFilterCond (Compute _ x) = firstFilterCond x
 firstFilterCond (Aggregate _ _ x) = firstFilterCond x
+firstFilterCond (BoundAggregate _ _ x) = firstFilterCond x
 firstFilterCond Unit = Nothing
+firstFilterCond (Distinct x) = firstFilterCond x
 firstFilterCond (Sort _ x) = firstFilterCond x
+firstFilterCond (BoundSort _ x) = firstFilterCond x
 firstFilterCond (Limit _ x) = firstFilterCond x
 firstFilterCond (Join _ l r _) = case firstFilterCond l of
     Just p -> Just p
@@ -3268,8 +3392,11 @@ anyFilter (Filter _ _) = True
 anyFilter (Project _ x) = anyFilter x
 anyFilter (Compute _ x) = anyFilter x
 anyFilter (Aggregate _ _ x) = anyFilter x
+anyFilter (BoundAggregate _ _ x) = anyFilter x
 anyFilter Unit = False
+anyFilter (Distinct x) = anyFilter x
 anyFilter (Sort _ x) = anyFilter x
+anyFilter (BoundSort _ x) = anyFilter x
 anyFilter (Limit _ x) = anyFilter x
 anyFilter (Join _ l r _) = anyFilter l || anyFilter r
 anyFilter (Scan _ _ _) = False
@@ -3282,9 +3409,12 @@ stripProjects :: RelOp -> RelOp
 stripProjects (Project _ x) = stripProjects x
 stripProjects (Compute items x) = Compute items (stripProjects x)
 stripProjects (Aggregate keys aggs x) = Aggregate keys aggs (stripProjects x)
+stripProjects (BoundAggregate keys aggs x) = BoundAggregate keys aggs (stripProjects x)
 stripProjects Unit = Unit
 stripProjects (Filter p x) = Filter p (stripProjects x)
+stripProjects (Distinct x) = Distinct (stripProjects x)
 stripProjects (Sort spec x) = Sort spec (stripProjects x)
+stripProjects (BoundSort spec x) = BoundSort spec (stripProjects x)
 stripProjects (Limit n x) = Limit n (stripProjects x)
 stripProjects (Join k l r c) = Join k (stripProjects l) (stripProjects r) c
 stripProjects (Scan a t _) = Scan a t Nothing
@@ -3379,6 +3509,8 @@ memReplaceSchema :: String -> [(String, Column)] -> [Row] -> MemoryStorage (Eith
 memReplaceSchema = replaceSchema
 
 instance MonadStorage Counting where
+    -- \| 纯测试状态在求值期间保持稳定
+    withSchemaGuard _ action = action
     -- \| 扫描：记一笔表名，其余走内存实现
     scan t = Counting $ \db -> case runMemoryStorage (memScan t) db of
         Left e -> Left e

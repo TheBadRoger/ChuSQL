@@ -13,8 +13,11 @@ data RelOp
     | Project [String] RelOp
     | Compute [(String, Expr)] RelOp
     | Aggregate [String] [(String, Expr)] RelOp
+    | BoundAggregate [(String, Expr)] [(String, Expr)] RelOp
+    | Distinct RelOp
     | Unit
     | Sort [(String, SortDir)] RelOp
+    | BoundSort [(Expr, SortDir)] RelOp
     | Limit Int RelOp
     | Join JoinKind RelOp RelOp Expr
     | Derived (Maybe String) RelOp
@@ -25,6 +28,7 @@ relOpCols :: Database -> RelOp -> [String]
 relOpCols _ Unit = []
 relOpCols _ (Compute items _) = map fst items
 relOpCols _ (Aggregate keys aggs _) = keys ++ map fst aggs
+relOpCols _ (BoundAggregate keys aggs _) = map fst keys ++ map fst aggs
 relOpCols _ (Scan mAlias _ (Just cols)) = map (qualify mAlias) cols
 relOpCols db (Scan mAlias tbl Nothing) =
     case lookup tbl db of
@@ -37,7 +41,9 @@ relOpCols db (Range mAlias tbl _ _ _) = relOpCols db (Scan mAlias tbl Nothing)
 relOpCols db (Filter _ x) = relOpCols db x
 relOpCols _ (Project ["*"] _) = ["*"]
 relOpCols _ (Project cols _) = cols
+relOpCols db (Distinct x) = relOpCols db x
 relOpCols db (Sort _ x) = relOpCols db x
+relOpCols db (BoundSort _ x) = relOpCols db x
 relOpCols db (Limit _ x) = relOpCols db x
 relOpCols db (Join _ l r _) = relOpCols db l ++ relOpCols db r
 relOpCols db (Derived mAlias x) = map (qualify mAlias) (relOpCols db x)
@@ -67,8 +73,12 @@ renderPlan = go 0
                 ++ show [label ++ " <- " ++ show e | (label, e) <- aggs]
                 ++ "\n"
                 ++ go (ind + 1) x
+        Distinct x -> pad ++ "Distinct\n" ++ go (ind + 1) x
+        BoundAggregate keys aggs x -> pad ++ "BoundAggregate keys=" ++ show keys
+            ++ " aggs=" ++ show aggs ++ "\n" ++ go (ind + 1) x
         Unit -> pad ++ "Unit"
         Sort s x -> pad ++ "Sort " ++ show s ++ "\n" ++ go (ind + 1) x
+        BoundSort s x -> pad ++ "BoundSort " ++ show s ++ "\n" ++ go (ind + 1) x
         Limit n x -> pad ++ "Limit " ++ show n ++ "\n" ++ go (ind + 1) x
         Join k l r c -> pad ++ kindLabel k ++ " on " ++ show c ++ "\n" ++ go (ind + 1) l ++ "\n" ++ go (ind + 1) r
         Derived a x -> pad ++ "Derived " ++ show a ++ "\n" ++ go (ind + 1) x

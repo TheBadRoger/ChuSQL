@@ -84,33 +84,58 @@ schema 类型不证明业务意义上的原子性。不满足 1NF 时更高范�
 
 建议只是一轮分解，子关系可能仍需继续分析，不承诺一次达到 BCNF。依赖不保持时需跨关系检查原约束。
 
-## 第一阶段限制
+## 当前限制
 
 - 最多接受 12 列，超过返回错误，避免指数枚举无界增长。
-- 仅提供 Haskell 只读 API。
-- CLI / Web 入口和自动迁移尚未实现。
+- 提供 Haskell 只读 API、TCP 专用请求、CLI 和 Web 结构入口；不执行数据迁移。
+- 输入与输出有预算，超过预算返回明确错误，不截断为完整报告。
 
-## 后续入口设计（尚未实现）
+## TCP、CLI 与 Web 入口
 
-以下 TCP、CLI 和 Web 接口尚未实现，拟议命令与端点目前不可用。实施状态以 agent-credientials/progress.txt 为准。
+以下只读入口已实现。分析只读取 schema，不能据此认定 SQL 数据满足声明或直接执行分解。实施状态以 .agents/context/progress.txt 为准。
 
 ### 协议与鉴权
 
-在 `ChuSQL.Interface.Protocol` 增加专用客户端请求 `normalization_analyze`，由 server 调用 engine API；不经最高权限专用的原始 `ReqStorage` 入口。请求包含 `api_version=1`、数据库与表标识、声明，以及可选的预期对象编号和 schema 指纹。server 在现有权限读门内以 catalog 解析现存对象，检查 CONNECT 与 SELECT；系统对象拒绝访问。事务内取该连接的 schema 快照，返回视图来源和对象编号，不能混入其他连接的快照。
+`ChuSQL.Interface.Protocol` 的专用客户端请求 `normalization_analyze` 由 server 调用 engine API；不经最高权限专用的原始 `ReqStorage` 入口。请求包含 `api_version=1`、数据库与表标识、声明，以及可选的预期对象编号和 schema 指纹。server 在现有权限读门内以 catalog 解析现存对象，检查 CONNECT 与 SELECT；系统对象拒绝访问。事务内取该连接的 schema 快照，返回视图来源和对象编号，不能混入其他连接的快照。
 
 声明字段固定为 `declared_keys`、`dependencies`（`lhs` / `rhs`）、`dependencies_complete`、`atomic_attributes`。完整性缺省 false，原子性缺省 null；不把 PRIMARY KEY、UNIQUE 或样本自动当作完整业务依赖。前端可以展示实际 schema 约束供用户选择，确认后才成为声明。候选键的 nullable 与 SQL UNIQUE 语义单独提示，不自动证明经典关系模型的键。
 
 响应包含对象编号、schema 指纹、规范化声明、候选键、四项 findings 和一次分解建议。稳定标签使用 `1nf/2nf/3nf/bcnf`、`satisfied/violated/insufficient`；条件说明与机器字段分开。所有结论标明“以声明为条件”，无损连接标签不代表现有 SQL 数据或袋语义已经验证。
 
-字段名称必须与返回 schema 的确切列名一致；对象名称使用现有标识符规则，数据库限定名必须与请求数据库一致。指纹只覆盖列名、类型和约束等语义结构，排除行数与直方图；定义确定性编码并同时绑定稳定对象编号，避免同名重建复用报告。
+字段名称必须与返回 schema 的确切列名一致；对象名称使用现有标识符规则，数据库限定名必须与请求数据库一致。`schema_fingerprint` 使用 SHA256，编码为 `[库/表编号字符串数组, 列结构数组]`；每列按名称、类型、nullable、default、auto_increment、primary_key、unique、check 排列。它排除行数、索引统计与直方图，并绑定稳定对象编号，避免同名重建复用报告。对象编号在报告中使用 UInt64 范围内的正整数十进制字符串，避免浏览器数值精度损失。
 
-拒绝未知协议版本、未知字段、重复字段、空右部、非最小声明键、空 schema 和超过 12 列。拟定请求上限 64 KiB、依赖条数 256、键声明 256；预算超限返回明确错误，不截断后给出完整报告。分析在有界工作队列运行，取消或超时释放权限读门与会话资源；输出也受传输预算约束，超限返回错误。实施时用最坏 12 列声明确定默认时间预算。
+拒绝未知协议版本、未知字段、重复字段、空右部、非最小声明键、空 schema 和超过 12 列。请求 JSON 上限 64 KiB、嵌套深度上限 64；依赖与键声明分别最多 256 项。服务端最多接纳 8 个请求，最多 2 个同时执行；排队、权限门等待与计算合计最多 5 秒。完整报告超过 64000 字节即拒绝，预留协议外层开销；客户端请求也为外层协议预留空间。超限返回 too_large，队列满返回 too_busy，超时返回 timeout，不截断成完整报告。取消执行或超时均释放执行槽和权限读门；断线请求最多运行至预算到期。
+
+请求外层形状：
+
+```json
+{"method":"normalization_analyze","request":{"api_version":1,"database":"sales","table":"orders","declaration":{"declared_keys":[["id"]],"dependencies":[],"dependencies_complete":false,"atomic_attributes":null}}}
+```
+
+成功响应的 `status` 为 `normalization`，`analysis` 保存完整报告；可选 `expected_object` 与 `expected_schema_fingerprint` 放在 `request` 中。数据库必须与该连接的工作库一致；表可使用裸名或同库限定名。没有登录返回 unauthorized，系统对象拒绝分析；不会通过另一个连接代取事务视图。
 
 ### CLI 与 Web
 
-CLI 拟议元命令为 `\normalize TABLE --declaration FILE --format text|json`，通过当前登录连接和工作库请求。声明文件为 UTF-8 JSON，错误写 stderr；成功分析退出码 0，即使结论违反或信息不足；协议、权限、输入与运行错误退出非零。批处理增加独立 `--normalize` 模式，与 `--execute` 互斥，不把元命令发给 SQL 解析器。
+CLI 元命令为 `\normalize TABLE --declaration FILE --format text|json`，通过当前登录连接和工作库请求。声明文件为 UTF-8 JSON，错误写 stderr；成功分析退出码 0，即使结论违反或信息不足；协议、权限、输入与运行错误退出非零。批处理使用独立 `--normalize` 模式，与 `--execute` 互斥，不把元命令发给 SQL 解析器。
 
-Web 拟议 `POST /api/normalization/analyze`，复用登录、CSRF 和 Cookie 串行规则。入口位于表结构页：展示 schema、编辑声明、提交分析、显示证据和分解字段列表。完整性与原子性不预先勾选；没有自动执行分解按钮。编辑页分析必须携带既有页面事务标识，不能自动开启另一事务。对象或 schema 改变返回冲突并要求重新分析。
+Web 使用 `POST /api/normalization/analyze`，复用登录、CSRF 和 Cookie 串行规则。入口位于资源管理器展开表后的结构区：展示 schema、编辑声明、提交分析、显示证据和分解字段列表。完整性与原子性不预先勾选；没有自动执行分解按钮。编辑页分析必须携带既有页面事务标识，不能自动开启另一事务；SQL 控制台有事务时，分析请求携带该控制台身份并使用其快照。对象或 schema 改变返回冲突并要求重新分析。
+
+声明文件示例（不自动声明完整性或原子性）：
+
+```json
+{
+  "declared_keys": [["student", "course"]],
+  "dependencies": [{"lhs": ["student"], "rhs": ["name"]}],
+  "dependencies_complete": true,
+  "atomic_attributes": true
+}
+```
+
+```sh
+csql -d school --normalize enrollment --declaration dependencies.json --format json
+```
+
+交互模式：`\normalize enrollment --declaration "My Data/dependencies.json" --format text`。成功报告即使违反范式或信息不足也退出 0；输入、权限、协议或预算错误退出非零。文本输出保留与 JSON 输出相同的报告字段。Web 在资源管理器展开表后点击“范式分析”，输入声明 JSON；初始声明为空，完整性 false、原子性 null。报告给出候选键、违反证据和一次分解建议，只有分析按钮。
 
 ### 入口验收
 
@@ -118,7 +143,7 @@ Web 拟议 `POST /api/normalization/analyze`，复用登录、CSRF 和 Cookie �
 
 ## 数据迁移设计（尚未实现）
 
-先实现只读入口，再在 [DOMAIN 约束](types.md#domain-约束设计尚未实现)、依赖目录和原子结构发布具备后实施迁移。
+只读入口已具备；在 [DOMAIN 约束](types.md#domain-约束设计尚未实现)、依赖目录和原子结构发布具备后实施迁移。
 
 ### 规划条件
 

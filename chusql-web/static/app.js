@@ -64,6 +64,8 @@ const state = {
   dockHeight: '22vh',
 };
 
+let normalizationTarget = null;
+
 const root = document.getElementById('root');
 
 // ---------------------------------------------------------------- 小工具
@@ -210,6 +212,21 @@ function renderShell() {
           <button type="button" class="primary" data-action="create-index">创建</button>
         </footer>
       </div>
+    </dialog>
+    <dialog id="dlg-normalization" class="dialog">
+      <div class="dialog-body">
+        <header class="dialog-header"><h2 id="normalization-title">范式分析</h2></header>
+        <div class="dialog-content">
+          <p>只读分析，以声明为条件。PRIMARY KEY、UNIQUE 和样本不会自动成为完整业务依赖；NULL 与重复行需要另行验证。</p>
+          <label class="field"><span>JSON 声明（完整性 false，原子性 null 表示未声明）</span><textarea id="normalization-declaration" rows="10"></textarea></label>
+          <p class="alert" id="normalization-error"></p>
+          <div id="normalization-result"></div>
+        </div>
+        <footer class="dialog-footer">
+          <button type="button" data-action="close-dialog">关闭</button>
+          <button type="button" class="primary" data-action="analyze-normalization" disabled>分析声明</button>
+        </footer>
+      </div>
     </dialog>`;
   renderAccount();
   applyLayout();
@@ -282,7 +299,7 @@ function renderSidebar() {
         <button class="mini danger" data-action="drop-table" data-table="${escapeHtml(table.name)}" title="删除表">✕</button>
       </div>
       ${open ? `<ul class="column-list">${columns}</ul>${indexList}
-        <div class="tree-actions"><button class="mini" data-action="open-index-dialog" data-table="${escapeHtml(table.name)}">＋ 索引</button></div>` : ''}
+        <div class="tree-actions">${state.database !== 'system' && !table.name.startsWith('__system_') ? `<button class="mini" data-action="open-normalization" data-table="${escapeHtml(table.name)}">范式分析</button>` : ''}<button class="mini" data-action="open-index-dialog" data-table="${escapeHtml(table.name)}">＋ 索引</button></div>` : ''}
     </li>`;
   }).join('');
 
@@ -1383,7 +1400,7 @@ function startSplitterDrag(kind, event) {
 
 // 这些动作都要求已经选中一个库（服务没有默认库）
 const DATABASE_ACTIONS = new Set([
-  'open-table', 'demo-data', 'open-table-dialog', 'create-table',
+  'open-normalization', 'analyze-normalization', 'open-table', 'demo-data', 'open-table-dialog', 'create-table',
   'open-index-dialog', 'create-index', 'drop-table', 'drop-column', 'drop-index',
   'drop-database', 'commit', 'rollback', 'copy-sql',
 ]);
@@ -1413,7 +1430,14 @@ function onClick(event) {
   }
 
   switch (action) {
+    case 'open-normalization':
+      void openNormalization(target.dataset.table);
+      break;
+    case 'analyze-normalization':
+      void analyzeNormalizationDeclaration();
+      break;
     case 'logout':
+      normalizationTarget = null;
       void (async () => {
         try {
           await api.logout();
@@ -1790,3 +1814,68 @@ async function boot() {
 }
 
 void boot();
+
+// 打开结构入口并绑定当前 schema 身份。
+async function openNormalization(table) {
+  const declaration = { declared_keys: [], dependencies: [], dependencies_complete: false, atomic_attributes: null };
+  const target = { database: state.database, table, report: null };
+  normalizationTarget = target;
+  region('dlg-normalization').querySelector('[data-action="analyze-normalization"]').disabled = true;
+  region('normalization-title').textContent = `范式分析 · ${target.database}.${table}`;
+  region('normalization-declaration').value = JSON.stringify(declaration, null, 2);
+  region('normalization-result').textContent = '正在读取结构…';
+  region('normalization-error').textContent = '';
+  region('dlg-normalization').onclose = () => { normalizationTarget = null; };
+  region('dlg-normalization').showModal();
+  try {
+    target.report = await api.analyzeNormalization(target.database, table, declaration);
+    if (normalizationTarget === target) {
+      renderNormalization(target.report);
+      region('dlg-normalization').querySelector('[data-action="analyze-normalization"]').disabled = false;
+    }
+  } catch (error) {
+    if (normalizationTarget === target) {
+      region('normalization-result').textContent = '';
+      region('normalization-error').textContent = error.message;
+    }
+  }
+}
+
+// 提交显式声明并复核绑定的对象结构。
+async function analyzeNormalizationDeclaration() {
+  const target = normalizationTarget;
+  if (!target?.report) return;
+  const button = region('dlg-normalization').querySelector('[data-action="analyze-normalization"]');
+  button.disabled = true;
+  region('normalization-error').textContent = '';
+  try {
+    const declaration = region('normalization-declaration').value;
+    const report = await api.analyzeNormalization(target.database, target.table, declaration, target.report);
+    if (normalizationTarget === target) {
+      target.report = report;
+      renderNormalization(report);
+    }
+  } catch (error) {
+    if (normalizationTarget === target) {
+      region('normalization-error').textContent = error.message;
+      if (error.code === 'conflict') {
+        target.report = null;
+        region('normalization-result').textContent = '对象或视图已变化，请关闭后重新打开范式分析。';
+      }
+    }
+  } finally {
+    button.disabled = !target.report;
+  }
+}
+
+// 展示条件结论、违反证据与一次分解。
+function renderNormalization(report) {
+  const labels = { satisfied: '满足', violated: '违反', insufficient: '信息不足' };
+  const schema = report.schema.map((column) => `${column.name}: ${column.ty}${column.nullable ? '（可空）' : '（非空）'}`).join('，');
+  const findings = report.findings.map((finding) => `<li><strong>${escapeHtml(finding.normal_form.toUpperCase())}: ${escapeHtml(labels[finding.verdict] ?? finding.verdict)}</strong>
+    <p>${escapeHtml(finding.condition)}</p><pre>${escapeHtml(JSON.stringify(finding.witnesses, null, 2))}</pre></li>`).join('');
+  region('normalization-result').innerHTML = `<p>${escapeHtml(schema)}</p><p>视图：${escapeHtml(report.view)} · 结论以声明为条件</p>
+    <details><summary>结构与约束</summary><pre>${escapeHtml(JSON.stringify(report.schema, null, 2))}</pre></details>
+    <p>相对于声明的候选键：${escapeHtml(JSON.stringify(report.candidate_keys))}</p><ul>${findings}</ul>
+    <p>一次分解建议（无损标签不证明现有 SQL 数据）：</p><pre>${escapeHtml(JSON.stringify(report.suggestions, null, 2))}</pre>`;
+}

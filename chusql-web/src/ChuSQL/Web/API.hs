@@ -72,10 +72,12 @@ import ChuSQL.Interface.Link (
     closeClient,
     connectClient,
  )
+import ChuSQL.Interface.Normalization (NormalizationRequest, decodeNormalizationJSON)
 import ChuSQL.Interface.Protocol (Grant (..), RoleView (..))
 import ChuSQL.Interface.RateLimit (RateLimiter, rateLimitBlock, rateLimitClear, rateLimitRecord, setRateLimit)
 import ChuSQL.Interface.Session (
     Session,
+    analyzeNormalization,
     authenticateSession,
     catalog,
     databases,
@@ -132,7 +134,7 @@ import qualified Data.Text.Encoding.Error as TEE
 import qualified Data.Text.Lazy as TL
 import Data.Time.Clock (getCurrentTime)
 import qualified Data.Vector as V
-import Network.HTTP.Types (Status, status204, status400, status401, status403, status404, status409, status413, status429, status500)
+import Network.HTTP.Types (Status, status204, status400, status401, status403, status404, status409, status413, status429, status500, status503)
 import Network.Wai (Application, Request (..))
 import Text.Read (readMaybe)
 import Web.Scotty
@@ -337,6 +339,7 @@ routes env = do
     delete "/api/roles/:name/grants" (withDatabase env revokeRoleH)
     post "/api/roles/:name/members" (withDatabase env addRoleMemberH)
     delete "/api/roles/:name/members/:user" (withDatabase env removeRoleMemberH)
+    post "/api/normalization/analyze" (withDatabase env normalizationH)
     post "/api/query" (withDatabase env queryH)
     post "/api/query/rollback" (rollbackConsoleH env)
     post "/api/edit/begin" (beginEditH env)
@@ -357,12 +360,13 @@ withDatabase env action = do
                 else do
                     editing <- header "X-ChuSQL-Edit"
                     req <- request
-                    let snapshotRead = editing /= Nothing && requestMethod req == "GET" && take 2 (pathInfo req) == ["api", "tables"]
+                    let snapshotRead = editing /= Nothing && ((requestMethod req == "GET" && take 2 (pathInfo req) == ["api", "tables"])
+                            || (requestMethod req == "POST" && pathInfo req == ["api", "normalization", "analyze"]))
                     console <- liftIO (readIORef (wsConsole ws))
                     caller <- consoleOwner
                     case console of
                         Just (owner, database) | not snapshotRead &&
-                            (pathInfo req /= ["api", "query"] || caller /= owner || (not (T.null chosen) && chosen /= database)) ->
+                            (pathInfo req `notElem` [["api", "query"], ["api", "normalization", "analyze"]] || caller /= owner || (not (T.null chosen) && chosen /= database)) ->
                                 apiError "conflict" "another SQL console owns this connection transaction; commit or rollback there first"
                         _ -> pure ()
                     current <- liftIO (sessionDatabase (wsSession ws))
@@ -391,7 +395,8 @@ requireSession env = do
             editHeader <- fmap TL.toStrict <$> header "X-ChuSQL-Edit"
             req <- request
             case editHeader of
-                Just editId | requestMethod req == "GET" && take 2 (pathInfo req) == ["api", "tables"] -> do
+                Just editId | (requestMethod req == "GET" && take 2 (pathInfo req) == ["api", "tables"])
+                    || (requestMethod req == "POST" && pathInfo req == ["api", "normalization", "analyze"]) -> do
                     active <- liftIO (readIORef (wsEdit ws))
                     database <- maybe "" (T.toLower . TL.toStrict) <$> header "X-ChuSQL-Database"
                     case active of
@@ -905,7 +910,7 @@ serverError message
     (rawCode, rest) = T.breakOn ":" message
     code = T.strip rawCode
     detail = T.strip (T.drop 1 rest)
-    knownCodes = ["unauthorized", "forbidden", "not_found", "conflict", "bad_request", "no_database", "query_error", "storage_error", "too_large"]
+    knownCodes = ["unauthorized", "forbidden", "not_found", "conflict", "bad_request", "no_database", "query_error", "storage_error", "too_large", "too_busy", "timeout"]
 
 -- | 取错误消息里的错误码
 errorCodeOf :: Text -> Text
@@ -920,6 +925,8 @@ statusOf code = case code of
     "conflict" -> status409
     "too_many_attempts" -> status429
     "too_large" -> status413
+    "too_busy" -> status503
+    "timeout" -> status503
     "storage_error" -> status500
     "internal" -> status500
     _ -> status400
@@ -1901,3 +1908,19 @@ data QueryRequest = QueryRequest
 
 instance FromJSON QueryRequest where
     parseJSON = withObject "QueryRequest" $ \o -> QueryRequest <$> o .: "sql"
+
+-- 使用现有连接视图转发只读范式请求。
+normalizationH :: AppEnv -> ActionM ()
+normalizationH env = do
+    ws <- requireSession env
+    rawBody <- body
+    case decodeNormalizationJSON rawBody of
+        Left message | BL.length rawBody > 65536 -> reply413
+                     | otherwise -> reply400 "bad_request" message
+        Right value -> case A.fromJSON value :: A.Result NormalizationRequest of
+            A.Error message -> reply400 "bad_request" (T.pack message)
+            A.Success payload -> do
+                result <- liftIO (analyzeNormalization (wsSession ws) payload)
+                case result of
+                    Left message -> serverError message
+                    Right report -> json report

@@ -77,6 +77,7 @@ planHasDivision (Filter p x) = hasDivision p || planHasDivision x
 planHasDivision (Join _ l r c) = hasDivision c || planHasDivision l || planHasDivision r
 planHasDivision (Compute items x) = any (hasDivision . snd) items || planHasDivision x
 planHasDivision (Project _ x) = planHasDivision x
+planHasDivision (Distinct x) = planHasDivision x
 planHasDivision (Sort _ x) = planHasDivision x
 planHasDivision (Limit _ x) = planHasDivision x
 planHasDivision (Derived _ x) = planHasDivision x
@@ -96,6 +97,8 @@ pushProjectLeaf db need leaf
 -- | 把需要哪些列往下传
 pushProject :: Database -> [String] -> RelOp -> RelOp
 pushProject _ _ Unit = Unit
+pushProject _ _ op@BoundSort{} = op
+pushProject _ _ op@BoundAggregate{} = op
 pushProject db _ (Compute items x) = Compute items (pushProject db (concatMap (colsInExpr . snd) items) x)
 pushProject db _ (Aggregate keys aggs x) =
     Aggregate keys aggs (pushProject db (keys ++ concatMap (colsInExpr . snd) aggs) x)
@@ -103,6 +106,7 @@ pushProject db _ (Project cols x) = case pushProject db cols x of
     Project cols' y | cols' == cols -> Project cols y
     other -> Project cols other
 pushProject db need (Filter p x) = Filter p (pushProject db (need ++ colsInExpr p) x)
+pushProject db _ (Distinct x) = Distinct (pushProject db (relOpCols db x) x)
 pushProject db need (Sort spec x) = Sort spec (pushProject db (need ++ map fst spec) x)
 pushProject db need (Limit n x) = Limit n (pushProject db need x)
 pushProject db need (Join kind l r c)
@@ -250,6 +254,7 @@ optimizeRelOp db = rewriteNode db . descend
     descend (Project cols x) = Project cols (optimizeRelOp db x)
     descend (Compute items x) = Compute items (optimizeRelOp db x)
     descend (Aggregate keys aggs x) = Aggregate keys aggs (optimizeRelOp db x)
+    descend (Distinct x) = Distinct (optimizeRelOp db x)
     descend (Sort spec x) = Sort spec (optimizeRelOp db x)
     descend (Limit n x) = Limit n (optimizeRelOp db x)
     descend (Join kind l r c) = Join kind (optimizeRelOp db l) (optimizeRelOp db r) c

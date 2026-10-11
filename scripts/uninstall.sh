@@ -17,7 +17,7 @@ Uninstall ChuSQL (Linux/macOS).
 Usage: uninstall.sh [options]
 
   --install-dir DIR   program directory (default: $HOME/.local/share/chusql)
-  --data-dir DIR      data directory (default: <install-dir>/data)
+  --data-dir DIR      data directory (default: settings.toml, then XDG data directory)
   --keep-data         keep the data directory, remove programs only
   --keep-config       keep settings.toml
   --yes               do not ask (required when there is no terminal)
@@ -36,6 +36,21 @@ fail() {
 stop_by_path() {
     target=$1
     [ -n "$target" ] || return 0
+    if [ "$(uname -s)" = Linux ]; then
+        for process in /proc/[0-9]*/exe; do
+            executable=$(readlink "$process" 2>/dev/null) || continue
+            [ "$executable" = "$target" ] || continue
+            pid=${process#/proc/}; pid=${pid%/exe}
+            kill "$pid" || fail "cannot stop $target ($pid)"
+            attempts=0
+            while [ -e "$process" ]; do
+                attempts=$((attempts + 1))
+                [ "$attempts" -lt 100 ] || fail "timed out stopping $target ($pid)"
+                sleep 0.1
+            done
+        done
+        return 0
+    fi
     pids=$(ps -eo pid=,args= 2>/dev/null |
         awk -v t="$target" '{ pid = $1; $1 = ""; sub(/^ +/, ""); if (index($0, t) == 1) print pid }' || true)
     [ -n "$pids" ] || return 0
@@ -73,9 +88,27 @@ while [ $# -gt 0 ]; do
 done
 
 install_dir=${install_dir:-$HOME/.local/share/chusql}
-data_dir=${data_dir:-${XDG_DATA_HOME:-$HOME/.local/share}/chusql/data}
 config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ChuSQL"
 config_file="$config_dir/settings.toml"
+if [ -z "$data_dir" ] && [ -f "$config_file" ]; then
+    data_dir=$(awk '/^[[:space:]]*\[storage\]/ { storage=1; next } /^[[:space:]]*\[/ { storage=0 } storage && /^[[:space:]]*data_dir[[:space:]]*=[[:space:]]*"[^"\\]*"[[:space:]]*(#.*)?$/ { sub(/^[^=]*=[[:space:]]*"/, ""); sub(/"[[:space:]]*(#.*)?$/, ""); print; exit }' "$config_file")
+    [ -n "$data_dir" ] || fail 'settings.toml needs an explicit double-quoted storage.data_dir without escapes; pass --data-dir'
+    case "$data_dir" in /*) ;; *) data_dir="$install_dir/$data_dir" ;; esac
+fi
+data_dir=${data_dir:-${XDG_DATA_HOME:-$HOME/.local/share}/chusql/data}
+if [ "$(uname -s)" = Linux ]; then
+    install_dir=$(realpath -m -- "$install_dir")
+    data_dir=$(realpath -m -- "$data_dir")
+else
+    if [ -d "$install_dir" ]; then install_dir=$(CDPATH= cd -- "$install_dir" && pwd -P); fi
+    if [ -d "$data_dir" ]; then data_dir=$(CDPATH= cd -- "$data_dir" && pwd -P); fi
+fi
+case "$install_dir" in /|"$HOME") fail 'refusing to remove the root or home directory' ;; esac
+case "$data_dir" in /|"$HOME") fail 'refusing to remove the root or home data directory' ;; esac
+case "$install_dir" in "$data_dir"|"$data_dir"/*) fail 'data directory must not contain the installation' ;; esac
+for entry in bin static csql csql-web csql-web.sh uninstall.sh; do
+    case "$data_dir" in "$install_dir/$entry"|"$install_dir/$entry"/*) fail 'data directory overlaps installed program files' ;; esac
+done
 profile="$HOME/.profile"
 
 if [ "$assume_yes" = 'no' ]; then
@@ -108,23 +141,16 @@ step 'Removing files'
 if [ ! -d "$install_dir" ]; then
     note "not found: $install_dir"
 elif [ "$keep_data" = 'yes' ]; then
-    for entry in "$install_dir"/*; do
+    for entry in "$install_dir"/bin "$install_dir"/static "$install_dir"/csql "$install_dir"/csql-web "$install_dir"/csql-web.sh "$install_dir"/uninstall.sh; do
         [ -e "$entry" ] || continue
-        if [ "$entry" = "$data_dir" ]; then
-            note "kept data: $entry"
-            continue
-        fi
         rm -rf "$entry"
     done
-    note "kept $install_dir (data only)"
+    note "kept data: $data_dir"
 else
     rm -rf "$install_dir"
-    case "$data_dir" in
-        "$install_dir" | "$install_dir"/*) ;;
-        *) rm -rf "$data_dir" ;;
-    esac
     note "removed $install_dir"
 fi
+if [ "$keep_data" = 'no' ] && [ -d "$data_dir" ]; then rm -rf "$data_dir"; fi
 
 step 'Removing settings.toml'
 if [ "$keep_config" = 'yes' ]; then
@@ -139,11 +165,11 @@ step 'Removing the PATH entry'
 marker='# ChuSQL'
 if [ ! -f "$profile" ]; then
     note "no $profile"
-elif grep -q "^$marker" "$profile"; then
+elif grep -q "^$marker$" "$profile"; then
     tmp="$profile.chusql-uninstall"
     awk -v m="$marker" '
         skip > 0 { skip--; next }
-        index($0, m) == 1 { skip = 2; next }
+        $0 == m { skip = 2; next }
         { print }
     ' "$profile" >"$tmp" && mv "$tmp" "$profile"
     note "removed the $marker block from $profile"

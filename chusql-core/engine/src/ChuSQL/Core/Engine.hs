@@ -3,14 +3,14 @@ module ChuSQL.Core.Engine (runStatement, runStatementM, rowsOf) where
 import ChuSQL.Core.Engine.Algebra.Eval (evalCondForRowM, evalExprM)
 import ChuSQL.Core.Engine.Algebra.Expr (evalCondForRow, evalExpr)
 import ChuSQL.Core.Engine.Runtime.Query (bindQuery, executeQueryM)
-import ChuSQL.Core.Model
 import ChuSQL.Core.Engine.Semantic (prepare, prepareRowExpression)
 import ChuSQL.Core.Engine.Storage (MonadStorage (..))
 import ChuSQL.Core.Engine.Storage.Memory (MemoryStorage (runMemoryStorage))
 import ChuSQL.Core.Engine.Syntax.AST
 import ChuSQL.Core.Engine.Syntax.Parser (parseExpression)
+import ChuSQL.Core.Model
+import Data.HashSet qualified as HS
 import Data.Maybe (mapMaybe)
-import qualified Data.HashSet as HS
 
 -- 引擎入口：检查语义、按语句分发执行，另有内存实现与泛型版本。
 
@@ -39,6 +39,10 @@ runStatementM q = do
 
 -- | 按语句类型分发（已检查过）
 runStatementUncheckedM :: (MonadStorage m) => Database -> Statement -> m (Either String [Row])
+runStatementUncheckedM db q@SelectDistinct{} =
+    case bindQuery db q of
+        Left e -> pure (Left e)
+        Right bound -> executeQueryM bound
 runStatementUncheckedM db q@Select{} =
     case bindQuery db q of
         Left e -> pure (Left e)
@@ -74,7 +78,7 @@ runStatementUncheckedM db (Delete tbl mWhere) = do
                             result <- replaceAll tbl kept
                             pure (result >> Right [])
   where
-    -- | 取行里的整数 id，取不到就报错
+    -- \| 取行里的整数 id，取不到就报错
     rowId :: Row -> Either String Int
     rowId r = case lookup "id" r of
         Just (VInt k) -> Right k
@@ -104,9 +108,15 @@ runStatementUncheckedM _ (CreateDomain name base) = do
 runStatementUncheckedM _ (DropDomain name) = do
     result <- dropTable (domainTableName name)
     pure (result >> Right [])
-runStatementUncheckedM db ShowDomains = pure (Right
-    [[("domain", VStr (drop (length (domainTableName "")) name)), ("base_type", VStr (typeName (columnType base)))]
-    | (name, table) <- db, isDomainTable name, Just base <- [lookup "base" (tableCols table)]])
+runStatementUncheckedM db ShowDomains =
+    pure
+        ( Right
+            [ [("domain", VStr (drop (length (domainTableName "")) name)), ("base_type", VStr (typeName (columnType base)))]
+            | (name, table) <- db
+            , isDomainTable name
+            , Just base <- [lookup "base" (tableCols table)]
+            ]
+        )
 runStatementUncheckedM _ (DropTable name) = do
     result <- dropTable name
     pure (result >> Right [])
@@ -132,11 +142,13 @@ runStatementUncheckedM db (AlterColumnNull tbl col nullable) =
 runStatementUncheckedM _ CreateUser{} = pure (Left "CREATE USER is executed by the account service")
 runStatementUncheckedM _ AlterUser{} = pure (Left "ALTER USER is executed by the account service")
 runStatementUncheckedM _ AlterIdentity{} = pure (Left "ALTER ROLE is executed by the account service")
+runStatementUncheckedM _ ShowGrants = pure (Left "SHOW GRANTS is executed by the account service")
 runStatementUncheckedM _ ShowRoles = pure (Left "SHOW ROLES is executed by the account service")
 runStatementUncheckedM _ DropUser{} = pure (Left "DROP USER is executed by the account service")
 runStatementUncheckedM _ CreateRole{} = pure (Left "CREATE ROLE is executed by the privilege service")
 runStatementUncheckedM _ DropRole{} = pure (Left "DROP ROLE is executed by the privilege service")
 runStatementUncheckedM _ GrantPrivileges{} = pure (Left "GRANT is executed by the privilege service")
+runStatementUncheckedM _ RevokeGrantOption{} = pure (Left "REVOKE is executed by the privilege service")
 runStatementUncheckedM _ RevokePrivileges{} = pure (Left "REVOKE is executed by the privilege service")
 runStatementUncheckedM _ GrantRole{} = pure (Left "GRANT is executed by the privilege service")
 runStatementUncheckedM _ RevokeRole{} = pure (Left "REVOKE is executed by the privilege service")
@@ -157,9 +169,9 @@ existingRows tbl table
     | needsRows table = scan tbl
     | otherwise = pure (Right [])
   where
-    -- | 这一表有没有要判约束的列
+    -- \| 这一表有没有要判约束的列
     needsRows t = any (constraintColumn . snd) (tableCols t)
-    -- | 这一列带不带要判的约束
+    -- \| 这一列带不带要判的约束
     constraintColumn c = columnAutoIncrement c || columnUnique c || columnPrimaryKey c
 
 -- | 插一行：补齐缺列、给自增值、收类型、查约束
@@ -172,7 +184,7 @@ buildRows table current cols rows = do
             let auto = autoColumn table
             go auto (autoStart auto current) values []
   where
-    -- | 逐行构造，最后统一查一遍约束
+    -- \| 逐行构造，最后统一查一遍约束
     go _ _ [] acc = do
         let built = reverse acc
         plan <- checkPlan table
@@ -189,25 +201,27 @@ buildRow :: Table -> Maybe (String, Column) -> [String] -> Int -> [Value] -> Eit
 buildRow table auto cols counter vals = go (tableCols table) counter []
   where
     provided = zip cols vals
-    -- | 按列定义逐列补值
+    -- \| 按列定义逐列补值
     go [] c acc = Right (reverse acc, c)
     go ((name, col) : rest) c acc = do
         (v, c') <- pick name col c
         v' <- coerceValue (columnType col) v
         go rest c' ((name, v') : acc)
-    -- | 决定这一列取什么值
+    -- \| 决定这一列取什么值
     pick name col c
         | Just (autoName, _) <- auto
         , name == autoName
-        , maybe True (== VNull) (lookup name provided) = Right (VInt c, c + 1)
+        , maybe True (== VNull) (lookup name provided) =
+            Right (VInt c, c + 1)
         | Just v <- lookup name provided = Right (v, bump name col c v)
         | Just d <- columnDefault col = Right (d, c)
         | columnNullable col = Right (VNull, c)
         | otherwise = Left ("INSERT: column " ++ name ++ " is NOT NULL and has no default")
-    -- | 自增值跟着已有的值往前推
+    -- \| 自增值跟着已有的值往前推
     bump name _ c v
         | Just (autoName, _) <- auto
-        , name == autoName = max (c + 1) (valueInt v + 1)
+        , name == autoName =
+            max (c + 1) (valueInt v + 1)
         | otherwise = c
 
 -- | 取自增值，不是整数就当 0
@@ -235,9 +249,9 @@ type CheckPlan = [(String, Expr)]
 checkPlan :: Table -> Either String CheckPlan
 checkPlan table = mapM parse (mapMaybe checked (tableCols table))
   where
-    -- | 只挑出带 CHECK 文本的列
+    -- \| 只挑出带 CHECK 文本的列
     checked (name, col) = (,) name <$> columnCheck col
-    -- | 解析一列的 CHECK 文本
+    -- \| 解析一列的 CHECK 文本
     parse (name, text) = case parseExpression text of
         Left err -> Left ("CHECK on " ++ name ++ ": " ++ firstLine err)
         Right e -> do
@@ -248,7 +262,7 @@ checkPlan table = mapM parse (mapMaybe checked (tableCols table))
 runChecks :: CheckPlan -> Row -> Either String ()
 runChecks plan row = mapM_ check plan
   where
-    -- | 跑一条 CHECK
+    -- \| 跑一条 CHECK
     check (name, e) = case evalCondForRow e row of
         Left err -> Left ("CHECK on " ++ name ++ ": " ++ err)
         Right True -> Right ()
@@ -262,7 +276,7 @@ firstLine = takeWhile (/= '\n')
 enforceNotNull :: [(String, Column)] -> [Row] -> Either String ()
 enforceNotNull cols rows = mapM_ check cols
   where
-    -- | 查这一列的 NOT NULL
+    -- \| 查这一列的 NOT NULL
     check (name, col)
         | columnNullable col = Right ()
         | any (\r -> lookup name r == Just VNull) rows = Left ("NOT NULL: column " ++ name ++ " cannot be null")
@@ -273,11 +287,11 @@ enforceUnique :: [(String, Column)] -> [Row] -> Either String ()
 enforceUnique cols rows = mapM_ check targets
   where
     targets = [(n, c) | (n, c) <- cols, columnUnique c || columnPrimaryKey c]
-    -- | 查这一列有没有重复值
+    -- \| 查这一列有没有重复值
     check (name, _) = go name HS.empty (mapMaybe (lookup name) rows)
-    -- | 逐个值比过去
+    -- \| 逐个值比过去
     go _ _ [] = Right ()
-    -- | NULL 不算冲突，跳过
+    -- \| NULL 不算冲突，跳过
     go name seen (VNull : rest) = go name seen rest
     go name seen (v : rest)
         | HS.member (canonicalValue v) seen = Left ("UNIQUE: duplicate value in column " ++ name)
@@ -317,7 +331,7 @@ setColumn col v = map (\(k, val) -> if k == col then (k, v) else (k, val))
 splitByConditionM :: (MonadStorage m) => Database -> Maybe Expr -> [Row] -> m (Either String ([Row], [Row]))
 splitByConditionM db cond = go [] []
   where
-    -- | 逐行分流
+    -- \| 逐行分流
     go doomed kept [] = pure (Right (reverse doomed, reverse kept))
     go doomed kept (r : rs) = do
         hit <- case cond of
@@ -346,9 +360,9 @@ alterTable db tbl change = case lookupTable db tbl of
                     result <- replaceSchema tbl cols newRows
                     pure (result >> Right [])
   where
-    -- | 改完再统一查一遍约束
+    -- \| 改完再统一查一遍约束
     checkAltered (cols, rows) = do
-        let table = Table tbl cols rows Nothing
+        let table = Table tbl cols rows Nothing Nothing Nothing
         plan <- checkPlan table
         mapM_ (runChecks plan) rows
         enforceNotNull cols rows
@@ -387,7 +401,7 @@ retypeColumn col ty cols rows
         rows' <- mapM convert rows
         Right (map (\entry@(n, c) -> if n == col then (n, c{columnType = ty}) else entry) cols, rows')
   where
-    -- | 把这一列的老值收进新类型
+    -- \| 把这一列的老值收进新类型
     convert row = case lookup col row of
         Nothing -> Right row
         Just v -> do

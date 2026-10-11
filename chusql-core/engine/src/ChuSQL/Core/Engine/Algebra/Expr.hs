@@ -11,6 +11,13 @@ import ChuSQL.Core.Engine.Runtime.SQL (invokeSQLFunction, constructSQLValue)
 evalExpr :: Expr -> Row -> Either String Value
 evalExpr (Col name) row =
     maybe (Left ("unknown column: " ++ name)) Right (lookup name row)
+evalExpr (ColumnSlot slot name) row = case drop slot row of
+    (key, value) : _ | slot >= 0, key == name -> Right value
+    [] -> Left ("missing bound column: " ++ name)
+    _ -> Left ("bound column position mismatch: " ++ name)
+evalExpr (OuterColumnSlot localWidth slot name) row
+    | localWidth < 0 || slot < 0 = Left ("bound column position mismatch: " ++ name)
+    | otherwise = evalExpr (ColumnSlot slot name) (drop localWidth row)
 evalExpr (FunctionCall name _) _ = Left ("unbound function call: " ++ name)
 evalExpr (Construct _ _) _ = Left "unbound runtime constructor"
 evalExpr (BoundConstruct tid arguments) row = mapM (\argument -> evalExpr argument row) arguments >>= constructSQLValue tid
@@ -70,6 +77,8 @@ quantifiedCompare op lhs vs q = case vs of
 -- | 表达式用到了哪些列
 colsInExpr :: Expr -> [String]
 colsInExpr (Col c) = [c]
+colsInExpr (ColumnSlot _ c) = [c]
+colsInExpr (OuterColumnSlot _ _ c) = [c]
 colsInExpr (Construct _ arguments) = concatMap colsInExpr arguments
 colsInExpr (BoundConstruct _ arguments) = concatMap colsInExpr arguments
 colsInExpr (FunctionCall _ arguments) = concatMap colsInExpr arguments
@@ -247,6 +256,8 @@ bareColumns e = case e of
     FunctionCall _ arguments -> concatMap bareColumns arguments
     BoundFunction _ _ arguments -> concatMap bareColumns arguments
     Col c -> [c]
+    ColumnSlot _ c -> [c]
+    OuterColumnSlot _ _ c -> [c]
     Add a b -> both a b
     Sub a b -> both a b
     Mul a b -> both a b

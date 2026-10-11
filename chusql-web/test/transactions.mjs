@@ -12,7 +12,7 @@ globalThis.document = { getElementById: (id) => id === 'root' ? { addEventListen
 let source = await readFile(new URL('../static/app.js', import.meta.url), 'utf8');
 source = source.replaceAll("'./api.js'", JSON.stringify(new URL('../static/api.js', import.meta.url).href))
   .replaceAll("'./core.js'", JSON.stringify(new URL('../static/core.js', import.meta.url).href))
-  .replace('void boot();', 'export { state, commitAll, rollbackAll, stageUpdate, removeStaged, ensureEdit, runSql };');
+  .replace('void boot();', 'export { state, commitAll, rollbackAll, stageUpdate, removeStaged, ensureEdit, runSql, renderNormalization };');
 const app = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
 let calls;
 let commitResponse;
@@ -172,4 +172,53 @@ test('edits are locked while SQL releases the previous snapshot', async () => {
   await job;
   assert.equal(app.state.editBusy, false);
   assert.equal(app.state.edit, null);
+});
+
+// 校验分析复用编辑视图并保留严格声明的原始字段。
+test('normalization keeps snapshot ownership, exact identities and duplicate declaration fields', async () => {
+  await api.beginEdit('normalization-page', 'test');
+  const expected = { object: { database_id: '9007199254740993', object_id: '18446744073709551615' }, schema_fingerprint: 'schema' };
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init });
+    return response({ api_version: 1, findings: [], schema: [] });
+  };
+  await api.analyzeNormalization('test', 'users', '{"atomic_attributes":true,"atomic_attributes":false}', expected);
+  const sent = calls.find((call) => call.url === '/api/normalization/analyze');
+  assert.equal(new Headers(sent.init.headers).get('X-ChuSQL-Edit'), 'normalization-page');
+  assert.equal(new Headers(sent.init.headers).get('X-ChuSQL-Database'), 'test');
+  assert.equal((sent.init.body.match(/"atomic_attributes"/g) ?? []).length, 2);
+  assert.deepEqual(JSON.parse(sent.init.body).expected_object, expected.object);
+  assert.equal(calls.filter((call) => call.url === '/api/edit/begin').length, 1);
+  api.forgetEdit();
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init });
+    return response(url === '/api/query'
+      ? { columns: [], rows: [], rowCount: 0, truncated: false, transaction: true }
+      : { api_version: 1, findings: [], schema: [] });
+  };
+  await api.query('BEGIN', 'test', 'normalization-console');
+  await api.analyzeNormalization('test', 'users', '{}', expected);
+  const fromConsole = calls.filter((call) => call.url === '/api/normalization/analyze').at(-1);
+  const begun = calls.filter((call) => call.url === '/api/query').at(-1);
+  assert.equal(new Headers(fromConsole.init.headers).get('X-ChuSQL-Console'), new Headers(begun.init.headers).get('X-ChuSQL-Console'));
+  assert.equal(new Headers(fromConsole.init.headers).get('X-ChuSQL-Edit'), null);
+});
+
+// 校验结构、违反证据和分解中的用户文字全部转义。
+test('normalization escapes schema names, conditions, witnesses and suggestions', () => {
+  const result = { innerHTML: '' };
+  const original = document.getElementById;
+  document.getElementById = (id) => id === 'normalization-result' ? result : original(id);
+  try {
+    app.renderNormalization({ schema: [{ name: '<img src=x onerror=alert(1)>', ty: 'str', nullable: true }],
+      view: 'live_schema', candidate_keys: [['<script>']],
+      findings: [{ normal_form: 'bcnf', verdict: 'violated', condition: '<script>alert(1)</script>', witnesses: [{ lhs: ['<img>'], rhs: ['id'] }] }],
+      suggestions: [{ relations: [['<script>'], ['id']] }] });
+    assert.equal(result.innerHTML.includes('<img'), false);
+    assert.equal(result.innerHTML.includes('<script>'), false);
+    assert.equal(result.innerHTML.includes('&lt;img'), true);
+    assert.equal(result.innerHTML.includes('结构与约束'), true);
+  } finally {
+    document.getElementById = original;
+  }
 });

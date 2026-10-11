@@ -17,8 +17,19 @@
 
 - `SELECT` 支持 `WHERE`、`ORDER BY`、`LIMIT`、`JOIN` / `LEFT JOIN`、`GROUP BY` 与聚合，以及标量 / `IN` / `EXISTS` 子查询和量词比较（`op ANY` / `op ALL`）。
 - 来源可以是派生表：`SELECT d.name FROM (SELECT name FROM users) d`。派生表必须带别名，内层不能引用外层列；输出列取裸列名（内层写 `u.id`，外层用 `d.id` 引用）。
-- 投影列可以起别名：`SELECT count(*) AS total FROM orders ORDER BY total`，别名就是结果集的列名。`ORDER BY` 优先使用唯一的投影别名，再查来源列；重复的排序别名报歧义错误，来源列可以用限定名消除同名冲突。排序暂不接受任意表达式或列序号。
+- 投影列可以起别名：`SELECT count(*) AS total FROM orders ORDER BY total`，别名就是结果集的列名。`ORDER BY` 优先使用唯一的投影别名，再查来源列；重复的排序别名报歧义错误，来源列可以用限定名消除同名冲突。排序接受从 1 开始的输出列序号（例如 `ORDER BY 2 DESC`），在 `*` 展开后解析，零或越界序号报错；暂不接受任意表达式。
 - 鉴权覆盖整棵来源树：查派生表时内层表也要有权限，只有外层引用的表有权限不够。
+
+### DISTINCT 与 ALL
+
+`SELECT DISTINCT` 按完整输出值组合去重，保留首次出现的行，然后执行排序和 LIMIT。NULL 在去重时视为相同值；等值整数与整值浮点按既有数值语义合并。默认 SELECT 或显式 `SELECT ALL` 保留重复行。
+
+```sql
+SELECT DISTINCT user_id FROM orders ORDER BY 1 LIMIT 10;
+SELECT DISTINCT user_id + 1 AS next_id FROM orders ORDER BY next_id;
+```
+
+DISTINCT 的排序列必须出现在输出中；排序可使用输出别名、选出的来源列或输出列序号。缺少比较能力的 List / Maybe / Tuple 类型仍拒绝 DISTINCT。去重支持连接、聚合、子查询、CTE 和当前连接的事务快照。
 
 ### 比较运算符
 
@@ -115,6 +126,8 @@ ALTER ROLE analyst NOSUPERUSER;
 SHOW ROLES;
 ```
 
+`SHOW GRANTS` 允许登录身份查看自己的有效对象权限，输出 `identity`、`privilege`、`object` 和 `grant_option`。结果包含直接授权、启用角色继承、PUBLIC 默认 CONNECT 和所有权隐含权限；表范围授权按现存表展开，超级用户展示全部业务对象权限。系统对象不列出，不接受 `FOR` 查询他人身份。该命令不要求选中工作库；事务中也读取当前权限目录。
+
 `SHOW ROLES` 展示全部身份的编号、名称、登录能力、最高权限标志、启用状态及创建时间，不返回口令。`ALTER USER` 与 `ALTER ROLE` 的属性和口令修改语法通用；同一属性不能重复指定。身份管理仅允许最高权限身份执行。
 
 `SUPERUSER` 不依赖启动参数里的管理员名称（`--user`），也不会通过角色成员关系继承。禁用登录身份会拒绝登录；禁用权限角色会停止贡献继承权限。属性修改会使受影响的既有连接失效，下一次请求返回 `unauthorized` 后关闭。最后一个启用且可以登录的最高权限身份不能删除、禁用、取消登录或取消最高权限。
@@ -151,6 +164,8 @@ REVOKE SELECT ON sales.orders FROM reviewer;
 最高权限身份拥有完整权限。数据库默认向 PUBLIC 开放 CONNECT，不默认授予 CREATE 或数据权限。具有数据库 CREATE 的身份可建表，并成为新表所有者；表所有者可管理表、字段及索引，并授予该表权限。数据库所有者可删除自己的数据库，创建数据库与管理 DOMAIN 仍要求最高权限。
 
 `GRANT ... WITH GRANT OPTION` 允许再转授；所有者也可授予自身对象的权限。普通授予者可撤销自己的授予，所有者及最高权限身份可撤销对象上的其他授予。撤销时收回相应 grant option，并级联清理失去合法来源的下游授权；仍有独立来源的授权保留。转授权能力随启用的角色继承，循环转授不能独立维持权限。REVOKE 不移除所有者的隐含权限。
+
+`REVOKE GRANT OPTION FOR SELECT ON users FROM alice` 只移除指定授权来源的转授权能力，保留 alice 的 SELECT 权限；失去唯一支持来源的下游授权会级联撤销，独立来源继续有效。最高权限身份或对象所有者可撤销全部匹配来源，普通授予者只能撤销自己的来源；所有权自身的权限不受 REVOKE 影响。
 
 系统目录访问还受目录管理属性控制，具体能力见 [用户与角色](users-and-roles.md)。
 

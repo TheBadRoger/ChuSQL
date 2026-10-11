@@ -2,7 +2,7 @@
 
 module ChuSQL.Server.Privileges
     ( Grant (..), Membership (..), PrivilegeCommand (..), PrivilegeError (..), Privileges, RoleView (..)
-    , affectedAccounts, authorize, authorizeTables, authorizeConnect, filterTables, listRoleViews
+    , affectedAccounts, authorize, authorizeTables, authorizeConnect, filterTables, listRoleViews, listSelfGrants
     , newPrivileges, normalizeObject, privilegeCommand, runPrivilegeCommand, claimObject, prepareObject, reconcileObjects, affectedObject
     ) where
 
@@ -22,7 +22,7 @@ import qualified Data.Text as T
 data PrivilegeError = PrivilegeError Text Text deriving (Show, Eq)
 data Membership = Membership { memberRole :: Text, memberUser :: Text } deriving (Show, Eq, Ord)
 data PrivilegeCommand = CreateRoleCommand Text | DropRoleCommand Text
-    | GrantPrivilegesCommand [Text] Text Text Bool | RevokePrivilegesCommand [Text] Text Text
+    | GrantPrivilegesCommand [Text] Text Text Bool | RevokePrivilegesCommand [Text] Text Text | RevokeGrantOptionCommand [Text] Text Text
     | GrantRoleCommand Text [Text] | RevokeRoleCommand Text [Text] deriving (Show, Eq)
 data Privileges = Privileges { pvCatalog :: Catalog, pvBackend :: Backend }
 
@@ -38,6 +38,7 @@ privilegeCommand statement = case statement of
     CreateRole name -> Just (CreateRoleCommand (T.pack name))
     DropRole name -> Just (DropRoleCommand (T.pack name))
     GrantPrivileges items object role option -> Just (GrantPrivilegesCommand (map (T.toLower . T.pack) items) (T.pack object) (T.pack role) option)
+    RevokeGrantOption items object role -> Just (RevokeGrantOptionCommand (map (T.toLower . T.pack) items) (T.pack object) (T.pack role))
     RevokePrivileges items object role -> Just (RevokePrivilegesCommand (map (T.toLower . T.pack) items) (T.pack object) (T.pack role))
     GrantRole role members -> Just (GrantRoleCommand (T.pack role) (map T.pack members))
     RevokeRole role members -> Just (RevokeRoleCommand (T.pack role) (map T.pack members))
@@ -47,6 +48,7 @@ privilegeCommand statement = case statement of
 runPrivilegeCommand :: Privileges -> Principal -> Text -> PrivilegeCommand -> IO (Either PrivilegeError ())
 runPrivilegeCommand service principal database command = withTables service $ case command of
     GrantPrivilegesCommand items object role option -> catalog (OA.objectGrant backend directory principal database items object role option)
+    RevokeGrantOptionCommand items object role -> catalog (OA.objectRevokeGrantOption backend directory principal database items object role)
     RevokePrivilegesCommand items object role -> catalog (OA.objectRevoke backend directory principal database items object role)
     CreateRoleCommand role
         | principalIsCatalogManager principal -> do
@@ -106,6 +108,7 @@ affectedAccounts service command = withTables service (catalog (OA.objectAffecte
         CreateRoleCommand _ -> []
         DropRoleCommand role -> [role]
         GrantPrivilegesCommand _ _ role _ -> [role]
+        RevokeGrantOptionCommand _ _ role -> [role]
         RevokePrivilegesCommand _ _ role -> [role]
         GrantRoleCommand _ members -> members
         RevokeRoleCommand _ members -> members
@@ -195,6 +198,7 @@ reconcileObjects service = withTables service (catalog (OA.objectReconcile (pvBa
 -- 收集数据语句及子查询所需的表权限。
 requiredActions :: Statement -> Maybe [(Text, Text)]
 requiredActions statement = case statement of
+    SelectDistinct q -> requiredActions q
     Select{} -> Just (selectNeeds (selectFrom statement) (maybe [] (: []) (selectWhere statement)))
     SelectExpr{} -> Just (selectNeeds (selectFrom statement) (maybe [] (: []) (selectWhere statement) ++ map snd (selectItems statement)))
     Insert table _ rows -> Just ((T.pack table, "insert") : selectsOf (concat rows))
@@ -231,3 +235,7 @@ storageError message = PrivilegeError code (T.pack message)
 
 forbidden :: PrivilegeError
 forbidden = PrivilegeError "forbidden" "administrator required"
+
+-- 查询登录身份自己的有效权限。
+listSelfGrants :: Privileges -> Principal -> IO (Either PrivilegeError [Grant])
+listSelfGrants service principal = withTables service (catalog (OA.objectSelfViews (pvBackend service) (pvCatalog service) principal))

@@ -21,7 +21,7 @@ function hasValidRows(body) {
 async function request(url, init, database) {
   const headers = new Headers(init && init.headers ? init.headers : undefined);
   if (database) headers.set('X-ChuSQL-Database', database);
-  if (editing && editing.database === database && url.startsWith('/api/tables') && (!init || init.method === 'GET')) {
+  if (editing && editing.database === database && ((url.startsWith('/api/tables') && (!init || init.method === 'GET')) || url === '/api/normalization/analyze')) {
     headers.set('X-ChuSQL-Edit', editing.id);
   }
   let response;
@@ -325,4 +325,24 @@ export async function loadUiSettings() {
 // 保存 IDE 设置。
 export async function saveUiSettings(settings) {
   await request('/api/ui-settings', jsonInit('PUT', settings));
+}
+
+// 在页面已有视图上请求只读范式分析。
+export async function analyzeNormalization(database, table, declaration, expected) {
+  const payload = { api_version: 1, database, table };
+  if (expected) {
+    payload.expected_object = expected.object;
+    payload.expected_schema_fingerprint = expected.schema_fingerprint;
+  }
+  const init = jsonInit('POST', payload);
+  if (!editing && consoleTransaction?.database === database) {
+    init.headers['X-ChuSQL-Console'] = consoleTransaction.console;
+  }
+  // 原始声明直接嵌入，重复字段交给服务端明确拒绝。
+  init.body = `${JSON.stringify(payload).slice(0, -1)},"declaration":${typeof declaration === 'string' ? declaration : JSON.stringify(declaration)}}`;
+  const result = await request('/api/normalization/analyze', init, database);
+  if (!isObject(result) || result.api_version !== 1 || !Array.isArray(result.findings) || !Array.isArray(result.schema)) {
+    throw new Error('服务器返回的范式报告无法识别。');
+  }
+  return result;
 }
