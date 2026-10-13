@@ -8,14 +8,7 @@ import ChuSQL.Core.Engine.Runtime.Functions (FunctionId)
 
 data Statement
     = Select
-        { selectCols :: [String]
-        , selectFrom :: FromClause
-        , selectWhere :: Maybe Expr
-        , selectGroupBy :: [String]
-        , selectOrderBy :: [(String, SortDir)]
-        , selectLimit :: Maybe Int
-        }
-    | SelectExpr
+        -- | 输出名称与投影表达式，普通列用 Col
         { selectItems :: [(String, Expr)]
         , selectFrom :: FromClause
         , selectWhere :: Maybe Expr
@@ -170,7 +163,7 @@ data SortDir
 makeSelect :: [String] -> String -> Maybe Expr -> Statement
 makeSelect cols tbl w =
     Select
-        { selectCols = cols
+        { selectItems = [(c, Col c) | c <- cols]
         , selectFrom = FromTable Nothing tbl
         , selectWhere = w
         , selectGroupBy = []
@@ -181,7 +174,6 @@ makeSelect cols tbl w =
 -- | 将去重排序映射到输出列
 distinctOrdering :: Statement -> Either String [(String, SortDir)]
 distinctOrdering q@Select{} = resolveDistinctOrdering q
-distinctOrdering q@SelectExpr{} = resolveDistinctOrdering q
 distinctOrdering _ = Left "DISTINCT requires SELECT"
 
 -- | 解析去重输出的排序列
@@ -189,8 +181,7 @@ resolveDistinctOrdering :: Statement -> Either String [(String, SortDir)]
 resolveDistinctOrdering q = mapM resolve (selectOrderBy q)
   where
     items = case q of
-        Select { selectCols = cols } -> [(c, Col c) | c <- cols]
-        SelectExpr { selectItems = projected } -> projected
+        Select { selectItems = projected } -> projected
         _ -> []
     -- | 排序键必须出现在去重结果中
     resolve (column, direction) = case [label | (label, e) <- items, label == column || e == Col column] of

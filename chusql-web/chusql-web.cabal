@@ -12,7 +12,6 @@ build-type:     Simple
 library
     hs-source-dirs:   src
     exposed-modules:  ChuSQL.Web.API
-                      ChuSQL.Web.Demo
                       ChuSQL.Web.Secure
                       ChuSQL.Web.Static
                       ChuSQL.Web.UISettings

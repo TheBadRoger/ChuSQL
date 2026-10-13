@@ -1,6 +1,10 @@
-# 自定义类型与预定义类型
+# 类型、函数与类型目录
 
-本文描述 ChuSQL 当前实现。预定义类型是引擎已经支持的基础类型；自定义类型使用 `DOMAIN` 给基础类型命名，便于多个表列复用同一类型定义。
+[← 返回 README](../README.md)
+
+**本页导航：** [自定义类型 DOMAIN](#自定义类型-domain) · [预定义类型的含义](#预定义类型的含义) · [系统类型目录字段](#系统类型目录字段) · [运行时类型与函数](#运行时类型与函数) · [DOMAIN 约束设计（尚未实现）](#domain-约束设计尚未实现)
+
+ChuSQL 支持基础类型、运行时复合类型和按数据库保存的 DOMAIN。DOMAIN 为基础类型命名，便于多个表列复用同一定义。
 
 ## 自定义类型 DOMAIN
 
@@ -47,22 +51,49 @@ DOMAIN 按数据库保存，保留名称并复用基础类型的校验与运算�
 
 首次安装完成管理员初始化后登记类型。重复引导保留一致的记录并补齐缺失项；同名定义冲突会报错，停止安装启动流程，不覆盖现有定义。
 
+## 运行时类型与函数
+
+```sql
+CREATE TABLE typed_values (
+    id Int,
+    name String,
+    numbers [Int],
+    label Maybe String,
+    pair (Int, String)
+);
+
+INSERT INTO typed_values (id, name, numbers, label, pair)
+VALUES (1, 'abc', LIST<Int>(1, 2), MAYBE<String>(), TUPLE<Int, String>(3, 'x'));
+
+SELECT length(name), numbers, label, pair FROM typed_values;
+
+UPDATE typed_values SET numbers = LIST<Int>(9), label = MAYBE<String>('ready') WHERE id = 1;
+
+SELECT LIST<Maybe Int>(MAYBE<Int>(), MAYBE<Int>(42));
+SELECT not(TRUE), length('你好');
+```
+
+| 类型或函数 | 写法与语义 |
+| --- | --- |
+| 标量 | `Int`、`Double`、`Bool`、`String` |
+| 列表 | `[a]` / `List a`；`LIST<a>(...)` 按完整类型校验，不隐式转换元素类型 |
+| 可选值 | `Maybe a`；`MAYBE<a>()` 为 Nothing，`MAYBE<a>(value)` 为 Just |
+| 元组 | `(a, b, ...)`；`TUPLE<a, b>(...)` 校验各字段类型 |
+| `length` | `String -> Int` |
+| `not` | `Bool -> Bool` |
+
+空列表和 Nothing 也有确定类型。SQL 可空列的 `NULL` 与 Maybe 内部的 Nothing 不同，不能互相替代。内建函数名称不区分大小写，NULL 参数传播为 NULL，非空参数仍校验类型。
+
+> [!NOTE]
+> 复合类型尚无 SQL Eq / Ord / Hash 能力，不能自动用于比较、排序、分组、极值或索引。Web 可以显示复合值及构造器预览，修改须通过 SQL 控制台。
+
+### 类型身份与持久化
+
+内建构造器编号固定为 `Int=1`、`Double=2`、`Bool=3`、`String=4`、`List=5`、`Maybe=6`、`Tuple=7`；函数编号固定为 `length=1`、`not=2`。完整 `TypeId` 与逻辑类型、物理表示分开，schema 和值使用版本化编码。未知版本、类型或载荷不匹配、非有限浮点数明确报错。
+
+> [!IMPORTANT]
+> 旧标量编码可继续读取；包含运行时复合类型的数据不能交给不支持该编码的旧客户端。
+
 ## DOMAIN 约束设计（尚未实现）
 
-以下约束与 ALTER 能力是后续设计，当前 DOMAIN 仍只提供类型命名。实施依赖 [bound IR](architecture.md#bound-ir)，先固化类型、列身份与表达式求值规则。
-
-### 约束与默认值语义
-
-定义扩展为基础类型引用、可选 DEFAULT、NOT NULL、命名 CHECK 及定义版本。CHECK 只接受绑定的单值 `VALUE` 表达式和确定性内置函数，禁止子查询、表引用和自定义副作用函数；CHECK 的 false 拒绝，unknown 允许，NOT NULL 独立拒绝 NULL。嵌套领域从底层向外校验，约束取交集；显式列默认优先，否则使用最近外层有定义的领域默认，只在省略列值时使用，不替换显式 NULL。
-
-### 引擎与存储校验
-
-server/engine 负责绑定；Rust 存储根据版本化约束 IR 在全部写入口再次验证，包含批写、原始请求和迁移。两层必须共享运算符标识、类型及 NULL 规则并用相同测试向量验证；不能让 Rust 重新解析 SQL 或只依赖客户端验证。解析诊断不得吞错。
-
-### 结构变更与持久化
-
-首版仅支持 CREATE 带约束与 ALTER 添加经全量验证的约束、修改默认；不支持 NOT VALID 或 CASCADE。ALTER 在稳定 schema/数据视图中校验所有直接和间接使用列，短锁发布前复查版本；失败不改变定义。类型定义、依赖版本和受影响 schema 同一 WAL 组提交。现有 DOMAIN 空目录表升级为明确版本元数据，旧编码读入并转换，拒绝无法解析的定义。
-
-### 验收条件
-
-验收覆盖嵌套默认优先级、三值 CHECK、NULL、批写全回退、领域改变并发写、循环/间接依赖、内存事务提交与 WAL 重放。新约束加入既有事务后，提交必须按最新定义重新验证或报 schema 冲突。
+当前 DOMAIN 只提供类型命名，不支持自身 `CHECK`、`NOT NULL`、`DEFAULT`、`ALTER DOMAIN` 或 `CASCADE`。后续约束绑定依赖统一 [bound IR](architecture.md#bound-ir)、对象依赖管理和原子结构事务；不能仅放开语法而绕过写入校验、旧数据验证及 WAL 恢复。

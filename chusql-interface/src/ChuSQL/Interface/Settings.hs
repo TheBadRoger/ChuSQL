@@ -61,7 +61,6 @@ settingCatalogue =
     , owned "storage-btree-order" "Storage B+tree order" "storage" "int" "4" "btree" "order"
     , owned "storage-buffer-pool" "Storage buffer pool pages" "storage" "int" "1024" "buffer" "pool_size"
     , owned "storage-log" "Storage log level" "storage" "text" "info" "log" "level"
-    , item "seed" "Seed demo data on start" "storage" "bool" "1" True True
     , owned "tcp-listen-host" "TCP listen address" "network" "text" "127.0.0.1" "server" "listen_host"
     , owned "tcp-port" "TCP port" "network" "int" "7777" "server" "port"
     , owned "tcp-max-message" "TCP max request line (bytes)" "network" "int" "1048576" "server" "max_message"
@@ -231,7 +230,6 @@ effectiveSettings cfg =
         , ("max-page-size", tshow (wcMaxPageSize cfg))
         , ("max-rows", tshow (wcMaxRows cfg))
         , ("max-sql-length", tshow (wcMaxSqlLength cfg))
-        , ("seed", boolText (wcSeedDemo cfg))
         , ("data-dir", maybe "" T.pack (wcDataDir cfg))
         , ("log-files", T.pack (wcLogFiles cfg))
         ]

@@ -17,10 +17,8 @@ import ChuSQL.Interface.Config (
  )
 import ChuSQL.Interface.Link (clientPing, closeClient, connectClient)
 import ChuSQL.Interface.RateLimit (newRateLimiter)
-import ChuSQL.Interface.Session (authenticateSession, newSession)
 import ChuSQL.Interface.Settings (effectiveSettings)
 import ChuSQL.Interface.TOML (resolveConfigPath)
-import ChuSQL.Web.Demo (SeedReport (..), seedDemo)
 import Control.Exception (IOException, try)
 import Data.Char (toLower)
 import Data.String (fromString)
@@ -52,7 +50,6 @@ data Options = Options
     , optMaxPageSize :: Maybe Int
     , optMaxRows :: Maybe Int
     , optMaxSqlLength :: Maybe Int
-    , optSeedDemo :: Maybe Bool
     , optHelp :: Bool
     }
 
@@ -74,7 +71,6 @@ emptyOptions =
         , optMaxPageSize = Nothing
         , optMaxRows = Nothing
         , optMaxSqlLength = Nothing
-        , optSeedDemo = Nothing
         , optHelp = False
         }
 
@@ -99,7 +95,6 @@ parseArgs = go emptyOptions
     go opts ("--max-page-size" : v : rest) = withInt "--max-page-size" v (\n -> go opts{optMaxPageSize = Just n} rest)
     go opts ("--max-rows" : v : rest) = withInt "--max-rows" v (\n -> go opts{optMaxRows = Just n} rest)
     go opts ("--max-sql-length" : v : rest) = withInt "--max-sql-length" v (\n -> go opts{optMaxSqlLength = Just n} rest)
-    go opts ("--seed" : v : rest) = go opts{optSeedDemo = Just (isTrue v)} rest
     go opts ("--cookie-secure" : v : rest) = go opts{optCookieSecure = Just (isTrue v)} rest
     go _ (a : _) = Left ("unrecognized argument or missing value: " ++ a)
 
@@ -136,7 +131,6 @@ usage = do
     putStrLn "  --max-page-size N      rows per page ceiling       ([web] max_page_size, default 500)"
     putStrLn "  --max-rows N           rows returned per query     ([web] max_rows, default 1000)"
     putStrLn "  --max-sql-length N     max SQL characters          ([web] max_sql_length, default 20000)"
-    putStrLn "  --seed BOOL            load demo data when the db is empty ([web] seed, default false)"
     putStrLn ""
     putStrLn "administrator password: lives in the __system_users system table, never in settings.toml"
     putStrLn "  the installer always sets one; an account whose hash is still empty signs in with an empty password"
@@ -164,7 +158,6 @@ applyOptions cfg opts =
         , wcMaxPageSize = orElse (optMaxPageSize opts) (wcMaxPageSize cfg)
         , wcMaxRows = orElse (optMaxRows opts) (wcMaxRows cfg)
         , wcMaxSqlLength = orElse (optMaxSqlLength opts) (wcMaxSqlLength cfg)
-        , wcSeedDemo = orElse (optSeedDemo opts) (wcSeedDemo cfg)
         }
   where
     -- | 有就用新的，没有留旧值
@@ -220,7 +213,6 @@ run opts = do
             printBanner cfg configPath staticDir
             reportCredential cfg legacy
             checkServer (aeServerHost env) (aeServerPort env)
-            seedIfWanted cfg (aeServerHost env) (aeServerPort env)
             let settings =
                     Warp.setPort (wcPort cfg) (Warp.setHost (fromString (wcHost cfg)) Warp.defaultSettings)
             serve settings app
@@ -261,32 +253,6 @@ reportCredential cfg legacy = do
             putStrLn "  !! the [web] section still carries a plaintext password key; it is ignored now"
             putStrLn "  !! remove it: the administrator password lives in the __system_users system table"
         else pure ()
-
--- | 配了 seed 就补演示数据（管理员已设口令时跳过）
-seedIfWanted :: WebConfig -> Text -> Int -> IO ()
-seedIfWanted cfg host port
-    | not (wcSeedDemo cfg) = pure ()
-    | otherwise = do
-        opened <- connectClient host port
-        case opened of
-            Left message -> TIO.putStrLn ("demo data skipped: " <> message)
-            Right client -> do
-                session <- newSession client
-                signed <- authenticateSession session (rootUserName cfg) ""
-                case signed of
-                    Left message -> TIO.putStrLn ("demo data skipped: " <> message <> " (set the administrator password after seeding)")
-                    Right () -> do
-                        result <- seedDemo session
-                        case result of
-                            Left message -> TIO.putStrLn ("demo data skipped: " <> message)
-                            Right report ->
-                                TIO.putStrLn
-                                    ( "demo data: "
-                                        <> (if null (srCreated report) then "already present" else "created " <> T.pack (unwords (srCreated report)))
-                                        <> (if null (srSkipped report) then "" else ", kept " <> T.pack (unwords (srSkipped report)))
-                                        <> (if null (srIndexes report) then "" else ", index on " <> T.pack (unwords (srIndexes report)))
-                                    )
-                closeClient client
 
 -- | ping 一次 server，报告它通不通
 checkServer :: Text -> Int -> IO ()

@@ -297,11 +297,6 @@ export async function query(sql, database, tabId) {
   }
 }
 
-// 灌演示数据。
-export async function seedDemoData(database) {
-  return request('/api/demo-data', jsonInit('POST', {}), database);
-}
-
 // ---------------------------------------------------------------- 设置
 
 // 读取服务器设置。

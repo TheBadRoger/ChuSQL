@@ -47,10 +47,6 @@ runStatementUncheckedM db q@Select{} =
     case bindQuery db q of
         Left e -> pure (Left e)
         Right bound -> executeQueryM bound
-runStatementUncheckedM db q@SelectExpr{} =
-    case bindQuery db q of
-        Left e -> pure (Left e)
-        Right bound -> executeQueryM bound
 runStatementUncheckedM db (Insert tbl cols rows) =
     case lookupTable db tbl of
         Left e -> pure (Left e)

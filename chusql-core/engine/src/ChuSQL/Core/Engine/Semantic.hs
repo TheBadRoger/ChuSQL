@@ -238,21 +238,13 @@ inferSubqueryOutput db outerScope sq = case subqueryStatement sq of
         mapM_ (requireOrdering "DISTINCT" . snd) columns
         _ <- distinctOrdering q
         Right columns
-    q@Select{selectCols = cols} -> do
-        env <- checkFrom db enclosing (selectFrom q)
-        checkResolvedWith db enclosing q
-        mapM (columnTypeOf env) cols
-    q@SelectExpr{selectItems = items} -> do
+    q@Select{selectItems = items} -> do
         env <- checkFrom db enclosing (selectFrom q)
         checkResolvedWith db enclosing q
         mapM (\(l, e) -> (\t -> (l, t)) <$> inferExpr db "SELECT" (Scope env enclosing) e) items
     _ -> Left "subquery must be a SELECT"
   where
     enclosing = scopeFlat outerScope
-    -- \| 查这一列的推导类型
-    columnTypeOf env c = do
-        (_, col) <- scopeAt "SELECT" (Scope env enclosing) c
-        Right (c, inferredColumnType (columnType col))
 
 -- | 聚合的参数：列要在，且不能嵌套聚合
 aggregateArg :: Database -> String -> Scope -> Expr -> Either String InferredType
@@ -450,27 +442,13 @@ checkResolved db = checkResolvedWith db []
 checkResolvedWith :: Database -> [(String, Column)] -> Statement -> Either String ()
 checkResolvedWith db outer q = case q of
     SelectDistinct inner -> () <$ inferSubqueryOutput db (Scope [] outer) (Subquery (SelectDistinct inner) [])
-    Select
-        { selectCols = cols
-        , selectFrom = fromC
-        , selectWhere = mWhere
-        , selectGroupBy = groupBy
-        , selectOrderBy = orderBy
-        } -> do
-            env <- checkFrom db outer fromC
-            let full = Scope env outer
-            checkColumns "SELECT" full cols
-            checkGrouping full groupBy (map (\c -> (c, Col c)) cols)
-            checkColumns "ORDER BY" full (map fst orderBy)
-            mapM_ (checkRuntimeColumn "ORDER BY" full . fst) orderBy
-            mapM_ (checkNoAggregate "WHERE") mWhere
-            mapM_ (checkBool db "WHERE" full) mWhere
-    SelectExpr items fromC mWhere groupBy orderBy _ -> do
+    Select items fromC mWhere groupBy orderBy _ -> do
         env <- checkFrom db outer fromC
         let full = Scope env outer
+            direct = all (\(label, expression) -> expression == Col label) items
         mapM_ (\item -> () <$ inferExpr db "SELECT" full (snd item)) items
-        checkGrouping full groupBy (items ++ [(c, Col c) | (c, _) <- orderBy, c `notElem` map fst items])
-        mapM_ (checkOrder db full items . fst) orderBy
+        checkGrouping full groupBy (items ++ [(c, Col c) | (c, _) <- orderBy, not direct, c `notElem` map fst items])
+        mapM_ ((if direct then checkRuntimeColumn "ORDER BY" full else checkOrder db full items) . fst) orderBy
         mapM_ (checkNoAggregate "WHERE") mWhere
         mapM_ (checkBool db "WHERE" full) mWhere
     Insert tbl cols rows -> do
@@ -850,9 +828,7 @@ outerRefsOf db stmt = nub [c | c <- statementColumns stmt, not (inInner c)]
 statementColumns :: Statement -> [String]
 statementColumns stmt = case stmt of
     SelectDistinct q -> statementColumns q
-    Select cols fromC mWhere groupBy orderBy _ ->
-        cols ++ fromColumns fromC ++ concatMap colsInExpr mWhere ++ groupBy ++ map fst orderBy
-    SelectExpr items fromC mWhere groupBy orderBy _ ->
+    Select items fromC mWhere groupBy orderBy _ ->
         concatMap (colsInExpr . snd) items ++ fromColumns fromC ++ concatMap colsInExpr mWhere ++ groupBy ++ map fst orderBy
     _ -> []
   where
@@ -866,14 +842,12 @@ statementColumns stmt = case stmt of
 statementFrom :: Statement -> FromClause
 statementFrom (SelectDistinct q) = statementFrom q
 statementFrom Select{selectFrom = fromC} = fromC
-statementFrom SelectExpr{selectFrom = fromC} = fromC
 statementFrom _ = FromUnit
 
 -- | 解析子查询里的 SELECT
 resolveSubqueryStatement :: Database -> [(String, Column)] -> Statement -> Either String Statement
 resolveSubqueryStatement db outer (SelectDistinct q) = SelectDistinct <$> resolveSubqueryStatement db outer q
-resolveSubqueryStatement db outer q@Select{} = resolveQuery db outer q (map (\c -> (c, Col c)) (selectCols q))
-resolveSubqueryStatement db outer q@SelectExpr{} = resolveQuery db outer q (selectItems q)
+resolveSubqueryStatement db outer q@Select{} = resolveQuery db outer q (selectItems q)
 resolveSubqueryStatement _ _ _ = Left "subquery must be a SELECT"
 
 -- | 列名解析入口：查询走连接解析，改数据的语句按本表列解析
@@ -881,7 +855,6 @@ resolveStatement :: Database -> Statement -> Either String Statement
 resolveStatement db q = case q of
     SelectDistinct inner -> SelectDistinct <$> resolveStatement db inner
     Select{} -> resolveSelect db q
-    SelectExpr{} -> resolveSelect db q
     Update tbl assigns mWhere -> do
         (key, t) <- resolveTable db tbl
         let env = tableCols t
@@ -910,8 +883,7 @@ scopedColumnAt place inner outer c = scopeAt place (Scope inner outer) c
 
 -- | 单表保留原表头，连接使用唯一前缀
 resolveSelect :: Database -> Statement -> Either String Statement
-resolveSelect db q@Select{} = resolveQuery db [] q (map (\c -> (c, Col c)) (selectCols q))
-resolveSelect db q@SelectExpr{} = resolveQuery db [] q (selectItems q)
+resolveSelect db q@Select{} = resolveQuery db [] q (selectItems q)
 resolveSelect _ q = Right q
 
 -- | 检查排序输出别名或来源列
@@ -978,11 +950,9 @@ resolveQuery db outer q items = do
                 [] -> name "ORDER BY" c
                 [label] -> Right label
                 _ -> Left ("ORDER BY: ambiguous projection alias: " ++ c)
-        qIsExpression = case q of SelectExpr{} -> True; _ -> False
+        qIsExpression = any (\(label, expression) -> expression /= Col label) items
     ordering <- mapM (\(c, d) -> (\k -> (k, d)) <$> orderName c) (selectOrderBy q)
-    pure $ case q of
-        Select{} -> Select (map fst projected) source condition grouping ordering (selectLimit q)
-        _ -> SelectExpr projected source condition grouping ordering (selectLimit q)
+    pure (Select projected source condition grouping ordering (selectLimit q))
 
 -- | 收集没有别名遮蔽的来源表名
 sourceTableNames :: FromClause -> [String]
@@ -1028,19 +998,7 @@ resolveFrom db outer (FromJoin kind left right cond) = do
 -- | 派生表的输出列名：列取裸名，表达式保留原标签
 nameDerivedColumns :: Statement -> Either String Statement
 nameDerivedColumns (SelectDistinct q) = SelectDistinct <$> nameDerivedColumns q
-nameDerivedColumns q@Select{selectCols = cols, selectFrom = fromC} = do
-    let names = map lastTablePart cols
-    checkDerivedNames names
-    Right
-        ( SelectExpr
-            [(n, Col c) | (n, c) <- zip names cols]
-            fromC
-            (selectWhere q)
-            (selectGroupBy q)
-            (selectOrderBy q)
-            (selectLimit q)
-        )
-nameDerivedColumns q@SelectExpr{selectItems = items} = do
+nameDerivedColumns q@Select{selectItems = items} = do
     let names = map derivedItemName items
     checkDerivedNames names
     Right q{selectItems = zip names (map snd items)}

@@ -328,7 +328,6 @@ transactionData :: Statement -> Bool
 transactionData statement = case statement of
     SelectDistinct q -> transactionData q
     Select{} -> True
-    SelectExpr{} -> True
     Insert{} -> True
     Update{} -> True
     Delete{} -> True

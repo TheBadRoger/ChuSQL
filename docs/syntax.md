@@ -1,5 +1,9 @@
 # SQL 语法
 
+[← 返回 README](../README.md)
+
+**本页导航：** [查询、名称与事务](#查询名称与事务) · [自定义类型 DOMAIN](#自定义类型-domain) · [账号与权限](#账号与权限)
+
 客户端选项与元命令见 [commands.md](commands.md)，类型与身份字段分别见 [types.md](types.md) 和 [users-and-roles.md](users-and-roles.md)。
 
 ## 查询、名称与事务
@@ -7,7 +11,6 @@
 ### 表名与列名
 
 - 表级 DDL 可使用当前库限定名，例如选定 `sales` 后执行 `CREATE TABLE sales.orders (id INT)`；必须先选库，跨库 DDL 会被拒绝。
-
 - 选定数据库后语句里直接写表名即可，例如 `SELECT name FROM orders WHERE orders.id = 1`。
 - 表名可以带库前缀（`sales.orders`），列名可以带表限定符（`orders.id`）或库限定符（`sales.orders.id`），这几种写法指向同一张表和同一个列。
 - 只有候选唯一时才自动推导前缀；同名的表或列出现在多个候选上会以 `ambiguous table` / `ambiguous column` 报错，需要写全。
@@ -132,7 +135,7 @@ SHOW ROLES;
 
 `SUPERUSER` 不依赖启动参数里的管理员名称（`--user`），也不会通过角色成员关系继承。禁用登录身份会拒绝登录；禁用权限角色会停止贡献继承权限。属性修改会使受影响的既有连接失效，下一次请求返回 `unauthorized` 后关闭。最后一个启用且可以登录的最高权限身份不能删除、禁用、取消登录或取消最高权限。
 
-服务启动时迁移旧账号及角色，保留账号编号、口令、时间和原有授权关系。旧用户名与角色名重名时明确拒绝迁移，不合并身份。删除身份会同时清理其授权和两向成员关系；重建同名身份会分配新编号。
+删除身份同时清理授权和双向成员关系；重建同名身份分配新编号。升级迁移的兼容边界见 [用户与角色](users-and-roles.md#升级兼容)。
 
 常用角色和授权命令：
 
@@ -168,7 +171,6 @@ REVOKE SELECT ON sales.orders FROM reviewer;
 `REVOKE GRANT OPTION FOR SELECT ON users FROM alice` 只移除指定授权来源的转授权能力，保留 alice 的 SELECT 权限；失去唯一支持来源的下游授权会级联撤销，独立来源继续有效。最高权限身份或对象所有者可撤销全部匹配来源，普通授予者只能撤销自己的来源；所有权自身的权限不受 REVOKE 影响。
 
 系统目录访问还受目录管理属性控制，具体能力见 [用户与角色](users-and-roles.md)。
-
 
 目录管理属性示例（仅 SUPERUSER 可设置）：
 

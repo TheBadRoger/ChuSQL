@@ -147,7 +147,6 @@ function renderShell() {
         <div class="brand"><span class="brand-mark">ChuSQL</span><span class="brand-name">数据库终端</span></div>
         <nav class="titlebar-actions">
           <button data-action="new-query" title="新建查询">新建查询</button>
-          <button data-action="demo-data" title="灌一份演示数据">演示数据</button>
           <button data-action="refresh" title="重新加载当前库">刷新</button>
           <button data-action="settings" title="IDE 与服务器设置">设置</button>
         </nav>
@@ -1400,7 +1399,7 @@ function startSplitterDrag(kind, event) {
 
 // 这些动作都要求已经选中一个库（服务没有默认库）
 const DATABASE_ACTIONS = new Set([
-  'open-normalization', 'analyze-normalization', 'open-table', 'demo-data', 'open-table-dialog', 'create-table',
+  'open-normalization', 'analyze-normalization', 'open-table', 'open-table-dialog', 'create-table',
   'open-index-dialog', 'create-index', 'drop-table', 'drop-column', 'drop-index',
   'drop-database', 'commit', 'rollback', 'copy-sql',
 ]);
@@ -1495,18 +1494,6 @@ function onClick(event) {
       return;
     case 'refresh':
       void loadWorkspace().then(reloadOpenTables);
-      return;
-    case 'demo-data':
-      void (async () => {
-        try {
-          const report = await api.seedDemoData(state.database);
-          log('info', `演示数据：新建 ${(report.created ?? []).length} 张，保留 ${(report.skipped ?? []).length} 张。`);
-          await loadWorkspace();
-          await reloadOpenTables();
-        } catch (error) {
-          fail(error);
-        }
-      })();
       return;
     case 'open-db-dialog':
       region('dlg-db-name').value = '';

@@ -101,7 +101,6 @@ import ChuSQL.Interface.Settings (
     writeSettingsFile,
  )
 import ChuSQL.Interface.TOML (defaultConfigFile)
-import ChuSQL.Web.Demo (SeedReport (..), seedDemo)
 import ChuSQL.Web.Secure (bodyLimitDynamic, sameOriginOnly, securityHeaders, contentSecurityPolicy)
 import ChuSQL.Web.Static (contentTypeOf, readStatic, safeRelative)
 import ChuSQL.Web.UISettings (
@@ -331,7 +330,6 @@ routes env = do
     post "/api/tables/:t/indexes" (withDatabase env createIndexH)
     delete "/api/tables/:t/indexes/:col" (withDatabase env dropIndexH)
     delete "/api/tables/:t/columns/:col" (withDatabase env dropColumnH)
-    post "/api/demo-data" (withDatabase env demoDataH)
     get "/api/roles" (withDatabase env rolesH)
     post "/api/roles" (withDatabase env createRoleH)
     delete "/api/roles/:name" (withDatabase env dropRoleH)
@@ -1240,24 +1238,6 @@ dropColumnH env = do
                 else case dropColumnSql name column of
                     Left err -> reply400 "bad_request" (T.pack err)
                     Right sql -> runWrite ws sql
-
--- | 一键灌演示数据（缺什么补什么，可以反复点）
-demoDataH :: AppEnv -> ActionM ()
-demoDataH env = do
-    ws <- requireAdminSession env
-    _ <- requireDatabaseName ws
-    result <- liftIO (seedDemo (wsSession ws))
-    case result of
-        Left message -> serverError message
-        Right report ->
-            json
-                ( object
-                    [ "ok" .= True
-                    , "created" .= srCreated report
-                    , "skipped" .= srSkipped report
-                    , "indexes" .= srIndexes report
-                    ]
-                )
 
 -- | 角色总览：只有管理员能看
 rolesH :: AppEnv -> ActionM ()

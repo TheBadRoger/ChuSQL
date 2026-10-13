@@ -10,8 +10,7 @@ import Data.List (nub)
 queryTables :: Statement -> [String]
 queryTables statement = nub (case statement of
     SelectDistinct child -> queryTables child
-    Select _ source condition _ _ _ -> sourceTables source ++ concatMap expressionTables condition
-    SelectExpr items source condition _ _ _ -> sourceTables source
+    Select items source condition _ _ _ -> sourceTables source
         ++ concatMap (expressionTables . snd) items ++ concatMap expressionTables condition
     _ -> [])
 

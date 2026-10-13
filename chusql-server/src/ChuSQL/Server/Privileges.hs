@@ -199,8 +199,7 @@ reconcileObjects service = withTables service (catalog (OA.objectReconcile (pvBa
 requiredActions :: Statement -> Maybe [(Text, Text)]
 requiredActions statement = case statement of
     SelectDistinct q -> requiredActions q
-    Select{} -> Just (selectNeeds (selectFrom statement) (maybe [] (: []) (selectWhere statement)))
-    SelectExpr{} -> Just (selectNeeds (selectFrom statement) (maybe [] (: []) (selectWhere statement) ++ map snd (selectItems statement)))
+    Select{} -> Just (selectNeeds (selectFrom statement) (maybe [] (: []) (selectWhere statement) ++ map snd (selectItems statement)))
     Insert table _ rows -> Just ((T.pack table, "insert") : selectsOf (concat rows))
     Update table assignments condition -> Just ((T.pack table, "update") : selectsOf (map snd assignments ++ maybe [] (: []) condition))
     Delete table condition -> Just ((T.pack table, "delete") : selectsOf (maybe [] (: []) condition))

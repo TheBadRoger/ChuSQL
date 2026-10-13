@@ -1,22 +1,18 @@
 # 命令与选项
 
+[← 返回 README](../README.md)
+
+**本页导航：** [组件命令](#组件命令) · [csql](#csql) · [chusql-web](#chusql-web) · [chusql-server](#chusql-server) · [范式分析](#范式分析)
+
 ChuSQL 的主要用户命令如下：
 
-类型说明见 [自定义类型与预定义类型](types.md)，身份属性说明见 [用户、角色与 root 属性](users-and-roles.md)。
+类型见 [类型与函数](types.md)，身份与授权见 [用户与角色](users-and-roles.md)。
 
 SQL 的查询、事务、类型、用户与授权语法见 [syntax.md](syntax.md)。
 
 ## 组件命令
 
-安装脚本在启动服务前运行 `csql-bootstrap`：创建系统目录、初始化默认 `root`（LOGIN / SUPERUSER / ENABLED），再登记内置类型。管理员名称可通过安装选项修改。初始化失败时安装报错，停止启动服务。
-
-预装目录 `system.__system_types` 登记 18 个名称与别名：INT、INTEGER、BIGINT、SMALLINT、VARCHAR、CHAR、TEXT、STR、BOOLEAN、BOOL、FLOAT、REAL、DOUBLE、DECIMAL、NUMERIC、DATE、TIMESTAMP、BLOB；记录基础表示及是否接受类型参数。该目录为受保护的系统元数据，不创建预定义 DOMAIN；DOMAIN 仍按工作库保存。
-
-重复引导保留已有身份、密码及一致的类型记录，补齐缺失类型；同名定义冲突明确报错。已有引导身份失去管理员属性时拒绝继续，不自动提升权限。
-
-修复或补齐安装引导时，可停止数据库服务后运行 `csql-bootstrap --config FILE --user root --password-stdin`，通过标准输入提供口令。
-
-系统目录故障时，先停止所有数据库进程，再依次考虑 `csql-bootstrap repair --config FILE`、`recover` 或清除系统身份和授权的 `reset`。`repair` 仅修复结构，涉及数据修改时中止；完整说明见 [bootstrap.md](bootstrap.md)。
+安装器先运行 `csql-bootstrap` 初始化系统身份和类型目录，再启动服务；初始化失败即停止。重复引导与离线维护见 [系统引导与恢复](bootstrap.md)。
 
 | 命令 | 作用 |
 | --- | --- |
@@ -81,6 +77,7 @@ SQL 语句以分号结束，可跨多行输入。
 | `\c <库>` | 切换数据库 |
 | `\f <格式>` | 修改输出格式 |
 | `\dr` | 查看角色与授权信息（管理员） |
+| `\normalize TABLE --declaration FILE --format text\|json` | 只读分析表的范式 |
 
 ## chusql-web
 
@@ -112,8 +109,6 @@ chusql-web [options]
 
 SQL 控制台使用另一条服务端连接；SQL 的 BEGIN / COMMIT / ROLLBACK 绑定发起它的页面与查询标签。事务尚未结束时，其他控制台和普通 REST 写操作不能占用该连接；关闭所属查询标签或页面时请求回滚。系统身份修改不支持数据事务，账号表只读，使用 SQL 用户与角色命令管理。
 
-Web 模块测试入口为 `stack test chusql-web --fast`，其中同时运行 `node --test test/transactions.mjs`；测试环境需要 Node.js。
-
 ## chusql-server
 
 基本用法：
@@ -135,3 +130,35 @@ chusql-server [options]
 | `-h, --help` | 显示帮助 |
 
 `chusql-server` 是数据目录的唯一直接访问者。Web、CLI 及其他客户端均通过数据库服务访问数据。
+
+## 范式分析
+
+分析只读取 schema 和业务依赖声明，要求当前数据库的 `CONNECT` 与目标表的 `SELECT` 权限；系统对象拒绝分析。它不检查样本数据，也不执行数据迁移。
+
+声明文件使用 UTF-8 JSON，字段名须与表结构一致：
+
+```json
+{
+  "declared_keys": [["student", "course"]],
+  "dependencies": [{"lhs": ["student"], "rhs": ["name"]}],
+  "dependencies_complete": true,
+  "atomic_attributes": true
+}
+```
+
+```sh
+csql -d school --normalize enrollment --declaration dependencies.json --format json
+```
+
+| 入口 | 用法 |
+| --- | --- |
+| CLI 批处理 | `--normalize` 与 `--execute` 互斥，需提供声明文件 |
+| CLI 交互 | `\normalize enrollment --declaration dependencies.json --format text` |
+| Web | 在资源管理器展开表，进入结构区的“范式分析”，填写声明 JSON |
+
+> [!NOTE]
+> 结论以用户声明为条件。完整性默认 `false`、原子性默认 `null`，信息不足时不会认证高阶范式；SQL 约束和样本数据不会自动证明业务依赖。
+
+报告包含候选键、1NF / 2NF / 3NF / BCNF 结论、违反证据及一次 BCNF 分解建议。子关系可能仍需分析，分解不保证依赖保持，也不证明现有 SQL 数据满足声明。Web 使用发起页面或控制台的事务视图；对象或 schema 变化须重新分析。
+
+最多分析 12 列，依赖和键声明各最多 256 项，运行预算 5 秒；超限、权限或输入错误明确返回失败，不截断为完整报告。CLI 成功获得报告时退出码为 `0`，即使结论违反或信息不足；请求失败时退出非零。

@@ -2,7 +2,7 @@
 进度见 progress.txt，限制见 known-issues.txt，用户操作见 docs/。
 
 ## 架构与接口
-- 后续设计按领域记录于 docs/normalization.md、docs/types.md、docs/architecture.md 和 docs/release-signing.md；只读范式入口已提供；后续实施 bound IR / DOMAIN，再推进物化、递归、MVCC、compact 和并行写。各文档的设计章节定义拟议能力，现有运行语义不变。
+- 用户文档按主题记录于 docs/commands.md、docs/types.md、docs/architecture.md 和 docs/install.md；只读范式入口已提供。后续实施 bound IR / DOMAIN，再推进物化、递归、MVCC、compact 和并行写；规划不代表现有能力。
 - 范式迁移首版保留来源，拒绝 NULL、重复行与依赖不保持；发布目标须验证约束、完整重建并使用独立原子结构 WAL 组，不能复用禁止 DDL 的会话事务拼接执行。
 - 发布真实性采用 TUF 元数据链与 Ed25519，初始 root 必须可信取得；离线验证不证明最新版本，操作系统原生代码签名另行接入。
 - Web / CLI → server TCP → Haskell 引擎 → FFI → Rust 存储；server 独占数据目录，Haskell 库静态链接，存储为 cdylib。
