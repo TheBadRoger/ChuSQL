@@ -44,7 +44,6 @@ csql-web
 
 ## 更多参考文档
 
-- [数据库原理学习与答辩文档](learnning/README.md)
 - [安装与卸载](docs/install.md)
 - [配置选项](docs/config.md)
 - [命令与选项](docs/commands.md)

@@ -68,8 +68,6 @@ max_page_size = 500
 max_rows = 1000
 # Maximum SQL input length in characters accepted by the web interface.
 max_sql_length = 20000
-# Create demonstration data on startup; keep disabled for normal installations.
-seed = false
 # Minimum password length for ordinary accounts, in characters.
 password_min_length = 12
 # Minimum character classes required: lowercase, uppercase, digits and symbols.

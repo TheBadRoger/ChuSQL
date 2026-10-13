@@ -697,9 +697,7 @@ selectStatement = do
     groupBy <- fromMaybe [] <$> optional groupByClause
     orderBy <- fromMaybe [] <$> optional orderByClause
     mLimit <- optional limitClause
-    pure $ (if distinct then SelectDistinct else id) $ if all (\(name, e) -> e == Col name) cols
-        then Select (map fst cols) fromC mWhere groupBy orderBy mLimit
-        else SelectExpr cols fromC mWhere groupBy orderBy mLimit
+    pure $ (if distinct then SelectDistinct else id) (Select cols fromC mWhere groupBy orderBy mLimit)
 
 -- | 读 WITH：展开每个 CTE 再读主查询
 withStatement :: Parser Statement
@@ -741,20 +739,11 @@ cteKey = map toLower
 renameColumns :: String -> [String] -> Statement -> Either String Statement
 renameColumns _ [] q = Right q
 renameColumns name cols (SelectDistinct q) = SelectDistinct <$> renameColumns name cols q
-renameColumns name cols q@Select { selectCols = names } = do
-    checkCteArity name cols names
-    Right
-        ( SelectExpr
-            [(c, Col n) | (c, n) <- zip cols names]
-            (selectFrom q)
-            (selectWhere q)
-            (selectGroupBy q)
-            (selectOrderBy q)
-            (selectLimit q)
-        )
-renameColumns name cols q@SelectExpr { selectItems = items } = do
+renameColumns name cols q@Select { selectItems = items } = do
     checkCteArity name cols (map snd items)
-    ordering <- mapM renameOrder (selectOrderBy q)
+    ordering <- if all (\(label, expression) -> expression == Col label) items
+        then Right (selectOrderBy q)
+        else mapM renameOrder (selectOrderBy q)
     Right q { selectItems = zip cols (map snd items), selectOrderBy = ordering }
   where
     -- | 列清单同步改写内层排序输出别名
@@ -774,11 +763,7 @@ checkCteArity name cols out
 expandStatement :: [(String, Statement)] -> Statement -> Either String Statement
 expandStatement env stmt = case stmt of
     SelectDistinct q -> SelectDistinct <$> expandStatement env q
-    q@Select { selectFrom = fromC, selectWhere = mWhere } -> do
-        fromC' <- expandClause env fromC
-        w <- traverse (expandExpr env) mWhere
-        Right q { selectFrom = fromC', selectWhere = w }
-    q@SelectExpr { selectFrom = fromC, selectItems = items, selectWhere = mWhere } -> do
+    q@Select { selectFrom = fromC, selectItems = items, selectWhere = mWhere } -> do
         fromC' <- expandClause env fromC
         items' <- traverse (\(name, e) -> fmap ((,) name) (expandExpr env e)) items
         w <- traverse (expandExpr env) mWhere

@@ -45,4 +45,4 @@ DECIMAL 是有限浮点表示，采用 ties-to-even 舍入与舍入后溢出检�
 
 ## References
 
-按需读 `docs/runtime-types.md`；`docs/types.md` 含未来设计，必须与实现区分。以上源码模块是契约核对入口。
+按需读 `docs/types.md`，区分当前类型用法与未来约束设计。以上源码模块是契约核对入口。

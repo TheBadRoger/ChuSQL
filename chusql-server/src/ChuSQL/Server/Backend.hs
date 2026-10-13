@@ -76,8 +76,7 @@ data Backend = Backend
 columnsFromStatement :: Database -> Statement -> [String]
 columnsFromStatement db stmt = case prepare db stmt of
     Right (SelectDistinct q) -> columnsFromStatement db q
-    Right (Select cols _ _ _ _ _) -> cols
-    Right (SelectExpr items _ _ _ _ _) -> map fst items
+    Right (Select items _ _ _ _ _) -> map fst items
     Right ShowDomains -> ["domain", "base_type"]
     _ -> []
 
@@ -331,9 +330,6 @@ statementTables :: Statement -> [Text]
 statementTables stmt = nub (case stmt of
     SelectDistinct q -> statementTables q
     Select{} ->
-        tableRefsOf (selectFrom stmt)
-            ++ concatMap exprTables (maybe [] (: []) (selectWhere stmt) ++ map Col (selectCols stmt ++ selectGroupBy stmt ++ map fst (selectOrderBy stmt)))
-    SelectExpr{} ->
         tableRefsOf (selectFrom stmt)
             ++ concatMap exprTables (maybe [] (: []) (selectWhere stmt) ++ map snd (selectItems stmt) ++ map Col (selectGroupBy stmt ++ map fst (selectOrderBy stmt)))
     Insert table _ rows -> T.pack table : concatMap exprTables (concat rows)

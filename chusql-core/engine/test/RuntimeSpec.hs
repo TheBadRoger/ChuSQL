@@ -420,7 +420,7 @@ spec = do
         it "binds calls before execution" $ do
             let bound = parseStatement "SELECT length('abc')" >>= prepare []
             case bound of
-                Right SelectExpr {selectItems = [(_, BoundFunction (FunctionId 1) _ [_])]} -> pure ()
+                Right Select {selectItems = [(_, BoundFunction (FunctionId 1) _ [_])]} -> pure ()
                 _ -> expectationFailure (show bound)
         it "rejects unknown SQL functions before scanning" $
             sql "SELECT missing('abc')" `shouldSatisfy` isFailure

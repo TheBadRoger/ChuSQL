@@ -39,7 +39,7 @@ ChuSQL 能力与进展摘要
 - SQL 复合列声明、LIST / MAYBE / TUPLE、嵌套构造器、INSERT / UPDATE / CHECK / 子查询接入；CLI / Web 显示及 SQL 生成。
 - 兼容边界：旧 ColumnType 和 RelOp 保留，日期 / 时间戳 / Blob 明确使用 CompatibilityType；完整 capability / operator / cast / 用户 ADT / Extension 不在本阶段。
 - 本批已验证：Engine 466 / Server 141 / Web 75 / CLI 17 全部通过；前端运行时值 9 条断言及事务 10 项通过，改动文件注释检查无问题，git diff --check 通过。
-- 使用说明：docs/runtime-types.md；本批日志：logs/runtime-engine.log、logs/runtime-web.log、logs/runtime-web-final.log、logs/runtime-cli.log。Server 最终回归亦通过；Web 最终日志由单独重跑生成。
+- 使用说明：docs/types.md；本批日志：logs/runtime-engine.log、logs/runtime-web.log、logs/runtime-web-final.log、logs/runtime-cli.log。Server 最终回归亦通过；Web 最终日志由单独重跑生成。
 
 ## 既有模块验证
 

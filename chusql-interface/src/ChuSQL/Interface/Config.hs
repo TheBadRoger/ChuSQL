@@ -49,7 +49,6 @@ data WebConfig = WebConfig
     , wcMaxPageSize :: Int
     , wcMaxRows :: Int
     , wcMaxSqlLength :: Int
-    , wcSeedDemo :: Bool
     }
     deriving (Show, Eq)
 
@@ -73,7 +72,6 @@ defaultWebConfig =
         , wcMaxPageSize = 500
         , wcMaxRows = 1000
         , wcMaxSqlLength = 20000
-        , wcSeedDemo = False
         }
 
 -- | 把设置键统一成连字符写法，重名时连字符优先
@@ -148,7 +146,6 @@ webConfigFromSection saved =
         , wcMaxPageSize = sectionInt "max-page-size" saved (wcMaxPageSize defaultWebConfig)
         , wcMaxRows = sectionInt "max-rows" saved (wcMaxRows defaultWebConfig)
         , wcMaxSqlLength = sectionInt "max-sql-length" saved (wcMaxSqlLength defaultWebConfig)
-        , wcSeedDemo = sectionBool "seed" saved (wcSeedDemo defaultWebConfig)
         }
 
 -- | 分区里一个键的非空字符串值

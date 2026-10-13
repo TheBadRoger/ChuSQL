@@ -86,26 +86,16 @@ translate q = case q of
         ordering <- distinctOrdering inner
         plan <- case inner of
             s@Select{} -> translate s { selectOrderBy = [], selectLimit = Nothing }
-            s@SelectExpr{} -> translate s { selectOrderBy = [], selectLimit = Nothing }
             _ -> Left "DISTINCT requires SELECT"
         Right (limited ordering (selectLimit inner) (Distinct plan))
-    Select
-        { selectCols = cols
-        , selectFrom = fromC
-        , selectWhere = mWhere
-        , selectGroupBy = groupBy
-        , selectOrderBy = orderBy
-        , selectLimit = mLimit
-        } -> do
-            plan0 <- source fromC mWhere
-            let (plan, _) = grouped groupBy [] plan0
-            Right (Project cols (limited orderBy mLimit plan))
-    SelectExpr items fromC mWhere groupBy orderBy mLimit -> do
+    Select items fromC mWhere groupBy orderBy mLimit -> do
         plan0 <- source fromC mWhere
         let (plan, items') = grouped groupBy items plan0
-        Right $ if any (\(c, _) -> c `elem` map fst items') orderBy
-            then orderedProjection items' orderBy mLimit plan
-            else Compute items' (limited orderBy mLimit plan)
+        Right $ if all (\(label, expression) -> expression == Col label) items'
+            then Project (map fst items') (limited orderBy mLimit plan)
+            else if any (\(c, _) -> c `elem` map fst items') orderBy
+                then orderedProjection items' orderBy mLimit plan
+                else Compute items' (limited orderBy mLimit plan)
     _ -> Left "only SELECT is supported by translate"
 
 -- | 在排序前计算别名并保留输出顺序

@@ -1,5 +1,9 @@
 # 安装与卸载
 
+[← 返回 README](../README.md)
+
+**本页导航：** [在线安装](#在线安装) · [安装方式](#安装方式) · [包内安装](#包内安装) · [常用安装选项](#常用安装选项) · [从源码安装](#从源码安装) · [安装完成后](#安装完成后) · [更新](#更新) · [卸载](#卸载) · [发布校验](#发布校验)
+
 发行包已经包含编译后的程序，普通用户安装时无需安装 GHC 或 Rust 工具链。
 
 ## 在线安装
@@ -33,9 +37,11 @@ ChuSQL 支持三种安装方式：
 
 完成系统目录初始化后，安装程序默认会启动 `chusql-server`；如不希望自动启动，可使用 `--no-start`（Windows 为 `-NoStart`）。
 
+### Linux 用户服务
+
 Linux 默认注册 `chusql-server.service` 为当前操作系统用户的 systemd 服务，并启用 linger 和开机启动，无需登录即可运行，异常退出后自动重启。需要可用的 systemd 用户会话；若启用 linger 时权限不足，按安装提示执行 `sudo loginctl enable-linger "$(id -un)"` 后重试。数据库管理员 `--user` 与运行服务的操作系统用户是两个独立身份。
 
-`--no-start` 仅跳过本次启动，仍启用开机启动。非 systemd 环境可使用 `--no-service` 跳过服务注册，此时保留原有后台启动方式。
+`--no-start` 仅跳过本次启动，仍启用开机启动。非 systemd 环境可使用 `--no-service` 跳过服务注册，直接在后台启动进程。
 
 ```sh
 systemctl --user status chusql-server.service
@@ -117,16 +123,6 @@ Linux 更新会先停止该安装目录中的 Web 和数据库进程，保留已
 
 Linux 安装目录中保留 `uninstall.sh`。卸载时指定安装目录，数据目录默认读取现有配置。
 
-已构建的 Linux 包可用隔离验证脚本测试，不修改正常安装的配置或数据：
-
-```sh
-python3 scripts/test-linux-lifecycle.py releases/chusql-linux-x86_64.tar.gz
-```
-
-该验证需要 Python 3，使用真实数据库程序，覆盖安装、运行中更新、配置与 SQL 数据保留、保留数据卸载、重装和完全卸载；基础验证通过 `--no-service` 隔离 systemd 服务。
-
-添加 `--systemd` 可验证真实用户服务的注册、启动、更新及卸载。此选项要求不存在已有的 `chusql-server.service`，并且当前用户能够启用 linger（或已由管理员启用）；临时单元链接会在测试后清理。本机 HTTP 发行站夹具用于验证在线安装流程，不依赖 GitHub 上已有 Release。
-
 ## 卸载
 
 Linux / macOS：
@@ -145,6 +141,7 @@ Windows：
 
 Linux 卸载时会停止服务、取消开机启动并移除服务文件。用户的 linger 设置保留，其他用户服务仍可使用它。
 
-## 发布真实性与后续签名方案
+## 发布校验
 
-当前 SHA256 校验用于检测产物损坏，发布签名尚未实现。密钥管理、可信根、轮换、在线与离线验证的设计见[发布签名与验证](release-signing.md)；设计中的验证器和签名安装流程目前不可用。
+> [!IMPORTANT]
+> SHA256 校验只检测产物损坏，不证明发布来源。发布签名、可信根和轮换验证尚未实现。

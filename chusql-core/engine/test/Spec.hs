@@ -564,7 +564,7 @@ main = hspec $ do
             parseStatement "SELECT name FROM users JOIN orders ON id = user_id"
                 `shouldBe` Right
                     ( Select
-                        { selectCols = ["name"]
+                        { selectItems = [("name", Col "name")]
                         , selectFrom =
                             FromJoin
                                 InnerJoin
@@ -582,7 +582,7 @@ main = hspec $ do
             parseStatement "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id"
                 `shouldBe` Right
                     ( Select
-                        { selectCols = ["u.name"]
+                        { selectItems = [("u.name", Col "u.name")]
                         , selectFrom =
                             FromJoin
                                 InnerJoin
@@ -600,7 +600,7 @@ main = hspec $ do
             parseStatement "SELECT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id"
                 `shouldBe` Right
                     ( Select
-                        { selectCols = ["u.name"]
+                        { selectItems = [("u.name", Col "u.name")]
                         , selectFrom =
                             FromJoin
                                 LeftJoin
@@ -633,11 +633,11 @@ main = hspec $ do
             parseStatement "SELECT d.name FROM (SELECT name FROM users) d"
                 `shouldBe` Right
                     ( Select
-                        { selectCols = ["d.name"]
+                        { selectItems = [("d.name", Col "d.name")]
                         , selectFrom =
                             FromSubquery
                                 (Just "d")
-                                (Select ["name"] (FromTable Nothing "users") Nothing [] [] Nothing)
+                                (Select [("name", Col "name")] (FromTable Nothing "users") Nothing [] [] Nothing)
                         , selectWhere = Nothing
                         , selectGroupBy = []
                         , selectOrderBy = []
@@ -654,14 +654,14 @@ main = hspec $ do
                     ( FromJoin
                         InnerJoin
                         (FromTable (Just "u") "users")
-                        (FromSubquery (Just "d") (Select ["name"] (FromTable Nothing "users") Nothing [] [] Nothing))
+                        (FromSubquery (Just "d") (Select [("name", Col "name")] (FromTable Nothing "users") Nothing [] [] Nothing))
                         (Eq (Col "u.name") (Col "d.name"))
                     )
 
         it "parses a projection alias" $ do
             parseStatement "SELECT count(*) AS total FROM orders"
                 `shouldBe` Right
-                    ( SelectExpr
+                    ( Select
                         [("total", CountAll)]
                         (FromTable Nothing "orders")
                         Nothing
@@ -713,11 +713,11 @@ main = hspec $ do
             parseStatement "WITH t AS (SELECT name FROM users) SELECT t.name FROM t"
                 `shouldBe` Right
                     ( Select
-                        { selectCols = ["t.name"]
+                        { selectItems = [("t.name", Col "t.name")]
                         , selectFrom =
                             FromSubquery
                                 (Just "t")
-                                (Select ["name"] (FromTable Nothing "users") Nothing [] [] Nothing)
+                                (Select [("name", Col "name")] (FromTable Nothing "users") Nothing [] [] Nothing)
                         , selectWhere = Nothing
                         , selectGroupBy = []
                         , selectOrderBy = []
@@ -736,6 +736,14 @@ main = hspec $ do
         it "renames the output columns of a CTE" $ do
             values "WITH t(who) AS (SELECT name FROM users) SELECT t.who FROM t ORDER BY t.who"
                 `shouldBe` Right [[VStr "Alice"], [VStr "Bob"], [VStr "Carol"]]
+
+        it "keeps source ordering when renaming repeated CTE columns" $ do
+            values "WITH t(first, second) AS (SELECT name, name FROM users ORDER BY name DESC LIMIT 1) SELECT first, second FROM t"
+                `shouldBe` Right [[VStr "Carol", VStr "Carol"]]
+
+        it "renames expression ordering aliases with CTE columns" $ do
+            values "WITH t(next_age) AS (SELECT age + 1 AS years FROM users ORDER BY years DESC LIMIT 1) SELECT next_age FROM t"
+                `shouldBe` Right [[VInt 31]]
 
         it "takes a bare column from a CTE" $ do
             values "WITH t(who) AS (SELECT name FROM users) SELECT who FROM t ORDER BY who"
@@ -771,11 +779,11 @@ main = hspec $ do
 
         it "parses >= into GtE" $ do
             parseStatement "SELECT name FROM users WHERE age >= 18"
-                `shouldBe` Right (Select ["name"] (FromTable Nothing "users") (Just (GtE (Col "age") (LitInt 18))) [] [] Nothing)
+                `shouldBe` Right (Select [("name", Col "name")] (FromTable Nothing "users") (Just (GtE (Col "age") (LitInt 18))) [] [] Nothing)
 
         it "parses <= into LtE" $ do
             parseStatement "SELECT name FROM users WHERE age <= 30"
-                `shouldBe` Right (Select ["name"] (FromTable Nothing "users") (Just (LtE (Col "age") (LitInt 30))) [] [] Nothing)
+                `shouldBe` Right (Select [("name", Col "name")] (FromTable Nothing "users") (Just (LtE (Col "age") (LitInt 30))) [] [] Nothing)
 
         it "parses <> and != into the same node" $ do
             sql "SELECT name FROM users WHERE age <> 17"
@@ -855,11 +863,11 @@ main = hspec $ do
 
         it "parses > ANY into a quantified comparison" $ do
             parseStatement "SELECT name FROM users WHERE age > ANY (SELECT age FROM orders)"
-                `shouldBe` Right (Select ["name"] (FromTable Nothing "users") (Just (QuantCmp CmpGt (Col "age") (Subquery (Select ["age"] (FromTable Nothing "orders") Nothing [] [] Nothing) []) AnyQ)) [] [] Nothing)
+                `shouldBe` Right (Select [("name", Col "name")] (FromTable Nothing "users") (Just (QuantCmp CmpGt (Col "age") (Subquery (Select [("age", Col "age")] (FromTable Nothing "orders") Nothing [] [] Nothing) []) AnyQ)) [] [] Nothing)
 
         it "parses <> ALL into a quantified comparison" $ do
             parseStatement "SELECT name FROM users WHERE age <> ALL (SELECT age FROM orders)"
-                `shouldBe` Right (Select ["name"] (FromTable Nothing "users") (Just (QuantCmp CmpNe (Col "age") (Subquery (Select ["age"] (FromTable Nothing "orders") Nothing [] [] Nothing) []) AllQ)) [] [] Nothing)
+                `shouldBe` Right (Select [("name", Col "name")] (FromTable Nothing "users") (Just (QuantCmp CmpNe (Col "age") (Subquery (Select [("age", Col "age")] (FromTable Nothing "orders") Nothing [] [] Nothing) []) AllQ)) [] [] Nothing)
 
         it "still reads plain comparisons" $ do
             values "SELECT name FROM users WHERE age > 20 ORDER BY name"
@@ -1269,7 +1277,7 @@ main = hspec $ do
 
         it "user is reserved as an alias but still usable inside a longer name" $ do
             parseStatement "SELECT * FROM users user" `shouldSatisfy` isLeft
-            parseStatement "SELECT user1 FROM users" `shouldBe` Right (Select ["user1"] (FromTable Nothing "users") Nothing [] [] Nothing)
+            parseStatement "SELECT user1 FROM users" `shouldBe` Right (Select [("user1", Col "user1")] (FromTable Nothing "users") Nothing [] [] Nothing)
 
     describe "ChuSQL.Core.Engine (DELETE)" $ do
         it "parses DELETE with WHERE" $ do
@@ -1407,7 +1415,7 @@ main = hspec $ do
         it "executes ORDER BY age ASC" $ do
             let q =
                     Select
-                        { selectCols = ["name"]
+                        { selectItems = [("name", Col "name")]
                         , selectFrom = FromTable Nothing "users"
                         , selectWhere = Nothing
                         , selectGroupBy = []
@@ -1424,7 +1432,7 @@ main = hspec $ do
         it "executes ORDER BY age DESC" $ do
             let q =
                     Select
-                        { selectCols = ["name"]
+                        { selectItems = [("name", Col "name")]
                         , selectFrom = FromTable Nothing "users"
                         , selectWhere = Nothing
                         , selectGroupBy = []
@@ -1454,7 +1462,7 @@ main = hspec $ do
         it "executes LIMIT without ORDER BY" $ do
             let q =
                     Select
-                        { selectCols = ["name"]
+                        { selectItems = [("name", Col "name")]
                         , selectFrom = FromTable Nothing "users"
                         , selectWhere = Nothing
                         , selectGroupBy = []
@@ -1470,7 +1478,7 @@ main = hspec $ do
         it "executes LIMIT with ORDER BY" $ do
             let q =
                     Select
-                        { selectCols = ["name"]
+                        { selectItems = [("name", Col "name")]
                         , selectFrom = FromTable Nothing "users"
                         , selectWhere = Nothing
                         , selectGroupBy = []
@@ -1486,7 +1494,7 @@ main = hspec $ do
         it "executes LIMIT 0" $ do
             let q =
                     Select
-                        { selectCols = ["name"]
+                        { selectItems = [("name", Col "name")]
                         , selectFrom = FromTable Nothing "users"
                         , selectWhere = Nothing
                         , selectGroupBy = []
@@ -1535,7 +1543,7 @@ main = hspec $ do
             runStatement
                 testDB
                 ( Select
-                    { selectCols = ["u.name"]
+                    { selectItems = [("u.name", Col "u.name")]
                     , selectFrom =
                         FromJoin
                             InnerJoin
@@ -2512,7 +2520,7 @@ main = hspec $ do
                     runIPCStorage
                         ( runStatementM
                             ( Select
-                                { selectCols = ["name"]
+                                { selectItems = [("name", Col "name")]
                                 , selectFrom = FromTable Nothing "ipc_idx"
                                 , selectWhere = Just (Eq (Col "id") (LitInt 42))
                                 , selectGroupBy = []

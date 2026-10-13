@@ -1,5 +1,9 @@
 # 配置选项
 
+[← 返回 README](../README.md)
+
+**本页导航：** [存储配置](#存储配置) · [Web 配置](#web-配置) · [Server 配置](#server-配置) · [账号与安全](#账号与安全) · [修改配置](#修改配置)
+
 ChuSQL 使用统一配置文件 `settings.toml`。默认位置：
 
 | 平台 | 路径 |
@@ -38,7 +42,6 @@ ChuSQL 使用统一配置文件 `settings.toml`。默认位置：
 | `max_page_size` | `500` | 最大分页大小 |
 | `max_rows` | `1000` | 单次查询最大返回行数 |
 | `max_sql_length` | `20000` | SQL 最大字符数 |
-| `seed` | `false` | 空库时是否写入演示数据 |
 | `password_min_length` | `12` | 普通账号最短口令长度 |
 | `password_classes` | `2` | 口令至少包含的字符类别数 |
 
@@ -55,7 +58,8 @@ ChuSQL 使用统一配置文件 `settings.toml`。默认位置：
 
 本机 sudo 认证额外使用 `[server] sudo_auth_user`，默认空字符串，表示关闭。设置为一个已启用 `ALLOW_SUDO_AUTH` 的数据库身份后，必须以 Unix root 或 Windows 提升后的管理员运行 `chusql-server`。这是明确的本机身份映射，与启动参数 `--user` 和最高权限属性分别设置。配置变更后重启服务生效，Web 设置页面不提供此项。操作步骤见 [用户与角色](users-and-roles.md#本机-sudo-认证)。
 
-修改 Server 相关配置后需要重启 `chusql-server`。
+> [!NOTE]
+> 修改 Server 配置后须重启 `chusql-server`。sudo 映射默认关闭，启用时还须满足身份属性和操作系统提升要求。
 
 ## 账号与安全
 
