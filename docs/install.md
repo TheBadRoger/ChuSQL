@@ -13,7 +13,11 @@
 Linux / macOS：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/TheBadRoger/ChuSQL/main/scripts/install.sh | sh -s -- --component web
+(curl -fsSL --connect-timeout 10 \
+  https://raw.githubusercontent.com/TheBadRoger/ChuSQL/main/scripts/install.sh -o install.sh ||
+ curl -fsSL --connect-timeout 10 \
+  https://repo.chunana.cn/ChuNa7a/ChuSQL/raw/branch/main/scripts/install.sh -o install.sh) &&
+sh install.sh --component web
 ```
 
 也可从 ChuRepo 下载后执行：
@@ -28,7 +32,11 @@ sh install.sh --component web
 Windows PowerShell：
 
 ```powershell
-irm https://raw.githubusercontent.com/TheBadRoger/ChuSQL/main/scripts/install.ps1 -OutFile "$env:TEMP\install.ps1"
+try {
+    irm https://raw.githubusercontent.com/TheBadRoger/ChuSQL/main/scripts/install.ps1 -OutFile "$env:TEMP\install.ps1" -TimeoutSec 60 -ErrorAction Stop
+} catch {
+    irm https://repo.chunana.cn/ChuNa7a/ChuSQL/raw/branch/main/scripts/install.ps1 -OutFile "$env:TEMP\install.ps1" -TimeoutSec 60 -ErrorAction Stop
+}
 & "$env:TEMP\install.ps1" -Component web
 ```
 
@@ -39,7 +47,7 @@ irm https://repo.chunana.cn/ChuNa7a/ChuSQL/raw/branch/main/scripts/install.ps1 -
 & "$env:TEMP\install.ps1" -Component web
 ```
 
-以上在线安装脚本默认从 GitHub 获取发行包，脚本下载来源不会改变发行包来源。GitHub 不可用时，参见[包内安装](#包内安装)或[从源码安装](#从源码安装)。
+上述命令下载脚本时优先 GitHub，失败后尝试 ChuRepo。脚本安装和更新时也会自动回退：版本查询或发行包下载失败时尝试 ChuRepo；已选定的版本保持不变，校验失败直接报错。两站均无对应发行包时需使用包内安装或源码安装。显式指定其他仓库或归档 URL 时不会回退到官方仓库。
 
 ## 安装方式
 

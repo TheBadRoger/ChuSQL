@@ -31,6 +31,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: installer release fallback tests
+        run: python3 scripts/test-release-fallback.py
+
       # ---------- Rust 存储 ----------
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
