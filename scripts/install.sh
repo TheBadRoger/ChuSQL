@@ -17,6 +17,9 @@ esac
 
 # 查版本走 API，未认证只有 60 次/小时；给了 token 就带上（CI 里 GITHUB_TOKEN 一般就有）
 github_token="${CHUSQL_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
+churepo_base="${CHUSQL_CHUREPO_BASE:-https://repo.chunana.cn}"
+churepo_base="${churepo_base%/}"
+churepo_repo='ChuNa7a/ChuSQL'
 
 # 打印用法、选项与环境变量说明。
 usage() {
@@ -44,7 +47,7 @@ usage: ./install.sh [--component web|cli|both] [options]
   --no-service            skip Linux systemd registration and boot autostart
 
 where the files come from:
-  (default)               a package next to this script, else the newest GitHub release
+  (default)               a local package, else GitHub releases with ChuRepo fallback
   --url URL|PATH          install from this archive (URL, file:// URL or local path)
   --repo OWNER/NAME       GitHub repository (default: TheBadRoger/ChuSQL)
   --version TAG           release tag to download / git ref to build
@@ -59,6 +62,8 @@ environment:
                           --password
   CHUSQL_GITHUB_BASE      GitHub base URL: GitHub Enterprise, a mirror, or a
                           local test fixture (default: https://github.com)
+  CHUSQL_CHUREPO_BASE     fallback base URL (default: https://repo.chunana.cn)
+                          fallback only applies to the default repository
   CHUSQL_GITHUB_TOKEN     token for the version API (or GITHUB_TOKEN); without
                           one the API allows 60 requests per hour
 EOF
@@ -276,15 +281,15 @@ new_tmp() {
 download() {
     if command -v curl >/dev/null 2>&1; then
         if [ -n "${3:-}" ]; then
-            curl -fsSL -H "$3" -H 'Accept: application/vnd.github+json' -o "$2" "$1" || return 1
+            curl -fsSL --connect-timeout 10 --max-time 300 -H "$3" -H 'Accept: application/vnd.github+json' -o "$2" "$1" || return 1
         else
-            curl -fsSL -o "$2" "$1" || return 1
+            curl -fsSL --connect-timeout 10 --max-time 300 -o "$2" "$1" || return 1
         fi
     elif command -v wget >/dev/null 2>&1; then
         if [ -n "${3:-}" ]; then
-            wget -q --header="$3" --header='Accept: application/vnd.github+json' -O "$2" "$1" || return 1
+            wget -q --timeout=30 --tries=1 --header="$3" --header='Accept: application/vnd.github+json' -O "$2" "$1" || return 1
         else
-            wget -q -O "$2" "$1" || return 1
+            wget -q --timeout=30 --tries=1 -O "$2" "$1" || return 1
         fi
     else
         fail 'need curl or wget to download the package'
@@ -342,18 +347,41 @@ detect_platform() {
 }
 
 # ---- 发行 tag：问 GitHub API（不依赖 jq，用 awk 读 JSON）----
-# 请求 GitHub API 并落盘。
+# 请求发行列表，默认仓库失败或无版本时回退。
 api_get() {
     if [ -n "$github_token" ]; then
-        download "$api_base$1" "$2" "Authorization: Bearer $github_token"
+        download "$api_base$1" "$2" "Authorization: Bearer $github_token" &&
+            grep -q '"tag_name"' "$2" && return 0
     else
-        download "$api_base$1" "$2"
+        download "$api_base$1" "$2" && grep -q '"tag_name"' "$2" && return 0
     fi
+    [ "$repo" = "$default_repo" ] || return 1
+    note 'release API unavailable or empty; trying ChuRepo' >&2
+    download "$churepo_base/api/v1/repos/$churepo_repo/releases?limit=100" "$2"
+}
+
+# 将紧凑 JSON 按字符串外的分隔符换行。
+json_lines() {
+    awk '
+        {
+            for (i = 1; i <= length($0); i++) {
+                c = substr($0, i, 1)
+                printf "%s", c
+                if (quoted) {
+                    if (escaped) escaped = 0
+                    else if (c == "\\") escaped = 1
+                    else if (c == "\"") quoted = 0
+                } else if (c == "\"") quoted = 1
+                else if (c ~ /[][{},]/) printf "\n"
+            }
+            printf "\n"
+        }
+    ' "$1"
 }
 
 # 把 release JSON 解析成 tag 与资源行。
 parse_releases() {
-    awk '
+    json_lines "$1" | awk '
         in_assets {
             if ($0 ~ /^[[:space:]]*\]/) { in_assets = 0; next }
             if ($0 ~ /"name":/) {
@@ -372,7 +400,7 @@ parse_releases() {
         }
         /"prerelease":/ { pre = ($0 ~ /true/) ? 1 : 0; next }
         END { if (tag != "") { print tag "\t" pre "\t" assets } }
-    ' "$1"
+    '
 }
 
 # 这份 release 里有没有本平台的包。
@@ -466,6 +494,19 @@ fetch_asset() {
     archive="$tmp/$asset"
     if download "$url" "$archive" 2>/dev/null; then
         note "asset      $asset"
+        return 0
+    fi
+    [ "$repo" = "$default_repo" ] || return 1
+    fallback_version="$version"
+    if [ "$fallback_version" = 'latest' ]; then
+        download "$churepo_base/api/v1/repos/$churepo_repo/releases/latest" "$tmp/latest.json" 2>/dev/null || return 1
+        fallback_version=$(parse_releases "$tmp/latest.json" | cut -f1)
+        [ -n "$fallback_version" ] || return 1
+    fi
+    url="$churepo_base/$churepo_repo/releases/download/$fallback_version/$asset"
+    note "trying ChuRepo: $asset ($fallback_version)"
+    if download "$url" "$archive" 2>/dev/null; then
+        version="$fallback_version"
         return 0
     fi
     return 1

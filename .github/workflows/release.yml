@@ -9,7 +9,7 @@
 # 装的人拿到的就是编好的二进制，不需要 GHC / Rust：
 #   curl -fsSL https://raw.githubusercontent.com/TheBadRoger/ChuSQL/main/scripts/install.sh \
 #       | sh -s -- --component web
-# 也可下载 ChuRepo 脚本（发行包仍默认取自 GitHub）：
+# 也可下载 ChuRepo 脚本（发行包下载失败时自动回退）：
 #   curl -fsSL https://repo.chunana.cn/ChuNa7a/ChuSQL/raw/branch/main/scripts/install.sh -o install.sh
 #   sh install.sh --component web
 # 两站发行包与源码安装入口见 docs/install.md。

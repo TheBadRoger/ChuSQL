@@ -37,6 +37,8 @@ function Note([string]$msg) { Write-Host "  note: $msg" }
 
 # ---- 发行站、平台标签 ----
 $githubBase = if ($env:CHUSQL_GITHUB_BASE) { $env:CHUSQL_GITHUB_BASE.TrimEnd('/') } else { 'https://github.com' }
+$churepoBase = if ($env:CHUSQL_CHUREPO_BASE) { $env:CHUSQL_CHUREPO_BASE.TrimEnd('/') } else { 'https://repo.chunana.cn' }
+$churepoRepo = 'ChuNa7a/ChuSQL'
 $apiBase = if ($githubBase -match '^https?://github\.com$') { 'https://api.github.com' } else { "$githubBase/api/v3" }
 # 查版本走 API，未认证只有 60 次/小时；给了 token 就带上（CI 里 GITHUB_TOKEN 一般就有）
 $githubToken = if ($env:CHUSQL_GITHUB_TOKEN) { $env:CHUSQL_GITHUB_TOKEN } elseif ($env:GITHUB_TOKEN) { $env:GITHUB_TOKEN } else { '' }
@@ -69,18 +71,22 @@ function Select-Tag([bool]$stableOnly, [bool]$needPackage, $releases) {
 
 # 取 URL 的文本内容（字节数组先转字符串）。
 function Get-ResponseText([string]$url) {
-    $response = Invoke-WebRequest -Uri $url -Headers $apiHeaders -UseBasicParsing
+    $headers = if ($url.StartsWith("$churepoBase/")) { @{ 'User-Agent' = 'chusql-install' } } else { $apiHeaders }
+    $response = Invoke-WebRequest -Uri $url -Headers $headers -UseBasicParsing -TimeoutSec 300
     if ($response.Content -is [byte[]]) { return [System.Text.Encoding]::UTF8.GetString($response.Content) }
     return [string]$response.Content
 }
 
 # 拉取 release 列表并逐个输出。
 function Get-Releases {
-    try { $text = Get-ResponseText "$apiBase/repos/$Repo/releases?per_page=100" } catch { return }
-    try { $parsed = ConvertFrom-Json -InputObject $text } catch { return }
-    if ($null -eq $parsed) { return }
-    foreach ($release in @($parsed)) {
-        if ($null -ne $release) { Write-Output $release }
+    $urls = @("$apiBase/repos/$Repo/releases?per_page=100")
+    if ($Repo -eq 'TheBadRoger/ChuSQL') { $urls += "$churepoBase/api/v1/repos/$churepoRepo/releases?limit=100" }
+    foreach ($url in $urls) {
+        try {
+            $parsed = @(ConvertFrom-Json -InputObject (Get-ResponseText $url))
+            $releases = @($parsed | Where-Object { $null -ne $_ -and $_.tag_name })
+            if ($releases.Count -gt 0) { return $releases }
+        } catch { Note "release API unavailable: $url" }
     }
 }
 
@@ -241,13 +247,27 @@ if (-not (Test-Path (Join-Path $pack 'bin\chusql_core_storage.dll'))) {
         $tryUrl = if ($Version -eq 'latest') { "$githubBase/$Repo/releases/latest/download/$candidate" }
         else { "$githubBase/$Repo/releases/download/$Version/$candidate" }
         try {
-            Invoke-WebRequest -Uri $tryUrl -Headers $apiHeaders -OutFile $zip -UseBasicParsing
+            Invoke-WebRequest -Uri $tryUrl -Headers $apiHeaders -OutFile $zip -UseBasicParsing -TimeoutSec 300
             $asset = $candidate
             $assetUrl = $tryUrl
             break
-        } catch {
-            continue
-        }
+        } catch { Note "asset unavailable: $tryUrl" }
+        if ($Repo -ne 'TheBadRoger/ChuSQL') { continue }
+        try {
+            $fallbackVersion = $Version
+            if ($fallbackVersion -eq 'latest') {
+                $latest = ConvertFrom-Json -InputObject (Get-ResponseText "$churepoBase/api/v1/repos/$churepoRepo/releases/latest")
+                $fallbackVersion = $latest.tag_name
+                if (-not $fallbackVersion) { throw 'ChuRepo returned no release tag' }
+            }
+            $tryUrl = "$churepoBase/$churepoRepo/releases/download/$fallbackVersion/$candidate"
+            Note "trying ChuRepo: $candidate ($fallbackVersion)"
+            Invoke-WebRequest -Uri $tryUrl -OutFile $zip -UseBasicParsing -TimeoutSec 300
+            $asset = $candidate
+            $assetUrl = $tryUrl
+            $Version = $fallbackVersion
+            break
+        } catch { Note "ChuRepo asset unavailable: $candidate" }
     }
     if (-not $asset) {
         Fail "no package for windows-$arch in $Repo ($Version); try -ListVersions, or install from an archive you downloaded yourself"
