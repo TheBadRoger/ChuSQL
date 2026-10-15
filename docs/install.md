@@ -6,6 +6,8 @@
 
 发行包已经包含编译后的程序，普通用户安装时无需安装 GHC 或 Rust 工具链。
 
+项目仓库：[GitHub](https://github.com/TheBadRoger/ChuSQL) · [ChuRepo](https://repo.chunana.cn/ChuNa7a/ChuSQL)。两处均可获取源码，按网络情况选择。
+
 ## 在线安装
 
 Linux / macOS：
@@ -14,12 +16,30 @@ Linux / macOS：
 curl -fsSL https://raw.githubusercontent.com/TheBadRoger/ChuSQL/main/scripts/install.sh | sh -s -- --component web
 ```
 
+也可从 ChuRepo 下载后执行：
+
+```sh
+curl -fsSL \
+  https://repo.chunana.cn/ChuNa7a/ChuSQL/raw/branch/main/scripts/install.sh \
+  -o install.sh
+sh install.sh --component web
+```
+
 Windows PowerShell：
 
 ```powershell
 irm https://raw.githubusercontent.com/TheBadRoger/ChuSQL/main/scripts/install.ps1 -OutFile "$env:TEMP\install.ps1"
 & "$env:TEMP\install.ps1" -Component web
 ```
+
+ChuRepo 下载方式：
+
+```powershell
+irm https://repo.chunana.cn/ChuNa7a/ChuSQL/raw/branch/main/scripts/install.ps1 -OutFile "$env:TEMP\install.ps1"
+& "$env:TEMP\install.ps1" -Component web
+```
+
+以上在线安装脚本默认从 GitHub 获取发行包，脚本下载来源不会改变发行包来源。GitHub 不可用时，参见[包内安装](#包内安装)或[从源码安装](#从源码安装)。
 
 ## 安装方式
 
@@ -52,7 +72,9 @@ journalctl --user -u chusql-server.service
 
 ## 包内安装
 
-解压发行包后，在包根目录执行：
+发行包入口：[GitHub Releases](https://github.com/TheBadRoger/ChuSQL/releases) · [ChuRepo Releases](https://repo.chunana.cn/ChuNa7a/ChuSQL/releases)。两站的发行包需分别发布；若所选站点没有对应版本或平台的包，请切换站点或从源码安装。
+
+下载并解压对应平台的发行包后，在包根目录执行；包内安装不需要连接发行站点：
 
 ```sh
 ./install.sh --component web
@@ -84,9 +106,23 @@ Windows：
 
 源码安装需要 `git`、`cargo`、`stack` 和 `ghc`；部分 Linux 环境还需要 zlib 开发包。
 
+选择一个源码地址克隆（只需执行其中一条）：
+
 ```sh
-./install.sh --component web --from-source
+# GitHub
+git clone https://github.com/TheBadRoger/ChuSQL.git
+# 或 ChuRepo
+git clone https://repo.chunana.cn/ChuNa7a/ChuSQL.git
 ```
+
+Linux 进入仓库后使用本地源码构建，避免再次连接 GitHub 克隆：
+
+```sh
+cd ChuSQL
+sh scripts/install.sh --component web --from-source --source-dir .
+```
+
+`--from-source` 当前构建流程面向 Linux；Windows / macOS 优先使用对应平台发行包。
 
 源码构建完成后的配置、初始化和启动流程与发行包安装一致。
 
