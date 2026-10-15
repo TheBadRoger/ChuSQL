@@ -11,6 +11,8 @@
 
 ChuSQL 是采用 Haskell SQL 引擎与 Rust 存储层的数据库项目，提供 TCP 服务、CLI 和 Web 管理端。支持查询优化、快照事务、WAL 崩溃恢复、DOMAIN 自定义类型及用户与角色管理。
 
+项目仓库：[GitHub](https://github.com/TheBadRoger/ChuSQL) · [ChuRepo](https://repo.chunana.cn/ChuNa7a/ChuSQL)。两处均可获取源码，按网络情况选择。
+
 ## 快速开始
 
 ### 安装
@@ -21,12 +23,30 @@ Linux / macOS：
 curl -fsSL https://raw.githubusercontent.com/TheBadRoger/ChuSQL/main/scripts/install.sh | sh -s -- --component web
 ```
 
+也可从 ChuRepo 下载后执行：
+
+```sh
+curl -fsSL \
+  https://repo.chunana.cn/ChuNa7a/ChuSQL/raw/branch/main/scripts/install.sh \
+  -o install.sh
+sh install.sh --component web
+```
+
 Windows（PowerShell 里下下来再跑；也有下载 zip 解压的包内安装）：
 
 ```powershell
 irm https://raw.githubusercontent.com/TheBadRoger/ChuSQL/main/scripts/install.ps1 -OutFile "$env:TEMP\install.ps1"
 & "$env:TEMP\install.ps1" -Component web
 ```
+
+ChuRepo 下载方式：
+
+```powershell
+irm https://repo.chunana.cn/ChuNa7a/ChuSQL/raw/branch/main/scripts/install.ps1 -OutFile "$env:TEMP\install.ps1"
+& "$env:TEMP\install.ps1" -Component web
+```
+
+以上在线安装脚本默认从 GitHub 获取发行包，脚本下载来源不会改变发行包来源。GitHub 不可用时，参见[包内安装](docs/install.md#包内安装)或[从源码安装](docs/install.md#从源码安装)。
 
 ### 启动
 

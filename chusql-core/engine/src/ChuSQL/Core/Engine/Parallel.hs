@@ -9,7 +9,7 @@ import Control.Concurrent (forkIO)
 import Control.Concurrent.Chan (Chan, newChan, readChan, writeChan)
 import Control.Concurrent.MVar (MVar, modifyMVar, newEmptyMVar, newMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, throwIO, try)
-import Control.Monad (forever)
+import Control.Monad (forever, join)
 import System.IO.Unsafe (unsafePerformIO)
 
 -- 并行执行：常驻工作线程池，结果按提交顺序收回。
@@ -53,7 +53,7 @@ workerPool size = modifyMVar poolRef reuse
 
 -- | 一个工作线程：等待并执行队首待办
 worker :: Chan (IO ()) -> IO ()
-worker jobs = forever (readChan jobs >>= id)
+worker jobs = forever (join (readChan jobs))
 
 -- | 往池里丢一个待办
 submit :: Pool -> IO () -> IO ()

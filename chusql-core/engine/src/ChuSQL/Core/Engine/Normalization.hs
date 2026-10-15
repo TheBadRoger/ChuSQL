@@ -63,7 +63,7 @@ keysOf attrs f =
     [ x
     | x <- subsequences attrs
     , super x
-    , all (not . super) [x \\ [a] | a <- x]
+    , (not . any super) [x \\ [a] | a <- x]
     ]
   where
     -- 判断闭包是否覆盖关系。
@@ -123,7 +123,7 @@ analyzeNormalization schema declaration
     results =
         Finding NF1 atomic [] "attributes must have atomic domains; requires an explicit declaration"
             : [classify NF2 partial, classify NF3 third, classify BCNF boyce]
-    decompositions = [split d | d <- take 1 boyce, complete, atomic == Satisfied]
+    decompositions = [split d | complete, atomic == Satisfied, d <- take 1 boyce]
     -- 校验字段集合。
     valid xs = length xs == length (canonical xs) && subset xs attrs
     -- 校验依赖声明。

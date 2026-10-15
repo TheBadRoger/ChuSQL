@@ -21,6 +21,7 @@ module ChuSQL.Server.Backend (
     tableRefsOf,
 ) where
 
+import Data.Maybe (fromMaybe, mapMaybe, maybeToList)
 import ChuSQL.Core.Engine (runStatement, runStatementM)
 import ChuSQL.Core.Model
 import ChuSQL.Core.Engine.Semantic (prepare)
@@ -40,7 +41,7 @@ import ChuSQL.Core.Engine.Storage.IPC (
 import ChuSQL.Core.Engine.Syntax.AST
 import ChuSQL.Core.Engine.Syntax.Parser (parseStatement)
 import ChuSQL.Core.Protocol (TxnOp (..))
-import Control.Concurrent.MVar (MVar, modifyMVar, readMVar)
+import Control.Concurrent.MVar (MVar, modifyMVar)
 import Data.List (nub, isPrefixOf)
 import Data.Text (Text)
 import Data.Time (getCurrentTime)
@@ -75,16 +76,20 @@ data Backend = Backend
 -- | 按给定列名取列，固定列顺序
 columnsFromStatement :: Database -> Statement -> [String]
 columnsFromStatement db stmt = case prepare db stmt of
-    Right (SelectDistinct q) -> columnsFromStatement db q
-    Right (Select items _ _ _ _ _) -> map fst items
-    Right ShowDomains -> ["domain", "base_type"]
-    _ -> []
+    Left _ -> []
+    Right resolved -> columnsOf resolved
+  where
+    -- | 从已准备的语句提取输出列名
+    columnsOf (SelectDistinct q) = columnsOf q
+    columnsOf Select{selectItems = items} = map fst items
+    columnsOf ShowDomains = ["domain", "base_type"]
+    columnsOf _ = []
 
 -- | 走本地存储链路的后端
 ipcBackend :: IO Backend
 ipcBackend = do
     let backend current = Backend
-            { beStatement = \sql -> runIpc current sql
+            { beStatement = runIpc current
             , beCatalog = do
                 response <- sendRequest (ReqInDatabase current ReqListCatalog)
                 pure $ case response of
@@ -107,7 +112,7 @@ ipcBackend = do
                     RespTables names -> Right names
                     RespError err -> Left err
                     _ -> Left "unexpected database response"
-            , beStorage = \payload -> runRaw payload
+            , beStorage = runRaw
             , beSnapshot = runIPCStorageIn snapshot (sessionEnv current)
             , beApplyTransaction = \ops -> do
                 response <- sendRequest (ReqInDatabase current (ReqApplyTransaction ops))
@@ -149,9 +154,9 @@ ipcBackend = do
                     cols <- case rows of
                         [] -> do
                             db <- runIPCStorageIn schema env
-                            pure (fmap (\structures -> columnsFromStatement structures stmt) db)
+                            pure (fmap (`columnsFromStatement` stmt) db)
                         (r : _) -> pure (Right (map fst r))
-                    pure (fmap (\names -> StatementResult names rows) cols)
+                    pure (fmap (`StatementResult` rows) cols)
 
 -- | 测试用内存后端，状态是一个 Database
 memoryBackend :: String -> MVar Database -> Backend
@@ -331,10 +336,12 @@ statementTables stmt = nub (case stmt of
     SelectDistinct q -> statementTables q
     Select{} ->
         tableRefsOf (selectFrom stmt)
-            ++ concatMap exprTables (maybe [] (: []) (selectWhere stmt) ++ map snd (selectItems stmt) ++ map Col (selectGroupBy stmt ++ map fst (selectOrderBy stmt)))
+            ++ concatMap exprTables (maybeToList (selectWhere stmt) ++ maybeToList (selectHaving stmt)
+                ++ map snd (selectItems stmt) ++ map Col (selectGroupBy stmt)
+                ++ mapMaybe (orderKeyExpression . fst) (selectOrderBy stmt))
     Insert table _ rows -> T.pack table : concatMap exprTables (concat rows)
-    Update table assigns cond -> T.pack table : concatMap exprTables (map snd assigns ++ maybe [] (: []) cond)
-    Delete table cond -> T.pack table : concatMap exprTables (maybe [] (: []) cond)
+    Update table assigns cond -> T.pack table : concatMap exprTables (map snd assigns ++ maybeToList cond)
+    Delete table cond -> T.pack table : concatMap exprTables (maybeToList cond)
     CreateTable table _ -> [T.pack table]
     DropTable table -> [T.pack table]
     CreateIndex table _ -> [T.pack table]
@@ -368,12 +375,12 @@ statementNeedsDatabase stmt = case stmt of
 -- | 将当前库限定的结构目标转为裸表名
 scopeDdl :: String -> Statement -> Either String Statement
 scopeDdl current statement = case statement of
-    CreateTable table columns -> (\key -> CreateTable key columns) <$> target table
+    CreateTable table columns -> (`CreateTable` columns) <$> target table
     DropTable table -> DropTable <$> target table
-    CreateIndex table column -> (\key -> CreateIndex key column) <$> target table
-    DropIndex table column -> (\key -> DropIndex key column) <$> target table
-    DropColumn table column -> (\key -> DropColumn key column) <$> target table
-    AddColumn table column -> (\key -> AddColumn key column) <$> target table
+    CreateIndex table column -> (`CreateIndex` column) <$> target table
+    DropIndex table column -> (`DropIndex` column) <$> target table
+    DropColumn table column -> (`DropColumn` column) <$> target table
+    AddColumn table column -> (`AddColumn` column) <$> target table
     RenameColumn table old new -> (\key -> RenameColumn key old new) <$> target table
     AlterColumnType table column ty -> (\key -> AlterColumnType key column ty) <$> target table
     AlterColumnDefault table column value -> (\key -> AlterColumnDefault key column value) <$> target table
@@ -554,10 +561,10 @@ memoryAccounts db stamp req = do
             | any ((== T.toLower u) . accountUser) accounts -> Left "identity already exists"
             | otherwise -> Right (accounts ++ [Account (highWater + 1) (T.toLower u) "" 1 stamp Nothing False False True False False])
         ReqIdentityAlter u login super enabled manager sudo -> case filter ((== T.toLower u) . accountUser) accounts of
-            [_] -> preserveSuper [if accountUser a == T.toLower u then a{accountCanLogin = maybe (accountCanLogin a) id login,
-                accountIsSuperuser = maybe (accountIsSuperuser a) id super, accountEnabled = maybe (accountEnabled a) id enabled,
-                accountSystemCatalogManager = maybe (accountSystemCatalogManager a) id manager,
-                accountAllowSudoAuth = maybe (accountAllowSudoAuth a) id sudo,
+            [_] -> preserveSuper [if accountUser a == T.toLower u then a{accountCanLogin = fromMaybe (accountCanLogin a) login,
+                accountIsSuperuser = fromMaybe (accountIsSuperuser a) super, accountEnabled = fromMaybe (accountEnabled a) enabled,
+                accountSystemCatalogManager = fromMaybe (accountSystemCatalogManager a) manager,
+                accountAllowSudoAuth = fromMaybe (accountAllowSudoAuth a) sudo,
                 accountRevision = accountRevision a + 1} else a | a <- accounts] accounts
             _ -> Left "unknown account"
         ReqAccountCreate u h

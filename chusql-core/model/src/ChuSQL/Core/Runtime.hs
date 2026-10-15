@@ -6,6 +6,7 @@ module ChuSQL.Core.Runtime
     , validateValue, encodeValue, decodeValue, encodeType, decodeType, runtimeToJSON, runtimeFromJSON
     ) where
 
+import Control.Monad (zipWithM, zipWithM_)
 import Data.Aeson (Value (..), eitherDecode, encode)
 import Data.Aeson.Types (Parser, parseEither)
 import qualified Data.ByteString.Lazy as BS
@@ -115,7 +116,7 @@ parseTypeExpr source = case P.readP_to_S (P.skipSpaces *> expression <* P.skipSp
         P.<++ (tupleType <$> between "(" ")" (P.sepBy expression (symbol ",")))
     -- | 解析具有名称边界的类型关键字
     token word = do
-        _ <- mapM character word
+        mapM_ character word
         rest <- P.look
         case rest of
             c : _ | isAlphaNum c || c == '_' -> P.pfail
@@ -187,7 +188,7 @@ validatePhysical (Sequence child) (RList values) = mapM_ (validatePhysical child
 validatePhysical (Optional _) (RMaybe Nothing) = Right ()
 validatePhysical (Optional child) (RMaybe (Just value)) = validatePhysical child value
 validatePhysical (Product fields) (RTuple values)
-    | length fields == length values = sequence_ (zipWith validatePhysical fields values)
+    | length fields == length values = zipWithM_ validatePhysical fields values
 validatePhysical physical _ = Left ("value does not fit physical type: " ++ show physical)
 
 -- | 编码带版本与类型身份的值
@@ -289,5 +290,5 @@ parseValue (Optional child) (Array values) = case V.toList values of
     [value] -> RMaybe . Just <$> parseValue child value
     _ -> fail "invalid optional value"
 parseValue (Product fields) (Array values)
-    | length fields == V.length values = RTuple <$> sequence (zipWith parseValue fields (V.toList values))
+    | length fields == V.length values = RTuple <$> zipWithM parseValue fields (V.toList values)
 parseValue _ _ = fail "invalid physical value"

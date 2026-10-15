@@ -2,6 +2,7 @@
 
 module Main (main) where
 
+import Data.Maybe (fromMaybe)
 import ChuSQL.Bootstrap (preinstalledTypes, runBootstrap)
 import ChuSQL.Core.Protocol (Account (..))
 import ChuSQL.Core.Model (columnType, typeName)
@@ -85,7 +86,7 @@ identity super = A.object ["status" A..= ("accounts" :: Text), "accounts" A..= [
 
 -- | 已写入编号的类型响应
 installed :: A.Value
-installed = A.object ["status" A..= ("rows" :: Text), "rows" A..= map numbered (zip [1 :: Int ..] preinstalledTypes)]
+installed = A.object ["status" A..= ("rows" :: Text), "rows" A..= zipWith (curry numbered) [1 :: Int .. ] preinstalledTypes]
   where
     -- | 给预装定义添加持久化编号
     numbered (n, A.Object fields) = A.Object (KM.insert "id" (A.toJSON n) fields)
@@ -93,7 +94,7 @@ installed = A.object ["status" A..= ("rows" :: Text), "rows" A..= map numbered (
 
 -- | 读取响应中的一个字段
 field :: A.Key -> A.Value -> A.Value
-field key (A.Object fields) = maybe A.Null id (KM.lookup key fields)
+field key (A.Object fields) = fromMaybe A.Null (KM.lookup key fields)
 field _ _ = A.Null
 
 -- | 记录请求并返回指定响应

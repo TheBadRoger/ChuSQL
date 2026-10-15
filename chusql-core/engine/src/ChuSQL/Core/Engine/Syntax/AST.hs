@@ -1,4 +1,4 @@
-module ChuSQL.Core.Engine.Syntax.AST (Statement (..), FromClause (..), JoinKind (..), Expr (..), Subquery (..), Quantifier (..), CompareOp (..), SortDir (..), makeSelect, distinctOrdering) where
+module ChuSQL.Core.Engine.Syntax.AST (Statement (..), FromClause (..), JoinKind (..), Expr (..), Subquery (..), Quantifier (..), CompareOp (..), SortDir (..), OrderKey (..), makeSelect, distinctOrdering, orderPosition, orderExpression, orderKeyExpression) where
 
 import ChuSQL.Core.Model (Column (..), ColumnType, Value (..))
 import ChuSQL.Core.Engine.Runtime.Types (TypeId, TypeExpr, RuntimeValue)
@@ -13,7 +13,8 @@ data Statement
         , selectFrom :: FromClause
         , selectWhere :: Maybe Expr
         , selectGroupBy :: [String]
-        , selectOrderBy :: [(String, SortDir)]
+        , selectHaving :: Maybe Expr
+        , selectOrderBy :: [(OrderKey, SortDir)]
         , selectLimit :: Maybe Int
         }
     | SelectDistinct Statement
@@ -89,6 +90,11 @@ data Subquery = Subquery
     { subqueryStatement :: Statement
     , subqueryRefs :: [String]
     }
+    | BoundSubquery
+    { subqueryStatement :: Statement
+    , subqueryRefs :: [String]
+    , subquerySlots :: [(String, Expr)]
+    }
     deriving (Show, Eq)
 
 -- | 量词：ANY 至少一行成立，ALL 每一行都成立
@@ -159,6 +165,10 @@ data SortDir
     | Desc
     deriving (Show, Eq)
 
+-- | 区分排序列、输出序号与来源表达式
+data OrderKey = OrderColumn String | OrderPosition Int | OrderExpression Expr
+    deriving (Show, Eq)
+
 -- | 造一个最简单的 SELECT
 makeSelect :: [String] -> String -> Maybe Expr -> Statement
 makeSelect cols tbl w =
@@ -167,24 +177,60 @@ makeSelect cols tbl w =
         , selectFrom = FromTable Nothing tbl
         , selectWhere = w
         , selectGroupBy = []
+        , selectHaving = Nothing
         , selectOrderBy = []
         , selectLimit = Nothing
         }
 
 -- | 将去重排序映射到输出列
-distinctOrdering :: Statement -> Either String [(String, SortDir)]
+distinctOrdering :: Statement -> Either String [(OrderKey, SortDir)]
 distinctOrdering q@Select{} = resolveDistinctOrdering q
 distinctOrdering _ = Left "DISTINCT requires SELECT"
 
+-- | 校验排序序号并返回从零开始的位置
+orderPosition :: Int -> OrderKey -> Either String (Maybe Int)
+orderPosition width (OrderPosition position)
+    | position > 0, position <= width = Right (Just (position - 1))
+    | otherwise = Left "ORDER BY: position is outside the select list"
+orderPosition _ _ = Right Nothing
+
+-- | 按序号、唯一别名或来源列解析排序表达式
+orderExpression :: [(String, Expr)] -> OrderKey -> Either String Expr
+orderExpression _ (OrderExpression expression) = Right expression
+orderExpression items key@(OrderPosition _) = do
+    position <- orderPosition (length items) key
+    case position of
+        Just slot -> Right (snd (items !! slot))
+        Nothing -> Left "ORDER BY: missing output position"
+orderExpression items (OrderColumn column) = case [expression | (label, expression) <- items, label == column] of
+    [] -> Right (Col column)
+    [expression] -> Right expression
+    expressions | all (== Col column) expressions -> Right (Col column)
+    _ -> Left ("ORDER BY: ambiguous projection alias: " ++ column)
+
+-- | 收集原始排序键中可能含子查询的表达式
+orderKeyExpression :: OrderKey -> Maybe Expr
+orderKeyExpression (OrderColumn column) = Just (Col column)
+orderKeyExpression (OrderExpression expression) = Just expression
+orderKeyExpression (OrderPosition _) = Nothing
+
 -- | 解析去重输出的排序列
-resolveDistinctOrdering :: Statement -> Either String [(String, SortDir)]
+resolveDistinctOrdering :: Statement -> Either String [(OrderKey, SortDir)]
 resolveDistinctOrdering q = mapM resolve (selectOrderBy q)
   where
     items = case q of
         Select { selectItems = projected } -> projected
         _ -> []
     -- | 排序键必须出现在去重结果中
-    resolve (column, direction) = case [label | (label, e) <- items, label == column || e == Col column] of
-        [label] -> Right (label, direction)
-        [] -> Left "DISTINCT: ORDER BY column must appear in the select list"
-        _ -> Left "DISTINCT: ambiguous ORDER BY column"
+    resolve (key, direction) = do
+        position <- orderPosition (length items) key
+        case position of
+            Just _ -> Right (key, direction)
+            Nothing -> case [slot | (slot, (label, expression)) <- zip [1 ..] items, matches key label expression] of
+                [slot] -> Right (OrderPosition slot, direction)
+                [] -> Left "DISTINCT: ORDER BY column must appear in the select list"
+                _ -> Left "DISTINCT: ambiguous ORDER BY column"
+    -- | 名称或完整表达式必须对应去重输出项
+    matches (OrderColumn column) label expression = label == column || expression == Col column
+    matches (OrderExpression key) _ expression = key == expression
+    matches (OrderPosition _) _ _ = False

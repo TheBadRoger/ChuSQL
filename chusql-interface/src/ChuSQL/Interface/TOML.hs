@@ -36,12 +36,13 @@ writeSection path section values = do
     prepared <- prepareDirectory
     case prepared of
         Left err -> pure (Left err)
-        Right () -> do
-            exists <- doesFileExist path
-            raw <- if exists then TE.decodeUtf8 <$> BS.readFile path else pure ""
-            let updated = T.unlines (rewrite section values (T.lines raw))
-            written <- tryWrite (TE.encodeUtf8 updated)
-            pure written
+        Right () -> do exists <- doesFileExist path
+                       raw <- if exists then
+                                  TE.decodeUtf8 <$> BS.readFile path
+                              else
+                                  pure ""
+                       let updated = T.unlines (rewrite section values (T.lines raw))
+                       tryWrite (TE.encodeUtf8 updated)
   where
     -- | 目录不存在就先建
     prepareDirectory = do
@@ -111,7 +112,7 @@ rewrite :: Text -> Map Text Text -> [Text] -> [Text]
 rewrite section values = addMissing . replaceInSection . dropEmpties
   where
     -- | 删掉空值的键
-    dropEmpties = filter (\line -> maybe True (not . T.null . snd) (assignment line))
+    dropEmpties = filter (maybe True (not . T.null . snd) . assignment)
     -- | 在目标分区里就地换行
     replaceInSection = go ""
     -- | 走到目标分区后逐行替换
@@ -158,7 +159,7 @@ keysOf wanted = go ""
 appendSection :: Text -> [(Text, Text)] -> [Text] -> [Text]
 appendSection section entries lines' =
     lines'
-        ++ (if null lines' || not (T.null (last lines')) then [""] else [])
+        ++ (["" | null lines' || not (T.null (last lines'))])
         ++ ("[" <> section <> "]") : [assignmentLine key value | (key, value) <- entries]
 
 -- | 全局配置文件的固定路径，跟随系统惯例

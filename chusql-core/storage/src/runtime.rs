@@ -1335,7 +1335,7 @@ impl Server {
         }
     }
 
-    /// 持读门时复查绑定身份、版本和列定义
+    /// 持库门时复查绑定身份、版本和列定义
     fn validate_bound_schema(&self, table: &str, expected: &crate::protocol::BoundSchema) -> std::io::Result<()> {
         use std::io::Error;
         if self.recovery_required.load(Ordering::Acquire) { return Err(Error::other("storage recovery required")); }
@@ -1378,6 +1378,7 @@ impl Server {
             }
         }
         match req {
+            Request::ValidateWrite { .. } => Response::Ok,
             Request::BootstrapTypes { types } => match self.bootstrap_types(types) {
                 Ok(rows) => Response::Rows { rows },
                 Err(e) => Response::Error { message: e.to_string() },
@@ -2190,10 +2191,17 @@ impl Databases {
     fn request(&self, mut value: serde_json::Value) -> std::io::Result<Response> {
         use std::io::Error;
         let method = value.get("method").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        if value.get("schema_guard").is_some()
-            && !matches!(method.as_str(), "scan" | "scan_shard" | "lookup_by_index" | "range_by_index") {
-            return Err(Error::other("schema guard requires a table read"));
+        if method == "validate_write" && value.get("schema_guard").is_none() {
+            return Err(Error::other("write validation requires a schema guard"));
         }
+        let guarded_write = if value.get("schema_guard").is_some() {
+            match method.as_str() {
+                "scan" | "scan_shard" | "lookup_by_index" | "range_by_index" | "validate_write" => false,
+                "insert" | "insert_batch" | "delete_keys" | "replace_all" | "replace_schema"
+                    | "drop_column" | "drop_table" | "create_index" | "drop_index" => true,
+                _ => return Err(Error::other("schema guard requires a supported table operation")),
+            }
+        } else { false };
         let name = match value.get("database") {
             None => String::new(),
             Some(serde_json::Value::String(s)) => s.to_ascii_lowercase(),
@@ -2328,7 +2336,6 @@ impl Databases {
         let server = if global || selected == SYSTEM_DATABASE { Arc::clone(&self.system) }
             else { Arc::clone(named.get(&selected).ok_or_else(|| Error::other("unknown database"))?) };
         if let Some(bindings) = guard {
-            if !concurrent_read(&request) { return Err(Error::other("schema guard requires a table read")); }
             let mut servers = std::collections::BTreeMap::from([(selected.clone(), Arc::clone(&server))]);
             let mut dependencies = Vec::new();
             for binding in bindings {
@@ -2341,11 +2348,19 @@ impl Databases {
                 dependencies.push((database, table.to_owned(), binding));
             }
             if !dependencies.iter().any(|(database, table, _)| database == &selected && Some(table.as_str()) == request.table()) {
-                return Err(Error::other("bound read table has no schema guard"));
+                return Err(Error::other("bound table operation has no schema guard"));
             }
             drop(named);
-            let _gates = servers.values().map(|server| server.gate.read()
-                .map_err(|_| Error::other("storage read gate poisoned"))).collect::<std::io::Result<Vec<_>>>()?;
+            // 全部库按名称取门；写入目标独占，其他依赖共享。
+            let _gates = servers.iter().map(|(database, server)| {
+                if guarded_write && database == &selected {
+                    server.gate.write().map(|gate| (None, Some(gate)))
+                        .map_err(|_| Error::other("storage write gate poisoned"))
+                } else {
+                    server.gate.read().map(|gate| (Some(gate), None))
+                        .map_err(|_| Error::other("storage read gate poisoned"))
+                }
+            }).collect::<std::io::Result<Vec<_>>>()?;
             for (database, table, binding) in &dependencies {
                 servers[database].validate_bound_schema(table, binding)?;
             }
@@ -2369,6 +2384,7 @@ fn concurrent_read(req: &Request) -> bool {
     matches!(
         req,
         Request::Scan { .. }
+            | Request::ValidateWrite { .. }
             | Request::ScanShard { .. }
             | Request::LookupByIndex { .. }
             | Request::RangeByIndex { .. }

@@ -29,12 +29,17 @@ module ChuSQL.Server.Session
     ) where
 
 import ChuSQL.Core.Model (Database, Row, Table (..), Value (..), Column (..), typeName)
-import ChuSQL.Core.Protocol (SchemaColumn (..))
+import ChuSQL.Core.Protocol
+    ( SchemaColumn(..),
+      Account(..),
+      Request(..),
+      QueryResult(..),
+      TxnOp(..),
+      queryResultJson )
 import ChuSQL.Interface.Normalization
 import ChuSQL.Server.Normalization (normalizationBudget, normalizationReport)
 import Data.Aeson.Types (parseEither)
 import qualified Data.ByteString.Lazy as BL
-import ChuSQL.Core.Protocol (Account (..), Request (..), QueryResult (..), TxnOp (..), queryResultJson)
 import ChuSQL.Core.Engine.Storage.IPC (TableInfo (..))
 import qualified ChuSQL.Core.Engine as Engine
 import qualified ChuSQL.Core.Engine.Error as E
@@ -51,7 +56,7 @@ import Control.Exception (IOException, try)
 import Data.Bifunctor (first)
 import Data.Char (isAlpha, isAlphaNum)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, fromMaybe)
 import qualified Data.IntMap.Strict as IM
 import qualified Data.IntSet as IS
 import Data.Text (Text)
@@ -831,7 +836,7 @@ privilegeMessage (PrivilegeError _ message) = message
 
 -- | 只带库名的空结果
 emptyResult :: Maybe Text -> QueryResult
-emptyResult database = QueryResult [] [] 0 False database
+emptyResult = QueryResult [] [] 0 False
 
 -- | 存储结果转成查询结果
 resultOf :: StatementResult -> QueryResult
@@ -845,7 +850,7 @@ resultOf result =
         }
   where
     -- | 按列名取单元格
-    cellOf row name = maybe VNull id (lookup name row)
+    cellOf row name = fromMaybe VNull (lookup name row)
 
 
 -- 展示当前登录身份自己的有效权限。

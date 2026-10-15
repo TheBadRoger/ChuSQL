@@ -54,10 +54,10 @@ switch ($Kind) {
     }
     'stack' {
         Invoke-Step 'engine' $engine @('stack', 'test', 'chusql-core-engine', '--fast')
-        Invoke-Step 'server' (Join-Path $Root 'chusql-server') @('stack', 'test', 'chusql-server', '--fast')
+        Invoke-Step 'server' (Join-Path $Root 'chusql-server') @('stack', 'test', 'chusql-server', '--fast') @('chusql-core-model', 'chusql-core-engine', 'chusql-interface')
         Invoke-Step 'web' (Join-Path $Root 'chusql-web') @('stack', 'test', 'chusql-web', '--fast') @('chusql-core-model', 'chusql-core-engine', 'chusql-interface', 'chusql-server')
         Invoke-Step 'cli' (Join-Path $Root 'chusql-cli') @('stack', 'test', 'chusql-cli', '--fast')
-        Invoke-Step 'bootstrap' (Join-Path $Root 'chusql-bootstrap') @('stack', 'test', 'chusql-bootstrap', '--fast')
+        Invoke-Step 'bootstrap' (Join-Path $Root 'chusql-bootstrap') @('stack', 'test', 'chusql-bootstrap', '--fast') @('chusql-core-model', 'chusql-core-engine', 'chusql-interface')
     }
     'comments' {
         $check = Join-Path $PSScriptRoot 'comment-check.ps1'

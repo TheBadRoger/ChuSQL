@@ -2,6 +2,7 @@
 
 module Main (main) where
 
+import Data.Maybe (fromMaybe)
 import ChuSQL.Core.Engine.Storage.IPC (closeConnection, localStorageLink, sendRawRequest, setStorageLink)
 import ChuSQL.Bootstrap (preinstalledTypes, runBootstrap)
 import ChuSQL.Core.Engine.Storage.FFI (maintainStorage)
@@ -139,7 +140,7 @@ runMaintenance opts mode = do
         Left err -> failWith err
         Right plain -> do
             encoded <- if T.null plain then pure "" else hashPassword plain
-            let request = A.object ["mode" A..= mode, "user" A..= maybe "root" id (optUser opts), "password_hash" A..= encoded, "types" A..= preinstalledTypes]
+            let request = A.object ["mode" A..= mode, "user" A..= fromMaybe "root" (optUser opts), "password_hash" A..= encoded, "types" A..= preinstalledTypes]
             reply <- maintainStorage path (BL.toStrict (A.encode request))
             case reply of
                 Left err -> failWith err
@@ -155,9 +156,8 @@ send request = do
 readPassword :: Options -> IO (Either String Text)
 readPassword opts
     | optPasswordless opts = pure (Right "")
-    | optPasswordStdin opts = do
-        line <- TIO.getLine
-        pure (Right (T.dropWhileEnd (\c -> c == '\r' || c == '\n') line))
+    | optPasswordStdin opts = do Right . T.dropWhileEnd (\ c -> c == '\r' || c == '\n')
+                                   <$> TIO.getLine
     | otherwise = pure (Left "pass --password-stdin or --passwordless")
 
 -- | 打印错误并退出 1

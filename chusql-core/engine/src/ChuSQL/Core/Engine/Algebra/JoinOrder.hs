@@ -1,5 +1,6 @@
 module ChuSQL.Core.Engine.Algebra.JoinOrder (reorderJoins) where
 
+import Data.Maybe (fromMaybe)
 import ChuSQL.Core.Engine.Algebra.Cost (pointRows, rangeRows, selectivityOf, tableMetaOf)
 import ChuSQL.Core.Engine.Algebra.Expr (colsInExpr, hasDivision, hasSubquery)
 import ChuSQL.Core.Engine.Algebra.Op (RelOp (..), relOpCols)
@@ -23,6 +24,7 @@ pass db free (Project cols x) = Project cols (pass db free x)
 pass db free (Compute items x) = Compute items (pass db free x)
 pass db free (Filter p x) = Filter p (pass db free x)
 pass db free (Derived a x) = Derived a (pass db free x)
+pass db free (SemiJoin kind left right l r query) = SemiJoin kind left right (pass db free l) (pass db False r) query
 pass db free (Join kind l r c)
     | free
     , Just (leaves, conds) <- innerChain (Join kind l r c)
@@ -38,7 +40,7 @@ innerChain (Join InnerJoin l r c) = do
     (ls, lcs) <- innerChain l
     (rs, rcs) <- innerChain r
     pure (ls ++ rs, lcs ++ rcs ++ [c])
-innerChain (Join _ _ _ _) = Nothing
+innerChain (Join {}) = Nothing
 innerChain op = Just ([op], [])
 
 -- | 叶子算子的估算行数，拿不到统计就是 Nothing
@@ -79,7 +81,7 @@ scaleRows db p x rows = case p of
     GtE _ _ -> quarter
     LtE _ _ -> quarter
     NotEq _ _ -> quarter
-    QuantCmp _ _ _ _ -> quarter
+    QuantCmp {} -> quarter
     And a b -> max 1 (min (scaleRows db a x rows) (scaleRows db b x rows))
     _ -> quarter
   where
@@ -101,11 +103,9 @@ leafSource _ = Nothing
 
 -- | 某列在叶子统计里的不同值数
 distinctOf :: Database -> RelOp -> String -> Maybe Int
-distinctOf db leaf col = do
-    (alias, t) <- leafSource leaf
-    m <- tableMetaOf db t
-    num <- lookup (unqualify alias col) [(c, n) | (c, n, _) <- metaDistinct m]
-    pure num
+distinctOf db leaf col = do (alias, t) <- leafSource leaf
+                            m <- tableMetaOf db t
+                            lookup (unqualify alias col) [(c, n) | (c, n, _) <- metaDistinct m]
 
 -- | 若干叶子里某列最大的不同值数
 distinctOn :: Database -> [RelOp] -> String -> Maybe Int
@@ -138,11 +138,11 @@ stepRows db have acc x conds = case keyDistinct db have x conds of
     Just v | v > 1 -> max 1 (acc * rows `div` v)
     _ -> acc * rows
   where
-    rows = maybe 1 id (leafRows db x)
+    rows = fromMaybe 1 (leafRows db x)
 
 -- | 一批叶子按给定顺序连接，累加每一步的中间结果
 chainCost :: Database -> [RelOp] -> [Expr] -> Int
-chainCost db (l : ls) conds = go [l] (maybe 1 id (leafRows db l)) ls
+chainCost db (l : ls) conds = go [l] (fromMaybe 1 (leafRows db l)) ls
   where
     -- | 逐步接上后面的叶子
     go _ _ [] = 0
@@ -213,8 +213,7 @@ rebuildChain _ [] _ = Unit
 
 -- | 挂不上去的条件套成 Filter
 applyConds :: [Expr] -> RelOp -> RelOp
-applyConds [] op = op
-applyConds (c : cs) op = Filter c (applyConds cs op)
+applyConds cs op = foldr Filter op cs
 
 -- | 条件的列是不是都在可用列里
 subsetOf :: [String] -> [String] -> Bool

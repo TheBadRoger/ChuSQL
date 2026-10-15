@@ -13,9 +13,13 @@ data IndexResult
     deriving (Show, Eq)
 
 class (Monad m) => MonadStorage m where
-    -- \| 在稳定存储视图中执行绑定读取
+    -- \| 在实际读写前验证绑定依赖
     withSchemaGuard :: Database -> m (Either String a) -> m (Either String a)
     withSchemaGuard _ _ = pure (Left "bound schema guards are unavailable in this storage")
+
+    -- | 确认写守卫能力后执行绑定写入
+    withWriteSchemaGuard :: Database -> m (Either String a) -> m (Either String a)
+    withWriteSchemaGuard _ _ = pure (Left "bound write schema guards are unavailable in this storage")
 
     -- \| 建一个库
     createDatabase :: String -> m (Either String ())
@@ -48,7 +52,7 @@ class (Monad m) => MonadStorage m where
 
     -- \| 按分片并行扫描并按分片序拼接；默认退回顺序扫描
     scanShards :: Int -> String -> Maybe [String] -> m (Either String [Row])
-    scanShards _ t cols = maybe (scan t) (scanColumns t) cols
+    scanShards _ t = maybe (scan t) (scanColumns t)
 
     -- \| 追加一行
     insert :: String -> Row -> m (Either String ())

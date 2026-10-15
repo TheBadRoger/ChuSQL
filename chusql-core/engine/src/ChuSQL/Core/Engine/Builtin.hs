@@ -303,8 +303,9 @@ threeValuedNot :: Value -> Value
 threeValuedNot (VBool b) = VBool (not b)
 threeValuedNot _ = VNull
 
--- | IN 三值逻辑：命中为真，碰 NULL 得 NULL
+-- | IN 空集为假，非空集按三值逻辑比较
 inValues :: Value -> [Value] -> Either String Value
+inValues _ [] = Right (VBool False)
 inValues VNull _ = Right VNull
 inValues v vs = do
     results <- mapM (\x -> executeOperator OpEq [v, x]) vs

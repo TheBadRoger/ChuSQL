@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE OverloadedStrings #-}
 
@@ -30,6 +31,8 @@ module ChuSQL.Core.Engine.Storage.IPC (
     doListCatalog,
 ) where
 
+import Data.Foldable (for_)
+import Control.Monad (when)
 import ChuSQL.Core.Engine.Parallel (parallelShardLimit, poolRun, workerPool)
 import ChuSQL.Core.Engine.Storage
 import ChuSQL.Core.Engine.Storage.FFI (closeStorage, openStorage, storageRequest)
@@ -110,13 +113,13 @@ withStorageLink = bracket enter leave
         case current of
             Nothing -> pure ()
             Just _ -> modifyMVar_ users $ \count -> do
-                if count == 0 then takeMVar idle else pure ()
+                when (count == 0) $ takeMVar idle
                 pure (count + 1)
         pure current
     -- \| 最后一个请求结束后发出空闲信号
     leave Nothing = pure ()
     leave (Just _) = mask_ $ modifyMVar_ users $ \count -> do
-        if count == 1 then putMVar idle () else pure ()
+        when (count == 1) $ putMVar idle ()
         pure (count - 1)
 
 -- | 装入一条链路；一个进程只装一次
@@ -137,22 +140,21 @@ localStorageLink path = fmap (fmap toLink) (openStorage path)
 -- | 关掉当前链路（进程退出前调用）；没有链路就什么都不做
 closeConnection :: IO ()
 closeConnection = modifyMVar_ linkRef $ \current -> withMVar (snd linkUsers) $ \_ -> do
-    case current of
-        Nothing -> pure ()
-        Just link -> slClose link
+    for_ current slClose
     pure Nothing
 
 -- | 发一条请求并解码应答；链路没装就报错，不崩
 sendRequest :: Request -> IO Response
-sendRequest req = withStorageLink $ \current -> case current of
-    Nothing -> pure (RespError "storage not configured")
-    Just link -> do
-        raw <- slRequest link (BL.toStrict (encode req))
-        case raw of
-            Left e -> pure (RespError ("storage error: " ++ e))
-            Right bytes -> case eitherDecodeStrict (BS.dropWhileEnd (== 13) bytes) of
-                Left e -> pure (RespError ("decode error: " ++ e))
-                Right resp -> pure resp
+sendRequest req = withStorageLink $ \case
+                                      Nothing -> pure (RespError "storage not configured")
+                                      Just link
+                                        -> do raw <- slRequest link (BL.toStrict (encode req))
+                                              case raw of
+                                                Left e -> pure (RespError ("storage error: " ++ e))
+                                                Right bytes
+                                                  -> case eitherDecodeStrict (BS.dropWhileEnd (== 13) bytes) of
+                                                       Left e -> pure (RespError ("decode error: " ++ e))
+                                                       Right resp -> pure resp
 
 -- | 原样转发一条载荷给存储库
 sendRawRequest :: BS.ByteString -> IO (Either String BS.ByteString)
@@ -241,21 +243,23 @@ okOnly _ = Nothing
 
 -- | 发 Scan
 doScan :: Env -> String -> IO (Either String [Row])
-doScan env t = ask env "scan" (ReqScan t) $ \resp -> case resp of
-    RespRows rows -> Just rows
-    _ -> Nothing
+doScan env t = ask env "scan" (ReqScan t) $ \case
+                                              RespRows rows -> Just rows
+                                              _ -> Nothing
 
 -- | 发带投影的 Scan
 doScanColumns :: Env -> String -> [String] -> IO (Either String [Row])
-doScanColumns env t cols = ask env "scan" (ReqScanColumns t cols) $ \resp -> case resp of
-    RespRows rows -> Just [[(c, v) | c <- cols, Just v <- [lookup c row]] | row <- rows]
-    _ -> Nothing
+doScanColumns env t cols = ask env "scan" (ReqScanColumns t cols) $ \case
+                                                                      RespRows rows
+                                                                        -> Just
+                                                                             [[(c, v) | c <- cols, Just v <- [lookup c row]] | row <- rows]
+                                                                      _ -> Nothing
 
 -- | 发分片 Scan：只取第 shard 片
 doScanShard :: Env -> String -> Maybe [String] -> Int -> Int -> IO (Either String [Row])
-doScanShard env t cols shard shards = ask env "scan_shard" (ReqScanShard t cols shard shards) $ \resp -> case resp of
-    RespRows rows -> Just rows
-    _ -> Nothing
+doScanShard env t cols shard shards = ask env "scan_shard" (ReqScanShard t cols shard shards) $ \case
+                                                                                                  RespRows rows -> Just rows
+                                                                                                  _ -> Nothing
 
 -- | 发 Insert（索引由存储层维护）
 doInsert :: Env -> String -> Row -> IO (Either String ())
@@ -271,22 +275,22 @@ doDeleteKeys env t ks = ask env "delete_keys" (ReqDeleteKeys t ks) okOnly
 
 -- | 发 ListTables
 doListTables :: Env -> IO (Either String [String])
-doListTables env = ask env "list_tables" ReqListTables $ \resp -> case resp of
-    RespTables ts -> Just ts
-    _ -> Nothing
+doListTables env = ask env "list_tables" ReqListTables $ \case
+                                                           RespTables ts -> Just ts
+                                                           _ -> Nothing
 
 -- | 一次拿全库 schema
 doListCatalog :: Env -> IO (Either String [TableInfo])
-doListCatalog env = ask env "list_catalog" ReqListCatalog $ \resp -> case resp of
-    RespCatalog xs -> Just xs
-    _ -> Nothing
+doListCatalog env = ask env "list_catalog" ReqListCatalog $ \case
+                                                              RespCatalog xs -> Just xs
+                                                              _ -> Nothing
 
 -- | 按某一列的索引取一行（键可以是整数或字符串）
 doLookupByColumn :: Env -> String -> String -> Value -> IO (Either String IndexResult)
-doLookupByColumn env t c k = ask env "lookup_by_index" (ReqLookupByColumn t c k) $ \resp -> case resp of
-    RespRows rows -> Just (IndexRows rows)
-    RespNoIndex -> Just NoIndex
-    _ -> Nothing
+doLookupByColumn env t c k = ask env "lookup_by_index" (ReqLookupByColumn t c k) $ \case
+                                                                                     RespRows rows -> Just (IndexRows rows)
+                                                                                     RespNoIndex -> Just NoIndex
+                                                                                     _ -> Nothing
 
 -- | 范围扫描：没有可用索引就回 Nothing，让上层退回扫描
 doScanRange ::
@@ -296,16 +300,16 @@ doScanRange ::
     Maybe (Value, Bool) ->
     Maybe (Value, Bool) ->
     IO (Either String (Maybe [Row]))
-doScanRange env t c lo hi = ask env "range_by_index" (ReqRangeByIndex t c lo hi) $ \resp -> case resp of
-    RespRows rows -> Just (Just rows)
-    RespNoIndex -> Just Nothing
-    _ -> Nothing
+doScanRange env t c lo hi = ask env "range_by_index" (ReqRangeByIndex t c lo hi) $ \case
+                                                                                     RespRows rows -> Just (Just rows)
+                                                                                     RespNoIndex -> Just Nothing
+                                                                                     _ -> Nothing
 
 -- | 发 DescribeTable
 doDescribeTable :: Env -> String -> IO (Either String TableInfo)
-doDescribeTable env t = ask env "describe_table" (ReqDescribeTable t) $ \resp -> case resp of
-    RespSchema info -> Just info
-    _ -> Nothing
+doDescribeTable env t = ask env "describe_table" (ReqDescribeTable t) $ \case
+                                                                          RespSchema info -> Just info
+                                                                          _ -> Nothing
 
 -- | 发 DropTable
 doDropTable :: Env -> String -> IO (Either String ())
@@ -349,6 +353,16 @@ instance MonadStorage IPCStorage where
     withSchemaGuard dependencies action = IPCStorage $ \env ->
         runIPCStorageIn action env{envSchemaGuard = Just dependencies}
 
+    -- | 写前握手，旧存储不能先写入后才报错
+    withWriteSchemaGuard dependencies action = IPCStorage $ \env -> case dependencies of
+        [] -> pure (Left "bound write requires a target schema guard")
+        (target, _) : _ -> do
+            ready <- guardedRequest env dependencies (ReqValidateWrite target)
+            case ready of
+                RespOk -> runIPCStorageIn (withSchemaGuard dependencies action) env
+                RespError err -> pure (Left err)
+                _ -> pure (Left "unexpected response to validate_write")
+
     -- \| 建一个库
     createDatabase name = IPCStorage $ \env -> ask env "create_database" (ReqDatabase "create_database" name) okOnly
 
@@ -359,20 +373,18 @@ instance MonadStorage IPCStorage where
     useDatabase name = IPCStorage $ \env -> ask env "use_database" (ReqDatabase "use_database" name) okOnly
 
     -- \| 列出现有库
-    listDatabases = IPCStorage $ \env -> ask env "list_databases" (ReqDatabase "list_databases" "") $ \resp -> case resp of
-        RespTables names -> Just names
-        _ -> Nothing
+    listDatabases = IPCStorage $ \env -> ask env "list_databases" (ReqDatabase "list_databases" "") $ \case
+                                                                                                        RespTables names -> Just names
+                                                                                                        _ -> Nothing
 
     -- \| 发 Scan
-    scan t = IPCStorage (\env -> doScan env t)
+    scan t = IPCStorage (`doScan` t)
 
     -- \| 只取指定列
     scanColumns t cols = IPCStorage (\env -> doScanColumns env t cols)
 
     -- \| 并行分片数：按 RTS 能力数，封顶在 parallelShardLimit
-    parallelShards = IPCStorage $ \_ -> do
-        caps <- getNumCapabilities
-        pure (max 1 (min parallelShardLimit caps))
+    parallelShards = IPCStorage $ \_ -> do max 1 . min parallelShardLimit <$> getNumCapabilities
 
     -- \| 分片并行扫，再按分片序拼接
     scanShards width t cols
@@ -407,7 +419,7 @@ instance MonadStorage IPCStorage where
     replaceSchema name cols rows = IPCStorage $ \env -> ask env "replace_schema" (ReqReplaceSchema name (map toWire cols) rows) okOnly
 
     -- \| 发 DropTable
-    dropTable name = IPCStorage (\env -> doDropTable env name)
+    dropTable name = IPCStorage (`doDropTable` name)
 
     -- \| 建索引
     createIndex t c = IPCStorage $ \env -> ask env "create_index" (ReqCreateIndex t c) okOnly
@@ -439,9 +451,9 @@ instance MonadStorage IPCStorage where
 
     -- \| 只问数据字典要结构，设了当前库只留它的表
     schema = IPCStorage $ \env -> do
-        result <- ask env "all_catalogs" ReqAllCatalog $ \resp -> case resp of
-            RespCatalog infos -> Just infos
-            _ -> Nothing
+        result <- ask env "all_catalogs" ReqAllCatalog $ \case
+                                                           RespCatalog infos -> Just infos
+                                                           _ -> Nothing
         pure (fmap (concatMap (visibleTables (envDatabase env))) result)
 
 -- | 线上表信息转引擎侧统计
@@ -452,9 +464,7 @@ metaOf info = TableMeta (tiRows info) (tiStats info) (tiHistograms info) (tiInde
 visibleTables :: Maybe String -> TableInfo -> [(String, Table)]
 visibleTables current info
     | Just db <- current =
-        if unqualify (Just db) (tiTable info) /= tiTable info
-            then [bare named]
-            else []
+        [bare named | unqualify (Just db) (tiTable info) /= tiTable info]
     | otherwise = [bare info]
   where
     named = info{tiTable = unqualify current (tiTable info)}

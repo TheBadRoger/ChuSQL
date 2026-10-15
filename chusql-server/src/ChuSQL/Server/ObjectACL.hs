@@ -6,6 +6,8 @@ module ChuSQL.Server.ObjectACL
     , objectSelfViews, objectReconcile, objectAffected, objectOwner, objectConnect, objectPrepareCreate, objectUsers
     ) where
 
+import Data.Either (fromRight)
+import Control.Monad (void)
 import ChuSQL.Core.Protocol (Account (..), TableInfo (..))
 import ChuSQL.Interface.Protocol (Grant (..))
 import ChuSQL.Server.Accounts (Principal, principalIsRoot, principalName)
@@ -79,12 +81,12 @@ identifier _ = Left "invalid object identifier"
 resolve :: Backend -> Text -> Text -> IO (Either String Target)
 resolve backend database raw = do
     let object = T.toLower (T.strip raw)
-        (selected, table, kind, label) =
-            if "database:" `T.isPrefixOf` object then (T.drop 9 object, Nothing, "database", object)
-            else if object == "*" || ".*" `T.isSuffixOf` object then
+        (selected, table, kind, label)
+            | "database:" `T.isPrefixOf` object = (T.drop 9 object, Nothing, "database", object)
+            | object == "*" || ".*" `T.isSuffixOf` object =
                 let scope = if object == "*" then database else T.dropEnd 2 object
                 in (scope, Nothing, "tables", scope <> ".*")
-            else case T.splitOn "." object of
+            | otherwise = case T.splitOn "." object of
                 [name] -> (database, Just name, "table", database <> "." <> name)
                 [db, name] -> (db, Just name, "table", object)
                 _ -> ("", Just "", "table", object)
@@ -102,7 +104,7 @@ targets backend = do
     names <- beDatabases backend
     case names of
         Left err -> pure (Left err)
-        Right databases -> fmap (fmap concat . sequence) $ mapM one (filter (/= "system") databases)
+        Right databases -> fmap concat . sequence <$> mapM one (filter (/= "system") databases)
   where
     -- 展开一个数据库和它的表。
     one name = do
@@ -150,7 +152,12 @@ knownRole env value = value `elem` ["0", "public"] || any (\account -> T.pack (s
 roles :: Context -> Text -> [Text]
 roles env value = nub ("public" : go [value])
   where
-    pairs = [(parent, child) | (parentName, childName) <- contextMembers env, Right parent <- [roleId env parentName], Right child <- [roleId env childName], active env parent, active env child]
+    pairs = [(parent, child) |
+               (parentName, childName) <- contextMembers env,
+               Right parent <- [roleId env parentName],
+               active env parent,
+               Right child <- [roleId env childName],
+               active env child]
     -- 展开成员关系的向上闭包。
     go known = let more = [parent | (parent, child) <- pairs, child `elem` known, parent `notElem` known]
                in if null more then known else go (nub (known ++ more))
@@ -208,7 +215,7 @@ readACL backend = do
 
 -- 原子写入权限快照并检查并发版本。
 writeACL :: Backend -> Maybe Text -> ACL -> IO (Either String ())
-writeACL backend expected acl = fmap (fmap (const ())) $ request backend (A.object ["method" A..= ("object_acl_replace" :: Text), "expected" A..= expected, "payload" A..= TE.decodeUtf8 (BL.toStrict (A.encode acl))])
+writeACL backend expected acl = void <$> request backend (A.object ["method" A..= ("object_acl_replace" :: Text), "expected" A..= expected, "payload" A..= TE.decodeUtf8 (BL.toStrict (A.encode acl))])
 
 -- 将旧名称授权一次性绑定到现存对象。
 migrate :: Backend -> Catalog -> Context -> IO (Either String ACL)
@@ -269,7 +276,10 @@ privileges target names =
     if all (`elem` supported) expanded then Right expanded else Left "invalid privilege for object scope"
   where
     supported = if targetKind target == "database" then ["connect", "create"] else ["select", "insert", "update", "delete"]
-    expanded = nub (concatMap (\name -> if name == "all" then supported else [name]) (map T.toLower names))
+    expanded = nub (concatMap
+                      ((\ name -> if name == "all" then supported else [name])
+                         . T.toLower)
+                      names)
 
 -- 检查一组稳定对象上的业务权限。
 objectAuthorize :: Backend -> Catalog -> Principal -> Text -> [(Text, Text)] -> IO (Either String ())
@@ -299,8 +309,11 @@ objectGrant backend catalog principal database names object role option = do
         Right ((env, previous, acl), target) -> case do
             recipient <- roleId env role
             items <- privileges target names
-            grantor <- if principalIsRoot principal then Right (either (const "0") id (roleId env (principalName principal))) else roleId env (principalName principal)
-            case [item | item <- items, not (principalIsRoot principal), not (allowed env acl grantor target item True)] of
+            grantor <- if principalIsRoot principal then Right (fromRight "0" (roleId env (principalName principal))) else roleId env (principalName principal)
+            case [item |
+                    not (principalIsRoot principal),
+                    item <- items,
+                    not (allowed env acl grantor target item True)] of
                 item : _ -> Left ("grant option required: " ++ T.unpack (T.toUpper item <> " ON " <> object))
                 [] -> Right (recipient, grantor, items) of
                     Left err -> pure (Left err)

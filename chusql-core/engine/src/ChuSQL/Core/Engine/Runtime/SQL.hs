@@ -1,5 +1,6 @@
 module ChuSQL.Core.Engine.Runtime.SQL (resolveSQLFunction, sqlResultType, invokeSQLFunction, sqlType, constructSQLValue) where
 
+import Control.Monad (zipWithM_)
 import ChuSQL.Core.Engine.Runtime.Functions
 import ChuSQL.Core.Engine.Runtime.Types
 import ChuSQL.Core.Model (ColumnType (..), Value (..))
@@ -52,7 +53,8 @@ invokeSQLFunction fid expected values = do
             if length values /= length (signatureArguments sig)
                 then Left "function argument count mismatch"
                 else do
-                    sequence_ (zipWith validateArgument (signatureArguments sig) values)
+                    zipWithM_
+                      validateArgument (signatureArguments sig) values
                     if VNull `elem` values
                         then Right VNull
                         else do

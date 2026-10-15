@@ -13,7 +13,7 @@ import ChuSQL.CLI.Script (Meta (..), errorHint, metaHelp, parseMeta, takeStateme
 import ChuSQL.Interface.Session (Session, catalog, databases, roleViews, runStatement, sessionDatabase, switchDatabase)
 import ChuSQL.Core.Protocol (SchemaColumn (..), TableInfo (..))
 import ChuSQL.Interface.Protocol (Grant (..), RoleView (..))
-import Control.Monad (forM_, when)
+import Control.Monad (forM_, when, unless)
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef (IORef, readIORef, writeIORef)
 import Data.Text (Text)
@@ -84,7 +84,7 @@ drain :: Session -> IORef OutputFormat -> Text -> InputT IO Text
 drain session formatRef buffer = case takeStatement buffer of
     Nothing -> pure (T.strip buffer)
     Just (statement, rest) -> do
-        when (not (T.null statement)) $ do
+        unless (T.null statement) $ do
             rememberStatement (statement <> ";")
             runOne session formatRef statement
         drain session formatRef rest

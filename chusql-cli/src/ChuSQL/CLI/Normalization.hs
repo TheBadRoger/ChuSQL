@@ -38,7 +38,7 @@ normalizationArguments input = case readP_to_S (skipSpaces *> sepBy token skipSp
 -- 有界读取 UTF-8 声明并拒绝重复字段。
 loadNormalizationDeclaration :: FilePath -> IO (Either Text NormalizationDeclaration)
 loadNormalizationDeclaration path = do
-    loaded <- try (withBinaryFile path ReadMode (\handle -> BS.hGet handle 65537)) :: IO (Either IOException BS.ByteString)
+    loaded <- try (withBinaryFile path ReadMode (`BS.hGet` 65537)) :: IO (Either IOException BS.ByteString)
     pure $ case loaded of
         Left err -> Left (T.pack (show err))
         Right raw -> do

@@ -30,6 +30,9 @@ instance MonadStorage MemoryStorage where
     -- \| 纯状态视图在求值期间不受外部修改
     withSchemaGuard _ action = action
 
+    -- | 纯状态写入不受外部结构变更影响
+    withWriteSchemaGuard _ action = action
+
     -- \| 全表扫描
     scan t = MemoryStorage $ \db -> do
         tbl <- lookupTable db t

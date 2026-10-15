@@ -2,6 +2,7 @@
 
 module Main (main) where
 
+import Control.Monad (when)
 import ChuSQL.Core.Engine.Storage.FFI (storageVersion)
 import ChuSQL.Core.Engine.Storage.IPC (closeConnection, localStorageLink, setStorageLink)
 import ChuSQL.Interface.Config (
@@ -22,7 +23,7 @@ import ChuSQL.Server.TCP (
     newServerEnv,
     runServer,
  )
-import Control.Exception (IOException, bracket, try)
+import Control.Exception (IOException, try, bracket_)
 import qualified Data.Aeson as A
 import qualified Data.Aeson.KeyMap as KM
 import Data.Text (Text)
@@ -177,7 +178,8 @@ run opts = do
                     (fromIntegral (wcLoginWindow cfg))
             env <- newServerEnv backend rootName configPath config limiter
             let announce port = putStrLn ("listening:    tcp://" ++ scHost config ++ ":" ++ show port)
-            bracket (pure link) (const closeConnection) (const (serve env announce))
+            bracket_
+              (pure link) closeConnection (serve env announce)
 
 -- | 起 TCP 服务并处理绑定失败
 serve :: ServerEnv -> (Int -> IO ()) -> IO ()
@@ -211,17 +213,17 @@ checkInitialized backend = do
 reportCredential :: Backend -> Text -> Bool -> IO ()
 reportCredential backend rootName legacy = do
     putStrLn ("administrator: " ++ T.unpack rootName)
-    if legacy
-        then do
-            putStrLn "  !! the [web] section still carries a plaintext password key; it is ignored now"
-            putStrLn "  !! remove it: the administrator password lives in the __system_users system table"
-        else pure ()
+    when legacy
+      $ do putStrLn
+             "  !! the [web] section still carries a plaintext password key; it is ignored now"
+           putStrLn
+             "  !! remove it: the administrator password lives in the __system_users system table"
     passwordless <- administratorPasswordless backend rootName
-    if passwordless
-        then do
-            putStrLn "  !! the administrator has no password yet: sign in with an empty password, then set one"
-            putStrLn "  !!   ALTER USER root IDENTIFIED BY '...'   (or use the account page in the Web UI)"
-        else pure ()
+    when passwordless
+      $ do putStrLn
+             "  !! the administrator has no password yet: sign in with an empty password, then set one"
+           putStrLn
+             "  !!   ALTER USER root IDENTIFIED BY '...'   (or use the account page in the Web UI)"
 
 -- | 探测存储是否可用，答不上 ping 就退出
 checkStorage :: Backend -> IO ()
@@ -239,7 +241,7 @@ printBanner cfg config configPath = do
     version <- storageVersion
     putStrLn "================== ChuSQL Server ==================="
     putStrLn ("config file:  " ++ configPath)
-    putStrLn ("protocol:     chusql 1 (one JSON object per line)")
+    putStrLn "protocol:     chusql 1 (one JSON object per line)"
     putStrLn
         ( "limits:       message "
             ++ show (scMaxMessage config)

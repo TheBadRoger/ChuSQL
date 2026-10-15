@@ -18,10 +18,18 @@
 
 ### SELECT 与派生表
 
-- `SELECT` 支持 `WHERE`、`ORDER BY`、`LIMIT`、`JOIN` / `LEFT JOIN`、`GROUP BY` 与聚合，以及标量 / `IN` / `EXISTS` 子查询和量词比较（`op ANY` / `op ALL`）。
+- `SELECT` 支持 `WHERE`、`GROUP BY`、`HAVING`、`ORDER BY`、`LIMIT`、`JOIN` / `LEFT JOIN` 与聚合，以及标量 / `IN` / `EXISTS` 子查询和量词比较（`op ANY` / `op ALL`）。
 - 来源可以是派生表：`SELECT d.name FROM (SELECT name FROM users) d`。派生表必须带别名，内层不能引用外层列；输出列取裸列名（内层写 `u.id`，外层用 `d.id` 引用）。
-- 投影列可以起别名：`SELECT count(*) AS total FROM orders ORDER BY total`，别名就是结果集的列名。`ORDER BY` 优先使用唯一的投影别名，再查来源列；重复的排序别名报歧义错误，来源列可以用限定名消除同名冲突。排序接受从 1 开始的输出列序号（例如 `ORDER BY 2 DESC`），在 `*` 展开后解析，零或越界序号报错；暂不接受任意表达式。
-- 鉴权覆盖整棵来源树：查派生表时内层表也要有权限，只有外层引用的表有权限不够。
+- 投影列可以起别名：`SELECT count(*) AS total FROM orders ORDER BY total`，别名就是结果集的列名。`ORDER BY` 的单独名称优先使用唯一的投影别名，再查来源列；重复的排序别名报歧义错误，来源列可以用限定名消除同名冲突。排序接受从 1 开始的输出列序号（例如 `ORDER BY 2 DESC`），在 `*` 展开后解析，零或越界序号报错。
+- 排序也支持表达式、函数、聚合与子查询，例如 `ORDER BY age + 1 DESC`。复合表达式中的列名只查来源，不能引用输出别名；排序表达式在 LIMIT 前求值，其他投影在 LIMIT 后求值。NULL 升序在前、降序在后，同键保留原行序。
+- `HAVING` 在聚合之后、DISTINCT / ORDER BY / LIMIT 之前过滤，只保留布尔真；支持未投影的聚合、子查询及外层相关列，不能引用投影别名。没有 GROUP BY 时 HAVING 形成一个整体组，空输入也有这个组；当前层未聚合的来源列必须出现在 GROUP BY 中。
+- 鉴权覆盖整棵查询树：派生表、HAVING 与排序表达式中的子查询也要求内层表的 SELECT 权限。
+
+```sql
+SELECT user_id, SUM(amount) AS total FROM orders
+GROUP BY user_id HAVING COUNT(*) > 1
+ORDER BY SUM(amount) + user_id DESC LIMIT 10;
+```
 
 ### DISTINCT 与 ALL
 
@@ -32,7 +40,7 @@ SELECT DISTINCT user_id FROM orders ORDER BY 1 LIMIT 10;
 SELECT DISTINCT user_id + 1 AS next_id FROM orders ORDER BY next_id;
 ```
 
-DISTINCT 的排序列必须出现在输出中；排序可使用输出别名、选出的来源列或输出列序号。缺少比较能力的 List / Maybe / Tuple 类型仍拒绝 DISTINCT。去重支持连接、聚合、子查询、CTE 和当前连接的事务快照。
+DISTINCT 的排序项必须出现在输出中；排序可使用输出别名、选出的来源列、输出列序号或与投影完全相同的表达式。缺少比较能力的 List / Maybe / Tuple 类型仍拒绝 DISTINCT。去重支持连接、聚合、子查询、CTE 和当前连接的事务快照。
 
 ### 比较运算符
 
@@ -46,12 +54,18 @@ DISTINCT 的排序列必须出现在输出中；排序可使用输出别名、�
 - `ANY` 的空子查询为假、`ALL` 的空子查询为真；子查询里出现 `NULL` 时按 `AND` / `OR` 的三值规则，条件可能为 `NULL`（`WHERE` 里等同不通过）。
 - 量词与运算符组合示例：`<> ALL` 与 `NOT IN` 同义，`<> ANY` 表示至少存在一个不相等的值。
 
+### IN / EXISTS 的执行优化
+
+独立 `IN` / `NOT IN` 过滤，以及单表等值相关 `EXISTS` / `NOT EXISTS` 过滤可使用哈希半连接／反连接：右侧只扫描一次，左侧行序和重复行保留，右侧重复值不会放大输出。复杂条件仍使用查询内物化及相关子查询路径；SQL 写法不变。
+
+`NOT EXISTS` 保留没有匹配的行，包括空值键；`NOT IN` 的右侧出现 NULL 时，未匹配的非空键得到 NULL，过滤不通过。右侧为空时，IN 为假、NOT IN 为真，包括左值为 NULL 的情况；右侧非空时，NULL 左值按三值逻辑得到 NULL。表达式和半连接使用相同规则。
+
 ### WITH / CTE
 
 - `WITH 名字 AS (SELECT …), 另一个 AS (SELECT …) SELECT … FROM 名字` 先定义再引用，名字可以带列清单（`WITH t(who) AS (SELECT name FROM users) …`）。
 - `WITH` 在解析期就展开成派生表，所以引用处只能当普通表用：没有别名时用 CTE 名当限定名（`WITH t AS (…) SELECT t.name FROM t`）。
 - 名字不分大小写；只能引用前面已经定义的 CTE，向前引用会当成普通表名去查（有同名表就用表，没有就报 `unknown table`）。
-- 不支持递归 CTE，主语句与每个 CTE 都只能是 `SELECT`；同一个 CTE 被引用两次会各执行一次（不做物化）。
+- 不支持递归 CTE，主语句与每个 CTE 都只能是 `SELECT`。重复引用时，相同执行子树在一次查询中物化复用；不同投影或优化后的子树仍分别执行，尚无 `MATERIALIZED` / `NOT MATERIALIZED` 语法。
 - 鉴权同样覆盖 CTE 里的表：`WITH d AS (SELECT name FROM orders) …` 要求对 `orders` 有权限。
 
 ### 事务与保存点

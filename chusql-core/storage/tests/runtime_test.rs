@@ -198,7 +198,7 @@ fn bound_reads_recheck_dependencies_in_other_databases() -> Result<(), Box<dyn s
     Ok(())
 }
 
-/// 每种读取都复查守卫，拒绝旧版本和写入
+/// 每种读取都复查守卫，拒绝旧版本与库管理
 #[test]
 fn bound_reads_validate_dependencies_and_acknowledge_guards() -> Result<(), Box<dyn std::error::Error>> {
     let (_server, _data) = start_server();
@@ -232,6 +232,93 @@ fn bound_reads_validate_dependencies_and_acknowledge_guards() -> Result<(), Box<
     assert!(!databases["tables"].as_array().unwrap().iter().any(|database| database == "blocked"));
     let rows: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"scan","table":"guarded"}"#))?;
     assert_eq!(rows["rows"].as_array().unwrap().len(), 1);
+    Ok(())
+}
+
+/// 写入持独占门并拒绝过期或不含目标的守卫
+#[test]
+fn bound_writes_validate_before_publishing() -> Result<(), Box<dyn std::error::Error>> {
+    let (_server, _data) = start_server();
+    let mut c = connect()?;
+    request_ok(&mut c, serde_json::json!({"method":"create_table","table":"writes","columns":[{"name":"id","ty":"int"}]}))?;
+    let catalog: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"list_catalog"}"#))?;
+    let mut binding = catalog["schemas"][0].clone();
+    binding["database_id"] = binding["database_id"].as_u64().unwrap().to_string().into();
+    binding["object_id"] = binding["object_id"].as_u64().unwrap().to_string().into();
+    let ready: serde_json::Value = serde_json::from_str(&send(&mut c, &serde_json::json!({"method":"validate_write","table":"writes","schema_guard":[binding]}).to_string()))?;
+    assert_eq!(ready["status"], "guarded");
+    assert_eq!(ready["response"]["status"], "ok");
+    let unguarded: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"validate_write","table":"writes"}"#))?;
+    assert_eq!(unguarded["status"], "error");
+    for mut request in [
+        serde_json::json!({"method":"insert","table":"writes","row":{"id":1}}),
+        serde_json::json!({"method":"insert_batch","table":"writes","rows":[{"id":2}]}),
+        serde_json::json!({"method":"replace_all","table":"writes","rows":[{"id":3}]}),
+        serde_json::json!({"method":"delete_keys","table":"writes","keys":[3]}),
+    ] {
+        request["schema_guard"] = serde_json::json!([binding]);
+        let response: serde_json::Value = serde_json::from_str(&send(&mut c, &request.to_string()))?;
+        assert_eq!(response["status"], "guarded", "{response}");
+        assert_eq!(response["response"]["status"], "ok", "{response}");
+    }
+    let missing: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"insert","table":"writes","row":{"id":9},"schema_guard":[]}"#))?;
+    assert_eq!(missing["status"], "error");
+    request_ok(&mut c, serde_json::json!({"method":"drop_table","table":"writes"}))?;
+    request_ok(&mut c, serde_json::json!({"method":"create_table","table":"writes","columns":[{"name":"id","ty":"int"}]}))?;
+    let stale: serde_json::Value = serde_json::from_str(&send(&mut c, &serde_json::json!({"method":"insert","table":"writes","row":{"id":9},"schema_guard":[binding]}).to_string()))?;
+    assert_eq!(stale["status"], "error");
+    assert!(stale["message"].as_str().unwrap().contains("bound query object changed"));
+    let rows: serde_json::Value = serde_json::from_str(&send(&mut c, r#"{"method":"scan","table":"writes"}"#))?;
+    assert_eq!(rows["rows"], serde_json::json!([]));
+    Ok(())
+}
+
+/// 互相依赖的跨库写入按统一顺序取门
+#[test]
+fn guarded_cross_database_writes_do_not_deadlock() -> Result<(), Box<dyn std::error::Error>> {
+    let (_server, _data) = start_server();
+    let mut c = connect()?;
+    for database in ["guard_a", "guard_b"] {
+        request_ok(&mut c, serde_json::json!({"method":"create_database","database":database}))?;
+        request_ok(&mut c, serde_json::json!({"method":"create_table","database":database,"table":"items","columns":[{"name":"id","ty":"int"}]}))?;
+    }
+    let catalog: serde_json::Value = serde_json::from_str(&send_raw(&mut c, r#"{"method":"all_catalogs"}"#))?;
+    let bindings: Vec<_> = catalog["schemas"].as_array().unwrap().iter().filter(|entry|
+        entry["table"] == "guard_a.items" || entry["table"] == "guard_b.items").map(|entry| {
+            let mut binding = entry.clone();
+            binding["database_id"] = binding["database_id"].as_u64().unwrap().to_string().into();
+            binding["object_id"] = binding["object_id"].as_u64().unwrap().to_string().into();
+            binding
+        }).collect();
+    assert_eq!(bindings.len(), 2);
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let workers: Vec<_> = ["guard_a", "guard_b"].into_iter().map(|database| {
+        let storage = Arc::clone(&c.0);
+        let barrier = Arc::clone(&barrier);
+        let sender = sender.clone();
+        let bindings = bindings.clone();
+        std::thread::spawn(move || {
+            for id in 0..16 {
+                barrier.wait();
+                let response = storage.request_line(&serde_json::json!({
+                    "method":"insert","database":database,"table":"items","row":{"id":id},"schema_guard":bindings
+                }).to_string());
+                sender.send(response).unwrap();
+            }
+        })
+    }).collect();
+    drop(sender);
+    for _ in 0..32 {
+        let response: serde_json::Value = serde_json::from_str(&receiver.recv_timeout(std::time::Duration::from_secs(10))?)?;
+        assert_eq!(response["status"], "guarded", "{response}");
+        assert_eq!(response["response"]["status"], "ok", "{response}");
+    }
+    for worker in workers { worker.join().unwrap(); }
+    for database in ["guard_a", "guard_b"] {
+        let rows: serde_json::Value = serde_json::from_str(&send_raw(&mut c, &serde_json::json!({"method":"scan","database":database,"table":"items"}).to_string()))?;
+        assert_eq!(rows["rows"].as_array().unwrap().len(), 16);
+    }
     Ok(())
 }
 

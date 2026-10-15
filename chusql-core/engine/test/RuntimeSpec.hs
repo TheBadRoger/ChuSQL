@@ -3,17 +3,17 @@ module RuntimeSpec (spec) where
 import ChuSQL.Core.Engine.Runtime.Types
 import ChuSQL.Core.Engine.Runtime.Functions
 import ChuSQL.Core.Engine.Runtime.Binding
-import ChuSQL.Core.Engine.Runtime.Relation (bindRelOpColumns)
+import ChuSQL.Core.Engine.Runtime.Relation (bindRelOpColumns, bindWriteColumns)
 import qualified ChuSQL.Core.Engine.Algebra.Op as Rel
-import ChuSQL.Core.Engine.Algebra.Expr (evalExpr)
+import ChuSQL.Core.Engine.Algebra.Expr (evalExpr, subquerySlotsIn)
 import ChuSQL.Core.Engine.Algebra.Eval (evalRelOp)
 import ChuSQL.Core.Engine.Algebra.Sort (sortBoundRows)
 import ChuSQL.Core.Engine.Storage.Memory (runMemoryStorage)
 import qualified ChuSQL.Core.Engine.Runtime.Query as Query
-import ChuSQL.Core.Engine (rowsOf, runStatement)
+import ChuSQL.Core.Engine (rowsOf, runStatement, runStatementM, bindWrite, executeWriteM)
 import ChuSQL.Core.Engine.Semantic (prepare, prepareRowExpression)
 import ChuSQL.Core.Engine.Syntax.Parser (parseStatement)
-import ChuSQL.Core.Engine.Syntax.AST (Expr (..), Statement (..), SortDir (..))
+import ChuSQL.Core.Engine.Syntax.AST (Expr (..), Statement (..), Subquery (..), FromClause (..), SortDir (..))
 import qualified ChuSQL.Core.Model as SQL
 import ChuSQL.Core.Protocol (valueToJSON, valueFromJSON, TableInfo (..))
 import qualified Data.Aeson as A
@@ -22,6 +22,8 @@ import Data.Aeson.Types (parseEither)
 import Data.Hashable (hash)
 import Control.Monad (foldM)
 import qualified Data.ByteString.Lazy.Char8 as BS
+import Data.List (isInfixOf)
+import Data.Bifunctor (second)
 import Test.Hspec
 
 -- 运行时类型、函数绑定、物理编码和类型化查询测试。
@@ -38,6 +40,90 @@ sqlCatalog = foldM apply []
 -- | 检查运行时类型基础契约
 spec :: Spec
 spec = do
+    describe "bound write plans" $ do
+        it "reuses INSERT targets and constraints while refreshing the auto counter" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE DOMAIN cached_quantity AS INT"
+                        , "CREATE TABLE cached_insert (id INT AUTO_INCREMENT PRIMARY KEY, qty cached_quantity DEFAULT 2, tag TEXT CHECK (length(tag) > 1))"]
+                    statement <- parseStatement "INSERT INTO cached_insert (tag) VALUES ('abc')"
+                    bound <- bindWrite db statement
+                    (first, inserted) <- runMemoryStorage (executeWriteM bound) db
+                    first
+                    let reversed = [(name, table {SQL.tableRows = map reverse (SQL.tableRows table)}) | (name, table) <- inserted]
+                    (secondResult, final) <- runMemoryStorage (executeWriteM bound) reversed
+                    secondResult
+                    select <- parseStatement "SELECT id, qty, tag FROM cached_insert"
+                    map (map snd) <$> rowsOf (runStatement final select)
+            result `shouldBe` Right [[SQL.VInt 1, SQL.VInt 2, SQL.VStr "abc"], [SQL.VInt 2, SQL.VInt 2, SQL.VStr "abc"]]
+        it "reuses ordered UPDATE targets and final-row uniqueness checks" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE TABLE cached_update (id INT PRIMARY KEY, qty INT NOT NULL UNIQUE CHECK (qty < 10))"
+                        , "INSERT INTO cached_update (id, qty) VALUES (1, 1), (2, 8)"]
+                    statement <- parseStatement "UPDATE cached_update SET qty = qty + 1, qty = qty + id WHERE id = 1"
+                    bound <- bindWrite db statement
+                    duplicate <- parseStatement "UPDATE cached_update SET qty = 8 WHERE id = 1" >>= bindWrite db
+                    (first, updated) <- runMemoryStorage (executeWriteM bound) db
+                    first
+                    (secondResult, twice) <- runMemoryStorage (executeWriteM bound) updated
+                    secondResult
+                    (rejected, unchanged) <- runMemoryStorage (executeWriteM duplicate) twice
+                    Right (SQL.tableRows <$> lookup "cached_update" twice, rejected
+                        , SQL.tableRows <$> lookup "cached_update" unchanged)
+                rows = Just [[("id", SQL.VInt 1), ("qty", SQL.VInt 5)], [("id", SQL.VInt 2), ("qty", SQL.VInt 8)]]
+            result `shouldBe` Right (rows, Left "UNIQUE: duplicate value in column qty", rows)
+        it "defers assignment errors until a reused plan matches a current row" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE TABLE deferred_write (id INT, qty INT CHECK (qty > 0))"]
+                    statement <- parseStatement "UPDATE deferred_write SET qty = 1 / 0 WHERE id = 9"
+                    bound <- bindWrite db statement
+                    (empty, initial) <- runMemoryStorage (executeWriteM bound) db
+                    empty
+                    inserted <- parseStatement "INSERT INTO deferred_write (id, qty) VALUES (9, 5)" >>= runStatement initial
+                    (rejected, final) <- runMemoryStorage (executeWriteM bound) (fst inserted)
+                    Right (rejected, SQL.tableRows <$> lookup "deferred_write" final)
+            result `shouldBe` Right (Left "division by zero", Just [[("id", SQL.VInt 9), ("qty", SQL.VInt 5)]])
+        it "rejects stale INSERT UPDATE and DELETE plans before changing rows" $ do
+            mapM_ (\source -> do
+                let result = do
+                        db <- sqlCatalog ["CREATE TABLE saved_write (id INT, qty INT)", "INSERT INTO saved_write (id, qty) VALUES (1, 5)"]
+                        statement <- parseStatement source
+                        bound <- bindWrite db statement
+                        added <- parseStatement "ALTER TABLE saved_write ADD COLUMN extra TEXT" >>= runStatement db
+                        restored <- parseStatement "ALTER TABLE saved_write DROP COLUMN extra" >>= runStatement (fst added)
+                        (rejected, final) <- runMemoryStorage (executeWriteM bound) (fst restored)
+                        Right (rejected, SQL.tableRows <$> lookup "saved_write" final)
+                result `shouldBe` Right (Left "bound query schema changed: saved_write", Just [[("id", SQL.VInt 1), ("qty", SQL.VInt 5)]]))
+                [ "INSERT INTO saved_write (id, qty) VALUES (2, 8)"
+                , "UPDATE saved_write SET qty = qty + 1"
+                , "DELETE FROM saved_write WHERE id = 1"
+                ]
+        it "reuses a write plan across data and unrelated schema changes" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE TABLE reusable_write (id INT, qty INT)", "CREATE TABLE unrelated_write (id INT)", "INSERT INTO reusable_write (id, qty) VALUES (1, 5)"]
+                    statement <- parseStatement "UPDATE reusable_write SET qty = qty + 1 WHERE id = 1"
+                    bound <- bindWrite db statement
+                    changed <- parseStatement "INSERT INTO reusable_write (id, qty) VALUES (2, 9)" >>= runStatement db
+                    unrelated <- parseStatement "ALTER TABLE unrelated_write ADD COLUMN extra TEXT" >>= runStatement (fst changed)
+                    (first, updated) <- runMemoryStorage (executeWriteM bound) (fst unrelated)
+                    first
+                    (secondResult, final) <- runMemoryStorage (executeWriteM bound) updated
+                    secondResult
+                    Right (SQL.tableRows <$> lookup "reusable_write" final)
+            result `shouldBe` Right (Just [[("id", SQL.VInt 1), ("qty", SQL.VInt 7)], [("id", SQL.VInt 2), ("qty", SQL.VInt 9)]])
+        it "rejects replaced targets and changed subquery or DOMAIN dependencies" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE DOMAIN quantity AS INT", "CREATE TABLE dependent_write (id quantity)", "CREATE TABLE source_write (id INT)"]
+                    statement <- parseStatement "UPDATE dependent_write SET id = (SELECT MAX(id) FROM source_write)"
+                    let identified = [(name, table {SQL.tableIdentity = Just (SQL.TableIdentity 1 1)}) | (name, table) <- db]
+                    bound <- bindWrite identified statement
+                    let replaced = [(name, if name == "dependent_write" then table {SQL.tableIdentity = Just (SQL.TableIdentity 1 2)} else table) | (name, table) <- identified]
+                        domainChanged = [(name, if name == SQL.domainTableName "quantity" then table {SQL.tableSchemaVersion = Just 2} else table) | (name, table) <- identified]
+                    changed <- parseStatement "ALTER TABLE source_write ADD COLUMN extra TEXT" >>= runStatement identified
+                    target <- fst <$> runMemoryStorage (executeWriteM bound) replaced
+                    dependency <- fst <$> runMemoryStorage (executeWriteM bound) (fst changed)
+                    domain <- fst <$> runMemoryStorage (executeWriteM bound) domainChanged
+                    Right (target, dependency, domain)
+            result `shouldBe` Right (Left "bound query object changed: dependent_write", Left "bound query schema changed: source_write", Left "bound query schema changed: __system_domain_quantity")
     describe "runtime type registry" $ do
         it "keeps a fixed identity encoding across releases" $ withType (listType intType) $ \tid ->
             encodeType tid `shouldBe` BS.pack "[1,[5,[[1,[]]]]]"
@@ -58,6 +144,173 @@ spec = do
             resolveType builtinTypes (TypeApply (TypeConstructorId 5) []) `shouldSatisfy` isFailure
         it "rejects arguments to Int" $
             resolveType builtinTypes (TypeApply (TypeConstructorId 1) [intType]) `shouldSatisfy` isFailure
+    describe "bound write expressions" $ do
+        it "rejects missing existing key columns instead of skipping uniqueness checks" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE TABLE constraint_slots (id INT PRIMARY KEY, qty INT UNIQUE)"]
+                    insert <- parseStatement "INSERT INTO constraint_slots (id, qty) VALUES (2, 3)"
+                    let damaged = [(name, table {SQL.tableRows = [[("qty", SQL.VInt 9)]]}) | (name, table) <- db]
+                    Right (runStatement damaged insert)
+            case result of
+                Right rejected -> rejected `shouldSatisfy` either (isInfixOf "missing bound column: id") (const False)
+                Left err -> expectationFailure err
+        it "checks existing INSERT keys and ALTER constraints with reversed physical columns" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE TABLE constraint_order (id INT PRIMARY KEY, qty INT UNIQUE)"
+                        , "INSERT INTO constraint_order (id, qty) VALUES (1, 2), (2, 3)"]
+                    let reversed = [(name, table {SQL.tableRows = map reverse (SQL.tableRows table)}) | (name, table) <- db]
+                    insert <- parseStatement "INSERT INTO constraint_order (qty, id) VALUES (4, 3)"
+                    (inserted, _) <- runStatement reversed insert
+                    alter <- parseStatement "ALTER TABLE constraint_order ALTER COLUMN qty SET NOT NULL"
+                    (altered, _) <- runStatement inserted alter
+                    select <- parseStatement "SELECT id, qty FROM constraint_order"
+                    map (map snd) <$> rowsOf (runStatement altered select)
+            result `shouldBe` Right [[SQL.VInt 1, SQL.VInt 2], [SQL.VInt 2, SQL.VInt 3], [SQL.VInt 3, SQL.VInt 4]]
+        it "rejects missing ALTER input before evaluating bound constraints" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE TABLE altered_missing (id INT, qty INT UNIQUE)"]
+                    alter <- parseStatement "ALTER TABLE altered_missing ALTER COLUMN qty SET NOT NULL"
+                    let damaged = [(name, table {SQL.tableRows = [[("id", SQL.VInt 1)]]}) | (name, table) <- db]
+                    Right (runStatement damaged alter)
+            case result of
+                Right rejected -> rejected `shouldSatisfy` either (isInfixOf "missing bound column: qty") (const False)
+                Left err -> expectationFailure err
+        it "rejects UPDATE nullability and final-row uniqueness violations" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE TABLE update_constraints (id INT PRIMARY KEY, qty INT NOT NULL UNIQUE)"
+                        , "INSERT INTO update_constraints (id, qty) VALUES (1, 2), (2, 3)"]
+                    nullable <- parseStatement "UPDATE update_constraints SET qty = NULL WHERE id = 1"
+                    duplicate <- parseStatement "UPDATE update_constraints SET qty = 3 WHERE id = 1"
+                    primary <- parseStatement "UPDATE update_constraints SET id = 2 WHERE id = 1"
+                    Right (db, [(nullable, "NOT NULL"), (duplicate, "UNIQUE"), (primary, "UNIQUE")])
+            case result of
+                Right (db, statements) -> mapM_ (\(statement, marker) ->
+                    case runMemoryStorage (runStatementM statement) db of
+                        Right (Left err, unchanged) -> do
+                            err `shouldSatisfy` isInfixOf marker
+                            map (second SQL.tableRows) unchanged
+                                `shouldBe` map (second SQL.tableRows) db
+                        other -> expectationFailure (show other)) statements
+                Left err -> expectationFailure err
+        it "checks UPDATE uniqueness after all rows rather than each replacement" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE TABLE update_unique (id INT PRIMARY KEY, qty INT UNIQUE)"
+                        , "INSERT INTO update_unique (id, qty) VALUES (1, 2), (2, 3), (3, NULL), (4, NULL)"
+                        , "UPDATE update_unique SET qty = qty + 1 WHERE id < 3"]
+                    select <- parseStatement "SELECT id, qty FROM update_unique"
+                    map (map snd) <$> rowsOf (runStatement db select)
+            result `shouldBe` Right [[SQL.VInt 1, SQL.VInt 3], [SQL.VInt 2, SQL.VInt 4]
+                , [SQL.VInt 3, SQL.VNull], [SQL.VInt 4, SQL.VNull]]
+        it "rejects repeated INSERT targets instead of discarding later values" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE TABLE insert_targets (id INT, qty INT)"]
+                    statement <- parseStatement "INSERT INTO insert_targets (id, qty, qty) VALUES (1, 2, 9)"
+                    runStatement db statement
+            result `shouldSatisfy` either (isInfixOf "INSERT: duplicate target column: qty") (const False)
+        it "binds reordered INSERT inputs while retaining defaults, NULL and auto numbering" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE DOMAIN insert_label AS VARCHAR(4)"
+                        , "CREATE TABLE insert_slots (id INT AUTO_INCREMENT PRIMARY KEY, label insert_label DEFAULT 'ok', qty INT DEFAULT 7)"
+                        , "INSERT INTO insert_slots (qty, label, id) VALUES (NULL, 'ab', 10), (3, 'cd', NULL), (4, 'ef', 2)"
+                        , "INSERT INTO insert_slots (label) VALUES ('gh')"
+                        , "INSERT INTO insert_slots (qty) VALUES (8)"]
+                    select <- parseStatement "SELECT id, label, qty FROM insert_slots"
+                    map (map snd) <$> rowsOf (runStatement db select)
+            result `shouldBe` Right [[SQL.VInt 10, SQL.VStr "ab", SQL.VNull]
+                , [SQL.VInt 11, SQL.VStr "cd", SQL.VInt 3]
+                , [SQL.VInt 2, SQL.VStr "ef", SQL.VInt 4]
+                , [SQL.VInt 12, SQL.VStr "gh", SQL.VInt 7]
+                , [SQL.VInt 13, SQL.VStr "ok", SQL.VInt 8]]
+        it "binds write predicates and assignments to target schema positions" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE TABLE write_slots (id INT, qty INT)"]
+                    statement <- parseStatement "UPDATE write_slots SET qty = qty + id WHERE id = 1"
+                    prepare db statement >>= bindWriteColumns db
+            result `shouldBe` Right (Update "write_slots"
+                [("qty", Add (ColumnSlot 1 "qty") (ColumnSlot 0 "id"))]
+                (Just (Eq (ColumnSlot 0 "id") (LitInt 1))))
+        it "binds CHECK columns inside resolved function calls" $ do
+            let columns = [("id", SQL.plainColumn SQL.CInt), ("name", SQL.plainColumn SQL.CStr)]
+                result = prepareRowExpression columns (Gt (FunctionCall "length" [Col "name"]) (LitInt 1))
+            case result of
+                Right (Gt (BoundFunction (FunctionId 1) _ [ColumnSlot 1 "name"]) (LitInt 1)) -> pure ()
+                _ -> expectationFailure (show result)
+        it "preserves sequential updates and row order with reversed physical columns" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE TABLE write_slots (id INT, qty INT CHECK (qty >= 0))"
+                        , "INSERT INTO write_slots (id, qty) VALUES (1, 2), (2, 10), (3, 5)"]
+                    let reversed = [(name, table {SQL.tableRows = map reverse (SQL.tableRows table)}) | (name, table) <- db]
+                    update <- parseStatement "UPDATE write_slots SET qty = qty + 1, qty = qty + id WHERE id = 1"
+                    (updated, _) <- runStatement reversed update
+                    delete <- parseStatement "DELETE FROM write_slots WHERE qty = 10"
+                    (remaining, _) <- runStatement updated delete
+                    select <- parseStatement "SELECT id, qty FROM write_slots"
+                    map (map snd) <$> rowsOf (runStatement remaining select)
+            result `shouldBe` Right [[SQL.VInt 1, SQL.VInt 4], [SQL.VInt 3, SQL.VInt 5]]
+        it "keeps nested DOMAIN coercion, defaults and nullable writes" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE DOMAIN short_label AS VARCHAR(4)", "CREATE DOMAIN label AS short_label"
+                        , "CREATE TABLE write_domains (id INT, name label CHECK (length(name) > 1), qty INT DEFAULT 2)"
+                        , "INSERT INTO write_domains (id, name) VALUES (1, 'abc')"]
+                    select <- parseStatement "SELECT id, name, qty FROM write_domains"
+                    original <- map (map snd) <$> rowsOf (runStatement db select)
+                    update <- parseStatement "UPDATE write_domains SET qty = NULL WHERE id = 1"
+                    (updated, _) <- runStatement db update
+                    rejected <- parseStatement "UPDATE write_domains SET name = 'abcde' WHERE id = 1"
+                    rows <- map (map snd) <$> rowsOf (runStatement updated select)
+                    Right (original, rows, runStatement updated rejected)
+            case result of
+                Right (original, rows, rejected) -> do
+                    original `shouldBe` [[SQL.VInt 1, SQL.VStr "abc", SQL.VInt 2]]
+                    rows `shouldBe` [[SQL.VInt 1, SQL.VStr "abc", SQL.VNull]]
+                    rejected `shouldSatisfy` isFailure
+                Left err -> expectationFailure err
+        it "keeps correlated subqueries in bound assignments and DELETE predicates" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE TABLE write_outer (id INT, qty INT)"
+                        , "CREATE TABLE write_inner (id INT)"
+                        , "INSERT INTO write_outer (id, qty) VALUES (1, 2), (2, 10)"
+                        , "INSERT INTO write_inner (id) VALUES (2)"]
+                    update <- parseStatement "UPDATE write_outer SET qty = qty + (SELECT i.id FROM write_inner i WHERE i.id = qty) WHERE id = 1"
+                    (updated, _) <- runStatement db update
+                    select <- parseStatement "SELECT id, qty FROM write_outer"
+                    changed <- map (map snd) <$> rowsOf (runStatement updated select)
+                    delete <- parseStatement "DELETE FROM write_outer WHERE EXISTS (SELECT i.id FROM write_inner i WHERE i.id = qty - 2)"
+                    (remaining, _) <- runStatement updated delete
+                    kept <- map (map snd) <$> rowsOf (runStatement remaining select)
+                    Right (changed, kept)
+            result `shouldBe` Right ([[SQL.VInt 1, SQL.VInt 4], [SQL.VInt 2, SQL.VInt 10]]
+                , [[SQL.VInt 2, SQL.VInt 10]])
+        it "checks altered rows using schema order and keeps CHECK failures explicit" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE TABLE write_checks (id INT, qty INT CHECK (qty > id))"
+                        , "INSERT INTO write_checks (id, qty) VALUES (1, 3)"]
+                    let reversed = [(name, table {SQL.tableRows = map reverse (SQL.tableRows table)}) | (name, table) <- db]
+                    alter <- parseStatement "ALTER TABLE write_checks ADD COLUMN note TEXT DEFAULT 'ok'"
+                    (altered, _) <- runStatement reversed alter
+                    invalid <- parseStatement "UPDATE write_checks SET qty = 0 WHERE id = 1"
+                    Right (runStatement altered invalid)
+            case result of
+                Right (Left err) -> err `shouldSatisfy` isInfixOf "CHECK on qty failed"
+                other -> expectationFailure (show other)
+        it "does not evaluate skipped assignments or empty DELETE predicates" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE TABLE write_lazy (id INT, qty INT)"
+                        , "INSERT INTO write_lazy (id, qty) VALUES (1, 2)"]
+                    update <- parseStatement "UPDATE write_lazy SET qty = 1 / 0 WHERE id = 99"
+                    (updated, _) <- runStatement db update
+                    delete <- parseStatement "DELETE FROM write_lazy"
+                    (empty, _) <- runStatement updated delete
+                    invalid <- parseStatement "DELETE FROM write_lazy WHERE 1 / 0 = 1"
+                    runStatement empty invalid
+            result `shouldSatisfy` either (const False) (const True)
+        it "rejects missing physical columns before a write" $ do
+            let db = [("write_missing", SQL.Table "write_missing"
+                    [("id", SQL.plainColumn SQL.CInt), ("qty", SQL.plainColumn SQL.CInt)]
+                    [[("id", SQL.VInt 1)]] Nothing Nothing Nothing)]
+            mapM_ (\source -> rowsOf (parseStatement source >>= runStatement db)
+                `shouldBe` Left "missing bound column: qty")
+                ["UPDATE write_missing SET id = 2", "DELETE FROM write_missing WHERE id = 1"]
     describe "runtime encoding" $ do
         it "round trips nested lists, optional values and tuples" $ do
             let ty = tupleType [listType (maybeType intType), stringType, doubleType, boolType]
@@ -223,6 +476,16 @@ spec = do
                     rejected <- fst <$> runMemoryStorage (Query.executeQueryM bound) (fst referenced)
                     Right (accepted, rejected)
             result `shouldBe` Right (Right [[("n", SQL.VNull)]], Left "bound query schema changed: referenced")
+        it "guards tables referenced only by HAVING or expression ordering" $ do
+            let result query = do
+                    db <- sqlCatalog ["CREATE TABLE main_rows (id INT)", "CREATE TABLE dependency_rows (id INT)"]
+                    bound <- parseStatement query >>= Query.bindQuery db
+                    changed <- parseStatement "ALTER TABLE dependency_rows ADD COLUMN extra TEXT" >>= runStatement db
+                    fst <$> runMemoryStorage (Query.executeQueryM bound) (fst changed)
+            mapM_ (\query -> result query `shouldBe` Right (Left "bound query schema changed: dependency_rows"))
+                [ "SELECT COUNT(*) FROM main_rows HAVING COUNT(*) > (SELECT COUNT(*) FROM dependency_rows)"
+                , "SELECT id FROM main_rows ORDER BY (SELECT COUNT(*) FROM dependency_rows) + id"
+                ]
         it "rejects schema drift before executing an empty bound query" $ do
             let result = do
                     db <- sqlCatalog ["CREATE TABLE bound_items (id INT)"]
@@ -304,6 +567,45 @@ spec = do
         it "binds outer references after the local relation layout" $ do
             bindRelOpColumns [] ["outer.id"] (Rel.Compute [("id", Col "outer.id")] Rel.Unit)
                 `shouldBe` Right (Rel.Compute [("id", OuterColumnSlot 0 0 "outer.id")] Rel.Unit)
+        it "binds subquery references to parent slots before execution" $ do
+            let statement = Select [("value", Col "parent.id")] FromUnit Nothing [] Nothing [] Nothing
+                query = Subquery statement ["parent.id"]
+                source = Rel.Compute [("id", LitInt 1)] Rel.Unit
+                plan = Rel.Compute [("value", ScalarSub query)] source
+            bindRelOpColumns [] [] plan `shouldBe` Right (Rel.Compute
+                [("value", ScalarSub (BoundSubquery statement ["parent.id"] [("parent.id", ColumnSlot 0 "id")]))] source)
+            case bindRelOpColumns [] [] plan of
+                Left err -> expectationFailure err
+                Right bound -> evalRelOp [] bound `shouldBe` Right [[("value", SQL.VInt 1)]]
+        it "keeps exact outer subquery references ahead of local physical fallbacks" $ do
+            let statement = Select [("value", Col "parent.id")] FromUnit Nothing [] Nothing [] Nothing
+                query = Subquery statement ["parent.id"]
+                source = Rel.Compute [("id", LitInt 1)] Rel.Unit
+            bindRelOpColumns [] ["parent.id"] (Rel.Compute [("value", ScalarSub query)] source)
+                `shouldBe` Right (Rel.Compute [("value", ScalarSub (BoundSubquery statement ["parent.id"]
+                    [("parent.id", OuterColumnSlot 1 0 "parent.id")]))] source)
+        it "uses distinct bound positions when subqueries share a diagnostic name" $ do
+            let statement = Select [("value", Col "x")] FromUnit Nothing [] Nothing [] Nothing
+                first = ScalarSub (BoundSubquery statement ["x"] [("x", ColumnSlot 0 "a")])
+                second = ScalarSub (BoundSubquery statement ["x"] [("x", ColumnSlot 1 "b")])
+                table = SQL.Table "slot_cache" [("a", SQL.plainColumn SQL.CInt), ("b", SQL.plainColumn SQL.CInt)]
+                    [[("a", SQL.VInt 1), ("b", SQL.VInt 2)], [("a", SQL.VInt 1), ("b", SQL.VInt 3)]] Nothing Nothing Nothing
+                plan = Rel.Compute [("first", first), ("second", second)] (Rel.Scan Nothing "slot_cache" Nothing)
+            subquerySlotsIn (Add first second) `shouldBe` [ColumnSlot 0 "a", ColumnSlot 1 "b"]
+            evalRelOp [("slot_cache", table)] plan `shouldBe` Right
+                [[("first", SQL.VInt 1), ("second", SQL.VInt 2)]
+                , [("first", SQL.VInt 1), ("second", SQL.VInt 3)]]
+        it "rejects bound subquery layout mismatches instead of looking up names" $ do
+            let statement = Select [("value", Col "id")] FromUnit Nothing [] Nothing [] Nothing
+                query = BoundSubquery statement ["id"] [("id", ColumnSlot 0 "id")]
+                wrongLayout = Rel.Compute [("other", LitInt 2), ("id", LitInt 1)] Rel.Unit
+            evalRelOp [] (Rel.Compute [("value", ScalarSub query)] wrongLayout)
+                `shouldBe` Left "bound column position mismatch: id"
+            prepareRowExpression [] (ScalarSub query)
+                `shouldBe` Left "execution subquery cannot be used in semantic input"
+            bindRelOpColumns [] [] (Rel.Compute [("value", ScalarSub
+                (BoundSubquery statement ["id"] []))] Rel.Unit)
+                `shouldBe` Left "bound subquery references mismatch"
         it "preserves outer scope identity when rebinding beside a local name" $ do
             let source = Rel.Compute [("id", LitInt 1)] Rel.Unit
                 expression = OuterColumnSlot 0 0 "id"
@@ -315,6 +617,37 @@ spec = do
                 `shouldBe` Left "unknown column: id"
             prepareRowExpression [] expression `shouldBe` Left "execution column cannot be used in semantic input"
             prepareRowExpression [] (ColumnSlot 0 "id") `shouldBe` Left "execution column cannot be used in semantic input"
+        it "preserves duplicate column positions when rebinding local and outer slots" $ do
+            let source = Rel.Compute [("id", LitInt 1), ("id", LitInt 9)] Rel.Unit
+                plan = Rel.Compute [("value", ColumnSlot 1 "id")] source
+            bindRelOpColumns [] [] plan `shouldBe` Right plan
+            (bindRelOpColumns [] [] plan >>= evalRelOp [])
+                `shouldBe` Right [[("value", SQL.VInt 9)]]
+            bindRelOpColumns [] ["id", "id"] (Rel.Compute [("value", OuterColumnSlot 0 1 "id")] source)
+                `shouldBe` Right (Rel.Compute [("value", OuterColumnSlot 2 1 "id")] source)
+        it "rejects ambiguous slot relocation and invalid bound positions" $ do
+            let source = Rel.Compute [("other", LitInt 0), ("id", LitInt 1), ("id", LitInt 9)] Rel.Unit
+            bindRelOpColumns [] [] (Rel.Compute [("value", ColumnSlot 0 "id")] source)
+                `shouldBe` Left "ambiguous bound column: id"
+            bindRelOpColumns [] ["other", "id", "id"] (Rel.Compute [("value", OuterColumnSlot 0 0 "id")] Rel.Unit)
+                `shouldBe` Left "ambiguous bound column: id"
+            bindRelOpColumns [] [] (Rel.Compute [("value", ColumnSlot (-1) "id")] source)
+                `shouldBe` Left "bound column position mismatch: id"
+            bindRelOpColumns [] ["id"] (Rel.Compute [("value", OuterColumnSlot (-1) 0 "id")] Rel.Unit)
+                `shouldBe` Left "bound column position mismatch: id"
+            bindRelOpColumns [] [] (Rel.Compute [("value", ColumnSlot 0 "id")]
+                (Rel.Compute [("other", LitInt 0), ("id", LitInt 9)] Rel.Unit))
+                `shouldBe` Right (Rel.Compute [("value", ColumnSlot 1 "id")]
+                    (Rel.Compute [("other", LitInt 0), ("id", LitInt 9)] Rel.Unit))
+        it "keeps duplicate parent slots distinct through subquery rebinding and caching" $ do
+            let statement = Select [("value", Col "x")] FromUnit Nothing [] Nothing [] Nothing
+                first = ScalarSub (BoundSubquery statement ["x"] [("x", ColumnSlot 0 "id")])
+                second = ScalarSub (BoundSubquery statement ["x"] [("x", ColumnSlot 1 "id")])
+                source = Rel.Compute [("id", LitInt 1), ("id", LitInt 9)] Rel.Unit
+                plan = Rel.Compute [("first", first), ("second", second)] source
+            bindRelOpColumns [] [] plan `shouldBe` Right plan
+            (bindRelOpColumns [] [] plan >>= evalRelOp [])
+                `shouldBe` Right [[("first", SQL.VInt 1), ("second", SQL.VInt 9)]]
         it "keeps inner shadowing and multi-level correlated SQL references" $ do
             let result = do
                     db <- sqlCatalog ["CREATE TABLE scoped_items (id INT)"
@@ -323,6 +656,68 @@ spec = do
                     rows <- rowsOf (runStatement db statement)
                     Right (map (map snd) rows)
             result `shouldBe` Right [[SQL.VInt 1, SQL.VInt 1, SQL.VInt 1], [SQL.VInt 2, SQL.VInt 2, SQL.VInt 2]]
+        it "resolves the nearest of several enclosing column scopes" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE TABLE scope_far (id INT)", "CREATE TABLE scope_near (id INT)"
+                        , "INSERT INTO scope_far (id) VALUES (1), (2)", "INSERT INTO scope_near (id) VALUES (10), (11)"]
+                    statement <- parseStatement "SELECT o.id, (SELECT (SELECT id) FROM scope_near n WHERE n.id = o.id + 9) AS nearest FROM scope_far o"
+                    map (map snd) <$> rowsOf (runStatement db statement)
+            result `shouldBe` Right [[SQL.VInt 1, SQL.VInt 10], [SQL.VInt 2, SQL.VInt 11]]
+        it "keeps enclosing scopes separate when aliases and DOMAIN types overlap" $ withType stringType $ \tid -> do
+            let result = do
+                    db <- sqlCatalog ["CREATE DOMAIN scope_label AS VARCHAR(4)"
+                        , "CREATE TABLE scope_far (value INT)", "CREATE TABLE scope_near (value scope_label)"
+                        , "INSERT INTO scope_far (value) VALUES (7)", "INSERT INTO scope_near (value) VALUES ('abc')"]
+                    statement <- parseStatement "SELECT (SELECT (SELECT length(s.value)) FROM scope_near s) AS size FROM scope_far s"
+                    rows <- map (map snd) <$> rowsOf (runStatement db statement)
+                    domain <- parseStatement "SELECT (SELECT (SELECT s.value) FROM scope_near s) AS label FROM scope_far s"
+                    bound <- Query.bindQuery db domain
+                    Right (rows, Query.queryTypes bound)
+            result `shouldBe` Right ([[SQL.VInt 3]], [("label", Query.DomainType "scope_label" (Query.RuntimeType tid))])
+        it "skips empty or unrelated enclosing scopes and preserves NULL" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE TABLE scope_far (id INT)", "CREATE TABLE scope_near (name TEXT)"
+                        , "INSERT INTO scope_far (id) VALUES (NULL), (4)", "INSERT INTO scope_near (name) VALUES ('n')"]
+                    statement <- parseStatement "SELECT (SELECT (SELECT (SELECT id)) FROM scope_near n) AS echoed FROM scope_far o"
+                    map (map snd) <$> rowsOf (runStatement db statement)
+            result `shouldBe` Right [[SQL.VNull], [SQL.VInt 4]]
+        it "does not resolve an ambiguous nearer scope against a farther one" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE TABLE scope_far (id INT)", "CREATE TABLE scope_near (id INT)"]
+                    statement <- parseStatement "SELECT (SELECT (SELECT id) FROM scope_near a JOIN scope_near b ON a.id = b.id) FROM scope_far o"
+                    rowsOf (runStatement db statement)
+            result `shouldSatisfy` either (isInfixOf "ambiguous column") (const False)
+        it "does not take a missing column from a shadowed source alias" $ do
+            let result source = do
+                    db <- sqlCatalog ["CREATE TABLE source_far (id INT)", "CREATE TABLE source_near (other INT)"
+                        , "INSERT INTO source_far (id) VALUES (1)", "INSERT INTO source_near (other) VALUES (10)"]
+                    statement <- parseStatement source
+                    rowsOf (runStatement db statement)
+            mapM_ (\source -> result source `shouldSatisfy` either (isInfixOf "unknown column") (const False))
+                ["SELECT (SELECT s.id FROM source_near s) FROM source_far s"
+                , "SELECT (SELECT (SELECT s.id) FROM source_near s) FROM source_far s"]
+        it "keeps bare far columns visible when the nearer alias has no such column" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE TABLE source_far (id INT)", "CREATE TABLE source_near (other INT)"
+                        , "INSERT INTO source_far (id) VALUES (1), (2)", "INSERT INTO source_near (other) VALUES (10)"]
+                    statement <- parseStatement "SELECT (SELECT (SELECT id) FROM source_near s) AS inherited FROM source_far s"
+                    map (map snd) <$> rowsOf (runStatement db statement)
+            result `shouldBe` Right [[SQL.VInt 1], [SQL.VInt 2]]
+        it "uses lexical scopes in IN, EXISTS and quantified subqueries" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE TABLE scope_far (id INT)", "CREATE TABLE scope_near (id INT)"
+                        , "INSERT INTO scope_far (id) VALUES (1)", "INSERT INTO scope_near (id) VALUES (10)"]
+                    statement <- parseStatement "SELECT (SELECT 10 IN (SELECT id) AND EXISTS (SELECT 1 WHERE id = 10) AND 10 = ALL (SELECT id) FROM scope_near n) AS matched FROM scope_far o"
+                    map (map snd) <$> rowsOf (runStatement db statement)
+            result `shouldBe` Right [[SQL.VBool True]]
+        it "resolves JOIN conditions against the nearest enclosing scope" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE TABLE scope_far (value INT)", "CREATE TABLE scope_near (value INT)"
+                        , "CREATE TABLE scope_join (id INT)", "INSERT INTO scope_far (value) VALUES (1)"
+                        , "INSERT INTO scope_near (value) VALUES (10)", "INSERT INTO scope_join (id) VALUES (10)"]
+                    statement <- parseStatement "SELECT (SELECT (SELECT a.id FROM scope_join a JOIN scope_join b ON a.id = value AND b.id = a.id) FROM scope_near n) AS matched FROM scope_far o"
+                    map (map snd) <$> rowsOf (runStatement db statement)
+            result `shouldBe` Right [[SQL.VInt 10]]
         it "executes SQL against reversed physical column order" $ do
             let result = do
                     db <- sqlCatalog ["CREATE TABLE slot_items (id INT, name TEXT)"

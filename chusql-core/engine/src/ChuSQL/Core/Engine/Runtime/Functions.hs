@@ -3,6 +3,7 @@ module ChuSQL.Core.Engine.Runtime.Functions
     , builtinFunctions, resolveFunction, resolveNullableFunction, functionSignature, invokeFunction
     ) where
 
+import Control.Monad (zipWithM_)
 import ChuSQL.Core.Engine.Runtime.Types
 import Data.Char (toLower)
 
@@ -60,7 +61,8 @@ invokeFunction types (FunctionRegistry functions) fid values =
     case [(sig, implementation) | (sig, implementation) <- functions, signatureId sig == fid] of
         [(sig, implementation)]
             | length values == length (signatureArguments sig) -> do
-                sequence_ (zipWith (validateValue types) (signatureArguments sig) values)
+                zipWithM_
+                  (validateValue types) (signatureArguments sig) values
                 result <- implementation values
                 validateValue types (signatureResult sig) result
                 Right result

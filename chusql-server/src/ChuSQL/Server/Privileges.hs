@@ -6,11 +6,12 @@ module ChuSQL.Server.Privileges
     , newPrivileges, normalizeObject, privilegeCommand, runPrivilegeCommand, claimObject, prepareObject, reconcileObjects, affectedObject
     ) where
 
+import Data.Maybe (maybeToList)
 import ChuSQL.Core.Engine.Syntax.AST
 import ChuSQL.Core.Protocol (Account (..))
 import ChuSQL.Interface.Protocol (Grant (..), RoleView (..))
 import ChuSQL.Server.Accounts (Principal, principalIsRoot, principalIsCatalogManager)
-import ChuSQL.Server.Backend (Backend (..), exprTables, tableRefsOf, systemDatabaseName)
+import ChuSQL.Server.Backend (Backend (..), exprTables, statementTables, systemDatabaseName)
 import ChuSQL.Server.Catalog
 import qualified ChuSQL.Server.ObjectACL as OA
 import Data.List (nub, sort)
@@ -70,7 +71,7 @@ runPrivilegeCommand service principal database command = withTables service $ ca
                     Left err -> pure (Left err)
                     Right () -> eachAction members $ \member -> if (normalizeRole role, normalizeUser member) `elem` pairs then pure (Right ()) else catalog (addMember directory role member)
     RevokeRoleCommand role members
-        | principalIsRoot principal -> after (eachAction members (\member -> catalog (removeMember directory role member)))
+        | principalIsRoot principal -> after (eachAction members (catalog . removeMember directory role))
     _ -> pure (Left forbidden)
   where
     backend = pvBackend service
@@ -146,7 +147,7 @@ authorizeConnect service principal database
 authorizeTables :: Privileges -> Principal -> Text -> [(Text, Text)] -> IO (Either PrivilegeError ())
 authorizeTables service principal database needed
     | principalIsRoot principal = pure (Right ())
-    | T.null database && any (not . T.isPrefixOf "database:" . fst) needed = pure (Left (PrivilegeError "no_database" "no database selected"))
+    | T.null database && (not . all (T.isPrefixOf "database:" . fst)) needed = pure (Left (PrivilegeError "no_database" "no database selected"))
     | otherwise = withTables service $ do
         connected <- if T.null database then pure (Right ()) else catalog (OA.objectConnect (pvBackend service) (pvCatalog service) principal database)
         case connected of Left err -> pure (Left err); Right () -> catalog (OA.objectAuthorize (pvBackend service) (pvCatalog service) principal database needed)
@@ -172,7 +173,12 @@ listRoleViews service = withTables service $ do
     members <- catalog (readMembers (pvCatalog service))
     case (,) <$> names <*> members of
         Left err -> pure (Left err)
-        Right (identities, pairs) -> fmap sequence $ mapM (view pairs) (sort (map accountUser (filter (not . accountCanLogin) identities)))
+        Right (identities, pairs) -> sequence
+                                       <$>
+                                         mapM
+                                           (view pairs)
+                                           (sort
+                                              (map accountUser (filter (not . accountCanLogin) identities)))
   where
     -- 组装一个角色的公开权限视图。
     view members name = do
@@ -199,14 +205,12 @@ reconcileObjects service = withTables service (catalog (OA.objectReconcile (pvBa
 requiredActions :: Statement -> Maybe [(Text, Text)]
 requiredActions statement = case statement of
     SelectDistinct q -> requiredActions q
-    Select{} -> Just (selectNeeds (selectFrom statement) (maybe [] (: []) (selectWhere statement) ++ map snd (selectItems statement)))
+    Select{} -> Just [(ref, "select") | ref <- statementTables statement]
     Insert table _ rows -> Just ((T.pack table, "insert") : selectsOf (concat rows))
-    Update table assignments condition -> Just ((T.pack table, "update") : selectsOf (map snd assignments ++ maybe [] (: []) condition))
-    Delete table condition -> Just ((T.pack table, "delete") : selectsOf (maybe [] (: []) condition))
+    Update table assignments condition -> Just ((T.pack table, "update") : selectsOf (map snd assignments ++ maybeToList condition))
+    Delete table condition -> Just ((T.pack table, "delete") : selectsOf (maybeToList condition))
     _ -> Nothing
   where
-    -- 收集来源树和表达式的读取权限。
-    selectNeeds source expressions = [(ref, "select") | ref <- nub (tableRefsOf source)] ++ selectsOf expressions
     -- 收集表达式中子查询的读取权限。
     selectsOf expressions = [(ref, "select") | ref <- nub (concatMap exprTables expressions)]
 
@@ -218,7 +222,7 @@ withTables service action = withCatalogLock (pvCatalog service) $ do
 
 -- 将目录结果转换为权限错误。
 catalog :: IO (Either String a) -> IO (Either PrivilegeError a)
-catalog action = fmap (either (Left . storageError) Right) action
+catalog = fmap (either (Left . storageError) Right)
 
 -- 分类稳定对象目录的明确错误。
 storageError :: String -> PrivilegeError

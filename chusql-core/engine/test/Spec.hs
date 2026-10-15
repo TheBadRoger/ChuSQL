@@ -1,7 +1,9 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE CPP #-}
 
 module Main where
 
+import Data.Either (fromRight)
 import ChuSQL.Core.Engine.Algebra.Cost (rangeRows, selectivityOf)
 import ChuSQL.Core.Engine.Algebra.Eval (evalRelOp, evalRelOpM)
 import ChuSQL.Core.Engine.Algebra.Expr (colsInExpr, evalExpr)
@@ -25,7 +27,7 @@ import ChuSQL.Core.Engine.Syntax.Parser
 import Control.Concurrent (forkFinally, forkIO, killThread, threadDelay)
 import Control.Concurrent.Chan (newChan, readChan, writeChan)
 import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, readMVar, takeMVar, tryPutMVar)
-import Control.Monad (replicateM_, void)
+import Control.Monad (replicateM_, void, when)
 import Control.Exception (ErrorCall, IOException, bracket_, finally, try)
 import Data.Hashable (hash)
 import qualified Data.ByteString as BS
@@ -141,6 +143,26 @@ main = hspec $ do
                 `shouldBe` Right (RevokeGrantOption ["SELECT", "UPDATE"] "users" "alice")
             parseStatement "REVOKE GRANT OPTION FOR reader FROM alice" `shouldSatisfy` either (const True) (const False)
     describe "ORDER BY positions" $ do
+        it "sorts the selected output position despite duplicate aliases" $ do
+            let sql = "SELECT age AS x, -age AS x FROM users ORDER BY 2 LIMIT 1"
+            rowsOf (parseStatement sql >>= runStatement testDB)
+                `shouldBe` Right [[("x", VInt 30), ("x", VInt (-30))]]
+            sameResultAsUnoptimized sql
+            rowsOf (parseStatement "SELECT DISTINCT age AS x, -age AS x FROM users ORDER BY 2 LIMIT 1" >>= runStatement testDB)
+                `shouldBe` Right [[("x", VInt 30), ("x", VInt (-30))]]
+            rowsOf (parseStatement "SELECT DISTINCT user_id, user_id FROM orders ORDER BY 2 DESC" >>= runStatement testDB)
+                `shouldBe` Right [[("user_id", VInt 2), ("user_id", VInt 2)], [("user_id", VInt 1), ("user_id", VInt 1)]]
+            rowsOf (parseStatement "SELECT age, age FROM users ORDER BY age LIMIT 1" >>= runStatement testDB)
+                `shouldBe` Right [[("age", VInt 17), ("age", VInt 17)]]
+        it "preserves ordinal grouping, correlation and delayed projection errors" $ do
+            rowsOf (parseStatement "SELECT user_id AS x, count(*) AS x FROM orders GROUP BY user_id ORDER BY 2 DESC" >>= runStatement testDB)
+                `shouldBe` Right [[("x", VInt 1), ("x", VInt 2)], [("x", VInt 2), ("x", VInt 1)]]
+            rowsOf (parseStatement "SELECT name AS x, 1 / (age - 25) AS x FROM users ORDER BY 1 DESC LIMIT 1" >>= runStatement testDB)
+                `shouldBe` Right [[("x", VStr "Carol"), ("x", VInt 0)]]
+            rowsOf (parseStatement "SELECT o.id, (SELECT i.age AS x FROM users i WHERE i.id = o.id ORDER BY 1 LIMIT 1) AS age FROM users o ORDER BY 1" >>= runStatement testDB)
+                `shouldBe` Right [[("o.id", VInt 1), ("age", VInt 25)], [("o.id", VInt 2), ("age", VInt 17)], [("o.id", VInt 3), ("age", VInt 30)]]
+            rowsOf (parseStatement "WITH t(a, b) AS (SELECT age AS x, -age AS x FROM users ORDER BY 2 LIMIT 1) SELECT * FROM t" >>= runStatement testDB)
+                `shouldBe` Right [[("t.a", VInt 30), ("t.b", VInt (-30))]]
         it "resolves positions after wildcard expansion and before limiting" $ do
             rowsOf (parseStatement "SELECT * FROM orders ORDER BY 2 DESC, 1 DESC LIMIT 2" >>= runStatement testDB)
                 `shouldBe` Right [tableRows orders !! 1, tableRows orders !! 2]
@@ -149,6 +171,19 @@ main = hspec $ do
         it "rejects zero and positions beyond the output" $ do
             mapM_ (\sql -> (parseStatement sql >>= runStatement testDB) `shouldSatisfy` either (isInfixOf "outside the select list") (const False))
                 ["SELECT id FROM users ORDER BY 0", "SELECT id FROM users ORDER BY 2"]
+        it "keeps NULL and equal-key row order when mixing ordinals and aliases" $ do
+            let rows = [[("id", VInt n), ("name", VStr "same"), ("age", value)]
+                    | (n, value) <- [(1, VInt 2), (2, VNull), (3, VInt 2)]]
+                db = [("users", users { tableRows = rows })]
+                sql = "SELECT id AS x, age AS x, name AS tag FROM users ORDER BY 2, tag"
+            rowsOf (parseStatement sql >>= runStatement db)
+                `shouldBe` Right [[("x", VInt 2), ("x", VNull), ("tag", VStr "same")]
+                    , [("x", VInt 1), ("x", VInt 2), ("tag", VStr "same")]
+                    , [("x", VInt 3), ("x", VInt 2), ("tag", VStr "same")]]
+            (parseStatement "SELECT LIST<Int>(1) AS x, id AS x FROM users ORDER BY 1" >>= runStatement testDB)
+                `shouldSatisfy` either (isInfixOf "capability is not registered") (const False)
+            (parseStatement "SELECT age AS x, id AS x FROM users ORDER BY 1, x" >>= runStatement testDB)
+                `shouldSatisfy` either (isInfixOf "ambiguous projection alias") (const False)
     describe "SELECT DISTINCT" $ do
         it "deduplicates projected values before ordering and limiting" $ do
             let db = [("orders", orders { tableRows = tableRows orders ++ tableRows orders })]
@@ -193,6 +228,21 @@ main = hspec $ do
                 }
             (runIPCStorage (withSchemaGuard [] (scan "ignored"))
                 `shouldReturn` Left "storage did not confirm bound schema guard") `finally` closeConnection
+        it "rejects an ignored write handshake before sending the mutation" $ do
+            requests <- newMVar []
+            setStorageLink StorageLink
+                { slRequest = \payload -> do
+                    modifyMVar_ requests (pure . (payload :))
+                    pure (Right (BSC.pack "{\"status\":\"ok\"}"))
+                , slClose = pure ()
+                }
+            flip finally closeConnection $ do
+                runIPCStorage (withWriteSchemaGuard [("ignored", users)]
+                    (insert "ignored" [("id", VInt 1)]))
+                    `shouldReturn` Left "storage did not confirm bound schema guard"
+                sent <- readMVar requests
+                length sent `shouldBe` 1
+                head sent `shouldSatisfy` BS.isInfixOf (BSC.pack "\"method\":\"validate_write\"")
         it "propagates catalog failures through snapshot, schema and SQL" $ do
             setStorageLink StorageLink
                 { slRequest = \_ -> pure (Right (BSC.pack "{\"status\":\"error\",\"message\":\"catalog unavailable\"}"))
@@ -573,6 +623,7 @@ main = hspec $ do
                                 (Eq (Col "id") (Col "user_id"))
                         , selectWhere = Nothing
                         , selectGroupBy = []
+                        , selectHaving = Nothing
                         , selectOrderBy = []
                         , selectLimit = Nothing
                         }
@@ -591,6 +642,7 @@ main = hspec $ do
                                 (Eq (Col "u.id") (Col "o.user_id"))
                         , selectWhere = Nothing
                         , selectGroupBy = []
+                        , selectHaving = Nothing
                         , selectOrderBy = []
                         , selectLimit = Nothing
                         }
@@ -609,6 +661,7 @@ main = hspec $ do
                                 (Eq (Col "u.id") (Col "o.user_id"))
                         , selectWhere = Nothing
                         , selectGroupBy = []
+                        , selectHaving = Nothing
                         , selectOrderBy = []
                         , selectLimit = Nothing
                         }
@@ -637,9 +690,10 @@ main = hspec $ do
                         , selectFrom =
                             FromSubquery
                                 (Just "d")
-                                (Select [("name", Col "name")] (FromTable Nothing "users") Nothing [] [] Nothing)
+                                (Select [("name", Col "name")] (FromTable Nothing "users") Nothing [] Nothing [] Nothing)
                         , selectWhere = Nothing
                         , selectGroupBy = []
+                        , selectHaving = Nothing
                         , selectOrderBy = []
                         , selectLimit = Nothing
                         }
@@ -654,7 +708,7 @@ main = hspec $ do
                     ( FromJoin
                         InnerJoin
                         (FromTable (Just "u") "users")
-                        (FromSubquery (Just "d") (Select [("name", Col "name")] (FromTable Nothing "users") Nothing [] [] Nothing))
+                        (FromSubquery (Just "d") (Select [("name", Col "name")] (FromTable Nothing "users") Nothing [] Nothing [] Nothing))
                         (Eq (Col "u.name") (Col "d.name"))
                     )
 
@@ -666,6 +720,7 @@ main = hspec $ do
                         (FromTable Nothing "orders")
                         Nothing
                         []
+                        Nothing
                         []
                         Nothing
                     )
@@ -717,9 +772,10 @@ main = hspec $ do
                         , selectFrom =
                             FromSubquery
                                 (Just "t")
-                                (Select [("name", Col "name")] (FromTable Nothing "users") Nothing [] [] Nothing)
+                                (Select [("name", Col "name")] (FromTable Nothing "users") Nothing [] Nothing [] Nothing)
                         , selectWhere = Nothing
                         , selectGroupBy = []
+                        , selectHaving = Nothing
                         , selectOrderBy = []
                         , selectLimit = Nothing
                         }
@@ -779,11 +835,11 @@ main = hspec $ do
 
         it "parses >= into GtE" $ do
             parseStatement "SELECT name FROM users WHERE age >= 18"
-                `shouldBe` Right (Select [("name", Col "name")] (FromTable Nothing "users") (Just (GtE (Col "age") (LitInt 18))) [] [] Nothing)
+                `shouldBe` Right (Select [("name", Col "name")] (FromTable Nothing "users") (Just (GtE (Col "age") (LitInt 18))) [] Nothing [] Nothing)
 
         it "parses <= into LtE" $ do
             parseStatement "SELECT name FROM users WHERE age <= 30"
-                `shouldBe` Right (Select [("name", Col "name")] (FromTable Nothing "users") (Just (LtE (Col "age") (LitInt 30))) [] [] Nothing)
+                `shouldBe` Right (Select [("name", Col "name")] (FromTable Nothing "users") (Just (LtE (Col "age") (LitInt 30))) [] Nothing [] Nothing)
 
         it "parses <> and != into the same node" $ do
             sql "SELECT name FROM users WHERE age <> 17"
@@ -804,7 +860,8 @@ main = hspec $ do
             executeOperator OpNe [VInt 1, VFloat 1.0] `shouldBe` Right (VBool False)
 
         it "rewrites >= and <= into an inclusive index range" $ do
-            let stat rows distinct indexes = TableMeta rows [(c, d, False) | (c, d) <- distinct] [] indexes
+            let stat rows distinct
+                  = TableMeta rows [(c, d, False) | (c, d) <- distinct] []
                 dbWith m = [("users", Table "users" [("id", TInt), ("name", TStr)] [] (Just m) Nothing Nothing)]
                 indexed = dbWith (stat 10000 [("id", 10000)] ["id"])
                 low = Filter (GtE (Col "id") (LitInt 2)) (Scan Nothing "users" Nothing)
@@ -863,11 +920,11 @@ main = hspec $ do
 
         it "parses > ANY into a quantified comparison" $ do
             parseStatement "SELECT name FROM users WHERE age > ANY (SELECT age FROM orders)"
-                `shouldBe` Right (Select [("name", Col "name")] (FromTable Nothing "users") (Just (QuantCmp CmpGt (Col "age") (Subquery (Select [("age", Col "age")] (FromTable Nothing "orders") Nothing [] [] Nothing) []) AnyQ)) [] [] Nothing)
+                `shouldBe` Right (Select [("name", Col "name")] (FromTable Nothing "users") (Just (QuantCmp CmpGt (Col "age") (Subquery (Select [("age", Col "age")] (FromTable Nothing "orders") Nothing [] Nothing [] Nothing) []) AnyQ)) [] Nothing [] Nothing)
 
         it "parses <> ALL into a quantified comparison" $ do
             parseStatement "SELECT name FROM users WHERE age <> ALL (SELECT age FROM orders)"
-                `shouldBe` Right (Select [("name", Col "name")] (FromTable Nothing "users") (Just (QuantCmp CmpNe (Col "age") (Subquery (Select [("age", Col "age")] (FromTable Nothing "orders") Nothing [] [] Nothing) []) AllQ)) [] [] Nothing)
+                `shouldBe` Right (Select [("name", Col "name")] (FromTable Nothing "users") (Just (QuantCmp CmpNe (Col "age") (Subquery (Select [("age", Col "age")] (FromTable Nothing "orders") Nothing [] Nothing [] Nothing) []) AllQ)) [] Nothing [] Nothing)
 
         it "still reads plain comparisons" $ do
             values "SELECT name FROM users WHERE age > 20 ORDER BY name"
@@ -1080,9 +1137,9 @@ main = hspec $ do
                 Left err -> expectationFailure err
                 Right (_, _) -> do
                     rowsOf (runStatement testDB (makeSelect ["name"] "users" Nothing))
-                        `shouldSatisfy` \r -> case r of
-                            Right rows -> length rows == 3
-                            Left _ -> False
+                        `shouldSatisfy` \case
+                                          Right rows -> length rows == 3
+                                          Left _ -> False
 
         it "returns Left when column count does not match value count" $ do
             runStatement testDB (Insert "users" ["name", "age"] [[LitStr "Dave"]])
@@ -1277,7 +1334,7 @@ main = hspec $ do
 
         it "user is reserved as an alias but still usable inside a longer name" $ do
             parseStatement "SELECT * FROM users user" `shouldSatisfy` isLeft
-            parseStatement "SELECT user1 FROM users" `shouldBe` Right (Select [("user1", Col "user1")] (FromTable Nothing "users") Nothing [] [] Nothing)
+            parseStatement "SELECT user1 FROM users" `shouldBe` Right (Select [("user1", Col "user1")] (FromTable Nothing "users") Nothing [] Nothing [] Nothing)
 
     describe "ChuSQL.Core.Engine (DELETE)" $ do
         it "parses DELETE with WHERE" $ do
@@ -1399,17 +1456,17 @@ main = hspec $ do
                 `shouldBe` Right [[("x", VInt 25), ("x", VInt 1), ("who", VStr "Alice")]]
         it "parses ORDER BY DESC" $ do
             case parseStatement "SELECT name FROM users ORDER BY age DESC" of
-                Right q -> selectOrderBy q `shouldBe` [("age", Desc)]
+                Right q -> selectOrderBy q `shouldBe` [(OrderColumn "age", Desc)]
                 Left err -> expectationFailure err
 
         it "defaults to ASC" $ do
             case parseStatement "SELECT name FROM users ORDER BY age" of
-                Right q -> selectOrderBy q `shouldBe` [("age", Asc)]
+                Right q -> selectOrderBy q `shouldBe` [(OrderColumn "age", Asc)]
                 Left err -> expectationFailure err
 
         it "parses multiple ORDER BY columns" $ do
             case parseStatement "SELECT name FROM users ORDER BY age DESC, name ASC" of
-                Right q -> selectOrderBy q `shouldBe` [("age", Desc), ("name", Asc)]
+                Right q -> selectOrderBy q `shouldBe` [(OrderColumn "age", Desc), (OrderColumn "name", Asc)]
                 Left err -> expectationFailure err
 
         it "executes ORDER BY age ASC" $ do
@@ -1419,7 +1476,8 @@ main = hspec $ do
                         , selectFrom = FromTable Nothing "users"
                         , selectWhere = Nothing
                         , selectGroupBy = []
-                        , selectOrderBy = [("age", Asc)]
+                        , selectHaving = Nothing
+                        , selectOrderBy = [(OrderColumn "age", Asc)]
                         , selectLimit = Nothing
                         }
             rowsOf (runStatement testDB q)
@@ -1436,7 +1494,8 @@ main = hspec $ do
                         , selectFrom = FromTable Nothing "users"
                         , selectWhere = Nothing
                         , selectGroupBy = []
-                        , selectOrderBy = [("age", Desc)]
+                        , selectHaving = Nothing
+                        , selectOrderBy = [(OrderColumn "age", Desc)]
                         , selectLimit = Nothing
                         }
             rowsOf (runStatement testDB q)
@@ -1455,7 +1514,7 @@ main = hspec $ do
         it "parses LIMIT after ORDER BY" $ do
             case parseStatement "SELECT * FROM users ORDER BY age DESC LIMIT 1" of
                 Right q -> do
-                    selectOrderBy q `shouldBe` [("age", Desc)]
+                    selectOrderBy q `shouldBe` [(OrderColumn "age", Desc)]
                     selectLimit q `shouldBe` Just 1
                 Left err -> expectationFailure err
 
@@ -1466,6 +1525,7 @@ main = hspec $ do
                         , selectFrom = FromTable Nothing "users"
                         , selectWhere = Nothing
                         , selectGroupBy = []
+                        , selectHaving = Nothing
                         , selectOrderBy = []
                         , selectLimit = Just 2
                         }
@@ -1482,7 +1542,8 @@ main = hspec $ do
                         , selectFrom = FromTable Nothing "users"
                         , selectWhere = Nothing
                         , selectGroupBy = []
-                        , selectOrderBy = [("age", Desc)]
+                        , selectHaving = Nothing
+                        , selectOrderBy = [(OrderColumn "age", Desc)]
                         , selectLimit = Just 2
                         }
             rowsOf (runStatement testDB q)
@@ -1498,6 +1559,7 @@ main = hspec $ do
                         , selectFrom = FromTable Nothing "users"
                         , selectWhere = Nothing
                         , selectGroupBy = []
+                        , selectHaving = Nothing
                         , selectOrderBy = []
                         , selectLimit = Just 0
                         }
@@ -1552,6 +1614,7 @@ main = hspec $ do
                             (Eq (Col "u.id") (Col "x.id"))
                     , selectWhere = Nothing
                     , selectGroupBy = []
+                    , selectHaving = Nothing
                     , selectOrderBy = []
                     , selectLimit = Nothing
                     }
@@ -1726,17 +1789,232 @@ main = hspec $ do
             fmap (map (map snd)) result `shouldBe` Right [[VStr "Alice"], [VStr "Bob"]]
             scanTimes "orders" scans `shouldBe` 1
 
-        it "runs a correlated subquery once per distinct binding" $ do
+        it "scans simple correlated equality once through a semi join" $ do
             let (result, scans) =
                     countedRun "SELECT o.product FROM orders o WHERE EXISTS (SELECT * FROM users u WHERE u.id = o.user_id)"
             fmap (map (map snd)) result `shouldBe` Right [[VStr "Book"], [VStr "Pen"], [VStr "Cup"]]
-            scanTimes "users" scans `shouldBe` 2
+            scanTimes "users" scans `shouldBe` 1
             scanTimes "orders" scans `shouldBe` 1
 
         it "runs a non-correlated subquery in a computed column only once" $ do
             let (result, scans) = countedRun "SELECT name, (SELECT COUNT(*) FROM orders) FROM users"
-            length (either (const []) id result) `shouldBe` 3
+            length (fromRight [] result) `shouldBe` 3
             scanTimes "orders" scans `shouldBe` 1
+
+    describe "semi joins" $ do
+        let keysDB =
+                [ ("left_keys", users {tableName = "left_keys", tableCols = [("k", TInt)],
+                    tableRows = [[("k", value)] | value <- [VInt 1, VInt 1, VInt 2, VNull, VInt 3]]})
+                , ("right_keys", users {tableName = "right_keys", tableCols = [("k", TInt)],
+                    tableRows = [[("k", value)] | value <- [VInt 1, VInt 1, VNull]]})
+                ]
+            -- | 在键边界数据上执行查询
+            sql input = fmap (map (map snd)) (rowsOf (parseStatement input >>= runStatement keysDB))
+            -- | 检查经过语义解析的优化计划
+            plan input = renderPlan . optimize testDB <$> (parseStatement input >>= prepare testDB >>= translate)
+
+        it "keeps left duplicates without multiplying right matches" $ do
+            sql "SELECT k FROM left_keys WHERE k IN (SELECT k FROM right_keys)"
+                `shouldBe` Right [[VInt 1], [VInt 1]]
+            sql "SELECT l.k FROM left_keys l WHERE EXISTS (SELECT 1 FROM right_keys r WHERE r.k = l.k)"
+                `shouldBe` Right [[VInt 1], [VInt 1]]
+
+        it "distinguishes NOT EXISTS from NULL-aware NOT IN" $ do
+            sql "SELECT l.k FROM left_keys l WHERE NOT EXISTS (SELECT 1 FROM right_keys r WHERE l.k = r.k)"
+                `shouldBe` Right [[VInt 2], [VNull], [VInt 3]]
+            sql "SELECT k FROM left_keys WHERE k NOT IN (SELECT k FROM right_keys)" `shouldBe` Right []
+            sql "SELECT k FROM left_keys WHERE k NOT IN (SELECT k FROM right_keys WHERE k = 1)"
+                `shouldBe` Right [[VInt 2], [VInt 3]]
+
+        it "applies empty-set rules even to NULL left values" $ do
+            sql "SELECT k FROM left_keys WHERE k IN (SELECT k FROM right_keys WHERE k < 0)" `shouldBe` Right []
+            sql "SELECT k FROM left_keys WHERE k NOT IN (SELECT k FROM right_keys WHERE k < 0)"
+                `shouldBe` Right [[VInt 1], [VInt 1], [VInt 2], [VNull], [VInt 3]]
+            sql "SELECT l.k FROM left_keys l WHERE NOT EXISTS (SELECT r.k FROM right_keys r WHERE r.k = l.k AND r.k < 0)"
+                `shouldBe` Right [[VInt 1], [VInt 1], [VInt 2], [VNull], [VInt 3]]
+
+        it "plans eligible predicates as semi joins and scans the right once" $ do
+            mapM_ (\query -> do
+                plan query `shouldSatisfy` either (const False) (isInfixOf "SemiJoin")
+                sameResultAsUnoptimized query)
+                [ "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders)"
+                , "SELECT name FROM users WHERE id NOT IN (SELECT user_id FROM orders)"
+                , "SELECT o.product FROM orders o WHERE EXISTS (SELECT 1 FROM users u WHERE u.id = o.user_id)"
+                , "SELECT o.product FROM orders o WHERE NOT EXISTS (SELECT 1 FROM users u WHERE o.user_id = u.id)"
+                ]
+            let (_, scans) = countedRun "SELECT o.product FROM orders o WHERE EXISTS (SELECT 1 FROM users u WHERE u.id = o.user_id)"
+            scanTimes "users" scans `shouldBe` 1
+
+        it "keeps complex correlation and risky left keys on the original path" $ do
+            mapM_ (\query -> plan query `shouldSatisfy` either (const False) (not . isInfixOf "SemiJoin"))
+                [ "SELECT name FROM users WHERE 1 / (id - 1) IN (SELECT id FROM orders)"
+                , "SELECT u.name FROM users u WHERE EXISTS (SELECT 1 / 0 FROM orders o WHERE o.user_id = u.id)"
+                , "SELECT u.name FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id > u.id)"
+                , "SELECT u.name FROM users u WHERE EXISTS (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id)"
+                ]
+            sameResultAsUnoptimized "SELECT u.name FROM users u WHERE EXISTS (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id)"
+
+        it "skips the right side for empty left input and preserves right errors" $ do
+            let (empty, scans) = countedRun "SELECT d.id FROM (SELECT id FROM users WHERE id < 0) d WHERE d.id IN (SELECT 1 / 0 FROM orders)"
+            empty `shouldBe` Right []
+            scanTimes "orders" scans `shouldBe` 0
+            fst (countedRun "SELECT id FROM users WHERE id IN (SELECT 1 / (id - 2) FROM orders)")
+                `shouldBe` Left "division by zero"
+            fst (countedRun "SELECT u.id FROM users u WHERE EXISTS (SELECT 1 / 0 FROM orders o WHERE o.user_id = u.id)")
+                `shouldBe` Left "division by zero"
+
+        it "retains mixed numeric comparison at the floating precision boundary" $ do
+            let db =
+                    [ ("big", users {tableName = "big", tableCols = [("id", TInt)],
+                        tableRows = [[("id", VInt value)] | value <- [9007199254740995, 9007199254740996, 9007199254740997, 9007199254740998]]})
+                    , ("floats", users {tableName = "floats", tableCols = [("value", plainColumn CFloat)],
+                        tableRows = [[("value", VFloat 9007199254740996)]]})
+                    ]
+                result = do
+                    statement <- parseStatement "SELECT id FROM big WHERE id IN (SELECT value FROM floats)"
+                    original <- prepare db statement >>= translate
+                    unoptimized <- evalRelOp db original
+                    optimized <- rowsOf (runStatement db statement)
+                    Right (unoptimized, optimized)
+                expected = [[("id", VInt 9007199254740995)], [("id", VInt 9007199254740996)], [("id", VInt 9007199254740997)]]
+            result `shouldBe` Right (expected, expected)
+
+        it "keeps nested enclosing scopes and repeated bindings distinct" $ do
+            sameResultAsUnoptimized "SELECT u.id FROM users u WHERE EXISTS (SELECT o.id FROM orders o WHERE EXISTS (SELECT x.id FROM users x WHERE x.id = u.id))"
+            sameResultAsUnoptimized "SELECT u.id FROM users u WHERE EXISTS (SELECT o.id FROM orders o WHERE EXISTS (SELECT x.id FROM users x WHERE x.id = o.user_id))"
+
+        it "shares independent IN results with other subquery consumers" $ do
+            let (result, scans) = countedRun "SELECT name, (SELECT COUNT(*) FROM orders) AS n FROM users WHERE id IN (SELECT COUNT(*) FROM orders)"
+            result `shouldBe` Right [[("name", VStr "Carol"), ("n", VInt 3)]]
+            scanTimes "orders" scans `shouldBe` 1
+
+        it "preserves grouping, DISTINCT, ordering and LIMIT around semi joins" $ do
+            mapM_ sameResultAsUnoptimized
+                [ "SELECT DISTINCT user_id FROM orders WHERE user_id IN (SELECT id FROM users) ORDER BY user_id DESC LIMIT 1"
+                , "SELECT user_id, COUNT(*) FROM orders WHERE user_id IN (SELECT id FROM users) GROUP BY user_id HAVING COUNT(*) > 1 ORDER BY COUNT(*) DESC"
+                , "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders ORDER BY id LIMIT 1) ORDER BY age + 1"
+                ]
+            case parseStatement "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders)" >>= prepare testDB >>= translate of
+                Left err -> expectationFailure err
+                Right original -> optimize testDB (optimize testDB original) `shouldBe` optimize testDB original
+
+        it "executes semi and anti joins with NULL through storage IPC" $
+            withTestSession $ \srv -> withServerEnv srv $ do
+                -- | 在真实存储执行半连接查询
+                let query input = case parseStatement input of
+                        Left err -> pure (Left err)
+                        Right statement -> runIPCStorage (runStatementM statement)
+                mapM_ (\input -> query input `shouldReturn` Right [])
+                    [ "CREATE TABLE semi_left (k int)"
+                    , "CREATE TABLE semi_right (k int)"
+                    , "INSERT INTO semi_left (k) VALUES (1), (1), (2), (NULL)"
+                    , "INSERT INTO semi_right (k) VALUES (1), (1), (NULL)"
+                    ]
+                query "SELECT l.k FROM semi_left l WHERE EXISTS (SELECT 1 FROM semi_right r WHERE r.k = l.k)"
+                    `shouldReturn` Right [[("l.k", VInt 1)], [("l.k", VInt 1)]]
+                query "SELECT l.k FROM semi_left l WHERE NOT EXISTS (SELECT 1 FROM semi_right r WHERE r.k = l.k)"
+                    `shouldReturn` Right [[("l.k", VInt 2)], [("l.k", VNull)]]
+                query "SELECT k FROM semi_left WHERE k NOT IN (SELECT k FROM semi_right)" `shouldReturn` Right []
+                query "SELECT k FROM semi_left WHERE k NOT IN (SELECT k FROM semi_right WHERE k < 0)"
+                    `shouldReturn` Right [[("k", VInt 1)], [("k", VInt 1)], [("k", VInt 2)], [("k", VNull)]]
+
+    describe "NULL membership in empty subqueries" $ do
+        -- | 在测试库运行并取值
+        let values input = fmap (map (map snd)) (rowsOf (parseStatement input >>= runStatement testDB))
+        it "uses the same empty-set rule for membership and quantified comparison" $ do
+            inValues VNull [] `shouldBe` Right (VBool False)
+            values "SELECT NULL IN (SELECT id FROM orders WHERE id < 0), NULL NOT IN (SELECT id FROM orders WHERE id < 0), NULL = ANY (SELECT id FROM orders WHERE id < 0), NULL <> ALL (SELECT id FROM orders WHERE id < 0)"
+                `shouldBe` Right [[VBool False, VBool True, VBool False, VBool True]]
+        it "retains unknown results for nonempty sets" $ do
+            values "SELECT NULL IN (SELECT id FROM orders), NULL NOT IN (SELECT id FROM orders), NULL IN (NULL), NULL NOT IN (NULL)"
+                `shouldBe` Right [[VNull, VNull, VNull, VNull]]
+        it "keeps optimized filtering identical to the original plan" $ do
+            mapM_ sameResultAsUnoptimized
+                [ "SELECT name FROM users WHERE NULL IN (SELECT id FROM orders WHERE id < 0)"
+                , "SELECT name FROM users WHERE NULL NOT IN (SELECT id FROM orders WHERE id < 0)"
+                ]
+
+    describe "query materialization" $ do
+        it "shares one subquery across predicates, ordering and output" $ do
+            let query = "SELECT name, (SELECT COUNT(*) FROM orders) AS n FROM users WHERE (SELECT COUNT(*) FROM orders) > 0 ORDER BY (SELECT COUNT(*) FROM orders) + age DESC"
+                (result, scans) = countedRun query
+            fmap (map (map snd)) result `shouldBe` Right [[VStr "Carol", VInt 3], [VStr "Alice", VInt 3], [VStr "Bob", VInt 3]]
+            scanTimes "orders" scans `shouldBe` 1
+            sameResultAsUnoptimized query
+
+        it "shares correlated results by referenced values across operators" $ do
+            let query = "SELECT o.product, (SELECT COUNT(*) FROM users u WHERE u.id = o.user_id) AS n FROM orders o WHERE (SELECT COUNT(*) FROM users u WHERE u.id = o.user_id) > 0 ORDER BY o.product"
+                (result, scans) = countedRun query
+            fmap (map (map snd)) result `shouldBe` Right [[VStr "Book", VInt 1], [VStr "Cup", VInt 1], [VStr "Pen", VInt 1]]
+            scanTimes "users" scans `shouldBe` 2
+            sameResultAsUnoptimized query
+
+        it "shares rows while preserving each subquery consumer's semantics" $ do
+            let (result, scans) = countedRun "SELECT EXISTS (SELECT id FROM orders) AS found, 1 IN (SELECT id FROM orders) AS member, 0 < ALL (SELECT id FROM orders) AS positive"
+            fmap (map (map snd)) result `shouldBe` Right [[VBool True, VBool True, VBool True]]
+            scanTimes "orders" scans `shouldBe` 1
+            fst (countedRun "SELECT EXISTS (SELECT id FROM orders), (SELECT id FROM orders)")
+                `shouldBe` Left "scalar subquery returned more than one row"
+
+        it "shares empty results without confusing NULL and existence" $ do
+            let (result, scans) = countedRun "SELECT (SELECT id FROM orders WHERE id < 0) AS empty, EXISTS (SELECT id FROM orders WHERE id < 0) AS found, 1 IN (SELECT id FROM orders WHERE id < 0) AS member"
+            fmap (map (map snd)) result `shouldBe` Right [[VNull, VBool False, VBool False]]
+            scanTimes "orders" scans `shouldBe` 1
+
+        it "materializes repeated CTE bodies before applying source aliases" $ do
+            let query = "WITH t AS (SELECT id, name FROM users) SELECT a.name, b.name FROM t a JOIN t b ON a.id = b.id ORDER BY a.name"
+                (result, scans) = countedRun query
+            fmap (map (map snd)) result `shouldBe` Right [[VStr "Alice", VStr "Alice"], [VStr "Bob", VStr "Bob"], [VStr "Carol", VStr "Carol"]]
+            scanTimes "users" scans `shouldBe` 1
+            sameResultAsUnoptimized query
+
+        it "materializes repeated derived bodies and preserves duplicate rows" $ do
+            let query = "SELECT a.user_id, b.user_id FROM (SELECT user_id FROM orders) a JOIN (SELECT user_id FROM orders) b ON a.user_id = b.user_id"
+                (result, scans) = countedRun query
+            fmap (map (map snd)) result `shouldBe` Right [[VInt 1, VInt 1], [VInt 1, VInt 1], [VInt 2, VInt 2], [VInt 1, VInt 1], [VInt 1, VInt 1]]
+            scanTimes "orders" scans `shouldBe` 1
+            sameResultAsUnoptimized query
+
+        it "does not materialize unused subqueries or hide execution errors" $ do
+            let (result, scans) = countedRun "SELECT (SELECT 1 / 0 FROM orders) FROM users WHERE id < 0"
+            result `shouldBe` Right []
+            scanTimes "orders" scans `shouldBe` 0
+            fst (countedRun "WITH t AS (SELECT 1 / 0 AS bad FROM users) SELECT a.bad FROM t a JOIN t b ON a.bad = b.bad")
+                `shouldBe` Left "division by zero"
+
+        it "clears materialization between executions of the same bound query" $ do
+            case parseStatement "SELECT (SELECT COUNT(*) FROM orders) AS n" >>= Bound.bindQuery testDB of
+                Left err -> expectationFailure err
+                Right bound -> do
+                    -- | 两次执行之间修改来源数据
+                    let action = do
+                            first <- Bound.executeQueryM bound
+                            changed <- replaceAll "orders" []
+                            second <- Bound.executeQueryM bound
+                            pure (first, changed, second)
+                    case runCounting action testDB of
+                        Left err -> expectationFailure err
+                        Right ((first, changed, second), _, scans) -> do
+                            first `shouldBe` Right [[("n", VInt 3)]]
+                            changed `shouldBe` Right ()
+                            second `shouldBe` Right [[("n", VInt 0)]]
+                            scanTimes "orders" scans `shouldBe` 2
+
+        it "keeps enclosing rows distinct for raw name-based subquery calls" $ do
+            let statement = Select [("value", Col "id")] FromUnit Nothing [] Nothing [] Nothing
+                plan = Compute [("value", ScalarSub (Subquery statement ["id"]))] (Scan Nothing "users" Nothing)
+            evalRelOp testDB plan `shouldBe` Right [[("value", VInt 1)], [("value", VInt 2)], [("value", VInt 3)]]
+
+        it "executes repeated CTE references through real storage" $
+            withTestSession $ \srv -> withServerEnv srv $ do
+                -- | 在实际存储执行数据和查询语句
+                let query input = case parseStatement input of
+                        Left err -> pure (Left err)
+                        Right statement -> runIPCStorage (runStatementM statement)
+                query "CREATE TABLE materialized (id int, amount int)" `shouldReturn` Right []
+                query "INSERT INTO materialized (id, amount) VALUES (1, 10), (2, 20)" `shouldReturn` Right []
+                query "WITH t AS (SELECT id, amount FROM materialized) SELECT a.id, a.amount + b.amount AS total FROM t a JOIN t b ON a.id = b.id ORDER BY a.id"
+                    `shouldReturn` Right [[("a.id", VInt 1), ("total", VInt 20)], [("a.id", VInt 2), ("total", VInt 40)]]
 
     describe "ChuSQL.Core.Engine (聚合与 GROUP BY)" $ do
         -- sql：在默认库上跑 SQL 取结果行
@@ -1830,6 +2108,85 @@ main = hspec $ do
                 Right plan -> do
                     evalRelOp testDB plan `shouldBe` Right [[("user_id", VInt 1), ("COUNT(*)", VInt 2)], [("user_id", VInt 2), ("COUNT(*)", VInt 1)]]
                     evalRelOp testDB (optimize testDB plan) `shouldBe` evalRelOp testDB plan
+
+    describe "HAVING and expression ordering" $ do
+        -- | 在固定测试库执行查询
+        let sql text = rowsOf (parseStatement text >>= runStatement testDB)
+        it "filters groups using aggregates absent from the projection" $ do
+            sql "SELECT user_id FROM orders GROUP BY user_id HAVING COUNT(*) > 1 ORDER BY SUM(id) DESC"
+                `shouldBe` Right [[("user_id", VInt 1)]]
+
+        it "creates one implicit group, including an empty input" $ do
+            sql "SELECT 7 AS n FROM users HAVING COUNT(*) = 3" `shouldBe` Right [[("n", VInt 7)]]
+            sql "SELECT COUNT(*) AS n FROM users WHERE id < 0 HAVING COUNT(*) = 0"
+                `shouldBe` Right [[("n", VInt 0)]]
+            sql "SELECT 7 AS n FROM users WHERE id < 0 HAVING TRUE" `shouldBe` Right [[("n", VInt 7)]]
+            sql "SELECT COUNT(*) FROM users HAVING NULL" `shouldBe` Right []
+            sql "SELECT COUNT(*) FROM users HAVING FALSE" `shouldBe` Right []
+
+        it "checks grouping, boolean predicates and nested aggregates" $ do
+            mapM_ (\query -> sql query `shouldSatisfy` isLeft)
+                [ "SELECT name FROM users HAVING TRUE"
+                , "SELECT COUNT(*) FROM users HAVING age > 20"
+                , "SELECT COUNT(*) FROM users HAVING 1"
+                , "SELECT COUNT(*) FROM users HAVING SUM(COUNT(*)) > 0"
+                , "SELECT name FROM users ORDER BY COUNT(*)"
+                , "SELECT COUNT(*) AS n FROM users HAVING n > 0"
+                ]
+
+        it "rewrites aggregate calls inside IN predicates" $ do
+            sql "SELECT user_id FROM orders GROUP BY user_id HAVING COUNT(*) IN (1, 2) ORDER BY COUNT(*) DESC"
+                `shouldBe` Right [[("user_id", VInt 1)], [("user_id", VInt 2)]]
+            sql "SELECT COUNT(*) AS n FROM users HAVING 3 IN (COUNT(*), SUM(age))"
+                `shouldBe` Right [[("n", VInt 3)]]
+
+        it "combines expressions, aliases and output positions" $ do
+            sql "SELECT name AS n, age FROM users ORDER BY age - 25, 1 DESC LIMIT 2"
+                `shouldBe` Right [[("n", VStr "Bob"), ("age", VInt 17)], [("n", VStr "Alice"), ("age", VInt 25)]]
+            sql "SELECT name FROM users ORDER BY length(name), name DESC"
+                `shouldBe` Right [[("name", VStr "Bob")], [("name", VStr "Carol")], [("name", VStr "Alice")]]
+            sql "SELECT name AS n FROM users ORDER BY n + 1" `shouldSatisfy` isLeft
+
+        it "keeps projection errors deferred until after LIMIT" $ do
+            sql "SELECT 1 / (age - 17) AS n FROM users ORDER BY age + 0 DESC LIMIT 1"
+                `shouldSatisfy` either (const False) ((== 1) . length)
+            sql "SELECT name FROM users ORDER BY 1 / (age - 17) LIMIT 0"
+                `shouldBe` Left "division by zero"
+
+        it "sorts DISTINCT only by expressions present in its output" $ do
+            sql "SELECT DISTINCT age + 1 AS n FROM users ORDER BY age + 1 DESC LIMIT 1"
+                `shouldBe` Right [[("n", VInt 31)]]
+            sql "SELECT DISTINCT name FROM users ORDER BY age + 1" `shouldSatisfy` isLeft
+
+        it "expands CTEs inside HAVING and ORDER BY subqueries" $ do
+            sql "WITH x AS (SELECT id FROM users) SELECT name FROM users ORDER BY (SELECT MAX(id) FROM x) - age"
+                `shouldBe` Right [[("name", VStr "Carol")], [("name", VStr "Alice")], [("name", VStr "Bob")]]
+            sql "WITH x AS (SELECT id FROM users) SELECT COUNT(*) AS n FROM users HAVING COUNT(*) = (SELECT COUNT(*) FROM x)"
+                `shouldBe` Right [[("n", VInt 3)]]
+
+        it "binds correlated HAVING and ordering to their enclosing rows" $ do
+            sql "SELECT u.id FROM users u WHERE EXISTS (SELECT COUNT(*) FROM orders o HAVING COUNT(*) >= u.id) ORDER BY u.id"
+                `shouldBe` Right [[("u.id", VInt 1)], [("u.id", VInt 2)], [("u.id", VInt 3)]]
+            sql "SELECT u.name FROM users u ORDER BY (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) DESC, u.name"
+                `shouldBe` Right [[("u.name", VStr "Alice")], [("u.name", VStr "Bob")], [("u.name", VStr "Carol")]]
+
+        it "preserves semantics through optimizer rewrites" $ do
+            mapM_ sameResultAsUnoptimized
+                [ "SELECT user_id FROM orders GROUP BY user_id HAVING COUNT(*) > 1 ORDER BY SUM(id) + 1 LIMIT 1"
+                , "SELECT name FROM users ORDER BY age + 1 DESC, name LIMIT 2"
+                , "SELECT DISTINCT age + 1 FROM users ORDER BY age + 1"
+                ]
+
+        it "executes grouped HAVING and expression sorting through storage IPC" $
+            withTestSession $ \srv -> withServerEnv srv $ do
+                -- | 通过真实存储执行 SQL
+                let query text = case parseStatement text of
+                        Left err -> pure (Left err)
+                        Right statement -> runIPCStorage (runStatementM statement)
+                query "CREATE TABLE grouped (agg1 int, amount int)" `shouldReturn` Right []
+                query "INSERT INTO grouped (agg1, amount) VALUES (1, 10), (1, 20), (2, 5)" `shouldReturn` Right []
+                query "SELECT agg1, SUM(amount) AS total FROM grouped GROUP BY agg1 HAVING SUM(amount) > 5 ORDER BY SUM(amount) + agg1 DESC LIMIT 1"
+                    `shouldReturn` Right [[("agg1", VInt 1), ("total", VInt 30)]]
 
     describe "ChuSQL end-to-end" $ do
         it "parses and executes a complex query" $ do
@@ -1959,7 +2316,8 @@ main = hspec $ do
                 `shouldBe` Right (Just (LitBool False))
 
         it "picks the index only when the statistics make it cheaper" $ do
-            let stat rows distinct indexes = TableMeta rows [(c, d, False) | (c, d) <- distinct] [] indexes
+            let stat rows distinct
+                  = TableMeta rows [(c, d, False) | (c, d) <- distinct] []
                 dbWith m = [("users", Table "users" [("id", TInt), ("name", TStr)] [] (Just m) Nothing Nothing)]
                 unknown = [("users", Table "users" [("id", TInt), ("name", TStr)] [] Nothing Nothing Nothing)]
                 point = Filter (Eq (Col "id") (LitInt 1)) (Scan Nothing "users" Nothing)
@@ -2282,7 +2640,7 @@ main = hspec $ do
                             err `shouldContain` "config file not found"
                             err `shouldContain` path
                         Right handle -> closeStorage handle >> expectationFailure "expected missing config error"
-            poolRun pool (map checkOpen paths) >> pure ()
+            void (poolRun pool (map checkOpen paths))
 
         it "returns FFI input errors from workers and remains usable" $ do
             withTestSession $ \srv -> do
@@ -2293,9 +2651,47 @@ main = hspec $ do
                         requested `shouldSatisfy` either (isInfixOf "request is not valid UTF-8") (const False)
                         maintained <- maintainStorage (dataDir srv ++ ".toml") (BS.pack [255])
                         maintained `shouldSatisfy` either (isInfixOf "invalid utf-8") (const False)
-                poolRun pool (replicate 16 checkErrors) >> pure ()
+                void (poolRun pool (replicate 16 checkErrors))
                 sendRawRequest (BSC.pack "{\"method\":\"ping\"}")
                     `shouldReturn` Right (BSC.pack "{\"status\":\"pong\"}")
+
+        it "executes bound writes and CHECKs through real storage" $ do
+            withTestSession $ \srv -> withServerEnv srv $ do
+                -- | 解析并通过真实存储执行写语句
+                let query source = case parseStatement source of
+                        Left err -> expectationFailure err >> pure (Left err)
+                        Right statement -> runIPCStorage (runStatementM statement)
+                query "CREATE DOMAIN quantity AS INT" `shouldReturn` Right []
+                query "CREATE TABLE bound_writes (qty quantity DEFAULT 2, id INT, name TEXT CHECK (length(name) > 1))"
+                    `shouldReturn` Right []
+                query "INSERT INTO bound_writes (id, name) VALUES (1, 'abc'), (2, 'def')" `shouldReturn` Right []
+                rejectedInsert <- query "INSERT INTO bound_writes (id, qty, qty, name) VALUES (99, 1, 9, 'ok')"
+                rejectedInsert `shouldSatisfy` either (isInfixOf "INSERT: duplicate target column: qty") (const False)
+                query "SELECT id, qty FROM bound_writes" `shouldReturn` Right
+                    [[("id", VInt 1), ("qty", VInt 2)], [("id", VInt 2), ("qty", VInt 2)]]
+                query "UPDATE bound_writes SET qty = qty + (SELECT MIN(id) FROM bound_writes) WHERE id = 1"
+                    `shouldReturn` Right []
+                query "UPDATE bound_writes SET qty = qty + 1, qty = qty + id WHERE id = 1"
+                    `shouldReturn` Right []
+                rejected <- query "UPDATE bound_writes SET qty = qty + 10, name = 'x' WHERE id = 1"
+                rejected `shouldSatisfy` either (isInfixOf "CHECK on name failed") (const False)
+                query "DELETE FROM bound_writes WHERE qty = 2" `shouldReturn` Right []
+                query "SELECT id, qty, name FROM bound_writes" `shouldReturn` Right
+                    [[("id", VInt 1), ("qty", VInt 5), ("name", VStr "abc")]]
+
+        it "keeps enclosing scopes distinct through real storage" $ do
+            withTestSession $ \srv -> withServerEnv srv $ do
+                -- | 解析并通过真实存储执行相关查询
+                let query source = case parseStatement source of
+                        Left err -> expectationFailure err >> pure (Left err)
+                        Right statement -> runIPCStorage (runStatementM statement)
+                query "CREATE TABLE scope_far (id INT)" `shouldReturn` Right []
+                query "CREATE TABLE scope_near (id INT)" `shouldReturn` Right []
+                query "INSERT INTO scope_far (id) VALUES (1), (2)" `shouldReturn` Right []
+                query "INSERT INTO scope_near (id) VALUES (10), (11)" `shouldReturn` Right []
+                query "SELECT o.id, (SELECT (SELECT id) FROM scope_near n WHERE n.id = o.id + 9) AS nearest FROM scope_far o"
+                    `shouldReturn` Right [[("o.id", VInt 1), ("nearest", VInt 10)]
+                        , [("o.id", VInt 2), ("nearest", VInt 11)]]
 
         it "persists runtime type identities and nested values across restart" $ do
             withTestSession $ \srv -> do
@@ -2442,17 +2838,87 @@ main = hspec $ do
                 closeConnection
                 Right link <- localStorageLink (Just (dataDir srv ++ ".toml"))
                 setStorageLink link {slRequest = \payload -> do
-                    if BSC.pack "schema_guard" `BS.isInfixOf` payload
-                        then do
-                            changed <- slRequest link (BSC.pack "{\"method\":\"replace_schema\",\"database\":\"ipctest\",\"table\":\"raced\",\"columns\":[{\"name\":\"id\",\"ty\":\"int\"},{\"name\":\"extra\",\"ty\":\"str\"}],\"rows\":[]}")
-                            changed `shouldSatisfy` either (const False) (BS.isInfixOf (BSC.pack "ok"))
-                        else pure ()
+                    when (BSC.pack "schema_guard" `BS.isInfixOf` payload)
+                      $ do changed <- slRequest
+                                        link
+                                        (BSC.pack
+                                           "{\"method\":\"replace_schema\",\"database\":\"ipctest\",\"table\":\"raced\",\"columns\":[{\"name\":\"id\",\"ty\":\"int\"},{\"name\":\"extra\",\"ty\":\"str\"}],\"rows\":[]}")
+                           changed
+                             `shouldSatisfy` either (const False) (BS.isInfixOf (BSC.pack "ok"))
                     slRequest link payload}
                 case parseStatement "SELECT id FROM raced" >>= Bound.bindQuery catalog of
                     Left err -> expectationFailure err
                     Right query -> do
                         result <- runIPCStorage (Bound.executeQueryM query)
                         result `shouldSatisfy` either (isInfixOf "bound query schema changed") (const False)
+
+        it "rejects restored-schema races at the actual INSERT UPDATE DELETE and ALTER write" $ do
+            mapM_ (\(method, sql) -> withTestSession $ \srv -> withServerEnv srv $ do
+                runIPCStorage (createTable "write_race" [("id", TInt), ("qty", TInt)]) `shouldReturn` Right ()
+                runIPCStorage (insert "write_race" [("id", VInt 1), ("qty", VInt 5)]) `shouldReturn` Right ()
+                closeConnection
+                Right link <- localStorageLink (Just (dataDir srv ++ ".toml"))
+                setStorageLink link {slRequest = \payload -> do
+                    when (BSC.pack "schema_guard" `BS.isInfixOf` payload
+                        && BSC.pack ("\"method\":\"" ++ method ++ "\"") `BS.isInfixOf` payload) $ do
+                        added <- slRequest link (BSC.pack "{\"method\":\"replace_schema\",\"database\":\"ipctest\",\"table\":\"write_race\",\"columns\":[{\"name\":\"id\",\"ty\":\"int\"},{\"name\":\"qty\",\"ty\":\"int\"},{\"name\":\"extra\",\"ty\":\"str\"}],\"rows\":[{\"id\":1,\"qty\":5,\"extra\":\"x\"}]}")
+                        added `shouldSatisfy` either (const False) (BS.isInfixOf (BSC.pack "ok"))
+                        restored <- slRequest link (BSC.pack "{\"method\":\"replace_schema\",\"database\":\"ipctest\",\"table\":\"write_race\",\"columns\":[{\"name\":\"id\",\"ty\":\"int\"},{\"name\":\"qty\",\"ty\":\"int\"}],\"rows\":[{\"id\":1,\"qty\":5}]}")
+                        restored `shouldSatisfy` either (const False) (BS.isInfixOf (BSC.pack "ok"))
+                    slRequest link payload}
+                case parseStatement sql of
+                    Left err -> expectationFailure err
+                    Right statement -> do
+                        result <- runIPCStorage (runStatementM statement)
+                        result `shouldSatisfy` either (isInfixOf "bound query schema changed") (const False)
+                        runIPCStorage (scan "write_race") `shouldReturn` Right [[("id", VInt 1), ("qty", VInt 5)]])
+                [ ("insert_batch", "INSERT INTO write_race (id, qty) VALUES (2, 9)")
+                , ("replace_all", "UPDATE write_race SET qty = qty + 1")
+                , ("delete_keys", "DELETE FROM write_race WHERE id = 1")
+                , ("replace_schema", "ALTER TABLE write_race ADD COLUMN note TEXT")
+                ]
+
+        it "rechecks cross-database subquery dependencies before publishing a write" $ do
+            withTestSession $ \srv -> withServerEnv srv $ do
+                runIPCStorage (createTable "write_target" [("id", TInt)]) `shouldReturn` Right ()
+                runIPCStorage (insert "write_target" [("id", VInt 1)]) `shouldReturn` Right ()
+                runIPCStorage (createDatabase "write_source") `shouldReturn` Right ()
+                runIPCStorage (createTable "write_source.source" [("id", TInt)]) `shouldReturn` Right ()
+                runIPCStorage (insert "write_source.source" [("id", VInt 2)]) `shouldReturn` Right ()
+                closeConnection
+                Right link <- localStorageLink (Just (dataDir srv ++ ".toml"))
+                setStorageLink link {slRequest = \payload -> do
+                    when (BSC.pack "schema_guard" `BS.isInfixOf` payload
+                        && BSC.pack "\"method\":\"replace_all\"" `BS.isInfixOf` payload) $ do
+                        changed <- slRequest link (BSC.pack "{\"method\":\"replace_schema\",\"database\":\"write_source\",\"table\":\"source\",\"columns\":[{\"name\":\"id\",\"ty\":\"bigint\"}],\"rows\":[{\"id\":2}]}")
+                        changed `shouldSatisfy` either (const False) (BS.isInfixOf (BSC.pack "ok"))
+                    slRequest link payload}
+                case parseStatement "UPDATE ipctest.write_target SET id = (SELECT id FROM write_source.source)" of
+                    Left err -> expectationFailure err
+                    Right statement -> do
+                        result <- runIPCStorageIn (runStatementM statement) (envForDatabase Nothing)
+                        result `shouldSatisfy` either (isInfixOf "bound query schema changed") (const False)
+                        runIPCStorage (scan "write_target") `shouldReturn` Right [[("id", VInt 1)]]
+
+        it "guards newly referenced DOMAIN definitions during ALTER" $ do
+            withTestSession $ \srv -> withServerEnv srv $ do
+                runIPCStorage (runStatementM (CreateDomain "new_quantity" CInt)) `shouldReturn` Right []
+                runIPCStorage (createTable "domain_target" [("id", TInt)]) `shouldReturn` Right ()
+                closeConnection
+                Right link <- localStorageLink (Just (dataDir srv ++ ".toml"))
+                setStorageLink link {slRequest = \payload -> do
+                    when (BSC.pack "schema_guard" `BS.isInfixOf` payload
+                        && BSC.pack "\"method\":\"replace_schema\"" `BS.isInfixOf` payload) $ do
+                        changed <- slRequest link (BSC.pack "{\"method\":\"replace_schema\",\"database\":\"ipctest\",\"table\":\"__system_domain_new_quantity\",\"columns\":[{\"name\":\"base\",\"ty\":\"bigint\"}],\"rows\":[]}")
+                        changed `shouldSatisfy` either (const False) (BS.isInfixOf (BSC.pack "ok"))
+                    slRequest link payload}
+                case parseStatement "ALTER TABLE domain_target ADD COLUMN qty new_quantity" of
+                    Left err -> expectationFailure err
+                    Right statement -> do
+                        result <- runIPCStorage (runStatementM statement)
+                        result `shouldSatisfy` either (isInfixOf "bound query schema changed") (const False)
+                        Right catalog <- runIPCStorage schema
+                        fmap (map fst . tableCols) (lookup "domain_target" catalog) `shouldBe` Just ["id"]
 
         it "doListTables returns the tables that exist" $ do
             withTestSession $ \srv -> withServerEnv srv $ do
@@ -2524,6 +2990,7 @@ main = hspec $ do
                                 , selectFrom = FromTable Nothing "ipc_idx"
                                 , selectWhere = Just (Eq (Col "id") (LitInt 42))
                                 , selectGroupBy = []
+                                , selectHaving = Nothing
                                 , selectOrderBy = []
                                 , selectLimit = Nothing
                                 }
@@ -2840,6 +3307,31 @@ main = hspec $ do
                 `shouldSatisfy` either (isInfixOf "CHECK") (const False)
             vals (step db "INSERT INTO ck (age) VALUES (5)") "SELECT age FROM ck" `shouldBe` Right [[VInt 5]]
 
+        it "validates CHECK types and row-only expressions before creating an empty table" $ do
+            mapM_ (\ddl -> (parseStatement ddl >>= runStatement testDB) `shouldSatisfy` isLeft)
+                [ "CREATE TABLE invalid_ck (age int CHECK (age + 1))"
+                , "CREATE TABLE invalid_ck (age int CHECK (length(age) > 0))"
+                , "CREATE TABLE invalid_ck (age int CHECK (missing(age) > 0))"
+                , "CREATE TABLE invalid_ck (age int CHECK (COUNT(*) > 0))"
+                , "CREATE TABLE invalid_ck (age int CHECK (EXISTS (SELECT 1)))"
+                , "CREATE TABLE invalid_ck (age int CHECK (unknown > 0))"
+                ]
+
+        it "validates added CHECKs against existing and new column types" $ do
+            let db = withTable "CREATE TABLE add_ck (name text)"
+                run input = parseStatement input >>= runStatement db
+            run "ALTER TABLE add_ck ADD COLUMN age int CHECK (length(age) > 0)"
+                `shouldSatisfy` isLeft
+            run "ALTER TABLE add_ck ADD COLUMN age int CHECK (name > 0)"
+                `shouldSatisfy` isLeft
+            case run "ALTER TABLE add_ck ADD COLUMN age int CHECK (age > length(name))" of
+                Left err -> expectationFailure err
+                Right (updated, _) -> do
+                    vals (step updated "INSERT INTO add_ck (name, age) VALUES ('ab', 3)") "SELECT age FROM add_ck"
+                        `shouldBe` Right [[VInt 3]]
+                    (parseStatement "INSERT INTO add_ck (name, age) VALUES ('ab', 1)" >>= runStatement updated)
+                        `shouldSatisfy` either (isInfixOf "CHECK") (const False)
+
     describe "ChuSQL.Core.Engine (ALTER TABLE)" $ do
         -- vals：在给定库上跑 SQL 只取值
         let vals db input = fmap (map (map snd)) (parseStatement input >>= rowsOf . runStatement db)
@@ -2875,6 +3367,27 @@ main = hspec $ do
             vals widened "SELECT id FROM ty" `shouldBe` Right [[VInt 7]]
             let texty = step (withTable "CREATE TABLE ty2 (name str)") "INSERT INTO ty2 (name) VALUES ('x')"
             run texty "ALTER TABLE ty2 ALTER COLUMN name TYPE int" `shouldSatisfy` isLeft
+
+        it "rejects structural changes that invalidate CHECKs even on empty tables" $ do
+            let empty = withTable "CREATE TABLE checked_ddl (name text, qty int CHECK (qty > length(name)))"
+                filled = step empty "INSERT INTO checked_ddl (name, qty) VALUES ('ab', 3)"
+            mapM_ (\(db, expected) -> do
+                run db "ALTER TABLE checked_ddl DROP COLUMN name" `shouldSatisfy` isLeft
+                run db "ALTER TABLE checked_ddl RENAME COLUMN name TO label" `shouldSatisfy` isLeft
+                run db "ALTER TABLE checked_ddl ALTER COLUMN name TYPE int" `shouldSatisfy` isLeft
+                run db "ALTER TABLE checked_ddl ALTER COLUMN qty TYPE text" `shouldSatisfy` isLeft
+                vals db "SELECT name, qty FROM checked_ddl"
+                    `shouldBe` Right expected) [(empty, []), (filled, [[VStr "ab", VInt 3]])]
+            case run filled "ALTER TABLE checked_ddl DROP COLUMN qty" of
+                Left err -> expectationFailure err
+                Right (remaining, _) -> vals remaining "SELECT name FROM checked_ddl" `shouldBe` Right [[VStr "ab"]]
+            run filled "ALTER TABLE checked_ddl ALTER COLUMN qty TYPE bigint" `shouldSatisfy` isRight
+
+        it "rejects type changes that invalidate defaults or key capabilities" $ do
+            let defaults = withTable "CREATE TABLE default_ddl (name text DEFAULT 'hello')"
+                keys = withTable "CREATE TABLE key_ddl (qty int UNIQUE)"
+            run defaults "ALTER TABLE default_ddl ALTER COLUMN name TYPE int" `shouldSatisfy` isLeft
+            run keys "ALTER TABLE key_ddl ALTER COLUMN qty TYPE LIST<Int>" `shouldSatisfy` isLeft
 
         it "ALTER COLUMN SET/DROP DEFAULT changes what omitted columns get" $ do
             let base = withTable "CREATE TABLE df (id int, tag str)"
@@ -3277,6 +3790,8 @@ instance Monad ProbeStorage where
 instance MonadStorage ProbeStorage where
     -- \| 测试视图不支持并发结构变更
     withSchemaGuard _ action = action
+    -- | 测试视图不支持并发结构变更
+    withWriteSchemaGuard _ action = action
     scan table = ProbeStorage $ \probe -> do
         recordCall probe ("scan:" ++ table)
         pure (Right (tableRows (probeTable probe)))
@@ -3324,7 +3839,7 @@ filterPushedIntoLeft _ = False
 -- | 左侧子树里出现了下推下来的谓词（点查 / 范围 / 过滤）
 pushedIntoLeft :: RelOp -> Bool
 pushedIntoLeft (Filter _ _) = True
-pushedIntoLeft (Range _ _ _ _ _) = True
+pushedIntoLeft (Range {}) = True
 pushedIntoLeft (Project _ x) = pushedIntoLeft x
 pushedIntoLeft _ = False
 
@@ -3389,9 +3904,9 @@ firstFilterCond (Limit _ x) = firstFilterCond x
 firstFilterCond (Join _ l r _) = case firstFilterCond l of
     Just p -> Just p
     Nothing -> firstFilterCond r
-firstFilterCond (Scan _ _ _) = Nothing
-firstFilterCond (Lookup _ _ _ _) = Nothing
-firstFilterCond (Range _ _ _ _ _) = Nothing
+firstFilterCond (Scan {}) = Nothing
+firstFilterCond (Lookup {}) = Nothing
+firstFilterCond (Range {}) = Nothing
 firstFilterCond (Derived _ x) = firstFilterCond x
 
 -- | 判断计划里是否还有过滤节点
@@ -3407,9 +3922,9 @@ anyFilter (Sort _ x) = anyFilter x
 anyFilter (BoundSort _ x) = anyFilter x
 anyFilter (Limit _ x) = anyFilter x
 anyFilter (Join _ l r _) = anyFilter l || anyFilter r
-anyFilter (Scan _ _ _) = False
-anyFilter (Lookup _ _ _ _) = False
-anyFilter (Range _ _ _ _ _) = False
+anyFilter (Scan {}) = False
+anyFilter (Lookup {}) = False
+anyFilter (Range {}) = False
 anyFilter (Derived _ x) = anyFilter x
 
 -- | 去掉计划里的投影节点
@@ -3519,6 +4034,8 @@ memReplaceSchema = replaceSchema
 instance MonadStorage Counting where
     -- \| 纯测试状态在求值期间保持稳定
     withSchemaGuard _ action = action
+    -- | 纯测试状态不受外部结构变更影响
+    withWriteSchemaGuard _ action = action
     -- \| 扫描：记一笔表名，其余走内存实现
     scan t = Counting $ \db -> case runMemoryStorage (memScan t) db of
         Left e -> Left e

@@ -1,9 +1,12 @@
-module ChuSQL.Core.Engine.Algebra.Op (RelOp (..), relOpCols, renderPlan) where
+module ChuSQL.Core.Engine.Algebra.Op (RelOp (..), SemiKind (..), relOpCols, renderPlan) where
 
 import ChuSQL.Core.Model
-import ChuSQL.Core.Engine.Syntax.AST (Expr, JoinKind (..), SortDir)
+import ChuSQL.Core.Engine.Syntax.AST (Expr, Statement, JoinKind (..), SortDir)
 
 -- 关系代数算子定义、输出列推导与算子树文本渲染。
+
+-- | 区分存在匹配、无匹配与 NULL 感知排除
+data SemiKind = Matching | NonMatching | NotIn deriving (Show, Eq)
 
 data RelOp
     = Scan (Maybe String) String (Maybe [String])
@@ -20,6 +23,8 @@ data RelOp
     | BoundSort [(Expr, SortDir)] RelOp
     | Limit Int RelOp
     | Join JoinKind RelOp RelOp Expr
+    -- | 末项仅保存独立 IN 的物化身份
+    | SemiJoin SemiKind Expr Expr RelOp RelOp (Maybe Statement)
     | Derived (Maybe String) RelOp
     deriving (Show, Eq)
 
@@ -46,6 +51,7 @@ relOpCols db (Sort _ x) = relOpCols db x
 relOpCols db (BoundSort _ x) = relOpCols db x
 relOpCols db (Limit _ x) = relOpCols db x
 relOpCols db (Join _ l r _) = relOpCols db l ++ relOpCols db r
+relOpCols db (SemiJoin _ _ _ l _ _) = relOpCols db l
 relOpCols db (Derived mAlias x) = map (qualify mAlias) (relOpCols db x)
 
 -- | 连接的显示名
@@ -81,6 +87,8 @@ renderPlan = go 0
         BoundSort s x -> pad ++ "BoundSort " ++ show s ++ "\n" ++ go (ind + 1) x
         Limit n x -> pad ++ "Limit " ++ show n ++ "\n" ++ go (ind + 1) x
         Join k l r c -> pad ++ kindLabel k ++ " on " ++ show c ++ "\n" ++ go (ind + 1) l ++ "\n" ++ go (ind + 1) r
+        SemiJoin k left right l r _ -> pad ++ "SemiJoin " ++ show k ++ " keys=" ++ show (left, right)
+            ++ "\n" ++ go (ind + 1) l ++ "\n" ++ go (ind + 1) r
         Derived a x -> pad ++ "Derived " ++ show a ++ "\n" ++ go (ind + 1) x
       where
         pad = replicate (ind * 2) ' '

@@ -1,5 +1,6 @@
 module ChuSQL.Server.Security (readSecurity, writeSecurity) where
 
+import Control.Monad (when)
 import Control.Concurrent.MVar
 import Control.Exception (bracket_, mask_)
 import System.IO.Unsafe (unsafePerformIO)
@@ -21,11 +22,11 @@ readSecurity = bracket_ enter leave
     (turn, room, readers) = securityGate
     -- 登记共享读取者。
     enter = withMVar turn $ \_ -> modifyMVar_ readers $ \count -> do
-        if count == 0 then takeMVar room else pure ()
+        when (count == 0) $ takeMVar room
         pure (count + 1)
     -- 释放最后一个共享读取者。
     leave = mask_ $ modifyMVar_ readers $ \count -> do
-        if count == 1 then putMVar room () else pure ()
+        when (count == 1) $ putMVar room ()
         pure (count - 1)
 
 -- 独占执行权限或对象变更。
