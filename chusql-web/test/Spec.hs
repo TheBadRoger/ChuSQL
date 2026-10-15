@@ -34,8 +34,8 @@ import ChuSQL.Web.Static (contentTypeOf, safeRelative)
 import ChuSQL.Web.UISettings (validateUISettings)
 import Control.Concurrent (forkFinally, forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (IOException, bracket, throwIO, try)
-import Control.Monad (when)
+import Control.Exception (IOException, bracket, throwIO, try, bracket_)
+import Control.Monad (when, unless)
 import Data.Aeson (encode, object, (.=))
 import qualified Data.Aeson as A
 import qualified Data.Aeson.Key as K
@@ -159,15 +159,15 @@ getAs hs path = requestAs methodGet path hs BL.empty
 
 -- | 带 JSON 头发 POST 请求
 postAs :: [Header] -> BS.ByteString -> BL.ByteString -> TestSession WT.SResponse
-postAs hs path payload = requestAs methodPost path (jsonHeaders hs) payload
+postAs hs path = requestAs methodPost path (jsonHeaders hs)
 
 -- | 带 JSON 头发 PUT 请求
 putAs :: [Header] -> BS.ByteString -> BL.ByteString -> TestSession WT.SResponse
-putAs hs path payload = requestAs "PUT" path (jsonHeaders hs) payload
+putAs hs path = requestAs "PUT" path (jsonHeaders hs)
 
 -- | 带 JSON 头发 PATCH 请求
 patchAs :: [Header] -> BS.ByteString -> BL.ByteString -> TestSession WT.SResponse
-patchAs hs path payload = requestAs "PATCH" path (jsonHeaders hs) payload
+patchAs hs path = requestAs "PATCH" path (jsonHeaders hs)
 
 -- | 带头发 DELETE 请求
 deleteAs :: [Header] -> BS.ByteString -> TestSession WT.SResponse
@@ -214,7 +214,7 @@ ensureDatabase hs name = do
     listed <- getAs hs "/api/databases"
     expectStatusWith "list databases" listed 200
     let names = map asText (items (jsonBody listed))
-    when (name `notElem` names) $ do
+    unless (name `elem` names) $ do
         created <- postAs hs "/api/databases" (encode (object ["name" .= name]))
         expectStatusWith ("create database " <> T.unpack name) created 200
 
@@ -224,7 +224,7 @@ ensureTable hs name body = do
     listed <- getAs (withDb testDatabaseName hs) "/api/tables"
     expectStatusWith "list tables" listed 200
     let names = map (asText . at "table") (items (jsonBody listed))
-    when (name `notElem` names) $ do
+    unless (name `elem` names) $ do
         created <- postAs (withDb testDatabaseName hs) "/api/tables" body
         expectStatusWith ("create table " <> T.unpack name) created 200
 
@@ -341,9 +341,7 @@ tempFilePath name = do
 
 -- | 非重复后缀
 uniqueSuffix :: IO String
-uniqueSuffix = do
-    u <- newUnique
-    pure (show (hashUnique u))
+uniqueSuffix = do show . hashUnique <$> newUnique
 
 -- | 文件不存在也算成功
 removeIfExists :: FilePath -> IO ()
@@ -723,8 +721,8 @@ catalogSpec env = describe "databases, tables and rows" $ do
             check (arrayLen (at "columns" (jsonBody rows)) `shouldBe` 3)
             check (arrayLen (at "rows" (jsonBody rows)) `shouldBe` 1)
             check (asInt (at "total" (jsonBody rows)) `shouldBe` 1)
-            check (asInt (maybe A.Null id (nth 0 (firstRow rows))) `shouldBe` 1)
-            check (asText (maybe A.Null id (nth 1 (firstRow rows))) `shouldBe` "alice")
+            check (asInt (fromMaybe A.Null (nth 0 (firstRow rows))) `shouldBe` 1)
+            check (asText (fromMaybe A.Null (nth 1 (firstRow rows))) `shouldBe` "alice")
             updated <-
                 patchAs
                     (withDb testDatabaseName hs)
@@ -732,7 +730,7 @@ catalogSpec env = describe "databases, tables and rows" $ do
                     (encode (object ["values" .= object ["note" .= ("changed" :: Text)]]))
             expectStatusWith "update row" updated 200
             again <- getAs (withDb testDatabaseName hs) "/api/tables/people/rows?limit=10"
-            check (asText (maybe A.Null id (nth 2 (firstRow again))) `shouldBe` "changed")
+            check (asText (fromMaybe A.Null (nth 2 (firstRow again))) `shouldBe` "changed")
         it "deletes the row and then the table" $ do
             hs <- adminHeaders
             ensureDatabase hs testDatabaseName
@@ -932,7 +930,7 @@ roleSpec env = describe "roles and grants" $ do
             listed <- getAs hs "/api/roles"
             expectStatusWith "list roles" listed 200
             let matching = [view | view <- items (jsonBody listed), asText (at "name" view) == "passer"]
-            check ((concatMap (map (asBool . at "grantable") . items . at "grants") matching) `shouldBe` [True])
+            check (concatMap (map (asBool . at "grantable") . items . at "grants") matching `shouldBe` [True])
             refused <-
                 postAs
                     hs
@@ -1047,11 +1045,11 @@ querySpec env = describe "the SQL console" $ do
             ensureDatabase hs testDatabaseName
             result <- testSql hs "SELECT LIST<Int>(1, 2), length('abc')"
             expectStatusWith "typed SQL values" result 200
-            let value = maybe A.Null id (nth 0 (firstRow result))
+            let value = fromMaybe A.Null (nth 0 (firstRow result))
                 envelope = at "__chusql_runtime_v1" value
             check (arrayLen envelope `shouldBe` 3)
-            check (asInt (maybe A.Null id (nth 0 (items envelope))) `shouldBe` 1)
-            check (asInt (maybe A.Null id (nth 1 (firstRow result))) `shouldBe` 3)
+            check (asInt (fromMaybe A.Null (nth 0 (items envelope))) `shouldBe` 1)
+            check (asInt (fromMaybe A.Null (nth 1 (firstRow result))) `shouldBe` 3)
         it "runs DDL and DML and returns positional rows" $ do
             hs <- adminHeaders
             ensureDatabase hs testDatabaseName
@@ -1063,7 +1061,7 @@ querySpec env = describe "the SQL console" $ do
             expectStatusWith "select by SQL" res 200
             check (asInt (at "rowCount" (jsonBody res)) `shouldBe` 1)
             check (arrayLen (at "columns" (jsonBody res)) `shouldBe` 2)
-            check (asText (maybe A.Null id (nth 1 (firstRow res))) `shouldBe` "seven")
+            check (asText (fromMaybe A.Null (nth 1 (firstRow res))) `shouldBe` "seven")
         it "refuses an empty statement" $ do
             hs <- adminHeaders
             ensureDatabase hs testDatabaseName
@@ -1267,10 +1265,10 @@ editSpec env = describe "web editing transactions" $ withApp (webApp env) $ do
         let token = fromMaybe "" (lookup "Cookie" hs >>= parseCookieHeader sessionCookieName . TE.decodeUtf8)
         stored <- liftIO (lookupPayload (aeSessions env) token)
         app <- getState
-        res <- liftIO $ bracket
-            (setPayloadPolicy (aeSessions env) (SessionPolicy (-1) 86400))
-            (const (setPayloadPolicy (aeSessions env) defaultSessionPolicy))
-            (const (editFromApp app hs "expires" []))
+        res <- liftIO $ bracket_
+                          (setPayloadPolicy (aeSessions env) (SessionPolicy (- 1) 86400))
+                          (setPayloadPolicy (aeSessions env) defaultSessionPolicy)
+                          (editFromApp app hs "expires" [])
         expectStatusWith "expired commit" res 401
         case stored of
             Nothing -> check (expectationFailure "missing live web session")

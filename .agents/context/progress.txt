@@ -1,64 +1,41 @@
-ChuSQL 能力与进展摘要
-更新：2026-10-10
+ChuSQL 已完成事项
+更新：2026-10-13
 
-本文件是状态、测试计数及验收记录的唯一来源；用户确认其等价于 project-plan.txt。
-设计见 design-decisions.txt，限制见 known-issues.txt，后续支线见 side-branch-plan.txt。
+本文件是当前完成状态及最新验收的唯一来源，等价于 project-plan.txt；不保留历史批次、提交记录或修改流水。
+设计见 design-decisions.txt，未解决限制见 known-issues.txt，后续计划见 side-branch-plan.txt。
 
-## 主线能力
+## SQL 与查询执行
 
-- SQL：CRUD、表列约束、索引、连接、聚合、排序、分页、子查询、派生表、投影别名、CTE、比较运算符、ANY / ALL、DISTINCT / ALL 与 ORDER BY 输出列序号。
-- 优化：谓词 / 投影下推、常量折叠、点查 / 范围成本选择、贪心内连接重排、16 桶直方图、按外层绑定复用子查询与并行扫描。
-- 存储：页、堆表、B+Tree、catalog、WAL、LSN 检查点、幂等恢复与页内 compact。
-- 会话：按连接隔离工作库、快照事务、写写冲突检查、保存点和权限变更后的会话失效。
-- 身份：用户与角色统一名称空间，LOGIN / SUPERUSER / ENABLED、稳定编号、角色继承、转授权、迁移及删除清理。
-- 权限查询与撤销：当前登录身份 SHOW GRANTS、REVOKE GRANT OPTION FOR 与失效下游级联清理；工作区模块回归及 2026-10-09 所有者全量门禁通过。
-- 范式入口：专用 TCP 请求、CLI --normalize / \normalize 与 Web 结构区只读分析；CONNECT / SELECT、事务视图、稳定编号和 schema 指纹、声明及运行预算；工作区模块回归及 2026-10-09 所有者全量门禁通过。
-- 类型：CREATE / DROP / SHOW DOMAIN、库内嵌套定义、列引用、依赖 / 循环检查及持久化。
-- 相关列绑定：局部 ColumnSlot 与外层 OuterColumnSlot 分离，外层使用相对槽位，重新绑定保留外层身份；同名遮蔽及多层相关引用回归通过；仍使用扁平化外层行，多级词法作用域/来源编号尚待实施。
-- 绑定执行校验：执行前比较依赖表身份、schema 版本和列定义；IPC 每次扫描、分片、点查及范围读取在相关库读锁内复查全部依赖，再读取数据，跨库读锁按库名排序。依赖覆盖来源、连接条件、投影/过滤中的嵌套查询及递归 DOMAIN 定义，忽略数据/统计和无关对象变化。同名同结构重建或结构改变后恢复原定义使旧绑定失效；旧目录缺失编号或版本时保留列定义校验，已知身份或版本丢失则拒绝。守卫须有明确确认，未支持守卫的后端拒绝执行；纯内存视图保持稳定。多请求查询仍沿用既有数据隔离语义。本批待所有者新门禁验收。
-- bound IR 基础：SQL 查询输出类型保留嵌套 DOMAIN 引用及其基础类型；TypedExpression 按输入 schema 槽位绑定列；SQL RelOp 优化后绑定投影、过滤、计算、聚合参数、连接条件及排序/分组键；投影转换为 Compute，排序/分组使用 BoundSort/BoundAggregate，保留重复列、稳定排序、首次分组顺序及空输入聚合行为；相关子查询绑定局部和外层布局，存储返回按布局排列；独立作用域/来源身份及约束绑定尚待实施；槽位绑定基础已通过 2026-10-09 所有者全量门禁。
-- 引导与维护：初始化 system、默认 root 和 18 个内置类型；重复引导保留口令，冲突拒绝覆盖；system_catalog_manager 与 bootstrap repair / recover / reset。
-- 配置与发行：listen_host、data_dir / log_files 分离，固定 static，管理员名由 --user 指定，模板统一 resources/chusql.toml；Windows 打包安装冒烟、管道口令兼容及构建 UTF-8。
+- 实现 CRUD、表列约束、索引、INNER / LEFT JOIN、聚合、GROUP BY、HAVING、ORDER BY、LIMIT、投影别名、DISTINCT / ALL；排序支持输出序号、表达式、函数、聚合及子查询。
+- 实现标量及相关子查询、派生表、非递归 CTE、IN / EXISTS、比较与 ANY / ALL；保持 NULL 三值逻辑、重复列、稳定排序、空输入聚合及空集成员比较语义；HAVING 覆盖整体组与未投影聚合，新子句参与依赖守卫和表权限检查。
+- 实现谓词 / 投影下推、常量折叠、点查 / 范围成本选择、贪心内连接重排、16 桶直方图及保序并行扫描；子查询按定义和外层值在查询内物化、跨子句复用，相同 CTE / 派生执行子树共享结果；独立 IN / NOT IN 和简单等值相关 EXISTS / NOT EXISTS 使用哈希半连接 / 反连接。
 
-## 已实现侧分支
+## 类型与绑定
 
-以下四项已通过 2026-10-05 所有者全量门禁并提交；sudo 另有平台实机验收。
+- 建立固定类型 / 函数编号、TypeId / TypeExpr / Kind、逻辑与物理类型、版本化复合值编码；支持 Int / Double / Bool / String / List / Maybe / Tuple、length / not，接入 SQL、存储、CLI 和 Web。
+- 实现 CREATE / DROP / SHOW DOMAIN、库内嵌套定义、列引用、依赖与循环校验及持久化；查询输出保留 DOMAIN 身份。
+- 查询使用 BoundQuery；表达式、投影、连接、排序和分组按 schema 槽位绑定，存储返回行按布局整理，缺列和位置失配明确失败。
+- 相关列按最近到最远的独立词法作用域解析，局部 / 外层槽位分离；重绑定保留有效位置，失配仅允许唯一同名列重定位。子查询取值与缓存共享槽位绑定。
+- DML 使用可复用 BoundWrite，预绑定 INSERT 输入、UPDATE 目标、DELETE 布局及 CHECK / 非空 / 唯一性约束；保留默认值、自增、逐项赋值和未命中行不求值，唯一性按最终行集判断，失败不发布修改。
+- 查询与已有表写计划保存对象身份、schema 版本、列定义及传递 DOMAIN 依赖；执行前及实际存储操作锁内复查。写前握手拒绝不支持守卫的存储，跨库按名称排序取门；数据、统计和无关结构变化不使计划失效。
+- CHECK 定义与执行共用类型及槽位绑定；建表、加列和结构变更校验条件、默认值与键能力，空表不跳过，失效引用明确拒绝。
 
-- Web 编辑事务：独立连接绑定页面与数据库，跨表原子提交；保存点回退保留编辑集，冲突要求重新加载；提交去重、SQL 标签隔离与断线 / 退出清理。
-- sudo 认证：默认关闭的 allow_sudo_auth 与显式本机身份映射；操作系统保护凭据、回环对端校验及一次性 HMAC 挑战；不继承、不提权，撤销使既有会话失效。
-- 对象授权：持久化且不复用的库 / 表编号，所有者与 grant option；DATABASE CONNECT / CREATE、表级数据权限及 PUBLIC；跨入口鉴权、来源追踪、级联撤销和事务提交复查。
-- 范式检查器：基于 schema 与声明的阿姆斯特朗闭包，分析 1NF / 2NF / 3NF / BCNF；区分信息不足，输出违反依赖与一次无损分解并验证依赖保持；只读 API，最多 12 列。
+## 存储与事务
 
-## 阶段 A：类型与函数基础
+- 实现页、堆表、B+Tree、catalog、WAL、LSN 检查点、已提交组幂等恢复及页内 compact；持久化对象编号、高水位和 schema 版本，失败进入 recovery_required。
+- 实现按连接隔离工作库、整库快照事务、写写冲突检查、保存点和差分提交；权限及对象身份在事务提交时复查。
+- Web 编辑使用独立连接与页面绑定，支持跨表原子提交、保存点重放、提交去重、冲突重载、SQL 标签隔离及退出清理。
 
-- 状态：实现完成，模块测试及所有者全量门禁通过；实现提交 8ce4239，发行检查修正 0475a61，正式版 v26.10.1 发布验收进行中。
-- 固定 TypeConstructorId、结构化 TypeId、TypeExpr / Kind 与内建 Type Registry；Int / Double / Bool / String / List / Maybe / Tuple。
-- 独立 PhysicalType，递归复合值、kind / 参数校验、版本化类型和值编码、协议验证、catalog schema 及存储重载。
-- 固定 FunctionId 与 Builtin Function Registry，length / not 的签名解析和类型化执行；SQL NULL 保持三值语义。
-- schema 驱动的 TypedExpression / TypedPlan；SQL SELECT 使用 BoundQuery，函数及构造器节点携带已解析身份，输出按位置校验。
-- SQL 复合列声明、LIST / MAYBE / TUPLE、嵌套构造器、INSERT / UPDATE / CHECK / 子查询接入；CLI / Web 显示及 SQL 生成。
-- 兼容边界：旧 ColumnType 和 RelOp 保留，日期 / 时间戳 / Blob 明确使用 CompatibilityType；完整 capability / operator / cast / 用户 ADT / Extension 不在本阶段。
-- 本批已验证：Engine 466 / Server 141 / Web 75 / CLI 17 全部通过；前端运行时值 9 条断言及事务 10 项通过，改动文件注释检查无问题，git diff --check 通过。
-- 使用说明：docs/types.md；本批日志：logs/runtime-engine.log、logs/runtime-web.log、logs/runtime-web-final.log、logs/runtime-cli.log。Server 最终回归亦通过；Web 最终日志由单独重跑生成。
+## 身份、工具与发行
 
-## 既有模块验证
+- 用户与角色统一名称空间，支持 LOGIN / SUPERUSER / ENABLED、稳定编号、角色继承、迁移及删除清理；权限变更使受影响会话失效。
+- 实现对象所有权、grant option、DATABASE CONNECT / CREATE、表级数据权限及 PUBLIC、SHOW GRANTS、REVOKE GRANT OPTION FOR 和失效授权级联清理。
+- 实现默认关闭的本机 sudo 身份映射、受保护凭据、回环校验与一次性 HMAC 挑战；已验证 Windows 非提升拒绝及 Debian/WSL root 凭据安全边界。
+- 范式检查通过 Haskell / TCP / CLI / Web 提供只读分析，依据 schema 与声明检查 1NF / 2NF / 3NF / BCNF，输出违反依赖、一次无损分解及依赖保持结果。
+- 引导初始化 system、默认 root 与 18 个内置类型，重复引导保留口令并拒绝冲突；实现 system_catalog_manager 及 bootstrap repair / recover / reset。
+- 统一监听、数据 / 日志目录与配置模板；完成 Windows 分组件打包安装冒烟、管道口令兼容、敏感 SQL 诊断 / 历史脱敏及 UTF-8 构建。发行与平台未验收事项见 known-issues.txt。
 
-- 2026-10-10 schema 版本与读守卫：Rust catalog 持久化表级 schema_version；新表为 1，旧目录缺失字段保留未知版本 0，补列、列定义变化、删列、改名与类型名迁移递增；数据及统计变化不递增，相同定义及重复删列不递增，耗尽明确返回错误。新增删列及列定义替换 WAL 记录在落盘前确定目标版本，应用与恢复使用该版本，覆盖检查点失败、多次结构变化及重复恢复；旧 WAL 载荷仍可读取。版本以精确十进制字符串透传到 TableInfo / Table、IPC schema / 快照及内存 Server，内存 DDL 同样递增；BoundQuery 比较依赖版本并为真实读取携带守卫，覆盖恢复原定义、版本丢失、校验与读取之间的 DDL、四种读路径、跨库依赖变化、写请求拒绝及旧存储缺少确认。
-- 本批 Engine 511 / Server 161 / Web 80 / Rust 189，均零失败；clippy、release 动态库构建、相关文件注释检查及 git diff --check 通过。日志见 logs/schema-guard-engine.log、logs/schema-guard-server.log、logs/schema-guard-web.log、logs/schema-guard-storage.log、logs/schema-guard-build.log、logs/schema-guard-comments.log。上一批 CLI 20 / Bootstrap 9 零失败，日志见 logs/schema-bind-cli.log、logs/schema-bind-bootstrap.log，本批未重跑。尚待所有者全量门禁，未提交。
+## 最新验证
 
-- 2026-10-10 对象绑定批次：Table / TableInfo 保留库和表身份，IPC schema / 快照及内存 Server 目录透传；精确 64 位编号采用十进制字符串输出，兼容旧数值并拒绝非法输入。查询复查对象身份与传递 DOMAIN 依赖，覆盖同结构重建、身份丢失、跨库视角和无关领域变化。
-- 本批模块验证：Engine 505 / Server 160 / Web 80 / CLI 20 / Bootstrap 9，均零失败；Web 内含前端值与事务测试，17 个相关文件注释检查及 git diff --check 通过。日志见 logs/object-bind-engine.log、logs/object-bind-server.log、logs/object-bind-web.log、logs/object-bind-cli.log、logs/object-bind-bootstrap.log。本批尚待所有者全量门禁，未提交。
-- 已登记最近模块结果：Engine 501 / Server 159 / Web 80 / CLI 20 / Rust 181，均通过；2026-10-09 所有者全量门禁已验证本组结果，Bootstrap 9 项及 clippy 亦通过。
-- Web 前端事务 10 项测试通过；对象授权阶段 clippy、release 构建和改动文件注释检查通过。
-- sudo 原生凭据已验证 Windows 非提升拒绝路径及 Debian/WSL root 安全边界；其他平台链路验收仍待完成。
-- 2026-10-09 所有者全量门禁覆盖当时工作区：cargo-test / clippy、engine / server / web / cli / bootstrap、注释检查均通过；日志见 logs/cargo.log、logs/stack.log、logs/comments.log。该结果不覆盖之后的对象绑定批次。
-
-## 后续与验收
-
-- 2026-10-09 所有者全量门禁通过：三条车道全部 exit=0，STEPS=0,0,0,0，GATE_EXIT=0，用时 136 秒；Engine 501 / Server 159 / Web 80 / CLI 20 / Bootstrap 9，均零失败。此结果不替代生产恢复演练、持续负载及平台实机验收。
-
-- 2026-10-05 所有者全量门禁通过：cargo / stack / comments 全部 exit=0，STEPS=0,0,0,0，GATE_EXIT=0；bootstrap 9 项通过。Windows 正式包 CLI / Web 分组件安装验证通过。
-- 正式版 v26.10.1 包含从零介绍的发行说明；按用户要求仅发布 Windows x86_64 / Linux x86_64 的 zip / tar.gz 安装包及 SHA256。要求两平台安装验证及 Linux 测试通过，XDG 验证隔离已修复。最终发布状态待登记。
-- sudo 的 Windows 提升成功路径、macOS 编译运行及 Linux 完整提升链路待实机验收。
-- 在线安装、Linux $ORIGIN 与 macOS 发行待目标平台验收；发布签名待设计。
-- 范式自动迁移、存储查询架构扩展和 DOMAIN 自身约束等后续事项见 side-branch-plan.txt 与 known-issues.txt。
+- 全量门禁通过：Rust 191 / Engine 598 / Server 163 / Web 80 / CLI 20 / Bootstrap 9，均零失败；动态库重建、Clippy、注释检查及 git diff --check 通过；受影响 HLint 仅保留既有惰性相关建议。
+- 验收入口：gate-check/run-gate.ps1；最新日志：logs/empty-in-gate.log。局部改动验证受影响模块，较大改动执行全量门禁；当前工作区改动未提交。

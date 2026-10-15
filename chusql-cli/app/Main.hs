@@ -19,7 +19,7 @@ import ChuSQL.Interface.Link (Client, closeClient, connectClient)
 import ChuSQL.Interface.Sudo (SudoCredential, readSudoCredential)
 import ChuSQL.Interface.TOML (resolveConfigPath)
 import Control.Exception (finally)
-import Control.Monad (unless)
+import Control.Monad (unless, when)
 import Data.IORef (IORef, newIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
@@ -107,7 +107,8 @@ main = do
     let rootName = rootUserName base
         userName = fromMaybe (if optSudo options then scSudoUser config else rootName) (optUser options)
     credential <- if optSudo options then do
-        if T.null userName then reportError "sudo_auth_user is not configured" >> exitFailure else pure ()
+        when (T.null userName)
+          $ reportError "sudo_auth_user is not configured" >> exitFailure
         local <- readSudoCredential (scPort config)
         case local of
             Left message -> reportError message >> exitFailure

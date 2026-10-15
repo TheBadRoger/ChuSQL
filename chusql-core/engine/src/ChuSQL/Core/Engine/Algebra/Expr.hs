@@ -1,4 +1,4 @@
-module ChuSQL.Core.Engine.Algebra.Expr (evalExpr, evalCondForRow, colsInExpr, subqueryRefsIn, aggregatesIn, hasAggregate, bareColumns, hasSubquery, hasDivision, inValues, threeValuedNot, quantifiedCompare) where
+module ChuSQL.Core.Engine.Algebra.Expr (evalExpr, evalCondForRow, colsInExpr, subqueryRefsIn, subquerySlotsIn, subqueryColumns, aggregatesIn, hasAggregate, bareColumns, hasSubquery, hasDivision, inValues, threeValuedNot, quantifiedCompare) where
 
 import ChuSQL.Core.Model
 import ChuSQL.Core.Engine.Syntax.AST
@@ -20,10 +20,10 @@ evalExpr (OuterColumnSlot localWidth slot name) row
     | otherwise = evalExpr (ColumnSlot slot name) (drop localWidth row)
 evalExpr (FunctionCall name _) _ = Left ("unbound function call: " ++ name)
 evalExpr (Construct _ _) _ = Left "unbound runtime constructor"
-evalExpr (BoundConstruct tid arguments) row = mapM (\argument -> evalExpr argument row) arguments >>= constructSQLValue tid
+evalExpr (BoundConstruct tid arguments) row = mapM (`evalExpr` row) arguments >>= constructSQLValue tid
 evalExpr (RuntimeLiteral tid value) _ = coerceValue (CRuntime tid) (VRuntime tid value)
 evalExpr (BoundFunction fid tid arguments) row =
-    mapM (\argument -> evalExpr argument row) arguments >>= invokeSQLFunction fid tid
+    mapM (`evalExpr` row) arguments >>= invokeSQLFunction fid tid
 evalExpr LitNull _ = Right VNull
 evalExpr (LitInt n) _ = Right (VInt n)
 evalExpr (LitFloat d) _ = Right (VFloat d)
@@ -55,13 +55,13 @@ evalExpr (IsNotNull a) row = do
     Right (VBool (v /= VNull))
 evalExpr (InList a es negated) row = do
     v <- evalExpr a row
-    vs <- mapM (\e -> evalExpr e row) es
+    vs <- mapM (`evalExpr` row) es
     r <- inValues v vs
     Right (if negated then threeValuedNot r else r)
 evalExpr (ScalarSub _) _ = Left subqueryNeedsDatabase
-evalExpr (InSub _ _ _) _ = Left subqueryNeedsDatabase
+evalExpr (InSub {}) _ = Left subqueryNeedsDatabase
 evalExpr (ExistsSub _ _) _ = Left subqueryNeedsDatabase
-evalExpr (QuantCmp _ _ _ _) _ = Left subqueryNeedsDatabase
+evalExpr (QuantCmp {}) _ = Left subqueryNeedsDatabase
 evalExpr agg _ = Left ("aggregate functions are not allowed here: " ++ show agg)
 
 -- | 子查询要连上存储才能跑
@@ -112,21 +112,34 @@ colsInExpr _ = []
 
 -- | 表达式里子查询引用的外层列
 subqueryRefsIn :: Expr -> [String]
-subqueryRefsIn e = case e of
-    Construct _ arguments -> concatMap subqueryRefsIn arguments
-    BoundConstruct _ arguments -> concatMap subqueryRefsIn arguments
-    FunctionCall _ arguments -> concatMap subqueryRefsIn arguments
-    BoundFunction _ _ arguments -> concatMap subqueryRefsIn arguments
-    ScalarSub sq -> subqueryRefs sq
-    InSub a sq _ -> subqueryRefsIn a ++ subqueryRefs sq
-    InList a es _ -> concatMap subqueryRefsIn (a : es)
-    ExistsSub sq _ -> subqueryRefs sq
-    QuantCmp _ a sq _ -> subqueryRefsIn a ++ subqueryRefs sq
+subqueryRefsIn = subqueryReferences subqueryRefs
+
+-- | 提取子查询依赖的父布局表达式
+subquerySlotsIn :: Expr -> [Expr]
+subquerySlotsIn = subqueryReferences (map snd . subqueryColumns)
+
+-- | 取得原始或已绑定的外部列
+subqueryColumns :: Subquery -> [(String, Expr)]
+subqueryColumns (Subquery _ names) = [(name, Col name) | name <- names]
+subqueryColumns (BoundSubquery _ _ bindings) = bindings
+
+-- | 收集表达式中子查询的外部引用
+subqueryReferences :: (Subquery -> [a]) -> Expr -> [a]
+subqueryReferences references e = case e of
+    Construct _ arguments -> concatMap collect arguments
+    BoundConstruct _ arguments -> concatMap collect arguments
+    FunctionCall _ arguments -> concatMap collect arguments
+    BoundFunction _ _ arguments -> concatMap collect arguments
+    ScalarSub sq -> references sq
+    InSub a sq _ -> collect a ++ references sq
+    InList a es _ -> concatMap collect (a : es)
+    ExistsSub sq _ -> references sq
+    QuantCmp _ a sq _ -> collect a ++ references sq
     Add a b -> both a b
     Sub a b -> both a b
     Mul a b -> both a b
     Div a b -> both a b
-    Neg a -> subqueryRefsIn a
+    Neg a -> collect a
     Gt a b -> both a b
     Lt a b -> both a b
     Eq a b -> both a b
@@ -135,17 +148,19 @@ subqueryRefsIn e = case e of
     NotEq a b -> both a b
     And a b -> both a b
     Or a b -> both a b
-    IsNull a -> subqueryRefsIn a
-    IsNotNull a -> subqueryRefsIn a
-    CountOf a -> subqueryRefsIn a
-    SumOf a -> subqueryRefsIn a
-    AvgOf a -> subqueryRefsIn a
-    MinOf a -> subqueryRefsIn a
-    MaxOf a -> subqueryRefsIn a
+    IsNull a -> collect a
+    IsNotNull a -> collect a
+    CountOf a -> collect a
+    SumOf a -> collect a
+    AvgOf a -> collect a
+    MinOf a -> collect a
+    MaxOf a -> collect a
     _ -> []
   where
+    -- | 递归收集当前提取器的引用
+    collect = subqueryReferences references
     -- | 两个子表达式的外层列拼起来
-    both a b = subqueryRefsIn a ++ subqueryRefsIn b
+    both a b = collect a ++ collect b
 
 -- | 表达式里有没有除法（除法可能报错，不能提前或延后求值）
 hasDivision :: Expr -> Bool
@@ -181,10 +196,10 @@ hasSubquery e = case e of
     FunctionCall _ arguments -> any hasSubquery arguments
     BoundFunction _ _ arguments -> any hasSubquery arguments
     ScalarSub _ -> True
-    InSub _ _ _ -> True
+    InSub {} -> True
     InList a es _ -> any hasSubquery (a : es)
     ExistsSub _ _ -> True
-    QuantCmp _ _ _ _ -> True
+    QuantCmp {} -> True
     Add a b -> both a b
     Sub a b -> both a b
     Mul a b -> both a b
@@ -224,6 +239,8 @@ aggregatesIn e = case e of
     a@(MinOf _) -> [a]
     a@(MaxOf _) -> [a]
     QuantCmp _ a _ _ -> aggregatesIn a
+    InSub a _ _ -> aggregatesIn a
+    InList a values _ -> aggregatesIn a ++ concatMap aggregatesIn values
     Add a b -> both a b
     Sub a b -> both a b
     Mul a b -> both a b

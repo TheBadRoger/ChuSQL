@@ -122,6 +122,7 @@ pub enum Request {
         #[serde(default)]
         columns: Option<Vec<String>>,
     },
+    ValidateWrite { table: String },
     /// 分片扫描：第 shard 片只读总页数按 shards 均分后的那一段
     ScanShard {
         table: String,
@@ -231,7 +232,7 @@ impl Request {
     /// 普通表操作的统一访问边界
     pub fn table(&self) -> Option<&str> {
         match self {
-            Self::Scan { table, .. } | Self::ScanShard { table, .. }
+            Self::Scan { table, .. } | Self::ScanShard { table, .. } | Self::ValidateWrite { table }
             | Self::Insert { table, .. }
             | Self::InsertBatch { table, .. } | Self::DeleteKeys { table, .. }
             | Self::LookupByIndex { table, .. } | Self::ReplaceAll { table, .. }

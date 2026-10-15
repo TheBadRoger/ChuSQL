@@ -8,6 +8,7 @@ module ChuSQL.Web.UISettings (
     writeUISettings,
 ) where
 
+import Data.Maybe (fromMaybe)
 import Control.Exception (IOException, try)
 import qualified Data.Aeson as A
 import qualified Data.Aeson.Key as K
@@ -40,7 +41,7 @@ resolveUISettingsFile = do
         Just path -> pure path
         Nothing -> do
             ready <- firstExistingDir uiSettingsFileCandidates
-            pure (maybe firstCandidate id ready)
+            pure (fromMaybe firstCandidate ready)
   where
     -- | 首选候选路径
     firstCandidate = case uiSettingsFileCandidates of

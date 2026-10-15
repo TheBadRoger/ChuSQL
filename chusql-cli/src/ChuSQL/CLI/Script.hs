@@ -10,6 +10,7 @@ module ChuSQL.CLI.Script
     , metaHelp
     ) where
 
+import Data.Maybe (isJust)
 import ChuSQL.CLI.Normalization (normalizationArguments)
 import ChuSQL.CLI.Format (OutputFormat (..), formatName, parseFormat)
 import Data.Char (isSpace)
@@ -90,7 +91,7 @@ data ScanState = ScanNormal | ScanString | ScanLineComment | ScanBlockComment
 
 -- | 攒下来的内容里有没有一条以分号结束的语句
 statementComplete :: Text -> Bool
-statementComplete = maybe False (const True) . takeStatement
+statementComplete = isJust . takeStatement
 
 -- | 去掉结尾的空白与分号（-e 直接执行时用）
 stripTerminator :: Text -> Text

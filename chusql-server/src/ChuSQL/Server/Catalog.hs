@@ -23,6 +23,7 @@ module ChuSQL.Server.Catalog
     , removeMember
     ) where
 
+import Control.Monad (void)
 import ChuSQL.Core.Model (Row, Value (..))
 import ChuSQL.Core.Protocol (Account (..), Request (..))
 import ChuSQL.Interface.Actions (escapeStringLiteral)
@@ -112,11 +113,11 @@ readIdentities catalog = beAccounts (catBackend catalog) ReqAccountsList
 
 -- | 新建一个角色
 insertRole :: Catalog -> Text -> IO (Either String ())
-insertRole catalog role = fmap (fmap (const ())) (beAccounts (catBackend catalog) (ReqRoleCreate (normalizeRole role)))
+insertRole catalog role = fmap void (beAccounts (catBackend catalog) (ReqRoleCreate (normalizeRole role)))
 
 -- | 删掉一个角色，连同它的授权与成员边
 dropRole :: Catalog -> Text -> IO (Either String ())
-dropRole catalog role = fmap (fmap (const ())) (beAccounts (catBackend catalog) (ReqAccountDrop (normalizeRole role)))
+dropRole catalog role = fmap void (beAccounts (catBackend catalog) (ReqAccountDrop (normalizeRole role)))
 
 -- | 全部授权，都不带 grant option
 readGrants :: Catalog -> IO (Either String [Grant])

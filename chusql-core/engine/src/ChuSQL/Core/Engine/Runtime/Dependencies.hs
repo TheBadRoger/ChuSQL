@@ -1,24 +1,54 @@
-module ChuSQL.Core.Engine.Runtime.Dependencies (queryTables, domainDependencies) where
+module ChuSQL.Core.Engine.Runtime.Dependencies (queryTables, domainDependencies, typeDependencies, validateDependencies) where
 
 import ChuSQL.Core.Engine.Syntax.AST
-import ChuSQL.Core.Model (Database, ColumnType (..), columnType, tableCols, domainTableName, lastTablePart)
+import ChuSQL.Core.Model (Database, ColumnType (..), columnType, tableCols, tableIdentity, tableSchemaVersion, domainTableName, lastTablePart)
 import Data.List (nub)
 
--- 收集查询及嵌套表达式的表依赖，供绑定执行前校验目录。
+-- 收集读写语句及嵌套表达式的表依赖，供执行期校验目录。
 
--- | 收集全部查询来源表
+-- | 复查绑定依赖的身份、版本及列定义
+validateDependencies :: Database -> Database -> Either String ()
+validateDependencies expected current = mapM_ validate expected
+  where
+    -- | 数据和统计变化不使结构绑定失效
+    validate (name, table) = case lookup name current of
+        Just actual | tableIdentity actual /= tableIdentity table -> Left ("bound query object changed: " ++ name)
+        Just actual | tableSchemaVersion actual /= tableSchemaVersion table -> Left ("bound query schema changed: " ++ name)
+        Just actual | tableCols actual == tableCols table -> Right ()
+        _ -> Left ("bound query schema changed: " ++ name)
+
+-- | 收集读写目标、来源及子查询依赖
 queryTables :: Statement -> [String]
 queryTables statement = nub (case statement of
     SelectDistinct child -> queryTables child
-    Select items source condition _ _ _ -> sourceTables source
+    Select items source condition _ having ordering _ -> sourceTables source
         ++ concatMap (expressionTables . snd) items ++ concatMap expressionTables condition
+        ++ concatMap expressionTables having
+        ++ concatMap (maybe [] expressionTables . orderKeyExpression . fst) ordering
+    Insert target _ rows -> target : concatMap (concatMap expressionTables) rows
+    Update target assignments condition -> target : concatMap (expressionTables . snd) assignments
+        ++ concatMap expressionTables condition
+    Delete target condition -> target : concatMap expressionTables condition
+    DropTable target -> [target]
+    CreateIndex target _ -> [target]
+    DropIndex target _ -> [target]
+    DropColumn target _ -> [target]
+    AddColumn target _ -> [target]
+    RenameColumn target _ _ -> [target]
+    AlterColumnType target _ _ -> [target]
+    AlterColumnDefault target _ _ -> [target]
+    AlterColumnNull target _ _ -> [target]
     _ -> [])
 
 -- | 收集来源列依赖的领域定义
 domainDependencies :: Database -> [String] -> [String]
-domainDependencies catalog sources = collect []
-    [domain | (name, table) <- catalog, name `elem` sources
-        , (_, column) <- tableCols table, domain <- typeDomains (columnType column)]
+domainDependencies catalog sources = typeDependencies catalog
+    [columnType column | (name, table) <- catalog, name `elem` sources
+        , (_, column) <- tableCols table]
+
+-- | 收集声明类型依赖的领域目录
+typeDependencies :: Database -> [ColumnType] -> [String]
+typeDependencies catalog types = collect [] (concatMap typeDomains types)
   where
     -- | 递归展开定义并防止重复访问
     collect seen [] = seen

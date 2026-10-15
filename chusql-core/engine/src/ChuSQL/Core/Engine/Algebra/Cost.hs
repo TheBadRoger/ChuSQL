@@ -1,5 +1,6 @@
 module ChuSQL.Core.Engine.Algebra.Cost (tableMetaOf, probeCost, pointRows, rangeRows, selectivityOf, indexCheaper) where
 
+import Data.Maybe (fromMaybe)
 import ChuSQL.Core.Model
 
 -- 统计与成本估算：行数、不同值数、列直方图与索引探路页数。
@@ -32,8 +33,8 @@ estimateRows h lo hi = max 0 (min total (round (sum (zipWith overlap [0 ..] (his
   where
     total = sum (histBuckets h)
     width = if histHigh h > histLow h then (histHigh h - histLow h) / fromIntegral (length (histBuckets h)) else 0
-    lower = maybe (-1 / 0) id (boundOf lo)
-    upper = maybe (1 / 0) id (boundOf hi)
+    lower = fromMaybe (- (1 / 0)) (boundOf lo)
+    upper = fromMaybe (1 / 0) (boundOf hi)
     -- | 第 i 个桶与区间重叠的行数
     overlap :: Int -> Int -> Double
     overlap i count

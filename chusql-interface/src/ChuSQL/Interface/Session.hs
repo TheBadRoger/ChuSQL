@@ -17,6 +17,7 @@ module ChuSQL.Interface.Session (
     accounts,
 ) where
 
+import Data.Foldable (for_)
 import ChuSQL.Interface.Normalization
 import qualified Data.Aeson as A
 import ChuSQL.Core.Protocol (Account, QueryResult (..), TableInfo)
@@ -103,9 +104,8 @@ runStatement session sql = do
     case answer of
         Left message -> pure (Left message)
         Right result -> do
-            case qrDatabase result of
-                Just name -> writeIORef (ssCurrent session) name
-                Nothing -> pure ()
+            for_
+              (qrDatabase result) (writeIORef (ssCurrent session))
             pure (Right result)
 
 -- | 数据字典（\\dt 与 \\d 用）

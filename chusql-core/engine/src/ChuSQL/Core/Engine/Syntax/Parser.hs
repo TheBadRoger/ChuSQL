@@ -1,7 +1,9 @@
+{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE ImportQualifiedPost #-}
 
 module ChuSQL.Core.Engine.Syntax.Parser (parseStatement, parseExpression) where
 
+import Data.Functor (($>))
 import ChuSQL.Core.Model (Column (..), ColumnType (..), Value (..), plainColumn)
 import ChuSQL.Core.Engine.Builtin (Builtin (..), builtinName, builtinNames, builtinNode, compareNode)
 import ChuSQL.Core.Engine.Syntax.AST
@@ -259,15 +261,19 @@ literalValue =
     -- | 负浮点字面量
     negateLit d = VFloat (negate d)
 
--- | 一个排序列
-orderItem :: Parser (String, SortDir)
+-- | 一个排序键：输出序号、列名或表达式
+orderItem :: Parser (OrderKey, SortDir)
 orderItem = do
-    col <- qualifiedName <|> (("$position" ++) . show <$> integer)
+    expression <- expr
     dir <- sortDir
-    return (col, dir)
+    let key = case expression of
+            LitInt position -> OrderPosition position
+            Col column -> OrderColumn column
+            _ -> OrderExpression expression
+    return (key, dir)
 
 -- | ORDER BY 的列表
-orderByClause :: Parser [(String, SortDir)]
+orderByClause :: Parser [(OrderKey, SortDir)]
 orderByClause = do
     keyword "order"
     keyword "by"
@@ -337,6 +343,7 @@ reservedWords =
     , "auto_increment"
     , "type"
     , "group"
+    , "having"
     , "with"
     , "any"
     , "all"
@@ -358,9 +365,10 @@ tableRef = do
 -- | 连接类型：内连接 / 左外连接
 joinKind :: Parser JoinKind
 joinKind =
-    try (keyword "left" *> optional (keyword "outer") *> keyword "join" *> return LeftJoin)
-        <|> try (keyword "inner" *> keyword "join" *> return InnerJoin)
-        <|> (keyword "join" *> return InnerJoin)
+    try ((keyword "left" *> optional (keyword "outer") *> keyword "join")
+           $> LeftJoin)
+        <|> try ((keyword "inner" *> keyword "join") $> InnerJoin)
+        <|> (keyword "join" $> InnerJoin)
 
 -- | FROM 里的一个来源：表或派生表
 fromSource :: Parser FromClause
@@ -422,11 +430,9 @@ createTableStatement = do
 
 -- | 读 DROP TABLE
 dropTableStatement :: Parser Statement
-dropTableStatement = do
-    keyword "drop"
-    keyword "table"
-    name <- tableName
-    return (DropTable name)
+dropTableStatement = do keyword "drop"
+                        keyword "table"
+                        DropTable <$> tableName
 
 -- | 读 CREATE INDEX（列名即索引名）
 createIndexStatement :: Parser Statement
@@ -485,12 +491,10 @@ alterTableStatement = do
 
 -- | 读 CREATE USER，口令是明文
 createUserStatement :: Parser Statement
-createUserStatement = do
-    keyword "create"
-    keyword "user"
-    name <- userName
-    pw <- identifiedBy
-    return (CreateUser name pw)
+createUserStatement = do keyword "create"
+                         keyword "user"
+                         name <- userName
+                         CreateUser name <$> identifiedBy
 
 -- | 读 IDENTIFIED BY '口令'
 identifiedBy :: Parser String
@@ -529,11 +533,9 @@ alterRoleStatement = do
 
 -- | 读 DROP USER
 dropUserStatement :: Parser Statement
-dropUserStatement = do
-    keyword "drop"
-    keyword "user"
-    name <- userName
-    return (DropUser name)
+dropUserStatement = do keyword "drop"
+                       keyword "user"
+                       DropUser <$> userName
 
 -- | 读 CREATE ROLE
 createRoleStatement :: Parser Statement
@@ -613,11 +615,18 @@ columnDef = do
 columnConstraint :: Parser (Column -> Column)
 columnConstraint =
     choice
-        [ try (keyword "not" *> keyword "null" *> pure (\c -> c{columnNullable = False}))
-        , keyword "null" *> pure (\c -> c{columnNullable = True})
-        , keyword "auto_increment" *> pure (\c -> c{columnAutoIncrement = True, columnNullable = False})
-        , try (keyword "primary" *> keyword "key" *> pure (\c -> c{columnPrimaryKey = True, columnUnique = True, columnNullable = False}))
-        , keyword "unique" *> pure (\c -> c{columnUnique = True})
+        [ try ((keyword "not" *> keyword "null")
+                 $> (\ c -> c {columnNullable = False}))
+        , keyword "null" $> (\ c -> c {columnNullable = True})
+        , keyword "auto_increment"
+            $>
+              (\ c -> c {columnAutoIncrement = True, columnNullable = False})
+        , try ((keyword "primary" *> keyword "key")
+                 $>
+                   (\ c
+                      -> c {columnPrimaryKey = True, columnUnique = True,
+                            columnNullable = False}))
+        , keyword "unique" $> (\ c -> c {columnUnique = True})
         , keyword "default" *> ((\v c -> c{columnDefault = Just v}) <$> literalValue)
         , keyword "check" *> ((\s c -> c{columnCheck = Just s}) <$> checkText)
         ]
@@ -639,18 +648,18 @@ columnTypeP =
         , keyword "int" >> pure CInt
         , keyword "bigint" >> pure CBigInt
         , keyword "smallint" >> pure CSmallInt
-        , (keyword "varchar" >>) (maybe CStr CVarchar <$> optional sizeParen)
-        , (keyword "char" >>) (maybe (CChar 1) CChar <$> optional sizeParen)
+        , keyword "varchar" >> (maybe CStr CVarchar <$> optional sizeParen)
+        , keyword "char" >> (maybe (CChar 1) CChar <$> optional sizeParen)
         , keyword "text" >> pure CStr
         , keyword "str" >> pure CStr
         , keyword "boolean" >> pure CBool
         , keyword "bool" >> pure CBool
         , keyword "float" >> pure CFloat
         , keyword "real" >> pure CFloat
-        , try (keyword "double" *> keyword "precision" *> pure CDouble)
+        , try ((keyword "double" *> keyword "precision") $> CDouble)
         , keyword "double" >> pure CDouble
-        , (keyword "decimal" >>) decimalType
-        , (keyword "numeric" >>) decimalType
+        , keyword "decimal" >> decimalType
+        , keyword "numeric" >> decimalType
         , keyword "date" >> pure CDate
         , keyword "timestamp" >> pure CTimestamp
         , keyword "blob" >> pure CBlob
@@ -695,9 +704,10 @@ selectStatement = do
     fromC <- fromMaybe FromUnit <$> optional (keyword "from" *> fromClause)
     mWhere <- optional (keyword "where" *> expr)
     groupBy <- fromMaybe [] <$> optional groupByClause
+    having <- optional (keyword "having" *> expr)
     orderBy <- fromMaybe [] <$> optional orderByClause
     mLimit <- optional limitClause
-    pure $ (if distinct then SelectDistinct else id) (Select cols fromC mWhere groupBy orderBy mLimit)
+    pure $ (if distinct then SelectDistinct else id) (Select cols fromC mWhere groupBy having orderBy mLimit)
 
 -- | 读 WITH：展开每个 CTE 再读主查询
 withStatement :: Parser Statement
@@ -747,10 +757,11 @@ renameColumns name cols q@Select { selectItems = items } = do
     Right q { selectItems = zip cols (map snd items), selectOrderBy = ordering }
   where
     -- | 列清单同步改写内层排序输出别名
-    renameOrder (column, direction) = case [new | ((old, _), new) <- zip items cols, old == column] of
-        [] -> Right (column, direction)
-        [new] -> Right (new, direction)
+    renameOrder (OrderColumn column, direction) = case [new | ((old, _), new) <- zip items cols, old == column] of
+        [] -> Right (OrderColumn column, direction)
+        [new] -> Right (OrderColumn new, direction)
         _ -> Left ("WITH: ambiguous ORDER BY alias: " ++ column)
+    renameOrder ordering = Right ordering
 renameColumns _ _ _ = Left "WITH: a CTE must be a SELECT"
 
 -- | 列清单个数必须和本体输出一致
@@ -765,10 +776,16 @@ expandStatement env stmt = case stmt of
     SelectDistinct q -> SelectDistinct <$> expandStatement env q
     q@Select { selectFrom = fromC, selectItems = items, selectWhere = mWhere } -> do
         fromC' <- expandClause env fromC
-        items' <- traverse (\(name, e) -> fmap ((,) name) (expandExpr env e)) items
+        items' <- traverse (\(name, e) -> fmap (name,) (expandExpr env e)) items
         w <- traverse (expandExpr env) mWhere
-        Right q { selectFrom = fromC', selectItems = items', selectWhere = w }
+        having <- traverse (expandExpr env) (selectHaving q)
+        ordering <- mapM expandOrder (selectOrderBy q)
+        Right q { selectFrom = fromC', selectItems = items', selectWhere = w, selectHaving = having, selectOrderBy = ordering }
     _ -> Right stmt
+  where
+    -- | 展开排序表达式中的 CTE 子查询
+    expandOrder (OrderExpression expression, direction) = (,) . OrderExpression <$> expandExpr env expression <*> pure direction
+    expandOrder ordering = Right ordering
 
 -- | 来源树里的 CTE 引用换成派生表
 expandClause :: [(String, Statement)] -> FromClause -> Either String FromClause
@@ -811,7 +828,7 @@ expandExpr env e = case e of
     ScalarSub sq -> ScalarSub <$> goSub sq
     InSub x sq neg -> (\x' sq' -> InSub x' sq' neg) <$> go x <*> goSub sq
     InList x es neg -> (\x' es' -> InList x' es' neg) <$> go x <*> traverse go es
-    ExistsSub sq neg -> (\sq' -> ExistsSub sq' neg) <$> goSub sq
+    ExistsSub sq neg -> (`ExistsSub` neg) <$> goSub sq
     QuantCmp op x sq q -> (\x' sq' -> QuantCmp op x' sq' q) <$> go x <*> goSub sq
     _ -> Right e
   where

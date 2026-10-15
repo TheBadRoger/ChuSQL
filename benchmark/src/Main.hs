@@ -2,6 +2,7 @@
 
 module Main where
 
+import Data.Either (lefts)
 import ChuSQL.Core.Protocol (QueryResult (..), TableInfo (..))
 import ChuSQL.Interface.Link (Client, clientPing, closeClient, connectClient)
 import ChuSQL.Interface.Session (
@@ -15,7 +16,7 @@ import ChuSQL.Interface.Session (
 import Control.Concurrent (forkIO, forkFinally, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (IOException, bracket, evaluate, throwIO, try)
-import Control.Monad (forM, forM_, replicateM, unless, when)
+import Control.Monad (forM_, replicateM, unless, when, void)
 import Data.List (intercalate, sort)
 import ChuSQL.Core.Model (Value (..))
 import Data.Text (Text)
@@ -77,7 +78,7 @@ timedQuery bench sql = do
         Left _ -> pure (-1)
         Right result -> evaluate (qrRowCount result)
     t1 <- getMonotonicTime
-    pure (t1 - t0, either Left (const (Right n)) r)
+    pure (t1 - t0, const (Right n) =<< r)
 
 -- | 打印一行结果
 report :: String -> Either Text Int -> Double -> IO ()
@@ -107,7 +108,7 @@ batchInsert bench label n mkSql = do
     results <- mapM (runSql bench . mkSql) [1 .. n]
     t1 <- getMonotonicTime
     let total = t1 - t0
-        errs = [e | Left e <- results]
+        errs = lefts results
     case errs of
         [] -> do
             printf
@@ -181,7 +182,7 @@ runBatch bench sqls = do
     t0 <- getMonotonicTime
     results <- mapM (runSql bench) sqls
     t1 <- getMonotonicTime
-    pure (t1 - t0, [e | Left e <- results])
+    pure (t1 - t0, lefts results)
 
 -- | 把 1..n 按 size 切成一段段
 chunked :: Int -> Int -> [[Int]]
@@ -590,7 +591,7 @@ pressureScenarios bench u o = do
     _ <- batchInsert bench "200 individual durable INSERTs" 200 (\i -> printf "INSERT INTO writes (id,name,age) VALUES (%d,'w%d',%d)" i i i)
     (milliseconds, ()) <- measure $ do
         (beginMs, _) <- measure (runSql bench "BEGIN")
-        (stagedMs, ()) <- measure $ forM_ [201 .. 400 :: Int] $ \i -> runSql bench (printf "INSERT INTO writes (id,name,age) VALUES (%d,'w%d',%d)" i i i) >> pure ()
+        (stagedMs, ()) <- measure $ forM_ [201 .. 400 :: Int] $ \i -> void (runSql bench (printf "INSERT INTO writes (id,name,age) VALUES (%d,'w%d',%d)" i i i))
         (commitMs, _) <- measure (runSql bench "COMMIT")
         printf "TXN_PHASE begin_ms=%.3f staged_ms=%.3f commit_ms=%.3f\n" beginMs stagedMs commitMs
         pure ()
@@ -609,17 +610,33 @@ pressureScenarios bench u o = do
 -- | 用多条独立会话同步开始点查
 concurrentLookup :: Bench -> Int -> IO ()
 concurrentLookup bench workers = do
-    completions <- forM [1 .. workers] $ \_ -> do
-        start <- newEmptyMVar
-        done <- newEmptyMVar
-        client <- connectClient "127.0.0.1" (bPort bench) >>= either (ioError . userError . T.unpack) pure
-        session <- newSession client
-        authenticateSession session "admin" "" >>= either (ioError . userError . T.unpack) pure
-        switchDatabase session "bench" >>= either (ioError . userError . T.unpack) pure
-        _ <- forkFinally (takeMVar start >> bracket (pure client) closeClient (\_ -> replicateM 100 (fst <$> measure (do
-            result <- runStatement session "SELECT id FROM users WHERE id = 1"
-            unless (fmap qrRows result == Right [[VInt 1]]) (ioError (userError "concurrent lookup mismatch")))))) (putMVar done)
-        pure (start, done)
+    completions <- replicateM
+                     workers
+                     (do start <- newEmptyMVar
+                         done <- newEmptyMVar
+                         client <- connectClient "127.0.0.1" (bPort bench)
+                                     >>= either (ioError . userError . T.unpack) pure
+                         session <- newSession client
+                         authenticateSession session "admin" ""
+                           >>= either (ioError . userError . T.unpack) pure
+                         switchDatabase session "bench"
+                           >>= either (ioError . userError . T.unpack) pure
+                         _ <- forkFinally
+                                (takeMVar start
+                                   >>
+                                     bracket
+                                       (pure client) closeClient
+                                       (\ _
+                                          -> replicateM
+                                               100
+                                               (fst
+                                                  <$>
+                                                    measure
+                                                      (do result <- runStatement
+                                                                      session "SELECT id FROM users WHERE id = 1"
+                                                          unless (fmap qrRows result == Right [[VInt 1]]) (ioError (userError "concurrent lookup mismatch"))))))
+                                (putMVar done)
+                         pure (start, done))
     (milliseconds, results) <- measure $ do
         mapM_ (\(start, _) -> putMVar start ()) completions
         mapM (takeMVar . snd) completions

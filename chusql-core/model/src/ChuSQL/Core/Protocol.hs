@@ -15,16 +15,17 @@ module ChuSQL.Core.Protocol (
     queryResultJson,
 ) where
 
-import ChuSQL.Core.Model (Histogram (..), Row, Value (..), TableIdentity (..))
-import ChuSQL.Core.Runtime (builtinTypes, runtimeToJSON, runtimeFromJSON)
-import Data.Aeson (FromJSON (..), ToJSON (..), object, withObject, (.:), (.:?), (.!=), (.=))
+import ChuSQL.Core.Model (Histogram (..), Row, TableIdentity (..), Value (..))
+import ChuSQL.Core.Runtime (builtinTypes, runtimeFromJSON, runtimeToJSON)
+import Data.Aeson (FromJSON (..), ToJSON (..), object, withObject, (.!=), (.:), (.:?), (.=))
 import qualified Data.Aeson as A
 import qualified Data.Aeson.Key as K
 import qualified Data.Aeson.KeyMap as KM
 import Data.Aeson.Types (Parser)
-import Data.Scientific (floatingOrInteger, fromFloatDigits, base10Exponent)
-import qualified Data.Text as T
+import Data.Char (isDigit)
+import Data.Scientific (base10Exponent, floatingOrInteger, fromFloatDigits)
 import Data.Text (Text)
+import qualified Data.Text as T
 import Data.Word (Word64)
 import Text.Read (readMaybe)
 
@@ -97,6 +98,7 @@ data Request
     | ReqLookupByColumn String String Value
     | ReqRangeByIndex String String (Maybe (Value, Bool)) (Maybe (Value, Bool))
     | ReqDescribeTable String
+    | ReqValidateWrite String
     | ReqCreateTable String [SchemaColumn]
     | ReqDropTable String
     | ReqCreateIndex String String
@@ -136,6 +138,7 @@ instance ToJSON TxnOp where
 
 -- | 请求编码成 JSON
 instance ToJSON Request where
+    toJSON (ReqValidateWrite t) = object ["method" .= ("validate_write" :: T.Text), "table" .= t]
     toJSON (ReqDatabase method name) = object ["method" .= method, "database" .= name]
     toJSON ReqAllCatalog = object ["method" .= ("all_catalogs" :: T.Text)]
     toJSON (ReqInDatabase name req) = case toJSON req of
@@ -145,8 +148,16 @@ instance ToJSON Request where
     toJSON ReqAccountsList = object ["method" .= ("accounts_list" :: T.Text)]
     toJSON (ReqIdentityInitialize u) = object ["method" .= ("identity_initialize" :: T.Text), "administrator" .= u]
     toJSON (ReqRoleCreate u) = object ["method" .= ("role_create" :: T.Text), "user" .= u]
-    toJSON (ReqIdentityAlter u login super enabled manager sudo) = object ["method" .= ("identity_alter" :: T.Text), "user" .= u,
-        "can_login" .= login, "is_superuser" .= super, "enabled" .= enabled, "system_catalog_manager" .= manager, "allow_sudo_auth" .= sudo]
+    toJSON (ReqIdentityAlter u login super enabled manager sudo) =
+        object
+            [ "method" .= ("identity_alter" :: T.Text)
+            , "user" .= u
+            , "can_login" .= login
+            , "is_superuser" .= super
+            , "enabled" .= enabled
+            , "system_catalog_manager" .= manager
+            , "allow_sudo_auth" .= sudo
+            ]
     toJSON (ReqAccountCreate u h) = object ["method" .= ("account_create" :: T.Text), "user" .= u, "password_hash" .= h]
     toJSON (ReqAccountReset u h) = object ["method" .= ("account_reset" :: T.Text), "user" .= u, "password_hash" .= h]
     toJSON (ReqAccountLogin u at) = object ["method" .= ("account_login" :: T.Text), "user" .= u, "at" .= at]
@@ -286,9 +297,12 @@ instance ToJSON TableInfo where
 -- | 解码精确且有界的对象编号
 parseObjectNumber :: A.Value -> Parser Word64
 parseObjectNumber (A.String value)
-    | not (T.null value), T.length value <= 20, T.all (\c -> c >= '0' && c <= '9') value
-    , Just number <- (readMaybe (T.unpack value) :: Maybe Integer)
-    , number <= toInteger (maxBound :: Word64) = pure (fromInteger number)
+    | not (T.null value)
+    , T.length value <= 20
+    , T.all isDigit value
+    , Just number <- readMaybe (T.unpack value) :: Maybe Integer
+    , number <= toInteger (maxBound :: Word64) =
+        pure (fromInteger number)
 parseObjectNumber value@(A.Number number)
     | base10Exponent number >= -20, base10Exponent number <= 20 = A.parseJSON value
 parseObjectNumber _ = fail "invalid table object identity"
@@ -307,7 +321,7 @@ instance FromJSON TableInfo where
         count <- o .: "row_count"
         indexes <- o .:? "indexes" .!= []
         stats <- o .:? "stats" .!= []
-        indexColumns <- mapM (\v -> withObject "IndexWire" (.: "column") v) (indexes :: [A.Value])
+        indexColumns <- mapM (withObject "IndexWire" (.: "column")) (indexes :: [A.Value])
         parsed <- mapM parseStat (stats :: [A.Value])
         database <- o .:? "database_id" >>= traverse parseObjectNumber
         tableId <- o .:? "object_id" >>= traverse parseObjectNumber
@@ -319,8 +333,17 @@ instance FromJSON TableInfo where
             _ -> fail ("incomplete table object identity: " ++ show (database, tableId))
         let parsedStats = [(name, distinct, capped) | (name, distinct, capped, _) <- parsed]
             parsedHistograms = [(name, h) | (name, _, _, Just h) <- parsed]
-        pure (TableInfo table columns count indexColumns parsedStats parsedHistograms identity
-            (version >>= \v -> if v == 0 then Nothing else Just v))
+        pure
+            ( TableInfo
+                table
+                columns
+                count
+                indexColumns
+                parsedStats
+                parsedHistograms
+                identity
+                (version >>= \v -> if v == 0 then Nothing else Just v)
+            )
       where
         parseStat = withObject "ColumnStat" $ \o -> do
             name <- o .: "name"
@@ -344,7 +367,8 @@ data Account = Account
     , accountEnabled :: Bool
     , accountSystemCatalogManager :: Bool
     , accountAllowSudoAuth :: Bool
-    } deriving (Eq)
+    }
+    deriving (Eq)
 
 -- | 账号的展示：只露账号名与版本号
 instance Show Account where
@@ -352,17 +376,36 @@ instance Show Account where
 
 -- | JSON 解回账号
 instance FromJSON Account where
-    parseJSON = withObject "Account" $ \o -> Account <$> o .: "id" <*> o .: "user"
-        <*> o .: "password_hash" <*> o .: "revision"
-        <*> o .:? "registered_at" .!= "" <*> o .:? "last_login_at"
-        <*> o .:? "can_login" .!= True <*> o .:? "is_superuser" .!= False <*> o .:? "enabled" .!= True <*> o .:? "system_catalog_manager" .!= False <*> o .:? "allow_sudo_auth" .!= False
+    parseJSON = withObject "Account" $ \o ->
+        Account
+            <$> o .: "id"
+            <*> o .: "user"
+            <*> o .: "password_hash"
+            <*> o .: "revision"
+            <*> o .:? "registered_at" .!= ""
+            <*> o .:? "last_login_at"
+            <*> o .:? "can_login" .!= True
+            <*> o .:? "is_superuser" .!= False
+            <*> o .:? "enabled" .!= True
+            <*> o .:? "system_catalog_manager" .!= False
+            <*> o .:? "allow_sudo_auth" .!= False
 
 -- | 账号编码成 JSON
 instance ToJSON Account where
-    toJSON a = object ["id" .= accountId a, "user" .= accountUser a,
-        "password_hash" .= accountHash a, "revision" .= accountRevision a,
-        "registered_at" .= accountRegisteredAt a, "last_login_at" .= accountLastLoginAt a,
-        "can_login" .= accountCanLogin a, "is_superuser" .= accountIsSuperuser a, "enabled" .= accountEnabled a, "system_catalog_manager" .= accountSystemCatalogManager a, "allow_sudo_auth" .= accountAllowSudoAuth a]
+    toJSON a =
+        object
+            [ "id" .= accountId a
+            , "user" .= accountUser a
+            , "password_hash" .= accountHash a
+            , "revision" .= accountRevision a
+            , "registered_at" .= accountRegisteredAt a
+            , "last_login_at" .= accountLastLoginAt a
+            , "can_login" .= accountCanLogin a
+            , "is_superuser" .= accountIsSuperuser a
+            , "enabled" .= accountEnabled a
+            , "system_catalog_manager" .= accountSystemCatalogManager a
+            , "allow_sudo_auth" .= accountAllowSudoAuth a
+            ]
 
 -- | 存储层响应
 data Response
@@ -413,7 +456,8 @@ valueFromJSON (A.Number n) =
 valueFromJSON (A.String s) = pure (VStr (T.unpack s))
 valueFromJSON (A.Bool b) = pure (VBool b)
 valueFromJSON (A.Object fields)
-    | KM.size fields == 1, Just payload <- KM.lookup "__chusql_runtime_v1" fields =
+    | KM.size fields == 1
+    , Just payload <- KM.lookup "__chusql_runtime_v1" fields =
         either fail (pure . uncurry VRuntime) (runtimeFromJSON builtinTypes payload)
 valueFromJSON _ = fail "unsupported value type"
 
@@ -426,7 +470,7 @@ rowToJSON r =
 rowFromJSON :: A.Value -> Parser Row
 rowFromJSON (A.Object o) = mapM toPair (KM.toList o)
   where
-    -- | 键值对解成一个字段
+    -- \| 键值对解成一个字段
     toPair (k, v) = do
         val <- valueFromJSON v
         pure (K.toString k, val)
@@ -447,7 +491,8 @@ instance FromJSON QueryResult where
     parseJSON = withObject "QueryResult" $ \o -> do
         cols <- o .: "columns"
         rows <- o .: "rows"
-        QueryResult cols <$> mapM (mapM valueFromJSON) rows
+        QueryResult cols
+            <$> mapM (mapM valueFromJSON) rows
             <*> o .:? "rowCount" .!= 0
             <*> o .:? "truncated" .!= False
             <*> o .:? "database"

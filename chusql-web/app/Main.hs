@@ -2,6 +2,7 @@
 
 module Main (main) where
 
+import Control.Monad (when)
 import ChuSQL.Web.API (AppEnv (..), Live (..), newAppEnvAt, setLive, webApp)
 import ChuSQL.Interface.Auth (SessionPolicy (..), setPayloadPolicy)
 import ChuSQL.Interface.Config (
@@ -248,11 +249,11 @@ serve settings app = do
 reportCredential :: WebConfig -> Bool -> IO ()
 reportCredential cfg legacy = do
     putStrLn ("administrator: " ++ T.unpack (rootUserName cfg))
-    if legacy
-        then do
-            putStrLn "  !! the [web] section still carries a plaintext password key; it is ignored now"
-            putStrLn "  !! remove it: the administrator password lives in the __system_users system table"
-        else pure ()
+    when legacy
+      $ do putStrLn
+             "  !! the [web] section still carries a plaintext password key; it is ignored now"
+           putStrLn
+             "  !! remove it: the administrator password lives in the __system_users system table"
 
 -- | ping 一次 server，报告它通不通
 checkServer :: Text -> Int -> IO ()

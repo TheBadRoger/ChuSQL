@@ -46,6 +46,7 @@ library
                     , parser-combinators
                     , scientific
                     , text
+                    , transformers
                     , unordered-containers
                     , vector
     extra-libraries:  chusql_core_storage

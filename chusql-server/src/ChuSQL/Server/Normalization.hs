@@ -2,6 +2,7 @@
 
 module ChuSQL.Server.Normalization (normalizationBudget, normalizationReport, schemaFingerprint) where
 
+import Data.Maybe (fromMaybe)
 import qualified ChuSQL.Core.Engine.Normalization as N
 import ChuSQL.Core.Model (Column (..), parseColumnType)
 import ChuSQL.Core.Protocol (SchemaColumn (..), valueToJSON)
@@ -40,7 +41,7 @@ normalizationBudget action = mask $ \restore -> do
                     Right value -> do
                         size <- evaluate (BL.length (BL.take 64001 (A.encode value)))
                         pure (if size > 64000 then Left ("too_large", "normalization report exceeds transport budget") else Right value)
-            pure (maybe (Left ("timeout", "normalization exceeded its five second budget")) id result)
+            pure (fromMaybe (Left ("timeout", "normalization exceeded its five second budget")) result)
 
 -- 编码只影响语义的列信息。
 fingerprintColumn :: SchemaColumn -> A.Value

@@ -3,6 +3,7 @@
 
 module Main (main) where
 
+import Data.Either (lefts)
 import ChuSQL.Core.Engine.Storage.IPC (
     Account (..),
     Request (ReqAccountCreate, ReqAccountReset, ReqAccountsList, ReqIdentityAlter),
@@ -55,7 +56,7 @@ import Control.Concurrent (forkIO, forkFinally, killThread, threadDelay)
 import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, takeMVar)
 import System.Timeout (timeout)
 import Control.Exception (IOException, bracket, finally, try)
-import Control.Monad (replicateM_, void)
+import Control.Monad (replicateM_, void, (>=>), when)
 import Data.List (sort)
 import Data.Aeson (decode)
 import qualified Data.Aeson as A
@@ -244,7 +245,9 @@ identitySpec = describe "unified identities" $ do
             asText (at "status" shown) `shouldBe` "result"
             switched <- tcpQuery manager "use system"
             asText (at "status" switched) `shouldBe` "result"
-            mapM_ (\sql -> tcpQuery manager sql >>= \reply -> asText (at "code" reply) `shouldBe` "forbidden")
+            mapM_ (tcpQuery manager
+                     >=>
+                       (\ reply -> asText (at "code" reply) `shouldBe` "forbidden"))
                 ["alter user manager superuser", "alter user managed system_catalog_manager", "alter user managed allow_sudo_auth", "alter user admin identified by 'Another-Pass123!'", "create database forbidden"]
     it "does not inherit catalog management through role membership" $ withTcpServer defaultServerConfig $ \_ handle ->
         withConnection handle $ \admin -> withConnection handle $ \worker -> do
@@ -309,7 +312,9 @@ identitySpec = describe "unified identities" $ do
     it "protects the last enabled login superuser" $ withTcpServer defaultServerConfig $ \_ handle ->
         withConnection handle $ \h -> do
             _ <- tcpLogin h "admin" "s3cret"
-            mapM_ (\sql -> tcpQuery h sql >>= \reply -> asText (at "code" reply) `shouldBe` "bad_request")
+            mapM_ (tcpQuery h
+                     >=>
+                       (\ reply -> asText (at "code" reply) `shouldBe` "bad_request"))
                 ["alter user admin disabled", "alter role admin nologin", "alter user admin nosuperuser", "drop user admin", "drop role admin"]
             shown <- tcpQuery h "show roles"
             asText (at "status" shown) `shouldBe` "result"
@@ -406,7 +411,7 @@ testRootPassword = "s3cret"
 
 -- | 口令哈希：迭代次数压低，跑得快
 testPasswordHash :: Text -> Text
-testPasswordHash raw = hashPasswordWith 1000 (BS.replicate 16 7) raw
+testPasswordHash = hashPasswordWith 1000 (BS.replicate 16 7)
 
 -- 小工具
 
@@ -461,7 +466,8 @@ tempSettingsPath name = do
 removeIfExists :: FilePath -> IO ()
 removeIfExists path = do
     there <- doesFileExist path
-    if there then void (try (removeFile path) :: IO (Either IOException ())) else pure ()
+    when there
+      $ void (try (removeFile path) :: IO (Either IOException ()))
 
 -- | 起一台内存后端的测试服务器：管理员已设口令 `s3cret`
 withTcpServer :: ServerConfig -> (ServerEnv -> ServerHandle -> IO a) -> IO a
@@ -485,7 +491,7 @@ withTcpServerAs password config body = do
 
 -- | 连上服务器并配成行缓冲句柄
 withConnection :: ServerHandle -> (Handle -> IO a) -> IO a
-withConnection handle body = bracket open closeQuietly body
+withConnection handle = bracket open closeQuietly
   where
     -- | 关连接，忽略异常
     closeQuietly h = do
@@ -893,9 +899,9 @@ privilegeSpec = describe "server privileges" $ do
         _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
         _ <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["all"] "*" "reader" False)
         views <- listRoleViews service
-        fmap (concatMap (map grantPrivilege) . map roleGrants) views
+        fmap (concatMap (map grantPrivilege . roleGrants)) views
             `shouldBe` Right ["select", "insert", "update", "delete"]
-        fmap (concatMap (map grantObject) . map roleGrants) views `shouldBe` Right (replicate 4 "test.*")
+        fmap (concatMap (map grantObject . roleGrants)) views `shouldBe` Right (replicate 4 "test.*")
 
     it "revokes a privilege again" $ withPrivileges $ \service root -> do
         _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
@@ -1061,6 +1067,16 @@ privilegeSpec = describe "server privileges" $ do
         authorizeSql service (Ordinary testAccount) "SELECT name FROM users WHERE id > ANY (SELECT id FROM orders)"
             `shouldReturn` Left (PrivilegeError "forbidden" "permission denied: SELECT ON orders")
 
+    it "requires SELECT on subqueries in HAVING and expression ordering" $ withPrivileges $ \service root -> do
+        _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
+        _ <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "reader" False)
+        _ <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "reader" ["alice"])
+        mapM_ (\sql -> authorizeSql service (Ordinary testAccount) sql
+            `shouldReturn` Left (PrivilegeError "forbidden" "permission denied: SELECT ON orders"))
+            [ "SELECT COUNT(*) FROM users HAVING COUNT(*) > (SELECT COUNT(*) FROM orders)"
+            , "SELECT name FROM users ORDER BY (SELECT COUNT(*) FROM orders) + id"
+            ]
+
     it "lists the accounts a role change touches, members included" $ withPrivileges $ \service root -> do
         _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
         _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "inner")
@@ -1202,7 +1218,8 @@ objectPrivilegeSpec = describe "stable object privileges" $ do
         finished <- newEmptyMVar
         revoked <- newEmptyMVar
         let slow = backend{beWithDatabase = \name -> (beWithDatabase backend name){beStatement = \sql -> do
-                if sql == "SELECT * FROM users" then putMVar started () >> takeMVar release else pure ()
+                when (sql == "SELECT * FROM users")
+                  $ putMVar started () >> takeMVar release
                 beStatement (beWithDatabase backend name) sql}}
         settings <- tempSettingsPath "permission-race"
         reader <- newSession slow testRootName settings
@@ -1501,11 +1518,11 @@ sessionAge session wanted = do
 
 -- | 取失败里的文案
 failureMessage :: Either SessionError QueryResult -> Text
-failureMessage outcome = either sessMessage (const "") outcome
+failureMessage = either sessMessage (const "")
 
 -- | 取失败里的错误码
 failureCode :: Either SessionError QueryResult -> Text
-failureCode outcome = either sessCode (const "") outcome
+failureCode = either sessCode (const "")
 
 -- | 取结果第一列的整数
 intValues :: [[Value]] -> [Int]
@@ -1556,7 +1573,7 @@ transactionSpec = describe "server transactions" $ do
         tables <- beCatalog backend
         fmap (map tiTable) tables `shouldBe` Right ["users"]
         updated <- beStatement backend "UPDATE users SET id = 3"
-        fmap (const ()) updated `shouldBe` Right ()
+        void updated `shouldBe` Right ()
         snapshot <- beSnapshot (memoryBackend "other" ref)
         fmap (map (tableRows . snd)) snapshot `shouldBe` Right [[[ ("id", VInt 2) ]]]
     it "keeps catalog and snapshot identities stable across system views and replacements" $ do
@@ -1574,11 +1591,11 @@ transactionSpec = describe "server transactions" $ do
     it "preserves memory schema versions in catalogs and snapshots" $ do
         ref <- newMVar []
         let backend = memoryBackend "test" ref
-        fmap (const ()) <$> beStatement backend "CREATE TABLE versioned (id INT)" `shouldReturn` Right ()
+        void <$> beStatement backend "CREATE TABLE versioned (id INT)" `shouldReturn` Right ()
         first <- beCatalog backend
         fmap (map tiSchemaVersion) first `shouldBe` Right [Just 1]
-        fmap (const ()) <$> beStatement backend "ALTER TABLE versioned ADD COLUMN extra TEXT" `shouldReturn` Right ()
-        fmap (const ()) <$> beStatement backend "ALTER TABLE versioned DROP COLUMN extra" `shouldReturn` Right ()
+        void <$> beStatement backend "ALTER TABLE versioned ADD COLUMN extra TEXT" `shouldReturn` Right ()
+        void <$> beStatement backend "ALTER TABLE versioned DROP COLUMN extra" `shouldReturn` Right ()
         current <- beCatalog backend
         snapshot <- beSnapshot backend
         fmap (map tiSchemaVersion) current `shouldBe` Right [Just 3]
@@ -1686,6 +1703,23 @@ transactionSpec = describe "server transactions" $ do
         _ <- mustSql session "rollback"
         late <- runStatementCoded session "commit"
         failureMessage late `shouldBe` "no transaction in progress"
+
+    it "rejects UPDATE constraints without changing or ending the transaction" $ withMemorySession $ \session -> do
+        _ <- mustSql session "CREATE TABLE constrained_updates (id INT PRIMARY KEY, qty INT NOT NULL UNIQUE)"
+        _ <- mustSql session "INSERT INTO constrained_updates (id, qty) VALUES (1, 2), (2, 3)"
+        _ <- mustSql session "BEGIN"
+        mapM_ (\(query, marker) -> do
+            result <- runStatementCoded session query
+            failureMessage result `shouldSatisfy` T.isInfixOf marker)
+            [("UPDATE constrained_updates SET qty = NULL WHERE id = 1", "NOT NULL")
+            , ("UPDATE constrained_updates SET qty = 3 WHERE id = 1", "UNIQUE")
+            , ("UPDATE constrained_updates SET id = 2 WHERE id = 1", "UNIQUE")]
+        unchanged <- mustSql session "SELECT qty FROM constrained_updates ORDER BY id"
+        intValues (qrRows unchanged) `shouldBe` [2, 3]
+        _ <- mustSql session "UPDATE constrained_updates SET qty = qty + 1"
+        _ <- mustSql session "COMMIT"
+        committed <- mustSql session "SELECT qty FROM constrained_updates ORDER BY id"
+        intValues (qrRows committed) `shouldBe` [3, 4]
 
     it "does not switch database inside a transaction" $ withMemorySession $ \session -> do
         _ <- mustSql session "begin"
@@ -1880,10 +1914,10 @@ ipcConcurrencySpec = describe "server backend on the real storage" $ do
         let alpha = beWithDatabase base "alpha"
             beta = beWithDatabase base "beta"
         unselected <- beStatement base "CREATE TABLE alpha.t (id INT)"
-        fmap (const ()) unselected `shouldBe` Left "no database selected"
+        void unselected `shouldBe` Left "no database selected"
         mustRun (beStatement alpha "CREATE TABLE alpha.t (id INT, value INT)")
         duplicate <- beStatement alpha "CREATE TABLE t (id INT)"
-        fmap (const ()) duplicate `shouldSatisfy` either (const True) (const False)
+        void duplicate `shouldSatisfy` either (const True) (const False)
         mustRun (beStatement alpha "INSERT INTO t (id, value) VALUES (1, 7)")
         mustRun (beStatement alpha "CREATE INDEX ON alpha.t (value)")
         mustRun (beStatement alpha "DROP INDEX ON alpha.t (value)")
@@ -1894,7 +1928,7 @@ ipcConcurrencySpec = describe "server backend on the real storage" $ do
         rows <- rowsOf (beStatement alpha "SELECT score FROM t")
         intColumn "score" rows `shouldBe` [7]
         crossed <- beStatement beta "DROP TABLE alpha.t"
-        fmap (const ()) crossed `shouldBe` Left "DDL target is outside the current database: alpha.t"
+        void crossed `shouldBe` Left "DDL target is outside the current database: alpha.t"
         mustRun (beStatement alpha "ALTER TABLE alpha.t DROP COLUMN score")
         mustRun (beStatement alpha "DROP TABLE alpha.t")
         catalog <- beCatalog alpha >>= either fail pure
@@ -1903,7 +1937,7 @@ ipcConcurrencySpec = describe "server backend on the real storage" $ do
     it "isolates domain catalogs by database and hides them from table lists" $ withIpcStorage $ do
         base <- ipcBackend
         unselected <- beStatement base "SHOW DOMAINS"
-        fmap (const ()) unselected `shouldBe` Left "no database selected"
+        void unselected `shouldBe` Left "no database selected"
         mustRun (beStatement base "CREATE DATABASE alpha")
         mustRun (beStatement base "CREATE DATABASE beta")
         let alpha = beWithDatabase base "alpha"
@@ -1919,7 +1953,7 @@ ipcConcurrencySpec = describe "server backend on the real storage" $ do
         domains <- rowsOf (beStatement beta "SHOW DOMAINS")
         domains `shouldBe` [[("domain", VStr "code"), ("base_type", VStr "varchar(3)")]]
         refused <- beStatement beta "INSERT INTO typed (id) VALUES (1)"
-        fmap (const ()) refused `shouldSatisfy` either (const True) (const False)
+        void refused `shouldSatisfy` either (const True) (const False)
 
     it "resolves nested domains only inside their own database" $ withIpcStorage $ do
         base <- ipcBackend
@@ -1930,12 +1964,12 @@ ipcConcurrencySpec = describe "server backend on the real storage" $ do
         mustRun (beStatement alpha "CREATE DOMAIN label AS VARCHAR(3)")
         mustRun (beStatement alpha "CREATE DOMAIN product_label AS label")
         absent <- beStatement beta "CREATE DOMAIN product_label AS label"
-        fmap (const ()) absent `shouldBe` Left "unknown domain: label"
+        void absent `shouldBe` Left "unknown domain: label"
         mustRun (beStatement alpha "CREATE TABLE products (name product_label)")
         mustRun (beStatement alpha "INSERT INTO products (name) VALUES ('abc')")
         rowsOf (beStatement alpha "SELECT name FROM products") `shouldReturn` [[("name", VStr "abc")]]
         dependency <- beStatement alpha "DROP DOMAIN label"
-        fmap (const ()) dependency `shouldSatisfy` either (const True) (const False)
+        void dependency `shouldSatisfy` either (const True) (const False)
 
     it "keeps two databases apart" $ withIpcStorage $ do
         base <- ipcBackend
@@ -1965,7 +1999,7 @@ ipcConcurrencySpec = describe "server backend on the real storage" $ do
         _ <- forkIO (writeRows alpha [1 .. 20] doneA)
         _ <- forkIO (writeRows beta [101 .. 120] doneB)
         outs <- sequence [takeMVar doneA, takeMVar doneB]
-        [err | Left err <- concat outs] `shouldBe` []
+        lefts (concat outs) `shouldBe` []
         rowsA <- rowsOf (beStatement alpha "SELECT id FROM p")
         rowsB <- rowsOf (beStatement beta "SELECT id FROM p")
         intColumn "id" rowsA `shouldMatchList` [1 .. 20]

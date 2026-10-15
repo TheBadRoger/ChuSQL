@@ -1,3 +1,4 @@
+{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 module ChuSQL.Web.API (
@@ -20,6 +21,7 @@ module ChuSQL.Web.API (
     newAppEnvAt,
 ) where
 
+import Data.Either (fromRight)
 import ChuSQL.Core.Model (Row, Value (..))
 import ChuSQL.Core.Engine.Syntax.AST (Statement (BeginTransaction, CommitTransaction, RollbackTransaction))
 import ChuSQL.Core.Engine.Syntax.Parser (parseStatement)
@@ -113,7 +115,7 @@ import ChuSQL.Web.UISettings (
 import Control.Concurrent.MVar (MVar, modifyMVar, newMVar, withMVar)
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Exception (IOException, try)
-import Control.Monad (forever, when)
+import Control.Monad (forever, when, unless)
 import Data.Aeson (FromJSON (..), eitherDecode, object, withObject, (.:), (.=))
 import qualified Data.Aeson as A
 import qualified Data.Aeson.Key as K
@@ -124,7 +126,7 @@ import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (nub, sortBy)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
-import Data.Maybe (catMaybes, fromMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isJust)
 import Data.Scientific (fromFloatDigits)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -244,13 +246,13 @@ reservedDatabase name = name == systemDatabase
 resolveSettingsFileSafe :: IO FilePath
 resolveSettingsFileSafe = do
     found <- try defaultConfigFile :: IO (Either IOException FilePath)
-    pure (either (const "settings.toml") id found)
+    pure (fromRight "settings.toml" found)
 
 -- | 定位 IDE 设置文件，找不到就定下首个候选路径
 resolveUISettingsFileSafe :: IO FilePath
 resolveUISettingsFileSafe = do
     found <- try resolveUISettingsFile :: IO (Either IOException FilePath)
-    pure (either (const fallbackUISettingsFile) id found)
+    pure (fromRight fallbackUISettingsFile found)
   where
     fallbackUISettingsFile = case uiSettingsFileCandidates of
         (p : _) -> p
@@ -271,8 +273,8 @@ liveBodyLimit env = lvBodyLimit <$> readLive env
 -- | 组装 WAI 应用：路由外套四层中间件
 webApp :: AppEnv -> IO Application
 webApp env = do
-    started <- atomicModifyIORef' (aeReaperStarted env) (\old -> (True, old))
-    when (not started) $ do
+    started <- atomicModifyIORef' (aeReaperStarted env) (True,)
+    unless started $ do
         _ <- forkIO $ forever $ do
             threadDelay 60000000
             sweepWebSessions env
@@ -358,7 +360,7 @@ withDatabase env action = do
                 else do
                     editing <- header "X-ChuSQL-Edit"
                     req <- request
-                    let snapshotRead = editing /= Nothing && ((requestMethod req == "GET" && take 2 (pathInfo req) == ["api", "tables"])
+                    let snapshotRead = isJust editing && ((requestMethod req == "GET" && take 2 (pathInfo req) == ["api", "tables"])
                             || (requestMethod req == "POST" && pathInfo req == ["api", "normalization", "analyze"]))
                     console <- liftIO (readIORef (wsConsole ws))
                     caller <- consoleOwner
@@ -651,11 +653,11 @@ itemJson effectiveValues fileValues owner spec =
     fromProcess = Map.lookup (siKey spec) effectiveValues
     effectiveValue = fromMaybe (defaultOf (siKey spec)) fromProcess
     shownValue = if secret then "" else fromMaybe effectiveValue fromFile
-    hasValue = fromFile /= Nothing
+    hasValue = isJust fromFile
     source :: Text
     source
         | secret = if hasValue then "configured" else "not set"
-        | fromFile /= Nothing = "settings file"
+        | isJust fromFile = "settings file"
         | otherwise = "default"
 
 -- | 改设置：写配置文件并让可热改项立即生效
@@ -694,7 +696,7 @@ putSettingsH env = do
                                                 appliedNow = case reloaded of
                                                     Right _ -> nub (applied ++ [k | k <- policyKeys, Map.member k updates])
                                                     Left _ -> applied
-                                                needsRestart = [k | k <- Map.keys updates, not (k `elem` appliedNow), not (T.null (Map.findWithDefault "" k updates))]
+                                                needsRestart = [k | k <- Map.keys updates, k `notElem` appliedNow, not (T.null (Map.findWithDefault "" k updates))]
                                             liftIO (aeLog env ("settings updated by " <> user <> ": " <> T.intercalate ", " (Map.keys updates)))
                                             json
                                                 ( object
@@ -890,7 +892,7 @@ baseDeleteH _env ws target = do
 
 -- | 取一个列值
 lookupValue :: Text -> [(String, Value)] -> Maybe Value
-lookupValue name values = lookup (T.unpack name) values
+lookupValue name = lookup (T.unpack name)
 
 -- | 错误码 + 消息 → 状态码 + 统一错误体
 apiError :: Text -> Text -> ActionM a
@@ -1727,7 +1729,7 @@ executeSql ws live sql = do
                     , "rowCount" .= qrRowCount res
                     , "truncated" .= (qrTruncated res || qrRowCount res > lvMaxRows live)
                     , "database" .= qrDatabase res
-                    , "transaction" .= (transaction /= Nothing)
+                    , "transaction" .= isJust transaction
                     ]
                 )
 
@@ -1739,7 +1741,7 @@ requireUser env = wsUser <$> requireSession env
 requestSessionToken :: ActionM (Maybe Text)
 requestSessionToken = do
     rawHeader <- header "Cookie"
-    pure (fmap TL.toStrict rawHeader >>= \h -> parseCookieHeader sessionCookieName h)
+    pure (rawHeader >>= parseCookieHeader sessionCookieName . TL.toStrict)
 
 -- | 从 Cookie 头里取一个键（没有就给 Nothing）
 parseCookieHeader :: Text -> Text -> Maybe Text

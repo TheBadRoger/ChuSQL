@@ -12,7 +12,7 @@ import ChuSQL.Core.Engine.Storage (MonadStorage (schema, withSchemaGuard))
 import ChuSQL.Core.Engine.Runtime.SQL (sqlType)
 import ChuSQL.Core.Engine.Runtime.Types (TypeId)
 import ChuSQL.Core.Engine.Runtime.Relation (bindRelOpColumns)
-import ChuSQL.Core.Engine.Runtime.Dependencies (queryTables, domainDependencies)
+import ChuSQL.Core.Engine.Runtime.Dependencies (queryTables, domainDependencies, validateDependencies)
 import ChuSQL.Core.Model
 
 -- SQL 查询绑定边界：保存解析后的类型、函数身份及输出 schema。
@@ -57,22 +57,14 @@ bindQuery catalog statement = do
 executeQueryM :: MonadStorage m => BoundQuery -> m (Either String [Row])
 executeQueryM (BoundQuery catalog dependencies columns _ plan) = do
     current <- schema
-    case current >>= validateSchema of
+    case current >>= validateDependencies guardedTables of
         Left err -> pure (Left err)
         Right () -> do
-            result <- withSchemaGuard [(name, table) | (name, table) <- catalog, name `elem` dependencies]
+            result <- withSchemaGuard guardedTables
                 (evalRelOpM catalog plan)
             pure (result >>= mapM validateRow)
   where
-    -- | 拒绝绑定目录中的结构变化
-    validateSchema current = mapM_ (validateTable current)
-        [(name, table) | (name, table) <- catalog, name `elem` dependencies]
-    -- | 比较列定义而不比较数据或统计
-    validateTable current (name, expected) = case lookup name current of
-        Just actual | tableIdentity actual /= tableIdentity expected -> Left ("bound query object changed: " ++ name)
-        Just actual | tableSchemaVersion actual /= tableSchemaVersion expected -> Left ("bound query schema changed: " ++ name)
-        Just actual | tableCols actual == tableCols expected -> Right ()
-        _ -> Left ("bound query schema changed: " ++ name)
+    guardedTables = [(name, table) | (name, table) <- catalog, name `elem` dependencies]
     -- | 校验完整输出行而不重新解析函数
     validateRow row
         | map fst row /= map fst columns = Left "bound query output schema mismatch"

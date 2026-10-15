@@ -1,3 +1,5 @@
+{-# LANGUAGE TupleSections #-}
+
 module ChuSQL.Core.Engine.Algebra.Planner (translate) where
 
 import ChuSQL.Core.Engine.Algebra.Expr (aggregatesIn, colsInExpr)
@@ -30,7 +32,7 @@ nameAggs items = go (1 :: Int) [] (concatMap (aggregatesIn . snd) items)
     go _ acc [] = reverse acc
     go n acc (e : es)
         | any ((== e) . snd) acc = go n acc es
-        | otherwise = go (n + 1) (("agg" ++ show n, e) : acc) es
+        | otherwise = go (n + 1) (("$agg" ++ show n, e) : acc) es
 
 -- | 把聚合调用换成对聚合结果的引用
 rewriteAggs :: [(String, Expr)] -> Expr -> Expr
@@ -53,21 +55,16 @@ rewriteAggs aggs e = case [label | (label, agg) <- aggs, agg == e] of
         LtE a b -> LtE (go a) (go b)
         NotEq a b -> NotEq (go a) (go b)
         QuantCmp op a sq q -> QuantCmp op (go a) sq q
+        InSub a sq negated -> InSub (go a) sq negated
+        InList a values negated -> InList (go a) (map go values) negated
         And a b -> And (go a) (go b)
         Or a b -> Or (go a) (go b)
         IsNull a -> IsNull (go a)
         IsNotNull a -> IsNotNull (go a)
         other -> other
   where
+    -- | 递归替换当前查询层的聚合引用
     go = rewriteAggs aggs
-
--- | 过滤 + 分组：没有分组也没有聚合时原样返回
-grouped :: [String] -> [(String, Expr)] -> RelOp -> (RelOp, [(String, Expr)])
-grouped keys items base
-    | null keys && null aggs = (base, items)
-    | otherwise = (Aggregate keys aggs base, [(label, rewriteAggs aggs e) | (label, e) <- items])
-  where
-    aggs = nameAggs items
 
 -- | 排序 + 截断
 limited :: [(String, SortDir)] -> Maybe Int -> RelOp -> RelOp
@@ -79,7 +76,7 @@ limited orderBy mLimit op = case mLimit of
         [] -> op
         spec -> Sort spec op
 
--- | 翻成：过滤 -> 分组 -> 排序 -> 截断 -> 取列
+-- | 生成过滤、聚合、HAVING、排序和投影计划
 translate :: Statement -> Either String RelOp
 translate q = case q of
     SelectDistinct inner -> do
@@ -87,22 +84,56 @@ translate q = case q of
         plan <- case inner of
             s@Select{} -> translate s { selectOrderBy = [], selectLimit = Nothing }
             _ -> Left "DISTINCT requires SELECT"
-        Right (limited ordering (selectLimit inner) (Distinct plan))
-    Select items fromC mWhere groupBy orderBy mLimit -> do
+        let labels = case inner of
+                Select { selectItems = items } -> map fst items
+                _ -> []
+        keys <- mapM (distinctKey labels) ordering
+        namedOrdering <- mapM (columnKey labels) ordering
+        let sorted
+                | null keys = Distinct plan
+                | any (\(column, _) -> length (filter (== column) labels) > 1) namedOrdering = BoundSort keys (Distinct plan)
+                | otherwise = Sort namedOrdering (Distinct plan)
+        Right (maybe sorted (`Limit` sorted) (selectLimit inner))
+    Select items fromC mWhere groupBy having orderBy mLimit -> do
         plan0 <- source fromC mWhere
-        let (plan, items') = grouped groupBy items plan0
-        Right $ if all (\(label, expression) -> expression == Col label) items'
-            then Project (map fst items') (limited orderBy mLimit plan)
-            else if any (\(c, _) -> c `elem` map fst items') orderBy
-                then orderedProjection items' orderBy mLimit plan
-                else Compute items' (limited orderBy mLimit plan)
+        expressions <- mapM (orderExpression items . fst) orderBy
+        let aggs = nameAggs (items ++ [("having", expression) | expression <- maybe [] pure having]
+                ++ map ("order",) expressions)
+            aggregate = not (null groupBy && null aggs && null having)
+            grouped = if aggregate then Aggregate groupBy aggs plan0 else plan0
+            plan = maybe grouped (\condition -> Filter (rewriteAggs aggs condition) grouped) having
+            items' = [(label, rewriteAggs aggs expression) | (label, expression) <- items]
+            ordering = zip (map (rewriteAggs aggs) expressions) (map snd orderBy)
+            -- | 简单列排序保留可优化的名称算子
+            named (Col column, direction) = Just (column, direction)
+            named _ = Nothing
+            -- | 保持普通投影在 LIMIT 之后求值
+            projected child
+                | all (\(label, expression) -> expression == Col label) items' = Project (map fst items') child
+                | otherwise = Compute items' child
+        Right (case mapM named ordering of
+            Just spec -> projected (limited spec mLimit plan)
+            Nothing -> orderedProjection items' ordering mLimit plan)
     _ -> Left "only SELECT is supported by translate"
+  where
+    -- | 简单投影的序号映射到来源列
+    columnKey columns (column, direction) = do
+        position <- orderPosition (length columns) column
+        case position of
+            Just slot -> Right (columns !! slot, direction)
+            Nothing -> Left "DISTINCT: sorting requires an output position"
+    -- | 去重后按指定输出位置或唯一名称排序
+    distinctKey columns (column, direction) = do
+        position <- orderPosition (length columns) column
+        case position of
+            Just slot -> Right (ColumnSlot slot (columns !! slot), direction)
+            Nothing -> Left "DISTINCT: sorting requires an output position"
 
 -- | 在排序前计算别名并保留输出顺序
-orderedProjection :: [(String, Expr)] -> [(String, SortDir)] -> Maybe Int -> RelOp -> RelOp
+orderedProjection :: [(String, Expr)] -> [(Expr, SortDir)] -> Maybe Int -> RelOp -> RelOp
 orderedProjection items orderBy mLimit plan =
     Compute items (limited ordering mLimit (Compute (carried ++ keys) plan))
   where
-    carried = [(column, Col column) | column <- nub (concatMap (colsInExpr . snd) items)]
-    keys = [("$order" ++ show n, maybe (Col c) id (lookup c items)) | (n, (c, _)) <- zip [1 :: Int ..] orderBy]
+    keys = [("$order" ++ show n, expression) | (n, (expression, _)) <- zip [1 :: Int ..] orderBy]
     ordering = [(key, direction) | ((key, _), (_, direction)) <- zip keys orderBy]
+    carried = [(column, Col column) | column <- nub (concatMap (colsInExpr . snd) items)]

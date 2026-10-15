@@ -1,3 +1,5 @@
+{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 module ChuSQL.Server.TCP (
@@ -29,12 +31,12 @@ import ChuSQL.Server.Privileges (newPrivileges, reconcileObjects)
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar)
 import Control.Exception (IOException, bracket, finally, onException, try)
-import Control.Monad (filterM, void)
+import Control.Monad (filterM, void, when)
 import qualified Data.ByteString.Char8 as BSC
 import qualified Data.ByteString.Lazy.Char8 as BLC
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isNothing)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Network.Socket (
@@ -171,12 +173,15 @@ enableSudo :: ServerEnv -> Int -> IO ()
 enableSudo env port
     | T.null user = pure ()
     | not (isPlainIdentifier user) = ioError (userError "sudo_auth_user must be a plain identity name")
-    | otherwise = modifyMVar_ (srvSudo env) $ \current -> case current of
-        Just _ -> ioError (userError "sudo authentication is already running")
-        Nothing -> do
-            credential <- createSudoCredential port
-            hPutStrLn stderr ("sudo_auth enabled: local elevated identity -> " ++ T.unpack user)
-            pure (Just (port, user, credential))
+    | otherwise = modifyMVar_ (srvSudo env) $ \case
+                                                Just _
+                                                  -> ioError (userError "sudo authentication is already running")
+                                                Nothing
+                                                  -> do credential <- createSudoCredential port
+                                                        hPutStrLn
+                                                          stderr
+                                                          ("sudo_auth enabled: local elevated identity -> " ++ T.unpack user)
+                                                        pure (Just (port, user, credential))
   where
     user = scSudoUser (srvConfig env)
 
@@ -254,7 +259,7 @@ serveConnection env conn = do
     hSetNewlineMode h noNewlineTranslation
     entry <- newLiveEntry (isLocalPeer peer)
     unregister <- registerConnection (srvLive env) entry
-    session <- newSessionWith (srvBackend env) (srvRootName env) (srvSettingsFile env) (\names -> void (dropConnectionsOf (srvLive env) names))
+    session <- newSessionWith (srvBackend env) (srvRootName env) (srvSettingsFile env) (void . dropConnectionsOf (srvLive env))
     outcome <- try (loop h session entry BSC.empty `finally` unregister) :: IO (Either IOException ())
     case outcome of
         Left err | not (isEOFError err) -> hPutStrLn stderr ("connection error: " ++ show err)
@@ -275,7 +280,7 @@ serveConnection env conn = do
                         else do
                             (response, keepGoing) <- dispatch env session entry request
                             send h response
-                            if keepGoing then loop h session entry remaining else pure ()
+                            when keepGoing $ loop h session entry remaining
     -- | 发一条响应并冲缓冲
     send h response = do
         BLC.hPutStr h (encodeResponse response)
@@ -322,7 +327,7 @@ dispatch env session entry request = case request of
         configured <- readMVar (srvSudo env)
         who <- sessionUser session
         case configured of
-            Just _ | leLocal entry && who == Nothing -> do
+            Just _ | leLocal entry && isNothing who -> do
                 nonce <- sudoChallenge
                 now <- getCurrentTime
                 writeIORef (leChallenge entry) (Just (nonce, now))
@@ -376,13 +381,13 @@ dispatch env session entry request = case request of
 -- 消费一次性证明并登录本机映射账号。
 sudoLogin :: ServerEnv -> Session -> LiveEntry -> Text -> Text -> IO ServerResponse
 sudoLogin env session entry user proof = do
-    challenge <- atomicModifyIORef' (leChallenge entry) (\value -> (Nothing, value))
+    challenge <- atomicModifyIORef' (leChallenge entry) (Nothing,)
     configured <- readMVar (srvSudo env)
     now <- getCurrentTime
     who <- sessionUser session
     let key = T.toLower (T.strip user)
         mapped = maybe "" (\(_, name, _) -> name) configured
-        valid = leLocal entry && who == Nothing && key == mapped
+        valid = leLocal entry && isNothing who && key == mapped
             && case configured of
                 Just (_, _, credential) -> validSudoChallenge credential now challenge key proof
                 Nothing -> False

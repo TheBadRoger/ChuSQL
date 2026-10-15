@@ -9,7 +9,7 @@ pwsh -NoProfile -File gate-check/run-gate.ps1              # 全量
 pwsh -NoProfile -File gate-check/run-gate.ps1 -Clean       # 先清各项目自己的构建工件
 pwsh -NoProfile -File gate-check/run-gate.ps1 -Full        # 连依赖副本一起清（最慢，怀疑旧产物复用时才用）
 pwsh -NoProfile -File gate-check/run-gate.ps1 -NoLint      # 跳过 cargo clippy
-pwsh -NoProfile -File gate-check/run-gate.ps1 -Only server # 只跑一条车道：cargo|stack|comments
+pwsh -NoProfile -File gate-check/run-gate.ps1 -Only stack  # 只跑 Haskell 车道：cargo|stack|comments
 ```
 
 ## 车道与步骤
@@ -23,7 +23,7 @@ pwsh -NoProfile -File gate-check/run-gate.ps1 -Only server # 只跑一条车道�
 
 `build` 车道先跑完，再并行启动其余三条；这样动态库刷新与 Haskell 测试不会互相抢文件。
 
-Web 步骤会先显式刷新该工程里的 model、engine、interface 与 server 本地依赖，再运行 Web 测试，避免构建工具依赖复用旧的注册库。刷新失败会使 Web 步骤失败，不继续测试。
+Server 步骤先刷新该工程里的 model、engine 与 interface 本地依赖；Web 步骤先刷新 model、engine、interface 与 server，再运行对应模块测试，避免复用旧的注册库。刷新失败会使对应步骤失败，不继续测试。
 
 ## 退出码与日志
 
@@ -41,5 +41,5 @@ Web 步骤会先显式刷新该工程里的 model、engine、interface 与 serve
 
 ## 约定
 
-- 门禁由项目所有者手动运行；agent 只跑模块级测试，不跑全量门禁。
+- 局部改动运行受影响模块的规定测试；较大改动由 agent 运行全量门禁。
 - 计数、验收状态与主线进度以 `.agents/context/progress.txt` 为准。

@@ -8,6 +8,7 @@ module ChuSQL.Web.Secure (
     bodyLimitDynamic,
 ) where
 
+import Data.Maybe (isNothing)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import Data.Text (Text)
@@ -28,7 +29,7 @@ import Network.Wai (Middleware, Request (..), mapResponseHeaders, responseLBS)
 -- | 所有响应都带上的安全头
 securityHeaders :: Middleware
 securityHeaders app req respond =
-    app req (respond . mapResponseHeaders (\headers -> filter (\(name, _) -> name /= "Content-Security-Policy" || lookup name headers == Nothing) extraHeaders ++ headers))
+    app req (respond . mapResponseHeaders (\headers -> filter (\(name, _) -> name /= "Content-Security-Policy" || isNothing (lookup name headers)) extraHeaders ++ headers))
 
 -- | 只给编辑器样式发随机 nonce
 contentSecurityPolicy :: Maybe Text -> Text

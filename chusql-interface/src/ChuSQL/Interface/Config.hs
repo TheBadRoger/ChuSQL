@@ -200,9 +200,7 @@ loadServerConfigAt path = do
             Just value | not (T.null (T.strip value)) -> T.unpack (T.strip value)
             _ -> fallback
         -- | 取一个键的整数值
-        intOf key fallback = case Map.lookup key values >>= readMaybe . T.unpack . T.strip of
-            Just number -> number
-            Nothing -> fallback
+        intOf key fallback = fromMaybe fallback (Map.lookup key values >>= readMaybe . T.unpack . T.strip)
     pure
         defaultServerConfig
             { scHost = textOf "listen_host" (scHost defaultServerConfig)

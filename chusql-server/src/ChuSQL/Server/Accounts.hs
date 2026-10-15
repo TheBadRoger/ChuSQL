@@ -119,7 +119,7 @@ validateUserName name
 
 -- | 校验新身份的名称
 validateNewName :: Accounts -> Text -> Either AccountError ()
-validateNewName _ name = validateUserName name
+validateNewName _ = validateUserName
 
 storageFailure :: AccountError
 storageFailure = AccountError "storage_error" "account storage unavailable"
@@ -300,7 +300,7 @@ accountCommand _ = Nothing
 
 -- | 按目录管理权限执行账号命令
 runAccountCommand :: Accounts -> Principal -> AccountCommand -> IO (Either AccountError ())
-runAccountCommand service principal command = withMVar (acLock service) $ \_ -> run
+runAccountCommand service principal command = withMVar (acLock service) $ const run
   where
     -- | 校验并执行身份管理权限
     run
@@ -323,7 +323,7 @@ runAccountCommand service principal command = withMVar (acLock service) $ \_ -> 
     privilegedChange (AlterAccountAttributes _ attributes) = any (\(key, _) -> key `elem` ["superuser", "system_catalog_manager", "allow_sudo_auth"]) attributes
     privilegedChange _ = False
     -- | 执行已授权的身份命令
-    execute = executeWith (if principalIsRoot principal then service else service{acBackend = (acBackend service){beAccounts = \request -> beAccounts (acBackend service) (ReqCatalogManage request)}})
+    execute = executeWith (if principalIsRoot principal then service else service{acBackend = (acBackend service){beAccounts = beAccounts (acBackend service) . ReqCatalogManage}})
     -- | 通过受限存储请求执行管理操作
     executeWith managed = case command of
         CreateAccount name _ | normalize name == "public" -> pure (Left (AccountError "bad_request" "public is reserved for default privileges"))

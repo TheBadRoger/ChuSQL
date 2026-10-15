@@ -32,6 +32,7 @@ module ChuSQL.Interface.Actions (
     revokeRoleSql,
 ) where
 
+import Control.Monad (zipWithM)
 import ChuSQL.Core.Model (Column (..), ColumnType (..), Value (..), integerType, numericType, parseColumnType, plainColumn, typeName)
 import qualified ChuSQL.Core.Model as M
 import ChuSQL.Core.Runtime
@@ -127,7 +128,7 @@ runtimeLiteral (TypeApply (TypeConstructorId 6) [child]) (RMaybe value) = do
     Right ("MAYBE<" ++ renderTypeExpr child ++ ">(" ++ item ++ ")")
 runtimeLiteral (TypeApply (TypeConstructorId 7) fields) (RTuple values)
     | length fields == length values = do
-        items <- sequence (zipWith runtimeLiteral fields values)
+        items <- zipWithM runtimeLiteral fields values
         Right ("TUPLE<" ++ intercalate ", " (map renderTypeExpr fields) ++ ">(" ++ intercalate ", " items ++ ")")
 runtimeLiteral _ _ = Left "runtime value does not match its type expression"
 
