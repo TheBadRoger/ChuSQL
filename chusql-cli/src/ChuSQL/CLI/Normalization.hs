@@ -3,7 +3,7 @@
 module ChuSQL.CLI.Normalization (normalizationArguments, loadNormalizationDeclaration, renderNormalization, runNormalizationOnce) where
 
 import ChuSQL.Interface.Normalization
-import ChuSQL.Interface.Session (Session, sessionDatabase, analyzeNormalization)
+import ChuSQL.Interface.Session (Session, analyzeNormalization, sessionDatabase)
 import Control.Exception (IOException, try)
 import qualified Data.Aeson as A
 import qualified Data.Aeson.Key as K
@@ -59,7 +59,8 @@ jsonText = TE.decodeUtf8 . BL.toStrict . A.encode
 -- 缩进展示完整报告且保留所有证据。
 pretty :: Int -> A.Value -> Text
 pretty depth (A.Object fields) = T.intercalate "\n" [indent <> K.toText key <> ":\n" <> pretty (depth + 1) value | (key, value) <- KM.toList fields]
-  where indent = T.replicate depth "  "
+  where
+    indent = T.replicate depth "  "
 pretty depth value = T.replicate depth "  " <> jsonText value
 
 -- 发送声明并让失败决定 CLI 退出码。

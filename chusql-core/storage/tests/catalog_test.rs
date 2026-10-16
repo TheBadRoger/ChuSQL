@@ -33,9 +33,14 @@ fn schema_versions_track_structure_and_survive_reload() {
 fn legacy_schema_version_remains_unknown_until_change() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("catalog.json");
-    std::fs::write(&path, json!({"tables": {
-        "t": {"object_id": 42, "columns": []}
-    }}).to_string()).unwrap();
+    std::fs::write(
+        &path,
+        json!({"tables": {
+            "t": {"object_id": 42, "columns": []}
+        }})
+        .to_string(),
+    )
+    .unwrap();
     let mut c = Catalog::load(&path).unwrap();
     assert_eq!(c.describe("t").unwrap().schema_version, 0);
     c.save(&path).unwrap();
@@ -51,10 +56,15 @@ fn legacy_schema_version_remains_unknown_until_change() {
 fn exhausted_schema_version_preserves_structure() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("catalog.json");
-    std::fs::write(&path, json!({"tables": {
-        "t": {"object_id": 42, "schema_version": u64::MAX,
-            "columns": [{"name": "id", "ty": "int"}]}
-    }}).to_string()).unwrap();
+    std::fs::write(
+        &path,
+        json!({"tables": {
+            "t": {"object_id": 42, "schema_version": u64::MAX,
+                "columns": [{"name": "id", "ty": "int"}]}
+        }})
+        .to_string(),
+    )
+    .unwrap();
     let mut c = Catalog::load(&path).unwrap();
     assert!(c.remove_column("t", "id").is_err());
     assert!(c.set_columns("t", vec![]).is_err());
@@ -90,20 +100,42 @@ fn object_ids_survive_reload_and_are_not_reused() {
 fn legacy_object_ids_upgrade_without_collisions() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("catalog.json");
-    std::fs::write(&path, json!({"tables": {
-        "a": {"columns": [], "object_id": 42},
-        "b": {"columns": []}
-    }}).to_string()).unwrap();
+    std::fs::write(
+        &path,
+        json!({"tables": {
+            "a": {"columns": [], "object_id": 42},
+            "b": {"columns": []}
+        }})
+        .to_string(),
+    )
+    .unwrap();
     let catalog = Catalog::load(&path).unwrap();
     assert_eq!(catalog.describe("a").unwrap().object_id, 42);
     assert_eq!(catalog.describe("b").unwrap().object_id, 43);
     catalog.save(&path).unwrap();
-    assert_eq!(Catalog::load(&path).unwrap().describe("b").unwrap().object_id, 43);
-    std::fs::write(&path, json!({"tables": {
-        "a": {"columns": [], "object_id": 42},
-        "b": {"columns": [], "object_id": 42}
-    }}).to_string()).unwrap();
-    assert!(Catalog::load(&path).unwrap_err().to_string().contains("duplicate"));
+    assert_eq!(
+        Catalog::load(&path)
+            .unwrap()
+            .describe("b")
+            .unwrap()
+            .object_id,
+        43
+    );
+    std::fs::write(
+        &path,
+        json!({"tables": {
+            "a": {"columns": [], "object_id": 42},
+            "b": {"columns": [], "object_id": 42}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    assert!(
+        Catalog::load(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate")
+    );
 }
 
 /// 编号耗尽明确失败且不建立对象
@@ -114,8 +146,6 @@ fn exhausted_object_ids_fail_without_creating_table() {
     assert!(catalog.create_table("t", vec![]).is_err());
     assert!(catalog.describe("t").is_none());
 }
-
-
 
 /// 用键值对构造一行
 fn row(pairs: &[(&str, serde_json::Value)]) -> Row {
@@ -128,7 +158,8 @@ fn row(pairs: &[(&str, serde_json::Value)]) -> Row {
 
 /// 空文件得到空字典，未知表返回 None
 #[test]
-fn empty_file_gives_empty_catalog_and_unknown_table_returns_none() {    let dir = tempfile::tempdir().unwrap();
+fn empty_file_gives_empty_catalog_and_unknown_table_returns_none() {
+    let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("catalog.json");
     let c = Catalog::load(&path).unwrap();
     assert_eq!(c.table_names().len(), 0);
@@ -142,7 +173,8 @@ fn ensure_then_describe() {
     let path = dir.path().join("catalog.json");
 
     let mut c = Catalog::load(&path).unwrap();
-    c.ensure_columns("users", &row(&[("id", json!(1)), ("name", json!("Alice"))])).unwrap();
+    c.ensure_columns("users", &row(&[("id", json!(1)), ("name", json!("Alice"))]))
+        .unwrap();
     c.save(&path).unwrap();
 
     let c2 = Catalog::load(&path).unwrap();
@@ -164,8 +196,10 @@ fn second_insert_does_not_duplicate_columns() {
     let path = dir.path().join("catalog.json");
 
     let mut c = Catalog::load(&path).unwrap();
-    c.ensure_columns("users", &row(&[("id", json!(1))])).unwrap();
-    c.ensure_columns("users", &row(&[("id", json!(2))])).unwrap();
+    c.ensure_columns("users", &row(&[("id", json!(1))]))
+        .unwrap();
+    c.ensure_columns("users", &row(&[("id", json!(2))]))
+        .unwrap();
     assert_eq!(c.describe("users").unwrap().columns.len(), 1);
 }
 
@@ -176,9 +210,11 @@ fn remove_column_drops_definition_stats_and_index() {
     let path = dir.path().join("catalog.json");
 
     let mut c = Catalog::load(&path).unwrap();
-    c.ensure_columns("t", &row(&[("id", json!(1)), ("code", json!(5))])).unwrap();
+    c.ensure_columns("t", &row(&[("id", json!(1)), ("code", json!(5))]))
+        .unwrap();
     c.add_index("t", "code").unwrap();
-    c.rebuild_stats("t", &[row(&[("id", json!(1)), ("code", json!(5))])]).unwrap();
+    c.rebuild_stats("t", &[row(&[("id", json!(1)), ("code", json!(5))])])
+        .unwrap();
 
     let removed = c.remove_column("t", "code").unwrap();
     assert!(removed, "first remove should hit the column");
@@ -186,7 +222,10 @@ fn remove_column_drops_definition_stats_and_index() {
     assert_eq!(s.columns.len(), 1);
     assert_eq!(s.columns[0].name, "id");
     assert!(s.indexes.is_empty(), "index on code should be gone");
-    assert!(!s.stats.contains_key("code"), "stats for code should be gone");
+    assert!(
+        !s.stats.contains_key("code"),
+        "stats for code should be gone"
+    );
 
     let again = c.remove_column("t", "code").unwrap();
     assert!(!again);
@@ -217,7 +256,8 @@ fn stats_track_a_histogram_for_numeric_columns() {
     assert!(name.hist.is_empty(), "字符串列不进直方图");
     assert_eq!(name.lo, None);
 
-    c.record_insert("t", &row(&[("id", json!(1000)), ("name", json!("x"))])).unwrap();
+    c.record_insert("t", &row(&[("id", json!(1000)), ("name", json!("x"))]))
+        .unwrap();
     let s = c.describe("t").unwrap();
     let id = s.stats.get("id").unwrap();
     assert_eq!(id.lo, Some(0.0));
@@ -240,7 +280,9 @@ fn stats_track_a_histogram_for_numeric_columns() {
 fn duplicate_deletion_keeps_distinct_until_last_occurrence() {
     let mut catalog = Catalog::default();
     let duplicate = row(&[("id", json!(1)), ("v", json!(7))]);
-    catalog.rebuild_stats("t", &[duplicate.clone(), duplicate.clone()]).unwrap();
+    catalog
+        .rebuild_stats("t", &[duplicate.clone(), duplicate.clone()])
+        .unwrap();
     catalog.record_delete("t", std::slice::from_ref(&duplicate));
     assert_eq!(catalog.describe("t").unwrap().stats["v"].distinct, 1);
     catalog.record_delete("t", &[duplicate]);
@@ -251,7 +293,9 @@ fn duplicate_deletion_keeps_distinct_until_last_occurrence() {
 #[test]
 fn capped_distinct_keeps_histogram_and_other_columns_accurate() {
     let mut catalog = Catalog::default();
-    let rows: Vec<Row> = (0..5000).map(|n| row(&[("id", json!(n)), ("v", json!(n % 2))])).collect();
+    let rows: Vec<Row> = (0..5000)
+        .map(|n| row(&[("id", json!(n)), ("v", json!(n % 2))]))
+        .collect();
     catalog.rebuild_stats("t", &rows).unwrap();
     let schema = catalog.describe("t").unwrap();
     assert!(schema.stats["id"].capped);
@@ -277,7 +321,9 @@ fn rebuilt_histogram_has_exact_buckets_in_any_order() {
     let stat = &forward.describe("t").unwrap().stats["v"];
     assert_eq!(stat.hist, vec![10; 16]);
     assert_eq!(stat.hist, reverse.describe("t").unwrap().stats["v"].hist);
-    forward.record_insert("t", &row(&[("v", json!(10000))])).unwrap();
+    forward
+        .record_insert("t", &row(&[("v", json!(10000))]))
+        .unwrap();
     forward.record_delete("t", &[row(&[("v", json!(10000))])]);
     forward.rebuild_stats("t", &rows[80..]).unwrap();
     let repaired = &forward.describe("t").unwrap().stats["v"];
@@ -316,7 +362,13 @@ fn legacy_catalog_loads_and_normalizes() {
     assert_eq!(s.columns.len(), 2);
     assert!(s.columns[0].nullable, "老列默认可空");
     assert!(c.normalize_types().unwrap());
-    let types: Vec<&str> = c.describe("legacy").unwrap().columns.iter().map(|col| col.ty.as_str()).collect();
+    let types: Vec<&str> = c
+        .describe("legacy")
+        .unwrap()
+        .columns
+        .iter()
+        .map(|col| col.ty.as_str())
+        .collect();
     assert_eq!(types, vec!["int", "str"]);
     assert!(!c.normalize_types().unwrap(), "第二次没有可改的");
 }

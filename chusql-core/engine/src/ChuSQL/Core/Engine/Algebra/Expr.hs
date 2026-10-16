@@ -1,9 +1,9 @@
 module ChuSQL.Core.Engine.Algebra.Expr (evalExpr, evalCondForRow, colsInExpr, subqueryRefsIn, subquerySlotsIn, subqueryColumns, aggregatesIn, hasAggregate, bareColumns, hasSubquery, hasDivision, inValues, threeValuedNot, quantifiedCompare) where
 
-import ChuSQL.Core.Model
-import ChuSQL.Core.Engine.Syntax.AST
 import ChuSQL.Core.Engine.Builtin (Operator (..), compareNode, executeOperator, inValues, threeValuedNot)
-import ChuSQL.Core.Engine.Runtime.SQL (invokeSQLFunction, constructSQLValue)
+import ChuSQL.Core.Engine.Runtime.SQL (constructSQLValue, invokeSQLFunction)
+import ChuSQL.Core.Engine.Syntax.AST
+import ChuSQL.Core.Model
 
 -- 表达式求值：三值逻辑，NULL 参与运算结果仍是 NULL。
 
@@ -59,9 +59,9 @@ evalExpr (InList a es negated) row = do
     r <- inValues v vs
     Right (if negated then threeValuedNot r else r)
 evalExpr (ScalarSub _) _ = Left subqueryNeedsDatabase
-evalExpr (InSub {}) _ = Left subqueryNeedsDatabase
+evalExpr (InSub{}) _ = Left subqueryNeedsDatabase
 evalExpr (ExistsSub _ _) _ = Left subqueryNeedsDatabase
-evalExpr (QuantCmp {}) _ = Left subqueryNeedsDatabase
+evalExpr (QuantCmp{}) _ = Left subqueryNeedsDatabase
 evalExpr agg _ = Left ("aggregate functions are not allowed here: " ++ show agg)
 
 -- | 子查询要连上存储才能跑
@@ -157,9 +157,9 @@ subqueryReferences references e = case e of
     MaxOf a -> collect a
     _ -> []
   where
-    -- | 递归收集当前提取器的引用
+    -- \| 递归收集当前提取器的引用
     collect = subqueryReferences references
-    -- | 两个子表达式的外层列拼起来
+    -- \| 两个子表达式的外层列拼起来
     both a b = collect a ++ collect b
 
 -- | 表达式里有没有除法（除法可能报错，不能提前或延后求值）
@@ -185,7 +185,7 @@ hasDivision e = case e of
     QuantCmp _ a _ _ -> hasDivision a
     _ -> False
   where
-    -- | 两个子表达式里任意一个有除法
+    -- \| 两个子表达式里任意一个有除法
     both a b = hasDivision a || hasDivision b
 
 -- | 表达式里有没有子查询
@@ -196,10 +196,10 @@ hasSubquery e = case e of
     FunctionCall _ arguments -> any hasSubquery arguments
     BoundFunction _ _ arguments -> any hasSubquery arguments
     ScalarSub _ -> True
-    InSub {} -> True
+    InSub{} -> True
     InList a es _ -> any hasSubquery (a : es)
     ExistsSub _ _ -> True
-    QuantCmp {} -> True
+    QuantCmp{} -> True
     Add a b -> both a b
     Sub a b -> both a b
     Mul a b -> both a b
@@ -222,7 +222,7 @@ hasSubquery e = case e of
     MaxOf a -> hasSubquery a
     _ -> False
   where
-    -- | 两个子表达式里任意一个有
+    -- \| 两个子表达式里任意一个有
     both a b = hasSubquery a || hasSubquery b
 
 -- | 表达式里出现的聚合调用（按出现顺序）
@@ -258,7 +258,7 @@ aggregatesIn e = case e of
     IsNotNull a -> aggregatesIn a
     _ -> []
   where
-    -- | 两个子表达式的聚合拼起来
+    -- \| 两个子表达式的聚合拼起来
     both a b = aggregatesIn a ++ aggregatesIn b
 
 -- | 表达式里有没有聚合调用
@@ -297,7 +297,7 @@ bareColumns e = case e of
     QuantCmp _ a sq _ -> bareColumns a ++ subqueryRefs sq
     _ -> []
   where
-    -- | 两个子表达式的裸列拼起来
+    -- \| 两个子表达式的裸列拼起来
     both a b = bareColumns a ++ bareColumns b
 
 -- | 判断条件真假：只有 TRUE 通过，NULL 当作不通过

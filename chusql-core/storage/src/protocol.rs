@@ -94,19 +94,40 @@ pub struct IndexWire {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum Request {
-    CatalogManage { command: Box<Request> },
+    CatalogManage {
+        command: Box<Request>,
+    },
     AccountsList,
-    IdentityInitialize { administrator: String },
-    RoleCreate { user: String },
-    IdentityAlter { user: String, can_login: Option<bool>, is_superuser: Option<bool>, enabled: Option<bool>, system_catalog_manager: Option<bool>, allow_sudo_auth: Option<bool> },
-    AccountCreate { user: String, password_hash: String },
-    AccountReset { user: String, password_hash: String },
+    IdentityInitialize {
+        administrator: String,
+    },
+    RoleCreate {
+        user: String,
+    },
+    IdentityAlter {
+        user: String,
+        can_login: Option<bool>,
+        is_superuser: Option<bool>,
+        enabled: Option<bool>,
+        system_catalog_manager: Option<bool>,
+        allow_sudo_auth: Option<bool>,
+    },
+    AccountCreate {
+        user: String,
+        password_hash: String,
+    },
+    AccountReset {
+        user: String,
+        password_hash: String,
+    },
     AccountLogin {
         user: String,
         #[serde(default)]
         at: Option<String>,
     },
-    AccountDrop { user: String },
+    AccountDrop {
+        user: String,
+    },
     /// 引导系统目录：建系统表，给了 user 就同时补首个管理员
     BootstrapSystem {
         #[serde(default)]
@@ -115,14 +136,18 @@ pub enum Request {
         password_hash: Option<String>,
     },
     SystemStatus,
-    BootstrapTypes { types: Vec<Row> },
+    BootstrapTypes {
+        types: Vec<Row>,
+    },
     Ping,
     Scan {
         table: String,
         #[serde(default)]
         columns: Option<Vec<String>>,
     },
-    ValidateWrite { table: String },
+    ValidateWrite {
+        table: String,
+    },
     /// 分片扫描：第 shard 片只读总页数按 shards 均分后的那一段
     ScanShard {
         table: String,
@@ -177,6 +202,37 @@ pub enum Request {
         table: String,
     },
     ListCatalog,
+    DomainSnapshot,
+    MvccBegin {
+        #[serde(default)]
+        serializable: bool,
+    },
+    MvccLock {
+        transaction: String,
+        ops: Vec<StorageOp>,
+        #[serde(default)]
+        reads: Vec<String>,
+    },
+    MvccPreview {
+        transaction: String,
+    },
+    MvccCommit {
+        transaction: String,
+        checkpoint: String,
+        ops: Vec<StorageOp>,
+    },
+    MvccRollback {
+        transaction: String,
+    },
+    DatabaseSnapshot {
+        #[serde(default)]
+        checkpoint: Option<String>,
+    },
+    AlterDomain {
+        table: String,
+        columns: Vec<SchemaColumn>,
+        checkpoint: String,
+    },
     CreateIndex {
         table: String,
         column: String,
@@ -204,7 +260,7 @@ pub enum Request {
 }
 
 /// 事务提交里的一条写操作
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum StorageOp {
     /// 追加写入的行（提交端已先删掉要覆盖的行）
@@ -215,37 +271,89 @@ pub enum StorageOp {
     Replace { table: String, rows: Vec<Row> },
 }
 
+/// 检查存储表名和列名的字符集
+pub(crate) fn valid_storage_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// 检查一行顶层字段名
+fn valid_row_columns(row: &Row) -> bool {
+    row.keys().all(|name| valid_storage_name(name))
+}
+
 impl Request {
-    /// 拒绝可能影响文件路径的列名
+    /// 校验列定义与写入载荷的顶层字段名
     pub fn valid_columns(&self) -> bool {
-        let valid = |name: &str| !name.is_empty()
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
         match self {
-            Self::CreateIndex { column, .. } | Self::DropIndex { column, .. }
-            | Self::DropColumn { column, .. } | Self::LookupByIndex { column, .. }
-            | Self::RangeByIndex { column, .. } => valid(column),
-            Self::CreateTable { columns, .. } => columns.iter().all(|c| valid(&c.name)),
-            Self::ReplaceSchema { columns, .. } => columns.iter().all(|c| valid(&c.name)),
+            Self::CreateIndex { column, .. }
+            | Self::DropIndex { column, .. }
+            | Self::DropColumn { column, .. }
+            | Self::LookupByIndex { column, .. }
+            | Self::RangeByIndex { column, .. } => valid_storage_name(column),
+            Self::CreateTable { columns, .. } | Self::AlterDomain { columns, .. } => {
+                columns.iter().all(|c| valid_storage_name(&c.name))
+            }
+            Self::ReplaceSchema { columns, rows, .. } => {
+                columns.iter().all(|c| valid_storage_name(&c.name))
+                    && rows.iter().all(valid_row_columns)
+            }
+            Self::Insert { row, .. } => valid_row_columns(row),
+            Self::InsertBatch { rows, .. } | Self::ReplaceAll { rows, .. } => {
+                rows.iter().all(valid_row_columns)
+            }
+            Self::ApplyTransaction { ops }
+            | Self::MvccLock { ops, .. }
+            | Self::MvccCommit { ops, .. } => ops.iter().all(|op| match op {
+                StorageOp::Upsert { rows, .. } | StorageOp::Replace { rows, .. } => {
+                    rows.iter().all(valid_row_columns)
+                }
+                StorageOp::Delete { .. } => true,
+            }),
             _ => true,
         }
     }
     /// 普通表操作的统一访问边界
     pub fn table(&self) -> Option<&str> {
         match self {
-            Self::Scan { table, .. } | Self::ScanShard { table, .. } | Self::ValidateWrite { table }
+            Self::Scan { table, .. }
+            | Self::ScanShard { table, .. }
+            | Self::ValidateWrite { table }
             | Self::Insert { table, .. }
-            | Self::InsertBatch { table, .. } | Self::DeleteKeys { table, .. }
-            | Self::LookupByIndex { table, .. } | Self::ReplaceAll { table, .. }
+            | Self::InsertBatch { table, .. }
+            | Self::DeleteKeys { table, .. }
+            | Self::LookupByIndex { table, .. }
+            | Self::ReplaceAll { table, .. }
             | Self::RangeByIndex { table, .. }
-            | Self::DescribeTable { table } | Self::CreateTable { table, .. }
-            | Self::DropTable { table } | Self::CreateIndex { table, .. }
-            | Self::DropIndex { table, .. } | Self::DropColumn { table, .. }
+            | Self::DescribeTable { table }
+            | Self::CreateTable { table, .. }
+            | Self::DropTable { table }
+            | Self::CreateIndex { table, .. }
+            | Self::DropIndex { table, .. }
+            | Self::DropColumn { table, .. }
             | Self::Compact { table }
-            | Self::ReplaceSchema { table, .. } => Some(table),
-            Self::Ping | Self::ListTables | Self::ListCatalog | Self::AccountsList | Self::CatalogManage { .. }
-            | Self::IdentityInitialize { .. } | Self::RoleCreate { .. } | Self::IdentityAlter { .. }
-            | Self::AccountCreate { .. } | Self::AccountReset { .. } | Self::AccountLogin { .. }
-            | Self::AccountDrop { .. } | Self::BootstrapSystem { .. } | Self::SystemStatus
+            | Self::ReplaceSchema { table, .. }
+            | Self::AlterDomain { table, .. } => Some(table),
+            Self::Ping
+            | Self::ListTables
+            | Self::ListCatalog
+            | Self::DomainSnapshot
+            | Self::MvccPreview { .. }
+            | Self::MvccBegin { .. }
+            | Self::MvccLock { .. }
+            | Self::MvccCommit { .. }
+            | Self::MvccRollback { .. }
+            | Self::DatabaseSnapshot { .. }
+            | Self::AccountsList
+            | Self::CatalogManage { .. }
+            | Self::IdentityInitialize { .. }
+            | Self::RoleCreate { .. }
+            | Self::IdentityAlter { .. }
+            | Self::AccountCreate { .. }
+            | Self::AccountReset { .. }
+            | Self::AccountLogin { .. }
+            | Self::AccountDrop { .. }
+            | Self::BootstrapSystem { .. }
+            | Self::SystemStatus
             | Self::BootstrapTypes { .. }
             | Self::ApplyTransaction { .. } => None,
         }
@@ -284,14 +392,26 @@ fn default_id_column() -> String {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Response {
-    Guarded { response: Box<Response> },
-    Accounts { accounts: Vec<Account> },
+    Guarded {
+        response: Box<Response>,
+    },
+    Accounts {
+        accounts: Vec<Account>,
+    },
     Pong,
-    Rows { rows: Vec<Row> },
-    Tables { tables: Vec<String> },
+    Rows {
+        rows: Vec<Row>,
+    },
+    Tables {
+        tables: Vec<String>,
+    },
     Schema {
         table: String,
-        #[serde(default, serialize_with = "serialize_version", deserialize_with = "deserialize_version")]
+        #[serde(
+            default,
+            serialize_with = "serialize_version",
+            deserialize_with = "deserialize_version"
+        )]
         schema_version: u64,
         columns: Vec<SchemaColumn>,
         #[serde(default)]
@@ -309,9 +429,30 @@ pub enum Response {
         #[serde(default)]
         last_lsn: u64,
     },
-    Error { message: String },
-    Catalog { schemas: Vec<TableSchemaWire> },
-    Object { database_id: u64, object_id: Option<u64> },
+    Error {
+        message: String,
+    },
+    Catalog {
+        schemas: Vec<TableSchemaWire>,
+    },
+    DomainSnapshot {
+        schemas: Vec<TableSchemaWire>,
+        rows: Vec<(String, Vec<Row>)>,
+        checkpoint: String,
+    },
+    MvccSnapshot {
+        transaction: String,
+        schemas: Vec<TableSchemaWire>,
+        rows: Vec<(String, Vec<Row>)>,
+        checkpoint: String,
+    },
+    SnapshotUnchanged {
+        checkpoint: String,
+    },
+    Object {
+        database_id: u64,
+        object_id: Option<u64>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -330,7 +471,11 @@ pub struct TableSchemaWire {
     pub database_id: u64,
     #[serde(default)]
     pub object_id: u64,
-    #[serde(default, serialize_with = "serialize_version", deserialize_with = "deserialize_version")]
+    #[serde(
+        default,
+        serialize_with = "serialize_version",
+        deserialize_with = "deserialize_version"
+    )]
     pub schema_version: u64,
     pub columns: Vec<SchemaColumn>,
     #[serde(default)]
@@ -342,7 +487,10 @@ pub struct TableSchemaWire {
 }
 
 /// 将结构版本编码成精确十进制字符串
-fn serialize_version<S: serde::Serializer>(version: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+fn serialize_version<S: serde::Serializer>(
+    version: &u64,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
     serializer.serialize_str(&version.to_string())
 }
 
@@ -350,9 +498,14 @@ fn serialize_version<S: serde::Serializer>(version: &u64, serializer: S) -> Resu
 fn deserialize_version<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
     let value = serde_json::Value::deserialize(deserializer)?;
     match value {
-        serde_json::Value::String(s) if !s.is_empty() && s.len() <= 20 && s.bytes().all(|c| c.is_ascii_digit()) =>
-            s.parse().map_err(serde::de::Error::custom),
-        serde_json::Value::Number(n) => n.as_u64().ok_or_else(|| serde::de::Error::custom("invalid schema version")),
+        serde_json::Value::String(s)
+            if !s.is_empty() && s.len() <= 20 && s.bytes().all(|c| c.is_ascii_digit()) =>
+        {
+            s.parse().map_err(serde::de::Error::custom)
+        }
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .ok_or_else(|| serde::de::Error::custom("invalid schema version")),
         _ => Err(serde::de::Error::custom("invalid schema version")),
     }
 }

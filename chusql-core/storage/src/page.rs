@@ -3,6 +3,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use crate::page_wal::PageWal;
+
 // 页管理：定长页的读写，外加一层页缓冲池。
 
 pub type PageId = u64;
@@ -33,6 +35,7 @@ impl Page {
 #[derive(Debug)]
 pub struct PageFile {
     file: File,
+    journal: PageWal,
     page_size: usize,
     capacity: usize,
     cache: HashMap<PageId, Page>,
@@ -55,14 +58,16 @@ impl PageFile {
         page_size: usize,
         capacity: usize,
     ) -> io::Result<Self> {
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(path)?;
+            .open(path.as_ref())?;
+        let journal = PageWal::open(path.as_ref(), page_size, &mut file)?;
         Ok(PageFile {
             file,
+            journal,
             page_size,
             capacity,
             cache: HashMap::new(),
@@ -72,6 +77,16 @@ impl PageFile {
             hits: 0,
             misses: 0,
         })
+    }
+
+    /// 标记后续页修改所属的提交点
+    pub fn set_lsn(&mut self, lsn: u64) {
+        self.journal.set_lsn(lsn);
+    }
+
+    /// 读取已记录的页提交 LSN
+    pub fn page_lsn(&self, id: PageId) -> Option<u64> {
+        self.journal.page_lsn(id)
     }
 
     /// 页大小
@@ -109,7 +124,6 @@ impl PageFile {
         }
     }
 
-
     /// 标记为最近使用
     fn touch(&mut self, id: PageId) {
         self.clock += 1;
@@ -127,27 +141,28 @@ impl PageFile {
             return Ok(false);
         };
         if self.dirty.contains(&victim) {
-            let p = self.cache[&victim].clone();
-            self.write_raw(&p)?;
-            self.dirty.remove(&victim);
+            let pages: Vec<_> = self
+                .dirty
+                .iter()
+                .filter_map(|id| self.cache.get(id).cloned())
+                .collect();
+            let images: Vec<_> = pages
+                .iter()
+                .map(|page| (page.id, page.data.as_slice()))
+                .collect();
+            self.journal.prepare(&images)?;
+            for page in &pages {
+                self.write_image(page)?;
+            }
+            self.dirty.clear();
         }
         self.cache.remove(&victim);
         self.last_used.remove(&victim);
         Ok(true)
     }
 
-    /// 直接写文件
-    fn write_raw(&mut self, page: &Page) -> io::Result<()> {
-        if page.data.len() != self.page_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "page has {} bytes, this file uses {}",
-                    page.data.len(),
-                    self.page_size
-                ),
-            ));
-        }
+    /// 将已记录镜像的页写入数据文件
+    fn write_image(&mut self, page: &Page) -> io::Result<()> {
         self.file
             .seek(SeekFrom::Start(page.id * self.page_size as u64))?;
         self.file.write_all(&page.data)
@@ -156,11 +171,11 @@ impl PageFile {
     /// 直接从文件读
     fn read_raw(&mut self, id: PageId) -> io::Result<Page> {
         let mut data = vec![0u8; self.page_size];
-        self.file.seek(SeekFrom::Start(id * self.page_size as u64))?;
+        self.file
+            .seek(SeekFrom::Start(id * self.page_size as u64))?;
         self.file.read_exact(&mut data)?;
         Ok(Page { id, data })
     }
-
 
     /// 读一页（走缓存）
     pub fn read_page(&mut self, id: PageId) -> io::Result<Page> {
@@ -241,26 +256,27 @@ impl PageFile {
             ));
         }
         let on_disk = len / size;
-        let cached_max = self
-            .cache
-            .keys()
-            .copied()
-            .max()
-            .map(|m| m + 1)
-            .unwrap_or(0);
+        let cached_max = self.cache.keys().copied().max().map(|m| m + 1).unwrap_or(0);
         Ok(on_disk.max(cached_max))
     }
 
     /// 把脏页写回磁盘
     pub fn flush(&mut self) -> io::Result<()> {
-        let dirty: Vec<PageId> = self.dirty.iter().copied().collect();
-        for id in dirty {
-            if let Some(p) = self.cache.get(&id) {
-                let p = p.clone();
-                self.write_raw(&p)?;
-            }
+        let pages: Vec<Page> = self
+            .dirty
+            .iter()
+            .filter_map(|id| self.cache.get(id).cloned())
+            .collect();
+        let images: Vec<_> = pages
+            .iter()
+            .map(|page| (page.id, page.data.as_slice()))
+            .collect();
+        self.journal.prepare(&images)?;
+        for page in &pages {
+            self.write_image(page)?;
         }
         self.file.sync_all()?;
+        self.journal.checkpoint()?;
         self.dirty.clear();
         Ok(())
     }
@@ -272,6 +288,7 @@ impl PageFile {
 
     /// 清空文件
     pub fn truncate(&mut self) -> io::Result<()> {
+        self.journal.reset()?;
         self.cache.clear();
         self.last_used.clear();
         self.dirty.clear();

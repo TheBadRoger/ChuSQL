@@ -2,11 +2,23 @@
 
 [← 返回 README](../README.md)
 
-**本页导航：** [在线安装](#在线安装) · [安装方式](#安装方式) · [包内安装](#包内安装) · [常用安装选项](#常用安装选项) · [从源码安装](#从源码安装) · [安装完成后](#安装完成后) · [更新](#更新) · [卸载](#卸载) · [发布校验](#发布校验)
+本页内容：
 
-发行包已经包含编译后的程序，普通用户安装时无需安装 GHC 或 Rust 工具链。
+- [在线安装](#在线安装)
+- [安装方式](#安装方式)
+- [包内安装](#包内安装)
+- [常用安装选项](#常用安装选项)
+- [从源码安装](#从源码安装)
+- [安装完成后](#安装完成后)
+- [更新](#更新)
+- [卸载](#卸载)
+- [发布校验](#发布校验)
+
+本页帮助你安装、更新和卸载 ChuSQL。发行包包含编译后的程序，使用发行包时无需安装 Haskell 编译器 GHC 或 Rust 工具链。
 
 项目仓库：[GitHub](https://github.com/TheBadRoger/ChuSQL) · [ChuRepo](https://repo.chunana.cn/ChuNa7a/ChuSQL)。两处均可获取源码，按网络情况选择。
+
+使用容器部署时，按 [Docker 部署](docker.md) 创建口令文件并启动 Compose，无需在宿主机安装 GHC 或 Rust。
 
 ## 在线安装
 
@@ -47,7 +59,9 @@ irm https://repo.chunana.cn/ChuNa7a/ChuSQL/raw/branch/main/scripts/install.ps1 -
 & "$env:TEMP\install.ps1" -Component web
 ```
 
-上述命令下载脚本时优先 GitHub，失败后尝试 ChuRepo。脚本安装和更新时也会自动回退：版本查询或发行包下载失败时尝试 ChuRepo；已选定的版本保持不变，校验失败直接报错。两站均无对应发行包时需使用包内安装或源码安装。显式指定其他仓库或归档 URL 时不会回退到官方仓库。
+每个平台的首组命令优先从 GitHub 下载脚本，失败后尝试 ChuRepo。安装和更新时，版本查询或发行包下载失败也会尝试 ChuRepo；已选定的版本保持不变，校验失败直接报错。
+
+两站均无对应发行包时，使用包内安装或源码安装。显式指定其他仓库或归档 URL 时，不会回退到官方仓库。
 
 ## 安装方式
 
@@ -67,9 +81,15 @@ ChuSQL 支持三种安装方式：
 
 ### Linux 用户服务
 
-Linux 默认注册 `chusql-server.service` 为当前操作系统用户的 systemd 服务，并启用 linger 和开机启动，无需登录即可运行，异常退出后自动重启。需要可用的 systemd 用户会话；若启用 linger 时权限不足，按安装提示执行 `sudo loginctl enable-linger "$(id -un)"` 后重试。数据库管理员 `--user` 与运行服务的操作系统用户是两个独立身份。
+Linux 默认将 `chusql-server.service` 注册为当前操作系统用户的 systemd 服务。安装器启用开机启动和 linger（让用户服务在未登录时也能运行），异常退出后服务会自动重启。
+
+安装需要可用的 systemd 用户会话。若启用 linger 时权限不足，按安装提示执行 `sudo loginctl enable-linger "$(id -un)"` 后重试。
+
+数据库管理员 `--user` 与运行服务的操作系统用户是两个独立身份。
 
 `--no-start` 仅跳过本次启动，仍启用开机启动。非 systemd 环境可使用 `--no-service` 跳过服务注册，直接在后台启动进程。
+
+使用以下命令查看服务状态、重启、停止或查看日志：
 
 ```sh
 systemctl --user status chusql-server.service
@@ -136,7 +156,7 @@ sh scripts/install.sh --component web --from-source --source-dir .
 
 ## 安装完成后
 
-默认安装包含以下主要内容：
+安装器按所选组件安装下列程序，并生成配置及数据目录：
 
 - `chusql-server`：数据库服务；
 - `csql`：命令行客户端；
@@ -160,10 +180,14 @@ csql-web
 重新运行安装脚本，指定相同的安装目录和组件即可更新，也可用 `--version TAG` 选择版本：
 
 ```sh
-./install.sh --component both --install-dir "$HOME/.local/share/chusql" --version <tag>
+./install.sh --component both --install-dir "$HOME/.local/share/chusql" --version TAG
 ```
 
-Linux 更新会先停止该安装目录中的 Web 和数据库进程，保留已有 `settings.toml`、数据库和管理员口令，再引导检查系统目录。修改数据位置须编辑配置并自行迁移数据；更新时不能用不同的 `--data-dir` 覆盖现有配置。安装默认重启数据库服务，Web 管理端需重新运行 `csql-web`。
+`TAG` 替换为要安装的发行版本。
+
+Linux 更新会先停止该安装目录中的 Web 和数据库进程，保留已有 `settings.toml`、数据库和管理员口令，再引导检查系统目录。
+
+修改数据位置须编辑配置并自行迁移数据；更新时不能用不同的 `--data-dir` 覆盖现有配置。安装默认重启数据库服务，Web 管理端需重新运行 `csql-web`。
 
 Linux 安装目录中保留 `uninstall.sh`。卸载时指定安装目录，数据目录默认读取现有配置。
 

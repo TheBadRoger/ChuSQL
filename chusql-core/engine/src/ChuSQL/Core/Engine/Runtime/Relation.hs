@@ -20,14 +20,14 @@ bindWriteColumns db statement = case statement of
         Delete table <$> mapM (bindSlots columns []) condition
     _ -> Right statement
   where
-    -- | 保留写入目标并绑定右侧表达式
+    -- \| 保留写入目标并绑定右侧表达式
     bindItem columns (name, expression) = (,) name <$> bindSlots columns [] expression
 
 -- | 按绑定布局排列一行并拒绝缺列
 orderRow :: [String] -> Row -> Either String Row
 orderRow columns row = mapM column columns
   where
-    -- | 保留列名并取得物理值
+    -- \| 保留列名并取得物理值
     column name = case lookup name row of
         Just value -> Right (name, value)
         Nothing -> Left ("missing bound column: " ++ name)
@@ -84,8 +84,10 @@ bindSlots columns outer expression = case expression of
     ColumnSlot slot name -> ColumnSlot <$> rebindSlot columns slot name "unknown local column: " <*> pure name
     OuterColumnSlot width slot name
         | width < 0 -> Left ("bound column position mismatch: " ++ name)
-        | otherwise -> OuterColumnSlot (length columns)
-            <$> rebindSlot outer slot name "unknown column: " <*> pure name
+        | otherwise ->
+            OuterColumnSlot (length columns)
+                <$> rebindSlot outer slot name "unknown column: "
+                <*> pure name
     FunctionCall name arguments -> FunctionCall name <$> mapM bind arguments
     BoundFunction fid tid arguments -> BoundFunction fid tid <$> mapM bind arguments
     Construct ty arguments -> Construct ty <$> mapM bind arguments
@@ -121,7 +123,7 @@ bindSlots columns outer expression = case expression of
     bind = bindSlots columns outer
     -- \| 查找布局中首次出现的列
     slots names name = [slot | (slot, key) <- zip [0 ..] names, key == name]
-    -- | 保留有效位置，仅允许唯一列重定位
+    -- \| 保留有效位置，仅允许唯一列重定位
     rebindSlot names slot name missing
         | slot < 0 = Left ("bound column position mismatch: " ++ name)
         | take 1 (drop slot names) == [name] = Right slot
@@ -133,7 +135,7 @@ bindSlots columns outer expression = case expression of
     outerReference name = case slots outer name of
         slot : _ -> Right (OuterColumnSlot (length columns) slot name)
         [] -> Left ("unknown column: " ++ name)
-    -- | 将子查询自由变量绑定到父输入布局
+    -- \| 将子查询自由变量绑定到父输入布局
     bindSubquery query = do
         references <- case query of
             Subquery _ names -> mapM reference names
@@ -141,12 +143,12 @@ bindSlots columns outer expression = case expression of
                 | map fst references == names -> mapM rebind references
                 | otherwise -> Left "bound subquery references mismatch"
         Right (BoundSubquery (subqueryStatement query) (subqueryRefs query) references)
-    -- | 补回限定名之前先绑定真实物理列
+    -- \| 补回限定名之前先绑定真实物理列
     reference name = do
         let physical = if name `elem` (columns ++ outer) then name else reverse (takeWhile (/= '.') (reverse name))
         boundReference <- bind (Col physical)
         Right (name, boundReference)
-    -- | 重绑定时保留局部或外层身份
+    -- \| 重绑定时保留局部或外层身份
     rebind (name, boundReference) = (,) name <$> bind boundReference
     -- \| 绑定两个操作数
     binary constructor a b = constructor <$> bind a <*> bind b

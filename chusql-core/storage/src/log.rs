@@ -1,7 +1,7 @@
 use std::fmt;
 use std::io::{IsTerminal, Write};
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 // 极简日志：等级用原子变量，关掉的等级只花一次原子读。
 
@@ -123,8 +123,18 @@ fn streams_to_stderr(level: Level) -> bool {
 
 /// 按目标流是否终端决定是否着色
 fn color_enabled(to_stderr: bool) -> bool {
-    let cached = if to_stderr { &COLOR_STDERR } else { &COLOR_STDOUT };
-    *cached.get_or_init(|| if to_stderr { std::io::stderr().is_terminal() } else { std::io::stdout().is_terminal() })
+    let cached = if to_stderr {
+        &COLOR_STDERR
+    } else {
+        &COLOR_STDOUT
+    };
+    *cached.get_or_init(|| {
+        if to_stderr {
+            std::io::stderr().is_terminal()
+        } else {
+            std::io::stdout().is_terminal()
+        }
+    })
 }
 
 /// 拼一行（纯函数，可测）

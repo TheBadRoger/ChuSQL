@@ -1,35 +1,35 @@
-module ChuSQL.Server.Catalog
-    ( Catalog
-    , newCatalog
-    , normalizeRole
-    , normalizeUser
-    , normalizeObject
-    , withCatalog
-    , withCatalogLock
-    , ensureCatalog
-    , eachAction
-    , readRoleNames
-    , readIdentities
-    , insertRole
-    , dropRole
-    , readGrants
-    , addGrant
-    , removeGrant
-    , readGrantOptions
-    , addGrantOption
-    , removeGrantOption
-    , readMembers
-    , addMember
-    , removeMember
-    ) where
+module ChuSQL.Server.Catalog (
+    Catalog,
+    newCatalog,
+    normalizeRole,
+    normalizeUser,
+    normalizeObject,
+    withCatalog,
+    withCatalogLock,
+    ensureCatalog,
+    eachAction,
+    readRoleNames,
+    readIdentities,
+    insertRole,
+    dropRole,
+    readGrants,
+    addGrant,
+    removeGrant,
+    readGrantOptions,
+    addGrantOption,
+    removeGrantOption,
+    readMembers,
+    addMember,
+    removeMember,
+) where
 
-import Control.Monad (void)
 import ChuSQL.Core.Model (Row, Value (..))
 import ChuSQL.Core.Protocol (Account (..), Request (..))
 import ChuSQL.Interface.Actions (escapeStringLiteral)
 import ChuSQL.Interface.Protocol (Grant (..))
 import ChuSQL.Server.Backend (Backend (..), StatementResult (..), grantsTable, membersTable, optionsTable, rolesTable)
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
+import Control.Monad (void)
 import Data.List (intercalate, isInfixOf)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -77,7 +77,7 @@ withCatalog catalog action = withCatalogLock catalog $ do
 ensureCatalog :: Catalog -> IO (Either String ())
 ensureCatalog catalog = eachAction tableDefs (createTable catalog)
   where
-    -- | 三张系统表的定义
+    -- \| 三张系统表的定义
     tableDefs =
         [ (rolesTable, "(name VARCHAR(64))")
         , (grantsTable, "(role VARCHAR(64), privilege VARCHAR(16), object VARCHAR(128))")
@@ -191,7 +191,7 @@ grantOf row =
 
 -- | 一行带 grant option 的授权记录
 optionOf :: Row -> Grant
-optionOf row = (grantOf row) {grantable = True}
+optionOf row = (grantOf row){grantable = True}
 
 -- | 一行成员关系
 memberOf :: Row -> (Text, Text)
@@ -200,8 +200,14 @@ memberOf row = (normalizeRole (cell "role" row), normalizeUser (cell "member" ro
 -- | 拼一条删授权的语句
 deleteGrantSql :: String -> Text -> Text -> Text -> String
 deleteGrantSql table role privilege object =
-    "DELETE FROM " ++ table ++ " WHERE role = " ++ roleLiteral role
-        ++ " AND privilege = " ++ literal privilege ++ " AND object = " ++ literal object
+    "DELETE FROM "
+        ++ table
+        ++ " WHERE role = "
+        ++ roleLiteral role
+        ++ " AND privilege = "
+        ++ literal privilege
+        ++ " AND object = "
+        ++ literal object
 
 -- | 拼一条插入语句
 insertSql :: String -> [String] -> [Text] -> String

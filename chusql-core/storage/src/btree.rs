@@ -22,7 +22,8 @@ const SLOT: usize = 2;
 const CELL_FIXED: usize = 2 + 8;
 
 /// 键长上限：节点里的格子必须放得进一页
-pub const MAX_KEY_BYTES: usize = 64;
+pub const MAX_KEY_BYTES: usize = 128;
+const LEGACY_KEY_BYTES: usize = 64;
 
 /// 一个节点最多几个键
 fn max_keys(order: usize) -> usize {
@@ -31,7 +32,7 @@ fn max_keys(order: usize) -> usize {
 
 /// 一个格子最多占多少字节
 fn max_cell_bytes() -> usize {
-    CELL_FIXED + MAX_KEY_BYTES
+    CELL_FIXED + LEGACY_KEY_BYTES
 }
 
 /// 这个 order 放得进一页吗
@@ -42,6 +43,16 @@ pub fn fits_in_page(page_size: usize, order: usize) -> bool {
 /// 一页最多几个孩子
 pub fn max_order(page_size: usize) -> usize {
     page_size.saturating_sub(HEADER) / (SLOT + max_cell_bytes()) + 1
+}
+
+/// 按页容量和分支数计算有效键长
+pub fn key_limit(page_size: usize, order: usize) -> usize {
+    if order < 2 {
+        return 0;
+    }
+    (page_size.saturating_sub(HEADER) / (order - 1))
+        .saturating_sub(SLOT + CELL_FIXED)
+        .min(MAX_KEY_BYTES)
 }
 
 /// 读一个 u8
@@ -66,7 +77,12 @@ fn write_u16(p: &mut Page, off: usize, v: u16) {
 
 /// 读一个小端 u32
 fn read_u32(p: &Page, off: usize) -> u32 {
-    u32::from_le_bytes([p.data[off], p.data[off + 1], p.data[off + 2], p.data[off + 3]])
+    u32::from_le_bytes([
+        p.data[off],
+        p.data[off + 1],
+        p.data[off + 2],
+        p.data[off + 3],
+    ])
 }
 
 /// 写一个小端 u32
@@ -91,7 +107,7 @@ fn write_meta(page: &mut Page, page_size: usize, order: usize, root: PageId) {
     page.zero();
     page.data[0..4].copy_from_slice(META_MAGIC);
     write_u32(page, OFF_PAGE_SIZE, page_size as u32);
-    write_u16(page, OFF_MAX_KEY, MAX_KEY_BYTES as u16);
+    write_u16(page, OFF_MAX_KEY, key_limit(page_size, order) as u16);
     write_u64(page, OFF_ROOT, root);
     write_u16(page, OFF_ORDER, order as u16);
 }
@@ -113,6 +129,13 @@ fn check_meta(page: &Page, page_size: usize, order: usize) -> io::Result<()> {
                 "index file was built with page.size={} btree.order={}, config says page.size={} btree.order={}",
                 stored_page, stored_order, page_size, order
             ),
+        ));
+    }
+    let stored_key = read_u16(page, OFF_MAX_KEY) as usize;
+    if stored_key < LEGACY_KEY_BYTES || stored_key > key_limit(page_size, order) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported index key limit",
         ));
     }
     Ok(())
@@ -169,13 +192,19 @@ fn put_node(p: &mut Page, node: &Node) -> io::Result<()> {
 /// 从一页读出节点
 fn get_node(p: &Page) -> io::Result<Node> {
     if p.data.len() < HEADER {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated index node header"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated index node header",
+        ));
     }
     let kind = read_u8(p, OFF_KIND);
     let count = read_u16(p, OFF_COUNT) as usize;
     let slots_end = HEADER + count * SLOT;
     if !matches!(kind, NODE_LEAF | NODE_INTERNAL) || slots_end > p.data.len() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid index node kind or slot count"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid index node kind or slot count",
+        ));
     }
     let trailer = read_u64(p, OFF_NEXT);
     let mut keys = Vec::with_capacity(count);
@@ -184,30 +213,55 @@ fn get_node(p: &Page) -> io::Result<Node> {
     for i in 0..count {
         let off = read_u16(p, HEADER + i * SLOT) as usize;
         if off < slots_end || off + CELL_FIXED > p.data.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid index cell offset"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid index cell offset",
+            ));
         }
         let klen = read_u16(p, off) as usize;
         if klen > MAX_KEY_BYTES || off + CELL_FIXED + klen > p.data.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid index key length"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid index key length",
+            ));
         }
         if off + CELL_FIXED + klen > cell_end {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "overlapping index cells"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "overlapping index cells",
+            ));
         }
         cell_end = off;
         keys.push(p.data[off + 2..off + 2 + klen].to_vec());
         values.push(read_u64(p, off + 2 + klen));
     }
     if keys.windows(2).any(|pair| pair[0] > pair[1]) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "index keys are not sorted"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "index keys are not sorted",
+        ));
     }
     if kind == NODE_INTERNAL {
         values.push(trailer);
         if values.contains(&META_PAGE) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid index child page"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid index child page",
+            ));
         }
-        Ok(Node { kind, next: 0, keys, values })
+        Ok(Node {
+            kind,
+            next: 0,
+            keys,
+            values,
+        })
     } else {
-        Ok(Node { kind, next: trailer, keys, values })
+        Ok(Node {
+            kind,
+            next: trailer,
+            keys,
+            values,
+        })
     }
 }
 
@@ -244,7 +298,12 @@ fn split_node(node: &mut Node) -> (Vec<u8>, Node) {
         node.keys.pop();
         (
             sep,
-            Node { kind: NODE_INTERNAL, next: 0, keys: right_keys, values: right_values },
+            Node {
+                kind: NODE_INTERNAL,
+                next: 0,
+                keys: right_keys,
+                values: right_values,
+            },
         )
     }
 }
@@ -287,18 +346,24 @@ impl DiskBTree {
     }
 
     /// 键太长直接报错，避免写坏节点
-    fn check_key(&self, key: &[u8]) -> io::Result<()> {
-        if key.len() > MAX_KEY_BYTES {
+    pub(crate) fn check_key(key: &[u8], page_size: usize, order: usize) -> io::Result<()> {
+        let limit = key_limit(page_size, order);
+        if key.len() > limit {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
                     "index key is {} bytes, at most {} are supported",
                     key.len(),
-                    MAX_KEY_BYTES
+                    limit
                 ),
             ));
         }
         Ok(())
+    }
+
+    /// 按当前索引配置预检键长
+    pub(crate) fn validate_key(&self, key: &[u8]) -> io::Result<()> {
+        Self::check_key(key, self.file.page_size(), self.order)
     }
 
     /// 读根页页号；空树是 None
@@ -329,6 +394,11 @@ impl DiskBTree {
     /// 按页号写节点
     fn store(&mut self, id: PageId, node: &Node) -> io::Result<()> {
         self.file.update_page(id, |p| put_node(p, node))?
+    }
+
+    /// 设置后续索引页的提交点
+    pub(crate) fn set_lsn(&mut self, lsn: u64) {
+        self.file.set_lsn(lsn);
     }
 
     /// 清空整棵树
@@ -362,14 +432,26 @@ impl DiskBTree {
 
     /// 按 key 取全部位置（重复键按值升序）
     pub fn get_all(&mut self, key: &[u8]) -> io::Result<Vec<u64>> {
-        let mut values: Vec<_> = self.scan(Some(key), Some(key))?.into_iter().map(|(_, value)| value).collect();
+        let mut values: Vec<_> = self
+            .scan(Some(key), Some(key))?
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
         values.sort_unstable();
         Ok(values)
     }
 
     /// 插入一个键值对（键可重复）
     pub fn insert(&mut self, key: &[u8], value: u64) -> io::Result<()> {
-        self.check_key(key)?;
+        self.validate_key(key)?;
+        if key.len() > LEGACY_KEY_BYTES {
+            let limit = key_limit(self.file.page_size(), self.order);
+            let mut meta = self.file.read_page(META_PAGE)?;
+            if read_u16(&meta, OFF_MAX_KEY) as usize != limit {
+                write_u16(&mut meta, OFF_MAX_KEY, limit as u16);
+                self.file.write_page(&meta)?;
+            }
+        }
         match self.root()? {
             None => {
                 let node = Node {
@@ -412,7 +494,9 @@ impl DiskBTree {
         } else {
             let child = node.values[child_slot(&node.keys, key)];
             if let Some((sep, right_id)) = self.insert_rec(child, key, value)? {
-                let at = node.keys.partition_point(|k| k.as_slice() <= sep.as_slice());
+                let at = node
+                    .keys
+                    .partition_point(|k| k.as_slice() <= sep.as_slice());
                 node.keys.insert(at, sep);
                 node.values.insert(at + 1, right_id);
             }

@@ -1,0 +1,22 @@
+# 只发送构建所需源码，排除凭据、数据及宿主构建缓存。
+.git
+.agents
+.codex
+.aws
+**/.stack-work
+**/target
+**/dist
+**/dist-newstyle
+**/__pycache__
+logs
+secrets
+.env
+.env.*
+**/*.db
+**/*.idx
+**/wal.log
+**/wal.checkpoint
+Dockerfile*
+compose*.yaml
+docs
+benchmark

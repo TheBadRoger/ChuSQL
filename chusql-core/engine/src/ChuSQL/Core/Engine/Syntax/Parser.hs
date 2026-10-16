@@ -1,16 +1,16 @@
-{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE ImportQualifiedPost #-}
+{-# LANGUAGE TupleSections #-}
 
 module ChuSQL.Core.Engine.Syntax.Parser (parseStatement, parseExpression) where
 
-import Data.Functor (($>))
-import ChuSQL.Core.Model (Column (..), ColumnType (..), Value (..), plainColumn)
 import ChuSQL.Core.Engine.Builtin (Builtin (..), builtinName, builtinNames, builtinNode, compareNode)
-import ChuSQL.Core.Engine.Syntax.AST
 import ChuSQL.Core.Engine.Runtime.Types
+import ChuSQL.Core.Engine.Syntax.AST
+import ChuSQL.Core.Model (Column (..), ColumnType (..), Value (..), plainColumn)
 import Control.Monad (void)
 import Control.Monad.Combinators.Expr (Operator (..), makeExprParser)
 import Data.Char (isAlpha, isAlphaNum, isHexDigit, isSpace, toLower, toUpper)
+import Data.Functor (($>))
 import Data.List (intercalate, isInfixOf)
 import Data.Maybe (fromMaybe)
 import Data.Void (Void)
@@ -115,8 +115,9 @@ operatorTable =
     [ [Prefix (Neg <$ symbol "-")]
     , [InfixL (Mul <$ symbol "*"), InfixL (Div <$ symbol "/")]
     , [InfixL (Add <$ symbol "+"), InfixL (Sub <$ symbol "-")]
-    , [ InfixN comparisonOp ]
-    , [ Postfix inPredicate
+    , [InfixN comparisonOp]
+    ,
+        [ Postfix inPredicate
         , Postfix (try quantifiedCmp)
         , Postfix (IsNotNull <$ try (keyword "is" *> keyword "not" *> keyword "null"))
         , Postfix (IsNull <$ (keyword "is" *> keyword "null"))
@@ -210,22 +211,29 @@ subquerySelect = Subquery <$> queryStatement <*> pure []
 -- | 读取带具体类型参数的构造器
 constructorCall :: Parser Expr
 constructorCall = do
-    cid <- (TypeConstructorId 5 <$ keyword "list") <|> (TypeConstructorId 6 <$ keyword "maybe")
-        <|> (TypeConstructorId 7 <$ keyword "tuple")
+    cid <-
+        (TypeConstructorId 5 <$ keyword "list")
+            <|> (TypeConstructorId 6 <$ keyword "maybe")
+            <|> (TypeConstructorId 7 <$ keyword "tuple")
     arguments <- between (symbol "<") (symbol ">") (sepBy runtimeTypeP (symbol ","))
     values <- between (symbol "(") (symbol ")") (sepBy expr (symbol ","))
     pure (Construct (TypeApply cid arguments) values)
 
 -- | 解析运行时逻辑类型语法
 runtimeTypeP :: Parser TypeExpr
-runtimeTypeP = choice
-    [ intType <$ keyword "int", doubleType <$ keyword "double", boolType <$ keyword "bool"
-    , stringType <$ keyword "string", stringType <$ keyword "str", stringType <$ keyword "text"
-    , listType <$> between (symbol "[") (symbol "]") runtimeTypeP
-    , listType <$> (keyword "list" *> runtimeTypeP)
-    , maybeType <$> (keyword "maybe" *> runtimeTypeP)
-    , tupleType <$> between (symbol "(") (symbol ")") (sepBy runtimeTypeP (symbol ","))
-    ]
+runtimeTypeP =
+    choice
+        [ intType <$ keyword "int"
+        , doubleType <$ keyword "double"
+        , boolType <$ keyword "bool"
+        , stringType <$ keyword "string"
+        , stringType <$ keyword "str"
+        , stringType <$ keyword "text"
+        , listType <$> between (symbol "[") (symbol "]") runtimeTypeP
+        , listType <$> (keyword "list" *> runtimeTypeP)
+        , maybeType <$> (keyword "maybe" *> runtimeTypeP)
+        , tupleType <$> between (symbol "(") (symbol ")") (sepBy runtimeTypeP (symbol ","))
+        ]
 
 -- | 读取待绑定的标量函数调用
 scalarFunctionCall :: Parser Expr
@@ -238,11 +246,11 @@ scalarFunctionCall = do
 aggregateCall :: Parser Expr
 aggregateCall = choice (countAll : map named builtinNames)
   where
-    -- | COUNT(*)，没有参数
+    -- \| COUNT(*)，没有参数
     countAll = CountAll <$ try (keyword (builtinName BCountAll) *> between (symbol "(") (symbol ")") (symbol "*"))
-    -- | 表里每一个带参数的内置函数
+    -- \| 表里每一个带参数的内置函数
     named (name, builtin) = builtinNode builtin <$> aggArg name
-    -- | 读聚合函数的参数
+    -- \| 读聚合函数的参数
     aggArg name = try (keyword name *> between (symbol "(") (symbol ")") expr)
 
 -- | 只认字面量，给 DEFAULT 用
@@ -252,14 +260,11 @@ literalValue =
         [ VNull <$ keyword "null"
         , VBool True <$ keyword "TRUE"
         , VBool False <$ keyword "FALSE"
-        , try (negateLit <$> floatLit)
+        , try (symbol "-" *> (VFloat . negate <$> try floatLit <|> VInt . negate <$> integer))
+        , try (VFloat <$> floatLit)
         , VInt <$> integer
-        , VFloat <$> try floatLit
         , VStr <$> stringLit
         ]
-  where
-    -- | 负浮点字面量
-    negateLit d = VFloat (negate d)
 
 -- | 一个排序键：输出序号、列名或表达式
 orderItem :: Parser (OrderKey, SortDir)
@@ -365,8 +370,10 @@ tableRef = do
 -- | 连接类型：内连接 / 左外连接
 joinKind :: Parser JoinKind
 joinKind =
-    try ((keyword "left" *> optional (keyword "outer") *> keyword "join")
-           $> LeftJoin)
+    try
+        ( (keyword "left" *> optional (keyword "outer") *> keyword "join")
+            $> LeftJoin
+        )
         <|> try ((keyword "inner" *> keyword "join") $> InnerJoin)
         <|> (keyword "join" $> InnerJoin)
 
@@ -430,9 +437,10 @@ createTableStatement = do
 
 -- | 读 DROP TABLE
 dropTableStatement :: Parser Statement
-dropTableStatement = do keyword "drop"
-                        keyword "table"
-                        DropTable <$> tableName
+dropTableStatement = do
+    keyword "drop"
+    keyword "table"
+    DropTable <$> tableName
 
 -- | 读 CREATE INDEX（列名即索引名）
 createIndexStatement :: Parser Statement
@@ -491,10 +499,11 @@ alterTableStatement = do
 
 -- | 读 CREATE USER，口令是明文
 createUserStatement :: Parser Statement
-createUserStatement = do keyword "create"
-                         keyword "user"
-                         name <- userName
-                         CreateUser name <$> identifiedBy
+createUserStatement = do
+    keyword "create"
+    keyword "user"
+    name <- userName
+    CreateUser name <$> identifiedBy
 
 -- | 读 IDENTIFIED BY '口令'
 identifiedBy :: Parser String
@@ -513,15 +522,19 @@ alterUserStatement = do
 
 -- | 读身份属性开关
 identityAttribute :: Parser (String, Bool)
-identityAttribute = choice
-    [ ("allow_sudo_auth", True) <$ keyword "allow_sudo_auth"
-    , ("allow_sudo_auth", False) <$ keyword "noallow_sudo_auth"
-    , ("system_catalog_manager", True) <$ keyword "system_catalog_manager"
-    , ("system_catalog_manager", False) <$ keyword "nosystem_catalog_manager"
-    , ("login", True) <$ keyword "login", ("login", False) <$ keyword "nologin"
-    , ("superuser", True) <$ keyword "superuser", ("superuser", False) <$ keyword "nosuperuser"
-    , ("enabled", True) <$ keyword "enabled", ("enabled", False) <$ keyword "disabled"
-    ]
+identityAttribute =
+    choice
+        [ ("allow_sudo_auth", True) <$ keyword "allow_sudo_auth"
+        , ("allow_sudo_auth", False) <$ keyword "noallow_sudo_auth"
+        , ("system_catalog_manager", True) <$ keyword "system_catalog_manager"
+        , ("system_catalog_manager", False) <$ keyword "nosystem_catalog_manager"
+        , ("login", True) <$ keyword "login"
+        , ("login", False) <$ keyword "nologin"
+        , ("superuser", True) <$ keyword "superuser"
+        , ("superuser", False) <$ keyword "nosuperuser"
+        , ("enabled", True) <$ keyword "enabled"
+        , ("enabled", False) <$ keyword "disabled"
+        ]
 
 -- | 读 ALTER ROLE 属性或口令
 alterRoleStatement :: Parser Statement
@@ -533,9 +546,10 @@ alterRoleStatement = do
 
 -- | 读 DROP USER
 dropUserStatement :: Parser Statement
-dropUserStatement = do keyword "drop"
-                       keyword "user"
-                       DropUser <$> userName
+dropUserStatement = do
+    keyword "drop"
+    keyword "user"
+    DropUser <$> userName
 
 -- | 读 CREATE ROLE
 createRoleStatement :: Parser Statement
@@ -566,9 +580,11 @@ privilegeName =
 
 -- | ON 后面的授权对象：* 或一张表
 grantObject :: Parser String
-grantObject = try (("database:" ++) <$> (keyword "database" *> identifier))
-    <|> try ((++ ".*") <$> (identifier <* symbol "." <* symbol "*"))
-    <|> ("*" <$ symbol "*") <|> (optional (keyword "table") *> tableName)
+grantObject =
+    try (("database:" ++) <$> (keyword "database" *> identifier))
+        <|> try ((++ ".*") <$> (identifier <* symbol "." <* symbol "*"))
+        <|> ("*" <$ symbol "*")
+        <|> (optional (keyword "table") *> tableName)
 
 -- | 可选的 WITH GRANT OPTION
 grantOption :: Parser Bool
@@ -603,6 +619,64 @@ revokeStatement = do
         , if optionOnly then fail "GRANT OPTION FOR requires object privileges" else RevokeRole <$> userName <*> (keyword "from" *> sepBy1 userName (symbol ","))
         ]
 
+-- | 读取领域及其独立约束
+createDomainStatement :: Parser Statement
+createDomainStatement = do
+    name <- keyword "create" *> keyword "domain" *> identifier
+    ty <- keyword "as" *> columnTypeP
+    modifiers <- many domainConstraint
+    pure (CreateDomain name (foldl (flip ($)) (DomainDefinition (plainColumn ty) []) modifiers))
+
+-- | 读取领域属性或 CHECK 条件
+domainConstraint :: Parser (DomainDefinition -> DomainDefinition)
+domainConstraint =
+    choice
+        [ try (keyword "not" *> keyword "null") $> domainNull False
+        , keyword "null" $> domainNull True
+        , keyword "default" *> (domainDefault . Just <$> literalValue)
+        , do
+            name <- optional (keyword "constraint" *> identifier)
+            text <- keyword "check" *> checkText
+            pure (domainCheck (fromMaybe "" name) text)
+        ]
+
+-- | 设置领域非空声明
+domainNull :: Bool -> DomainDefinition -> DomainDefinition
+domainNull nullable (DomainDefinition column checks) = DomainDefinition column{columnNullable = nullable} checks
+
+-- | 设置领域默认值
+domainDefault :: Maybe Value -> DomainDefinition -> DomainDefinition
+domainDefault value (DomainDefinition column checks) = DomainDefinition column{columnDefault = value} checks
+
+-- | 增加领域检查条件
+domainCheck :: String -> String -> DomainDefinition -> DomainDefinition
+domainCheck name text (DomainDefinition column checks) = DomainDefinition column (checks ++ [(name, text)])
+
+-- | 读取领域约束与默认值变更
+alterDomainStatement :: Parser Statement
+alterDomainStatement = do
+    name <- keyword "alter" *> keyword "domain" *> identifier
+    action <-
+        choice
+            [ keyword "set"
+                *> choice
+                    [ DomainDefault . Just <$> (keyword "default" *> literalValue)
+                    , DomainNullable False <$ (keyword "not" *> keyword "null")
+                    ]
+            , keyword "drop"
+                *> choice
+                    [ DomainDefault Nothing <$ keyword "default"
+                    , DomainNullable True <$ (keyword "not" *> keyword "null")
+                    , DomainDropCheck <$> (keyword "constraint" *> identifier)
+                    ]
+            , keyword "add"
+                *> ( DomainAddCheck
+                        <$> optional (keyword "constraint" *> identifier)
+                        <*> (keyword "check" *> checkText)
+                   )
+            ]
+    pure (AlterDomain name action)
+
 -- | 建表时的一列：类型后面跟若干约束
 columnDef :: Parser (String, Column)
 columnDef = do
@@ -615,18 +689,24 @@ columnDef = do
 columnConstraint :: Parser (Column -> Column)
 columnConstraint =
     choice
-        [ try ((keyword "not" *> keyword "null")
-                 $> (\ c -> c {columnNullable = False}))
-        , keyword "null" $> (\ c -> c {columnNullable = True})
+        [ try
+            ( (keyword "not" *> keyword "null")
+                $> (\c -> c{columnNullable = False})
+            )
+        , keyword "null" $> (\c -> c{columnNullable = True})
         , keyword "auto_increment"
-            $>
-              (\ c -> c {columnAutoIncrement = True, columnNullable = False})
-        , try ((keyword "primary" *> keyword "key")
-                 $>
-                   (\ c
-                      -> c {columnPrimaryKey = True, columnUnique = True,
-                            columnNullable = False}))
-        , keyword "unique" $> (\ c -> c {columnUnique = True})
+            $> (\c -> c{columnAutoIncrement = True, columnNullable = False})
+        , try
+            ( (keyword "primary" *> keyword "key")
+                $> ( \c ->
+                        c
+                            { columnPrimaryKey = True
+                            , columnUnique = True
+                            , columnNullable = False
+                            }
+                   )
+            )
+        , keyword "unique" $> (\c -> c{columnUnique = True})
         , keyword "default" *> ((\v c -> c{columnDefault = Just v}) <$> literalValue)
         , keyword "check" *> ((\s c -> c{columnCheck = Just s}) <$> checkText)
         ]
@@ -669,13 +749,14 @@ columnTypeP =
 -- | 解析复合列的稳定类型身份
 runtimeColumnType :: Parser ColumnType
 runtimeColumnType = do
-    expression <- choice
-        [ listType <$> between (symbol "[") (symbol "]") runtimeTypeP
-        , listType <$> (keyword "list" *> runtimeTypeP)
-        , maybeType <$> (keyword "maybe" *> runtimeTypeP)
-        , tupleType <$> between (symbol "(") (symbol ")") (sepBy runtimeTypeP (symbol ","))
-        , stringType <$ keyword "string"
-        ]
+    expression <-
+        choice
+            [ listType <$> between (symbol "[") (symbol "]") runtimeTypeP
+            , listType <$> (keyword "list" *> runtimeTypeP)
+            , maybeType <$> (keyword "maybe" *> runtimeTypeP)
+            , tupleType <$> between (symbol "(") (symbol ")") (sepBy runtimeTypeP (symbol ","))
+            , stringType <$ keyword "string"
+            ]
     case resolveType builtinTypes expression of
         Left err -> fail err
         Right descriptor -> pure (CRuntime (descriptorId descriptor))
@@ -734,7 +815,7 @@ queryStatement = withStatement <|> selectStatement
 expandWith :: [(String, [String], Statement)] -> Statement -> Either String Statement
 expandWith defs main = go [] defs
   where
-    -- | 前面的 CTE 已进环境，接着展开本体
+    -- \| 前面的 CTE 已进环境，接着展开本体
     go env [] = expandStatement env main
     go env ((name, cols, body) : rest) = do
         body' <- expandStatement env body
@@ -749,14 +830,15 @@ cteKey = map toLower
 renameColumns :: String -> [String] -> Statement -> Either String Statement
 renameColumns _ [] q = Right q
 renameColumns name cols (SelectDistinct q) = SelectDistinct <$> renameColumns name cols q
-renameColumns name cols q@Select { selectItems = items } = do
+renameColumns name cols q@Select{selectItems = items} = do
     checkCteArity name cols (map snd items)
-    ordering <- if all (\(label, expression) -> expression == Col label) items
-        then Right (selectOrderBy q)
-        else mapM renameOrder (selectOrderBy q)
-    Right q { selectItems = zip cols (map snd items), selectOrderBy = ordering }
+    ordering <-
+        if all (\(columnName, expression) -> expression == Col columnName) items
+            then Right (selectOrderBy q)
+            else mapM renameOrder (selectOrderBy q)
+    Right q{selectItems = zip cols (map snd items), selectOrderBy = ordering}
   where
-    -- | 列清单同步改写内层排序输出别名
+    -- \| 列清单同步改写内层排序输出别名
     renameOrder (OrderColumn column, direction) = case [new | ((old, _), new) <- zip items cols, old == column] of
         [] -> Right (OrderColumn column, direction)
         [new] -> Right (OrderColumn new, direction)
@@ -774,16 +856,16 @@ checkCteArity name cols out
 expandStatement :: [(String, Statement)] -> Statement -> Either String Statement
 expandStatement env stmt = case stmt of
     SelectDistinct q -> SelectDistinct <$> expandStatement env q
-    q@Select { selectFrom = fromC, selectItems = items, selectWhere = mWhere } -> do
+    q@Select{selectFrom = fromC, selectItems = items, selectWhere = mWhere} -> do
         fromC' <- expandClause env fromC
         items' <- traverse (\(name, e) -> fmap (name,) (expandExpr env e)) items
         w <- traverse (expandExpr env) mWhere
         having <- traverse (expandExpr env) (selectHaving q)
         ordering <- mapM expandOrder (selectOrderBy q)
-        Right q { selectFrom = fromC', selectItems = items', selectWhere = w, selectHaving = having, selectOrderBy = ordering }
+        Right q{selectFrom = fromC', selectItems = items', selectWhere = w, selectHaving = having, selectOrderBy = ordering}
     _ -> Right stmt
   where
-    -- | 展开排序表达式中的 CTE 子查询
+    -- \| 展开排序表达式中的 CTE 子查询
     expandOrder (OrderExpression expression, direction) = (,) . OrderExpression <$> expandExpr env expression <*> pure direction
     expandOrder ordering = Right ordering
 
@@ -832,10 +914,10 @@ expandExpr env e = case e of
     QuantCmp op x sq q -> (\x' sq' -> QuantCmp op x' sq' q) <$> go x <*> goSub sq
     _ -> Right e
   where
-    -- | 继续看子表达式
+    -- \| 继续看子表达式
     go = expandExpr env
-    -- | 继续看子查询里的语句
-    goSub sq = (\stmt -> sq { subqueryStatement = stmt }) <$> expandStatement env (subqueryStatement sq)
+    -- \| 继续看子查询里的语句
+    goSub sq = (\stmt -> sq{subqueryStatement = stmt}) <$> expandStatement env (subqueryStatement sq)
 
 -- | 读 INSERT，可一次插多行
 insertStatement :: Parser Statement
@@ -878,15 +960,18 @@ updateStatement = do
 -- | 事务控制语句
 transactionStatement :: Parser Statement
 transactionStatement =
-    try (BeginTransaction <$ (keyword "start" *> keyword "transaction"))
-        <|> (BeginTransaction <$ (keyword "begin" *> optional (keyword "transaction")))
+    (beginMode =<< (try (keyword "start" *> keyword "transaction") <|> (keyword "begin" *> void (optional (keyword "transaction")))))
         <|> (CommitTransaction <$ (keyword "commit" *> optional (keyword "transaction")))
         <|> try (RollbackToSavepoint <$> rollbackToName)
         <|> (RollbackTransaction <$ (keyword "rollback" *> optional (keyword "transaction")))
         <|> (Savepoint <$> (keyword "savepoint" *> identifier))
         <|> (ReleaseSavepoint <$> (keyword "release" *> optional (keyword "savepoint") *> identifier))
   where
-    -- | ROLLBACK TO [SAVEPOINT] 名字
+    -- 解析可选的串行化隔离级别。
+    beginMode _ = do
+        mode <- optional (keyword "isolation" *> keyword "level" *> keyword "serializable")
+        pure (maybe BeginTransaction (const BeginSerializableTransaction) mode)
+    -- \| ROLLBACK TO [SAVEPOINT] 名字
     rollbackToName =
         keyword "rollback" *> keyword "to" *> optional (keyword "savepoint") *> identifier
 
@@ -897,7 +982,7 @@ parseStatement input =
         Left err -> Left (safeParseError input err)
         Right q -> Right q
   where
-    -- | 按关键字分派到各语句解析器
+    -- \| 按关键字分派到各语句解析器
     statementP =
         withStatement
             <|> transactionStatement
@@ -907,7 +992,8 @@ parseStatement input =
             <|> (UseDatabase <$> (keyword "use" *> identifier))
             <|> try (ShowDatabases <$ (keyword "show" *> keyword "databases"))
             <|> try (ShowDomains <$ (keyword "show" *> keyword "domains"))
-            <|> try (CreateDomain <$> (keyword "create" *> keyword "domain" *> identifier) <*> (keyword "as" *> columnTypeP))
+            <|> try createDomainStatement
+            <|> try alterDomainStatement
             <|> try (DropDomain <$> (keyword "drop" *> keyword "domain" *> identifier))
             <|> insertStatement
             <|> deleteStatement

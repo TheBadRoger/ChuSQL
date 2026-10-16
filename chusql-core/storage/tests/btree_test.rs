@@ -1,4 +1,4 @@
-use chusql_core_storage::btree::{fits_in_page, DiskBTree, MAX_KEY_BYTES};
+use chusql_core_storage::btree::{DiskBTree, MAX_KEY_BYTES, fits_in_page};
 use chusql_core_storage::config::{DEFAULT_BTREE_ORDER, DEFAULT_PAGE_SIZE};
 use chusql_core_storage::page::DEFAULT_POOL_SIZE;
 use std::io::{ErrorKind, Seek, SeekFrom, Write};
@@ -16,20 +16,28 @@ fn malformed_node_fields_return_invalid_data() {
         tree.insert(b"y", 2).unwrap();
     }
     let original = std::fs::read(&path).unwrap();
-    let cell = u16::from_le_bytes([original[DEFAULT_PAGE_SIZE + 11], original[DEFAULT_PAGE_SIZE + 12]]) as usize;
+    let cell = u16::from_le_bytes([
+        original[DEFAULT_PAGE_SIZE + 11],
+        original[DEFAULT_PAGE_SIZE + 12],
+    ]) as usize;
     for (name, offset, bytes) in [
         ("slot count", 1, vec![255, 255]),
         ("node kind", 0, vec![2]),
         ("cell overlaps slots", 11, vec![0, 0]),
         ("cell beyond page", 11, vec![255, 15]),
-        ("overlapping cells", 13, (cell as u16).to_le_bytes().to_vec()),
+        (
+            "overlapping cells",
+            13,
+            (cell as u16).to_le_bytes().to_vec(),
+        ),
         ("key length", cell, vec![255, 255]),
         ("key order", cell + 2, vec![b'z']),
         ("zero child", 0, vec![1]),
     ] {
         std::fs::write(&path, &original).unwrap();
         let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        file.seek(SeekFrom::Start((DEFAULT_PAGE_SIZE + offset) as u64)).unwrap();
+        file.seek(SeekFrom::Start((DEFAULT_PAGE_SIZE + offset) as u64))
+            .unwrap();
         file.write_all(&bytes).unwrap();
         drop(file);
         let mut tree = open(dir.path(), "corrupt.idx");
@@ -42,7 +50,13 @@ fn malformed_node_fields_return_invalid_data() {
 
 /// 按默认参数打开指定索引文件
 fn open(dir: &std::path::Path, name: &str) -> DiskBTree {
-    DiskBTree::open(dir.join(name), DEFAULT_PAGE_SIZE, DEFAULT_BTREE_ORDER, DEFAULT_POOL_SIZE).unwrap()
+    DiskBTree::open(
+        dir.join(name),
+        DEFAULT_PAGE_SIZE,
+        DEFAULT_BTREE_ORDER,
+        DEFAULT_POOL_SIZE,
+    )
+    .unwrap()
 }
 
 /// 整数键编码成保序的 8 字节（与堆表一致）
@@ -101,12 +115,24 @@ fn reopen_persists() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.idx");
     {
-        let mut t = DiskBTree::open(&path, DEFAULT_PAGE_SIZE, DEFAULT_BTREE_ORDER, DEFAULT_POOL_SIZE).unwrap();
+        let mut t = DiskBTree::open(
+            &path,
+            DEFAULT_PAGE_SIZE,
+            DEFAULT_BTREE_ORDER,
+            DEFAULT_POOL_SIZE,
+        )
+        .unwrap();
         for i in 0..50 {
             t.insert(&key(i), i as u64).unwrap();
         }
     }
-    let mut t = DiskBTree::open(&path, DEFAULT_PAGE_SIZE, DEFAULT_BTREE_ORDER, DEFAULT_POOL_SIZE).unwrap();
+    let mut t = DiskBTree::open(
+        &path,
+        DEFAULT_PAGE_SIZE,
+        DEFAULT_BTREE_ORDER,
+        DEFAULT_POOL_SIZE,
+    )
+    .unwrap();
     for i in 0..50 {
         assert_eq!(t.get(&key(i)).unwrap(), Some(i as u64));
     }
@@ -148,12 +174,26 @@ fn config_mismatch_errors() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.idx");
     {
-        let mut t = DiskBTree::open(&path, DEFAULT_PAGE_SIZE, DEFAULT_BTREE_ORDER, DEFAULT_POOL_SIZE).unwrap();
+        let mut t = DiskBTree::open(
+            &path,
+            DEFAULT_PAGE_SIZE,
+            DEFAULT_BTREE_ORDER,
+            DEFAULT_POOL_SIZE,
+        )
+        .unwrap();
         t.insert(&key(1), 1).unwrap();
     }
     assert!(DiskBTree::open(&path, DEFAULT_PAGE_SIZE, 8, DEFAULT_POOL_SIZE).is_err());
     assert!(DiskBTree::open(&path, 8192, DEFAULT_BTREE_ORDER, DEFAULT_POOL_SIZE).is_err());
-    assert!(DiskBTree::open(&path, DEFAULT_PAGE_SIZE, DEFAULT_BTREE_ORDER, DEFAULT_POOL_SIZE).is_ok());
+    assert!(
+        DiskBTree::open(
+            &path,
+            DEFAULT_PAGE_SIZE,
+            DEFAULT_BTREE_ORDER,
+            DEFAULT_POOL_SIZE
+        )
+        .is_ok()
+    );
 }
 
 /// 不是索引文件要报错
@@ -162,7 +202,15 @@ fn not_an_index_file_errors() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("junk.idx");
     std::fs::write(&path, vec![7u8; DEFAULT_PAGE_SIZE]).unwrap();
-    assert!(DiskBTree::open(&path, DEFAULT_PAGE_SIZE, DEFAULT_BTREE_ORDER, DEFAULT_POOL_SIZE).is_err());
+    assert!(
+        DiskBTree::open(
+            &path,
+            DEFAULT_PAGE_SIZE,
+            DEFAULT_BTREE_ORDER,
+            DEFAULT_POOL_SIZE
+        )
+        .is_err()
+    );
 }
 
 /// order 放不进一页要报错
@@ -182,7 +230,10 @@ fn delete_removes_only_that_key() {
         t.insert(&key(i), i as u64 + 1).unwrap();
     }
 
-    assert!(t.delete(&key(50), 51).unwrap(), "deleting an existing entry should return true");
+    assert!(
+        t.delete(&key(50), 51).unwrap(),
+        "deleting an existing entry should return true"
+    );
     assert_eq!(t.get(&key(50)).unwrap(), None);
     assert_eq!(t.get(&key(49)).unwrap(), Some(50));
     assert_eq!(t.get(&key(51)).unwrap(), Some(52));
@@ -262,7 +313,11 @@ fn splits_keep_keys_sorted() {
     let all: Vec<Vec<u8>> = t.iter_all().unwrap().into_iter().map(|(k, _)| k).collect();
     assert_eq!(all, expected);
     for k in &expected {
-        assert!(t.get(k).unwrap().is_some(), "missing {:?}", String::from_utf8_lossy(k));
+        assert!(
+            t.get(k).unwrap().is_some(),
+            "missing {:?}",
+            String::from_utf8_lossy(k)
+        );
     }
 }
 
@@ -313,4 +368,62 @@ fn clear_resets_the_tree() {
     assert!(t.iter_all().unwrap().is_empty());
     t.insert(b"c", 3).unwrap();
     assert_eq!(t.get(b"c").unwrap(), Some(3));
+}
+
+/// 长键跨页后可重启查询并保留旧配置
+#[test]
+fn long_keys_split_reopen_and_preserve_dense_configuration() {
+    use chusql_core_storage::btree::key_limit;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("long.idx");
+    let mut tree = DiskBTree::open(&path, 512, 4, DEFAULT_POOL_SIZE).unwrap();
+    for n in 0..80_u64 {
+        let key = format!("{n:03}{}", "a".repeat(125));
+        tree.insert(key.as_bytes(), n).unwrap();
+    }
+    drop(tree);
+    let mut tree = DiskBTree::open(&path, 512, 4, DEFAULT_POOL_SIZE).unwrap();
+    assert_eq!(tree.scan(None, None).unwrap().len(), 80);
+    for n in 0..80_u64 {
+        let key = format!("{n:03}{}", "a".repeat(125));
+        assert_eq!(tree.get(key.as_bytes()).unwrap(), Some(n));
+    }
+    let dense_path = dir.path().join("dense.idx");
+    let mut dense = DiskBTree::open(&dense_path, 512, 7, DEFAULT_POOL_SIZE).unwrap();
+    let limit = key_limit(512, 7);
+    assert!((64..MAX_KEY_BYTES).contains(&limit));
+    dense.insert(&vec![b'a'; limit], 1).unwrap();
+    assert_eq!(
+        dense.insert(&vec![b'b'; limit + 1], 2).unwrap_err().kind(),
+        ErrorKind::InvalidInput
+    );
+    assert_eq!(dense.get(&vec![b'a'; limit]).unwrap(), Some(1));
+}
+
+/// 旧文件头可无损打开并首次写入长键
+#[test]
+fn legacy_key_header_upgrades_only_when_long_keys_are_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy.idx");
+    let mut tree = open(dir.path(), "legacy.idx");
+    tree.insert(b"old", 1).unwrap();
+    drop(tree);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[8..10].copy_from_slice(&64_u16.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+    let mut tree = open(dir.path(), "legacy.idx");
+    assert_eq!(tree.get(b"old").unwrap(), Some(1));
+    drop(tree);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    let mut tree = open(dir.path(), "legacy.idx");
+    let key = "author/".to_string() + &"p".repeat(80);
+    tree.insert(key.as_bytes(), 2).unwrap();
+    drop(tree);
+    let mut tree = open(dir.path(), "legacy.idx");
+    assert_eq!(tree.get(key.as_bytes()).unwrap(), Some(2));
+    assert_eq!(tree.get(b"old").unwrap(), Some(1));
+    assert_eq!(
+        &std::fs::read(&path).unwrap()[8..10],
+        &128_u16.to_le_bytes()
+    );
 }

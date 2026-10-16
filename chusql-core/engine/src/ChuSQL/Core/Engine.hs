@@ -1,18 +1,19 @@
-module ChuSQL.Core.Engine (runStatement, runStatementM, rowsOf, BoundWrite, bindWrite, executeWriteM) where
+module ChuSQL.Core.Engine (runStatement, runStatementM, rowsOf, BoundWrite, bindWrite, executeWriteM, validateTableRows) where
 
 import ChuSQL.Core.Engine.Algebra.Eval (evalCondForRowM, evalExprM)
 import ChuSQL.Core.Engine.Algebra.Expr (evalCondForRow, evalExpr)
+import ChuSQL.Core.Engine.Domain
+import ChuSQL.Core.Engine.Runtime.Dependencies (domainDependencies, queryTables, typeDependencies, validateDependencies)
 import ChuSQL.Core.Engine.Runtime.Query (bindQuery, executeQueryM)
 import ChuSQL.Core.Engine.Runtime.Relation (bindWriteColumns, orderRow)
-import ChuSQL.Core.Engine.Runtime.Dependencies (queryTables, domainDependencies, typeDependencies, validateDependencies)
 import ChuSQL.Core.Engine.Semantic (prepare, prepareCheckExpression)
 import ChuSQL.Core.Engine.Storage (MonadStorage (..))
 import ChuSQL.Core.Engine.Storage.Memory (MemoryStorage (runMemoryStorage))
 import ChuSQL.Core.Engine.Syntax.AST
 import ChuSQL.Core.Engine.Syntax.Parser (parseExpression)
 import ChuSQL.Core.Model
-import Data.HashSet qualified as HS
 import Data.HashMap.Strict qualified as HM
+import Data.HashSet qualified as HS
 import Data.Maybe (mapMaybe)
 
 -- 引擎入口：检查语义、按语句分发执行，另有内存实现与泛型版本。
@@ -69,26 +70,27 @@ bindWrite :: Database -> Statement -> Either String BoundWrite
 bindWrite db statement = case statement of
     Select{} -> unsupported
     SelectDistinct{} -> unsupported
-    _ | null (queryTables statement) -> unsupported
-      | otherwise -> do
-        resolved <- prepare catalog statement >>= bindWriteColumns catalog
-        let sources = queryTables resolved
-        mapM_ (lookupTable catalog) sources
-        let names = sources ++ domainDependencies catalog sources ++ typeDependencies catalog (declaredTypes resolved)
-            dependencies = [(name, table) | (name, table) <- catalog, name `elem` names]
-        action <- bindWriteAction catalog resolved
-        Right (BoundWrite catalog dependencies action)
+    _
+        | null (queryTables statement) -> unsupported
+        | otherwise -> do
+            resolved <- prepare catalog statement >>= bindWriteColumns catalog
+            let sources = queryTables resolved
+            mapM_ (lookupTable catalog) sources
+            let names = sources ++ domainDependencies catalog sources ++ typeDependencies catalog (declaredTypes resolved)
+                dependencies = [(name, table) | (name, table) <- catalog, name `elem` names]
+            action <- bindWriteAction catalog resolved
+            Right (BoundWrite catalog dependencies action)
   where
     catalog = [(name, table{tableRows = []}) | (name, table) <- db]
     unsupported = Left "bound writes require an existing table target"
-    -- | 新声明类型也须保留领域依赖
+    -- \| 新声明类型也须保留领域依赖
     declaredTypes resolved = case resolved of
         AddColumn _ (_, column) -> [columnType column]
         AlterColumnType _ _ ty -> [ty]
         _ -> []
 
 -- | 复查结构后执行可复用的绑定写计划
-executeWriteM :: MonadStorage m => BoundWrite -> m (Either String [Row])
+executeWriteM :: (MonadStorage m) => BoundWrite -> m (Either String [Row])
 executeWriteM (BoundWrite catalog dependencies action) = do
     current <- schema
     case current >>= validateDependencies dependencies of
@@ -99,15 +101,24 @@ executeWriteM (BoundWrite catalog dependencies action) = do
 bindWriteAction :: Database -> Statement -> Either String WriteAction
 bindWriteAction catalog statement = case statement of
     Insert target columns rows -> do
-        table <- lookupTable catalog target
-        checks <- checkPlan table
-        let plan = InsertPlan (bindInsertTargets (tableCols table) columns) (length columns)
-                (autoColumn table) checks (constraintPlan (tableCols table))
+        declared <- lookupTable catalog target
+        columnsEffective <- effectiveColumns catalog (tableCols declared)
+        let table = declared{tableCols = columnsEffective}
+        checks <- checkPlan catalog table
+        let plan =
+                InsertPlan
+                    (bindInsertTargets (tableCols table) columns)
+                    (length columns)
+                    (autoColumn table)
+                    checks
+                    (constraintPlan (tableCols table))
         Right (InsertAction target plan rows)
     Update target assignments condition -> do
-        table <- lookupTable catalog target
+        declared <- lookupTable catalog target
+        columnsEffective <- effectiveColumns catalog (tableCols declared)
+        let table = declared{tableCols = columnsEffective}
         bound <- bindUpdateTargets (tableCols table) assignments
-        checks <- checkPlan table
+        checks <- checkPlan catalog table
         let plan = UpdatePlan (map fst (tableCols table)) bound condition checks (constraintPlan (tableCols table))
         Right (UpdateAction target plan)
     Delete target condition -> do
@@ -116,7 +127,7 @@ bindWriteAction catalog statement = case statement of
     _ -> Right (StructureAction statement)
 
 -- | 直接执行已绑定的数据修改或结构动作
-executeWriteActionM :: MonadStorage m => Database -> WriteAction -> m (Either String [Row])
+executeWriteActionM :: (MonadStorage m) => Database -> WriteAction -> m (Either String [Row])
 executeWriteActionM _ (InsertAction target plan rows) = do
     current <- existingRows target plan
     case current >>= \current' -> buildRows plan current' rows of
@@ -151,14 +162,14 @@ executeWriteActionM catalog (DeleteAction target columns condition) = do
                         result <- replaceAll target kept
                         pure (result >> Right [])
   where
-    -- | 取整数主键，否则使用原有整表删除路径
+    -- \| 取整数主键，否则使用原有整表删除路径
     rowId row = case lookup "id" row of
         Just (VInt key) -> Right key
         _ -> Left "row has no integer id"
 executeWriteActionM catalog (StructureAction statement) = runStatementUncheckedM catalog statement
 
 -- | 绑定并执行查询语句
-runQueryM :: MonadStorage m => Database -> Statement -> m (Either String [Row])
+runQueryM :: (MonadStorage m) => Database -> Statement -> m (Either String [Row])
 runQueryM db q = case bindQuery db q of
     Left e -> pure (Left e)
     Right bound -> executeQueryM bound
@@ -170,11 +181,19 @@ runStatementUncheckedM db q@Select{} = runQueryM db q
 runStatementUncheckedM _ Insert{} = pure (Left "INSERT requires a bound write plan")
 runStatementUncheckedM _ Update{} = pure (Left "UPDATE requires a bound write plan")
 runStatementUncheckedM _ Delete{} = pure (Left "DELETE requires a bound write plan")
-runStatementUncheckedM _ (CreateTable name cols) = do
-    result <- createTable name cols
-    pure (result >> Right [])
-runStatementUncheckedM _ (CreateDomain name base) = do
-    result <- createTable (domainTableName name) [("base", plainColumn base)]
+runStatementUncheckedM db (CreateTable name cols) = case validateDomainDefaults db cols of
+    Left err -> pure (Left err)
+    Right () -> do
+        result <- guardDomainCreation db (map (columnType . snd) cols) (createTable name cols)
+        pure (result >> Right [])
+runStatementUncheckedM db (CreateDomain name definition) = case canonicalDomain db name definition of
+    Left err -> pure (Left err)
+    Right normalized -> do
+        let DomainDefinition column _ = normalized
+        result <- guardDomainCreation db [columnType column] (createTable (domainTableName name) (domainColumns normalized))
+        pure (result >> Right [])
+runStatementUncheckedM _ (AlterDomain name action) = do
+    result <- alterDomain (domainTableName name) (prepareDomainAlter name action)
     pure (result >> Right [])
 runStatementUncheckedM _ (DropDomain name) = do
     result <- dropTable (domainTableName name)
@@ -201,7 +220,7 @@ runStatementUncheckedM _ (DropColumn tbl col) = do
     result <- dropColumn tbl col
     pure (result >> Right [])
 runStatementUncheckedM db (AddColumn tbl def) =
-    alterTable db tbl (\table -> addColumnTo def (tableCols table) (tableRows table))
+    alterTable db tbl (\table -> addColumnTo db def (tableCols table) (tableRows table))
 runStatementUncheckedM db (RenameColumn tbl old new) =
     alterTable db tbl (\table -> renameColumnIn old new (tableCols table) (tableRows table))
 runStatementUncheckedM db (AlterColumnType tbl col ty) =
@@ -228,11 +247,21 @@ runStatementUncheckedM _ q@DropDatabase{} = runStatementM q
 runStatementUncheckedM _ q@UseDatabase{} = runStatementM q
 runStatementUncheckedM _ ShowDatabases = runStatementM ShowDatabases
 runStatementUncheckedM _ BeginTransaction = pure (Left "BEGIN is executed by the session")
+runStatementUncheckedM _ BeginSerializableTransaction = pure (Left "BEGIN is executed by the session")
 runStatementUncheckedM _ CommitTransaction = pure (Left "COMMIT is executed by the session")
 runStatementUncheckedM _ RollbackTransaction = pure (Left "ROLLBACK is executed by the session")
 runStatementUncheckedM _ Savepoint{} = pure (Left "SAVEPOINT is executed by the session")
 runStatementUncheckedM _ RollbackToSavepoint{} = pure (Left "ROLLBACK TO is executed by the session")
 runStatementUncheckedM _ ReleaseSavepoint{} = pure (Left "RELEASE is executed by the session")
+
+-- | 建表时在实际发布点复查领域定义
+guardDomainCreation :: (MonadStorage m) => Database -> [ColumnType] -> m (Either String a) -> m (Either String a)
+guardDomainCreation db types action
+    | null dependencies = action
+    | otherwise = withWriteSchemaGuard dependencies action
+  where
+    names = typeDependencies db types
+    dependencies = [(name, table) | (name, table) <- db, name `elem` names]
 
 -- | 只有需要读全表才能判断约束时才扫表
 existingRows :: (MonadStorage m) => String -> InsertPlan -> m (Either String [Row])
@@ -317,11 +346,14 @@ autoStart (Just (name, _)) rows = case [n | r <- rows, Just (VInt n) <- [lookup 
     ns -> maximum ns + 1
 
 -- | 一次解析出来的 CHECK 条件
-data CheckPlan = CheckPlan [String] [(String, Expr)]
+data CheckPlan = CheckPlan [String] [(String, Expr)] [(String, Int, Expr)]
 
 -- | 按 schema 解析并绑定表上全部 CHECK
-checkPlan :: Table -> Either String CheckPlan
-checkPlan table = CheckPlan (map fst (tableCols table)) <$> mapM parse (mapMaybe checked (tableCols table))
+checkPlan :: Database -> Table -> Either String CheckPlan
+checkPlan db table = do
+    local <- mapM parse (mapMaybe checked (tableCols table))
+    domains <- domainCheckPlan db (tableCols table)
+    Right (CheckPlan (map fst (tableCols table)) local domains)
   where
     -- \| 只挑出带 CHECK 文本的列
     checked (name, col) = (,) name <$> columnCheck col
@@ -334,15 +366,26 @@ checkPlan table = CheckPlan (map fst (tableCols table)) <$> mapM parse (mapMaybe
 
 -- | 执行解析好的 CHECK 条件
 runChecks :: CheckPlan -> Row -> Either String ()
-runChecks (CheckPlan columns plan) row = do
+runChecks (CheckPlan columns plan domains) row = do
     ordered <- orderRow columns row
     mapM_ (check ordered) plan
+    runDomainChecks domains ordered
   where
     -- \| 跑一条 CHECK
     check ordered (name, e) = case evalCondForRow e ordered of
         Left err -> Left ("CHECK on " ++ name ++ ": " ++ err)
         Right True -> Right ()
         Right False -> Left ("CHECK on " ++ name ++ " failed")
+
+-- 校验最终行集的领域、检查与唯一约束。
+validateTableRows :: Database -> Table -> Either String ()
+validateTableRows db table = do
+    effective <- effectiveColumns db (tableCols table)
+    plan <- checkPlan db table
+    let rows = tableRows table
+    mapM_ (runChecks plan) rows
+    ordered <- mapM (orderRow (map fst effective)) rows
+    enforceConstraints (constraintPlan effective) [] ordered
 
 -- | 只取第一行（报错提示用）
 firstLine :: String -> String
@@ -370,7 +413,7 @@ enforceConstraints (ConstraintPlan columns required unique) current rows = do
 enforceNotNull :: [(String, Expr)] -> [Row] -> Either String ()
 enforceNotNull targets rows = mapM_ check targets
   where
-    -- | 按 schema 槽位检查 NOT NULL
+    -- \| 按 schema 槽位检查 NOT NULL
     check (name, reference) = do
         values <- mapM (evalExpr reference) rows
         if VNull `elem` values
@@ -411,7 +454,7 @@ data BoundAssignment = BoundAssignment Int String Column Expr
 bindUpdateTargets :: [(String, Column)] -> [(String, Expr)] -> Either String [BoundAssignment]
 bindUpdateTargets columns = mapM bindTarget
   where
-    -- | 只接受唯一目标并保留列定义
+    -- \| 只接受唯一目标并保留列定义
     bindTarget (name, expression) = case [(slot, column) | (slot, (key, column)) <- zip [0 ..] columns, key == name] of
         [(slot, column)] -> Right (BoundAssignment slot name column expression)
         [] -> Left ("UPDATE: unknown target column: " ++ name)
@@ -429,9 +472,11 @@ applyUpdatesM db (assignment@(BoundAssignment _ _ _ e) : rest) row = do
 -- | 校验目标位置并只覆盖该槽位的值
 writeAssignment :: BoundAssignment -> Row -> Value -> Either String Row
 writeAssignment (BoundAssignment slot name column _) row value = case splitAt slot row of
-    (before, (key, _) : after) | slot >= 0, key == name -> do
-        coerced <- coerceValue (columnType column) value
-        Right (before ++ ((name, coerced) : after))
+    (before, (key, _) : after)
+        | slot >= 0
+        , key == name -> do
+            coerced <- coerceValue (columnType column) value
+            Right (before ++ ((name, coerced) : after))
     (_, []) -> Left ("missing bound column: " ++ name)
     _ -> Left ("bound column position mismatch: " ++ name)
 
@@ -471,20 +516,23 @@ alterTable db tbl change = case lookupTable db tbl of
     -- \| 改完再统一查一遍约束
     checkAltered (cols, rows) = do
         let table = Table tbl cols rows Nothing Nothing Nothing
-        plan <- checkPlan table
-        mapM_ (runChecks plan) rows
-        enforceConstraints (constraintPlan cols) [] rows
+        validateDomainDefaults db cols
+        validateTableRows db table
         Right (cols, rows)
 
 -- | ADD COLUMN：老行补默认值或 NULL
-addColumnTo :: (String, Column) -> [(String, Column)] -> [Row] -> Either String ([(String, Column)], [Row])
-addColumnTo (name, col) cols rows
+addColumnTo :: Database -> (String, Column) -> [(String, Column)] -> [Row] -> Either String ([(String, Column)], [Row])
+addColumnTo db (name, declared) cols rows
     | name `elem` map fst cols = Left ("ADD COLUMN: column already exists: " ++ name)
     | otherwise = do
-        values <- fill
-        Right (cols ++ [(name, col)], [r ++ [(name, v)] | (r, v) <- zip rows values])
+        effective <- effectiveColumns db [(name, declared)]
+        values <- case effective of
+            [(_, column)] -> fill column
+            _ -> Left "invalid added column layout"
+        Right (cols ++ [(name, declared)], [r ++ [(name, v)] | (r, v) <- zip rows values])
   where
-    fill
+    -- \| 使用领域继承属性填充已有行
+    fill col
         | columnAutoIncrement col = mapM (coerceValue (columnType col) . VInt) [1 .. length rows]
         | Just d <- columnDefault col = mapM (\_ -> coerceValue (columnType col) d) rows
         | columnNullable col = mapM (\_ -> coerceValue (columnType col) VNull) rows

@@ -142,3 +142,147 @@ fn dirty_page_flushed_on_drop() {
     let p = pf2.read_page(0).unwrap();
     assert_eq!(p.data[0], 42);
 }
+
+/// 已同步镜像恢复撕裂页且页 LSN 持久保留
+#[test]
+fn full_page_image_repairs_torn_write_before_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("torn.db");
+    let metadata = dir.path().join("torn.db.pages");
+    let journal = dir.path().join("torn.db.page-wal");
+    let mut file = PageFile::with_options(&path, 512, 1).unwrap();
+    file.set_lsn(7);
+    file.write_page(&Page::new(0, 512)).unwrap();
+    file.flush().unwrap();
+    let old_metadata = std::fs::read(&metadata).unwrap();
+    file.set_lsn(13);
+    let mut changed = Page::new(0, 512);
+    changed.data.fill(0x5a);
+    file.write_page(&changed).unwrap();
+    file.append_page().unwrap(); // 淘汰页零前镜像已同步
+    let image = std::fs::read(&journal).unwrap();
+    assert!(!image.is_empty());
+    drop(file);
+    std::fs::write(&metadata, old_metadata).unwrap();
+    std::fs::write(&journal, &image).unwrap();
+    std::fs::write(&path, [0x11; 213]).unwrap();
+    let mut reopened = PageFile::open(&path, 512).unwrap();
+    assert_eq!(reopened.read_page(0).unwrap().data, changed.data);
+    assert_eq!(reopened.page_lsn(0), Some(13));
+    drop(reopened);
+    assert_eq!(std::fs::metadata(&journal).unwrap().len(), 0);
+    let mut reopened = PageFile::open(&path, 512).unwrap();
+    assert_eq!(reopened.read_page(0).unwrap().data, changed.data);
+    assert_eq!(reopened.page_lsn(0), Some(13));
+}
+
+/// 撕裂日志尾不发布，完整损坏帧明确拒绝
+#[test]
+fn page_image_tail_and_corruption_are_distinguished() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tail.db");
+    let metadata = dir.path().join("tail.db.pages");
+    let journal = dir.path().join("tail.db.page-wal");
+    let mut file = PageFile::with_options(&path, 512, 1).unwrap();
+    file.write_page(&Page::new(0, 512)).unwrap();
+    file.flush().unwrap();
+    let old_metadata = std::fs::read(&metadata).unwrap();
+    let old_data = std::fs::read(&path).unwrap();
+    file.set_lsn(20);
+    let mut changed = Page::new(0, 512);
+    changed.data.fill(9);
+    file.write_page(&changed).unwrap();
+    file.append_page().unwrap();
+    let image = std::fs::read(&journal).unwrap();
+    drop(file);
+    for end in [1, 39, image.len() - 1] {
+        std::fs::write(&metadata, &old_metadata).unwrap();
+        std::fs::write(&path, &old_data).unwrap();
+        std::fs::write(&journal, &image[..end]).unwrap();
+        let mut reopened = PageFile::open(&path, 512).unwrap();
+        assert_eq!(reopened.read_page(0).unwrap().data, vec![0; 512]);
+    }
+    let mut corrupt = image;
+    corrupt[40] ^= 1;
+    std::fs::write(&metadata, &old_metadata).unwrap();
+    std::fs::write(&journal, &corrupt).unwrap();
+    assert!(
+        PageFile::open(&path, 512)
+            .unwrap_err()
+            .to_string()
+            .contains("checksum")
+    );
+    assert_eq!(std::fs::read(&journal).unwrap(), corrupt);
+}
+
+/// 截断标记阻止旧页重放后复活
+#[test]
+fn truncate_clears_page_versions_and_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reset.db");
+    let mut file = PageFile::open(&path, 512).unwrap();
+    file.set_lsn(5);
+    for _ in 0..3 {
+        file.append_page().unwrap();
+    }
+    file.flush().unwrap();
+    file.set_lsn(8);
+    file.truncate().unwrap();
+    file.append_page().unwrap();
+    file.flush().unwrap();
+    assert_eq!(file.page_lsn(0), Some(8));
+    assert_eq!(file.page_lsn(2), None);
+    drop(file);
+    let mut file = PageFile::open(&path, 512).unwrap();
+    assert_eq!(file.num_pages().unwrap(), 1);
+    assert_eq!(file.page_lsn(0), Some(8));
+    assert_eq!(file.page_lsn(2), None);
+}
+
+/// 镜像写入失败后禁止析构或重试绕过恢复
+#[test]
+fn page_journal_error_fences_further_flushes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fenced.db");
+    let journal = dir.path().join("fenced.db.page-wal");
+    std::fs::write(&path, [0; 512]).unwrap();
+    let mut file = PageFile::open(&path, 512).unwrap();
+    let mut page = Page::new(0, 512);
+    page.data.fill(7);
+    file.write_page(&page).unwrap();
+    std::fs::create_dir(&journal).unwrap();
+    assert!(file.flush().is_err());
+    std::fs::remove_dir(&journal).unwrap();
+    assert!(
+        file.flush()
+            .unwrap_err()
+            .to_string()
+            .contains("requires recovery")
+    );
+    drop(file);
+    let mut file = PageFile::open(&path, 512).unwrap();
+    assert_eq!(file.read_page(0).unwrap().data, vec![0; 512]);
+}
+
+/// 小缓存淘汰不会反复记录同一批未改页
+#[test]
+fn eviction_batches_images_without_pool_sized_write_amplification() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bounded.db");
+    let journal = dir.path().join("bounded.db.page-wal");
+    let mut file = PageFile::with_options(&path, 512, 2).unwrap();
+    file.set_lsn(9);
+    for id in 0..100 {
+        let mut page = Page::new(id, 512);
+        page.data.fill(id as u8);
+        file.write_page(&page).unwrap();
+    }
+    assert!(std::fs::metadata(&journal).unwrap().len() <= 100 * (512 + 40));
+    file.flush().unwrap();
+    drop(file);
+    let mut file = PageFile::open(&path, 512).unwrap();
+    for id in 0..100 {
+        assert_eq!(file.read_page(id).unwrap().data, vec![id as u8; 512]);
+        assert_eq!(file.page_lsn(id), Some(9));
+    }
+}

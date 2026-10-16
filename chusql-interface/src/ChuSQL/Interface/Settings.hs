@@ -67,7 +67,7 @@ settingCatalogue =
     , owned "tcp-max-rows" "TCP rows per result" "network" "int" "1000" "server" "max_rows"
     ]
   where
-    -- | web 自己的键：分区写死 [web]
+    -- \| web 自己的键：分区写死 [web]
     item k l g kind def rootOnly restart =
         SettingItem
             { siKey = k
@@ -94,7 +94,7 @@ settingCatalogue =
             , siTomlKey = tomlKey
             }
 
-    -- | 换掉落盘用的键名：界面键与 TOML 键不同名时用
+    -- \| 换掉落盘用的键名：界面键与 TOML 键不同名时用
     withTomlKey key spec = spec{siTomlKey = key}
 
 -- | web 自己的分区名
@@ -130,7 +130,8 @@ isRestartRequired key = maybe False siRestart (findItem key)
 -- | 改完立刻生效的配置键
 liveKeys :: [Text]
 liveKeys =
-    [ "password-min-length", "password-classes"
+    [ "password-min-length"
+    , "password-classes"
     , "body-limit"
     , "session-idle"
     , "session-max"
@@ -146,7 +147,7 @@ liveKeys =
 readSettingsFile :: FilePath -> IO (Map.Map Text Text)
 readSettingsFile path = fmap Map.unions (mapM readSectionOf catalogueSections)
   where
-    -- | 读一个分区，摊成界面键
+    -- \| 读一个分区，摊成界面键
     readSectionOf section = do
         raw <- readSection path section
         let values = if section == webSection then canonicalSettingKeys raw else raw
@@ -163,7 +164,7 @@ readSettingsFile path = fmap Map.unions (mapM readSectionOf catalogueSections)
 writeSettingsFile :: FilePath -> Map.Map Text Text -> IO (Either String ())
 writeSettingsFile path values = writeSections catalogueSections
   where
-    -- | 各分区依次写回
+    -- \| 各分区依次写回
     writeSections [] = pure (Right ())
     writeSections (section : rest) = do
         let entries =
@@ -185,7 +186,7 @@ writeSettingsFile path values = writeSections catalogueSections
 applySettings :: Map.Map Text Text -> Map.Map Text Text -> Either String (Map.Map Text Text)
 applySettings current = go (Right current) . Map.toList
   where
-    -- | 逐项校验并合并
+    -- \| 逐项校验并合并
     go (Left e) _ = Left e
     go (Right acc) [] = Right acc
     go (Right acc) ((key, value) : rest) = case findItem key of
@@ -234,8 +235,8 @@ effectiveSettings cfg =
         , ("log-files", T.pack (wcLogFiles cfg))
         ]
   where
-    -- | 数值转文本
+    -- \| 数值转文本
     tshow = T.pack . show
-    -- | 布尔转 "1"/"0"
+    -- \| 布尔转 "1"/"0"
     boolText True = "1"
     boolText False = "0"

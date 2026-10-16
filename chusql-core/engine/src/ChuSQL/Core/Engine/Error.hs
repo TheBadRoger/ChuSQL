@@ -33,8 +33,12 @@ data ErrorRule = ErrorRule
 -- | 唯一的错误识别表，顺序即优先级
 errorRules :: [ErrorRule]
 errorRules =
-    [ ErrorRule "no database selected" NoDatabaseError "no_database"
+    [ ErrorRule "deadlock_detected:" StorageError "deadlock_detected"
+    , ErrorRule "lock_timeout:" StorageError "lock_timeout"
+    , ErrorRule "serialization_failure:" CatalogError "serialization_failure"
+    , ErrorRule "no database selected" NoDatabaseError "no_database"
     , ErrorRule "administrator required" PermissionError "forbidden"
+    , ErrorRule "serialization_failure: domain snapshot changed" CatalogError "serialization_failure"
     , ErrorRule "bound query object changed" CatalogError "serialization_failure"
     , ErrorRule "bound query schema changed" CatalogError "serialization_failure"
     , ErrorRule "unknown table" CatalogError "not_found"

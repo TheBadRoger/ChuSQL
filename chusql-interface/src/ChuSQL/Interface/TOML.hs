@@ -1,16 +1,16 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module ChuSQL.Interface.TOML
-    ( readSection
-    , writeSection
-    , defaultConfigFile
-    , resolveConfigPath
-    ) where
+module ChuSQL.Interface.TOML (
+    readSection,
+    writeSection,
+    defaultConfigFile,
+    resolveConfigPath,
+) where
 
 import Control.Exception (IOException, try)
 import qualified Data.ByteString as BS
-import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -36,15 +36,18 @@ writeSection path section values = do
     prepared <- prepareDirectory
     case prepared of
         Left err -> pure (Left err)
-        Right () -> do exists <- doesFileExist path
-                       raw <- if exists then
-                                  TE.decodeUtf8 <$> BS.readFile path
-                              else
-                                  pure ""
-                       let updated = T.unlines (rewrite section values (T.lines raw))
-                       tryWrite (TE.encodeUtf8 updated)
+        Right () -> do
+            exists <- doesFileExist path
+            raw <-
+                if exists
+                    then
+                        TE.decodeUtf8 <$> BS.readFile path
+                    else
+                        pure ""
+            let updated = T.unlines (rewrite section values (T.lines raw))
+            tryWrite (TE.encodeUtf8 updated)
   where
-    -- | 目录不存在就先建
+    -- \| 目录不存在就先建
     prepareDirectory = do
         let dir = takeDirectory path
         if null dir
@@ -52,7 +55,7 @@ writeSection path section values = do
             else do
                 done <- try (createDirectoryIfMissing True dir) :: IO (Either IOException ())
                 pure (either (Left . show) (const (Right ())) done)
-    -- | 写文件，异常转成错误串
+    -- \| 写文件，异常转成错误串
     tryWrite bytes = do
         done <- try (BS.writeFile path bytes) :: IO (Either IOException ())
         pure (either (Left . show) (const (Right ())) done)
@@ -61,7 +64,7 @@ writeSection path section values = do
 sectionEntries :: Text -> [Text] -> [(Text, Text)]
 sectionEntries wanted = go ""
   where
-    -- | 走到目标分区后收键值对
+    -- \| 走到目标分区后收键值对
     go _ [] = []
     go current (line : rest)
         | Just name <- sectionName line = go name rest
@@ -92,7 +95,7 @@ assignment line = case T.breakOn "=" (stripComment line) of
 stripComment :: Text -> Text
 stripComment = T.pack . go False . T.unpack
   where
-    -- | 引号外遇到 # 就到此为止
+    -- \| 引号外遇到 # 就到此为止
     go _ [] = []
     go inString ('#' : rest)
         | not inString = []
@@ -111,11 +114,11 @@ unquote value
 rewrite :: Text -> Map Text Text -> [Text] -> [Text]
 rewrite section values = addMissing . replaceInSection . dropEmpties
   where
-    -- | 删掉空值的键
+    -- \| 删掉空值的键
     dropEmpties = filter (maybe True (not . T.null . snd) . assignment)
-    -- | 在目标分区里就地换行
+    -- \| 在目标分区里就地换行
     replaceInSection = go ""
-    -- | 走到目标分区后逐行替换
+    -- \| 走到目标分区后逐行替换
     go _ [] = []
     go current (line : rest)
         | Just name <- sectionName line = line : go name rest
@@ -123,7 +126,7 @@ rewrite section values = addMissing . replaceInSection . dropEmpties
         | otherwise = case assignment line of
             Just (key, _) | Just value <- Map.lookup key values -> assignmentLine key value : go current rest
             _ -> line : go current rest
-    -- | 分区里缺的键补在末尾
+    -- \| 分区里缺的键补在末尾
     addMissing lines' =
         let present = Set.fromList (keysOf section lines')
             missing = [(key, value) | (key, value) <- Map.toList values, not (Set.member key present), not (T.null value)]
@@ -139,14 +142,14 @@ quote value
     | T.all allowed value && not (T.null value) = value
     | otherwise = "\"" <> T.replace "\"" "\\\"" value <> "\""
   where
-    -- | 可以裸写的字符集
+    -- \| 可以裸写的字符集
     allowed ch = ch `elem` ("0123456789.-" :: String)
 
 -- | 取某个分区里出现过的键
 keysOf :: Text -> [Text] -> [Text]
 keysOf wanted = go ""
   where
-    -- | 走到目标分区后收键名
+    -- \| 走到目标分区后收键名
     go _ [] = []
     go current (line : rest)
         | Just name <- sectionName line = go name rest
@@ -160,7 +163,8 @@ appendSection :: Text -> [(Text, Text)] -> [Text] -> [Text]
 appendSection section entries lines' =
     lines'
         ++ (["" | null lines' || not (T.null (last lines'))])
-        ++ ("[" <> section <> "]") : [assignmentLine key value | (key, value) <- entries]
+        ++ ("[" <> section <> "]")
+        : [assignmentLine key value | (key, value) <- entries]
 
 -- | 全局配置文件的固定路径，跟随系统惯例
 defaultConfigFile :: IO FilePath

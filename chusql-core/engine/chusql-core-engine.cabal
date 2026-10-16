@@ -10,7 +10,8 @@ build-type:     Simple
 
 library
     hs-source-dirs:   src
-    exposed-modules:  ChuSQL.Core.Engine.Algebra.Cost
+    exposed-modules:  ChuSQL.Core.Engine.Domain
+                      ChuSQL.Core.Engine.Algebra.Cost
                       ChuSQL.Core.Engine.Algebra.Eval
                       ChuSQL.Core.Engine.Algebra.Expr
                       ChuSQL.Core.Engine.Algebra.JoinOrder

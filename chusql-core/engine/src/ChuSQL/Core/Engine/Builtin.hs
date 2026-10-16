@@ -19,7 +19,8 @@ module ChuSQL.Core.Engine.Builtin (
 ) where
 
 import ChuSQL.Core.Engine.Syntax.AST (CompareOp (..), Expr (..))
-import ChuSQL.Core.Model (Value (..), compareValue)
+import ChuSQL.Core.Model (ColumnType (..), Value (..), compareValue, hasTypeCapability)
+import ChuSQL.Core.Runtime (TypeCapability (..), builtinTypes, validateValue)
 import Control.Monad (foldM)
 import Data.Char (toLower)
 
@@ -201,12 +202,12 @@ compareNode CmpLtE = LtE
 executeOperator :: Operator -> [Value] -> Either String Value
 executeOperator op vs = case (op, vs) of
     (OpNeg, [x]) -> evalNeg x
-    (OpGt, [x, y]) -> compareValues (== GT) x y
-    (OpLt, [x, y]) -> compareValues (< EQ) x y
-    (OpEq, [x, y]) -> compareValues (== EQ) x y
-    (OpGtE, [x, y]) -> compareValues (>= EQ) x y
-    (OpLtE, [x, y]) -> compareValues (<= EQ) x y
-    (OpNe, [x, y]) -> compareValues (/= EQ) x y
+    (OpGt, [x, y]) -> compareValues OrdCapability (== GT) x y
+    (OpLt, [x, y]) -> compareValues OrdCapability (< EQ) x y
+    (OpEq, [x, y]) -> compareValues EqCapability (== EQ) x y
+    (OpGtE, [x, y]) -> compareValues OrdCapability (>= EQ) x y
+    (OpLtE, [x, y]) -> compareValues OrdCapability (<= EQ) x y
+    (OpNe, [x, y]) -> compareValues EqCapability (/= EQ) x y
     (OpAnd, [x, y]) -> andValues x y
     (OpOr, [x, y]) -> orValues x y
     (_, [x, y]) | Just a <- arithOf op -> evalArith a x y
@@ -262,21 +263,26 @@ asDouble (VFloat d) = Just d
 asDouble _ = Nothing
 
 -- | 比较两个值：NULL 给 NULL，其余按全序比
-compareValues :: (Ordering -> Bool) -> Value -> Value -> Either String Value
-compareValues rel x y
+compareValues :: TypeCapability -> (Ordering -> Bool) -> Value -> Value -> Either String Value
+compareValues capability rel x y
     | x == VNull || y == VNull = Right VNull
-    | comparableValue x y = Right (VBool (rel (compareValue x y)))
+    | comparableValue capability x y = Right (VBool (rel (compareValue x y)))
     | otherwise = Left "type error: cannot compare these values"
 
 -- | 两个值是否落在可以用全序比较的同一族里
-comparableValue :: Value -> Value -> Bool
-comparableValue (VInt _) (VFloat _) = True
-comparableValue (VFloat _) (VInt _) = True
-comparableValue (VInt _) (VInt _) = True
-comparableValue (VFloat _) (VFloat _) = True
-comparableValue (VStr _) (VStr _) = True
-comparableValue (VBool _) (VBool _) = True
-comparableValue _ _ = False
+comparableValue :: TypeCapability -> Value -> Value -> Bool
+comparableValue _ (VInt _) (VFloat _) = True
+comparableValue _ (VFloat _) (VInt _) = True
+comparableValue _ (VInt _) (VInt _) = True
+comparableValue _ (VFloat _) (VFloat _) = True
+comparableValue _ (VStr _) (VStr _) = True
+comparableValue _ (VBool _) (VBool _) = True
+comparableValue capability (VRuntime left x) (VRuntime right y) =
+    left == right
+        && hasTypeCapability capability (CRuntime left)
+        && validateValue builtinTypes left x == Right ()
+        && validateValue builtinTypes right y == Right ()
+comparableValue _ _ _ = False
 
 -- | 逻辑与的三值真值表
 andValues :: Value -> Value -> Either String Value

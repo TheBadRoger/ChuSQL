@@ -1,15 +1,16 @@
 {-# LANGUAGE TupleSections #-}
-module ChuSQL.Core.Engine.Semantic (check, prepare, prepareRowExpression, prepareCheckExpression, querySchema) where
 
-import Control.Monad (void)
+module ChuSQL.Core.Engine.Semantic (check, prepare, prepareRowExpression, prepareCheckExpression, prepareDomainCheckExpression, querySchema) where
+
 import ChuSQL.Core.Engine.Algebra.Expr (bareColumns, colsInExpr, hasAggregate, hasSubquery)
 import ChuSQL.Core.Engine.Runtime.Functions (FunctionSignature (..), builtinFunctions, functionSignature)
-import ChuSQL.Core.Engine.Runtime.SQL (resolveSQLFunction, sqlResultType, sqlType)
 import ChuSQL.Core.Engine.Runtime.Relation (bindSlots)
+import ChuSQL.Core.Engine.Runtime.SQL (resolveSQLFunction, sqlResultType, sqlType)
 import ChuSQL.Core.Engine.Runtime.Types
 import ChuSQL.Core.Engine.Syntax.AST
 import ChuSQL.Core.Engine.Syntax.Parser (parseExpression)
 import ChuSQL.Core.Model
+import Control.Monad (void)
 import Data.Char (isAlphaNum, isAscii, toLower)
 import Data.List (intercalate, isInfixOf, isPrefixOf, isSuffixOf, nub)
 
@@ -46,7 +47,7 @@ data Scope = Scope
 scopeAt :: String -> Scope -> String -> Either String (String, Column)
 scopeAt place scope c = search (scopeFrames scope)
   where
-    -- | 在最近的可见列层停止查找
+    -- \| 在最近的可见列层停止查找
     search [] = Left (missingColumn place c (concat (scopeFrames scope)))
     search (columns : rest) = case columnAt place columns c of
         Right entry -> Right entry
@@ -116,7 +117,12 @@ checkGrouping env keys items having
     | null keys && null having && not (any (hasAggregate . snd) items) = Right ()
     | otherwise = do
         checkColumns "GROUP BY" env keys
-        mapM_ (checkRuntimeColumn "GROUP BY" env) keys
+        mapM_
+            ( \column -> do
+                (_, definition) <- scopeAt "GROUP BY" env column
+                void (requireHashing "GROUP BY" (InferType (columnType definition)))
+            )
+            keys
         mapM_ okCol (nub (concatMap (bareColumns . snd) items ++ concatMap bareColumns having))
   where
     -- \| 这一列能不能出现在分组查询里
@@ -172,12 +178,12 @@ inferExpr db place env (Neg a) = do
         InferType x
             | numericType x -> Right t
             | otherwise -> Left (place ++ ": operator needs TInt on both sides, got TInt and " ++ typeLabel x)
-inferExpr db place env (Gt a b) = comparison db place env a b
-inferExpr db place env (Lt a b) = comparison db place env a b
-inferExpr db place env (Eq a b) = comparison db place env a b
-inferExpr db place env (GtE a b) = comparison db place env a b
-inferExpr db place env (LtE a b) = comparison db place env a b
-inferExpr db place env (NotEq a b) = comparison db place env a b
+inferExpr db place env (Gt a b) = comparison OrdCapability db place env a b
+inferExpr db place env (Lt a b) = comparison OrdCapability db place env a b
+inferExpr db place env (Eq a b) = comparison EqCapability db place env a b
+inferExpr db place env (GtE a b) = comparison OrdCapability db place env a b
+inferExpr db place env (LtE a b) = comparison OrdCapability db place env a b
+inferExpr db place env (NotEq a b) = comparison EqCapability db place env a b
 inferExpr db place env (And a b) = boolean db place env a b
 inferExpr db place env (Or a b) = boolean db place env a b
 inferExpr db place env (IsNull a) = inferExpr db place env a >> Right (InferType CBool)
@@ -215,12 +221,15 @@ inferExpr db place env (InList a es _) = do
     mapM_ (itemType place ta) ts
     Right (InferType CBool)
 inferExpr _ _ _ (ExistsSub _ _) = Right (InferType CBool)
-inferExpr db place env (QuantCmp _ a sq q) = do
+inferExpr db place env (QuantCmp operator a sq q) = do
     ta <- inferExpr db place env a
     cols <- inferSubqueryOutput db env sq
     case cols of
         [(_, t)]
-            | compatible ta t -> Right (InferType CBool)
+            | compatible ta t -> do
+                let capability = if operator `elem` [CmpEq, CmpNe] then EqCapability else OrdCapability
+                mapM_ (requireCapability capability place) [ta, t]
+                Right (InferType CBool)
             | otherwise -> Left (place ++ ": " ++ quantLabel q ++ " subquery column has type " ++ renderType t ++ ", expected " ++ renderType ta)
         _ -> Left (place ++ ": " ++ quantLabel q ++ " subquery must return exactly one column")
 
@@ -241,7 +250,7 @@ inferSubqueryOutput _ _ BoundSubquery{} = Left "execution subquery cannot be use
 inferSubqueryOutput db outerScope sq = case subqueryStatement sq of
     SelectDistinct q -> do
         columns <- inferSubqueryOutput db outerScope sq{subqueryStatement = q}
-        mapM_ (requireOrdering "DISTINCT" . snd) columns
+        mapM_ (requireHashing "DISTINCT" . snd) columns
         _ <- distinctOrdering q
         Right columns
     q@Select{selectItems = items} -> do
@@ -295,12 +304,14 @@ numericOperand place want other t = case t of
     _ -> Left (place ++ ": operator needs " ++ renderType want ++ " on both sides, got " ++ renderType other ++ " and " ++ renderType t)
 
 -- | 比较两边的类型检查
-comparison :: Database -> String -> Scope -> Expr -> Expr -> Either String InferredType
-comparison db place env a b = do
+comparison :: TypeCapability -> Database -> String -> Scope -> Expr -> Expr -> Either String InferredType
+comparison capability db place env a b = do
     ta <- inferExpr db place env a
     tb <- inferExpr db place env b
     if compatible ta tb
-        then Right (InferType CBool)
+        then do
+            mapM_ (requireCapability capability place) [ta, tb]
+            Right (InferType CBool)
         else Left (place ++ ": both sides of = must have the same type, got " ++ renderType ta ++ " and " ++ renderType tb)
 
 -- | 两类能不能比，类型族规则来自 Model
@@ -362,7 +373,8 @@ prepare db q = do
     let visible = filter (not . isDomainTable . fst) db
     resolved <- resolveStatement visible typed
     case resolved of
-        CreateDomain name base -> do
+        CreateDomain name (DomainDefinition column _) -> do
+            let base = columnType column
             checkDomainName name
             checkTypeParameters base
             case base of
@@ -373,6 +385,9 @@ prepare db q = do
             if any ((== domainTableName name) . fst) db
                 then Left ("domain already exists: " ++ name)
                 else Right ()
+        AlterDomain name _ -> do
+            _ <- maybe (Left ("unknown domain: " ++ name)) Right (lookup (domainTableName name) db)
+            Right ()
         DropDomain name -> do
             _ <- maybe (Left ("unknown domain: " ++ name)) Right (lookup (domainTableName name) db)
             if any (any (usesDomain name . columnType . snd) . tableCols . snd) db
@@ -418,7 +433,9 @@ ddlTargets statement = case statement of
 -- | 从 schema 解析列上的命名类型
 resolveDomainTypes :: Database -> Statement -> Either String Statement
 resolveDomainTypes db statement = case statement of
-    CreateDomain name base -> CreateDomain name <$> resolveDomainType base
+    CreateDomain name (DomainDefinition column checks) -> do
+        ty <- resolveDomainType (columnType column)
+        Right (CreateDomain name (DomainDefinition column{columnType = ty} checks))
     CreateTable name cols -> CreateTable name <$> mapM resolveColumnType cols
     AddColumn name col -> AddColumn name <$> resolveColumnType col
     AlterColumnType name col ty -> AlterColumnType name col <$> resolveDomainType ty
@@ -491,9 +508,11 @@ checkResolvedWith db outer q = case q of
             else Right ()
     CreateIndex tbl col -> do
         t <- lookupTable db tbl
-        if col `elem` tableCols' t
-            then checkRuntimeColumn "CREATE INDEX" (Scope (tableCols t) []) col
-            else Left ("CREATE INDEX: unknown column: " ++ col)
+        case lookup col (tableCols t) of
+            Nothing -> Left ("CREATE INDEX: unknown column: " ++ col)
+            Just column
+                | typeClassOf (columnType column) == RuntimeClass -> Left "CREATE INDEX: runtime index key encoding is not registered"
+                | otherwise -> Right ()
     DropIndex tbl col -> do
         t <- lookupTable db tbl
         if col `elem` tableCols' t
@@ -579,10 +598,12 @@ checkResolvedWith db outer q = case q of
     UseDatabase name -> checkDatabaseName name
     ShowDatabases -> Right ()
     CreateDomain{} -> Right ()
+    AlterDomain{} -> Right ()
     DropDomain{} -> Right ()
     ShowDomains -> Right ()
     -- \| 事务控制由会话层执行，语义层不做列检查
     BeginTransaction -> Right ()
+    BeginSerializableTransaction -> Right ()
     CommitTransaction -> Right ()
     RollbackTransaction -> Right ()
     -- \| 保存点名字只是会话层的记号，不做列检查
@@ -660,7 +681,7 @@ checkChecks columns = mapM_ checkOne
         Just text -> case parseExpression text of
             Left err -> Left ("CHECK: " ++ firstLine err)
             Right e -> void (prepareCheckExpression columns e)
-    -- | 只保留解析错误的第一行
+    -- \| 只保留解析错误的第一行
     firstLine = takeWhile (/= '\n')
 
 -- | 账号名上限
@@ -825,6 +846,21 @@ prepareCheckExpression columns expression = do
     checkBool [] "CHECK" (Scope columns []) resolved
     bindSlots (map fst columns) [] resolved
 
+-- | 在单值作用域规范化领域 VALUE 的大小写
+prepareDomainCheckExpression :: ColumnType -> Expr -> Either String Expr
+prepareDomainCheckExpression ty expression = do
+    checkNoAggregate "CHECK" expression
+    if hasSubquery expression then Left "CHECK: subqueries are not allowed here" else Right ()
+    let names = nub ("value" : colsInExpr expression)
+        columns = [(name, plainColumn ty) | name <- names, map toLower name == "value"]
+    resolved <- resolveExpr [] columns [] valueName expression
+    prepareCheckExpression [("value", plainColumn ty)] resolved
+  where
+    -- \| 领域条件只允许引用 VALUE
+    valueName name
+        | map toLower name == "value" = Right "value"
+        | otherwise = Left ("unknown column in DOMAIN CHECK: " ++ name)
+
 -- | 将推导类型转换为可空参数类型
 inferredArgument :: InferredType -> Maybe ColumnType
 inferredArgument InferNull = Nothing
@@ -856,8 +892,14 @@ statementColumns stmt = case stmt of
     SelectDistinct q -> statementColumns q
     Select items fromC mWhere groupBy having orderBy _ -> do
         ordering <- mapM (orderExpression items . fst) orderBy
-        Right (concatMap (colsInExpr . snd) items ++ fromColumns fromC
-            ++ concatMap colsInExpr mWhere ++ groupBy ++ concatMap colsInExpr having ++ concatMap colsInExpr ordering)
+        Right
+            ( concatMap (colsInExpr . snd) items
+                ++ fromColumns fromC
+                ++ concatMap colsInExpr mWhere
+                ++ groupBy
+                ++ concatMap colsInExpr having
+                ++ concatMap colsInExpr ordering
+            )
     _ -> Right []
   where
     -- \| 取 FROM 里出现的列
@@ -909,11 +951,12 @@ nameIn env place c = fst <$> columnAt place env c
 scopedColumnAt :: String -> [(String, Column)] -> EnclosingScopes -> String -> Either String (String, Column)
 scopedColumnAt place inner outer c
     | length (filter (== '.') c) == 1
-    , columns : _ <- filter ownsSource (inner : outer) = columnAt place columns c
+    , columns : _ <- filter ownsSource (inner : outer) =
+        columnAt place columns c
     | otherwise = scopeAt place (Scope inner outer) c
   where
     qualifier = takeWhile (/= '.') c ++ "."
-    -- | 判断当前层是否声明该来源限定名
+    -- \| 判断当前层是否声明该来源限定名
     ownsSource = any (isPrefixOf qualifier . fst)
 
 -- | 单表保留原表头，连接使用唯一前缀
@@ -927,18 +970,21 @@ checkOrder db env items column = do
     expression <- orderExpression items column
     void (inferExpr db "ORDER BY" env expression >>= requireOrdering "ORDER BY")
 
--- | 校验列已有排序能力
-checkRuntimeColumn :: String -> Scope -> String -> Either String ()
-checkRuntimeColumn place env column = do
-    (_, definition) <- scopeAt place env column
-    void (requireOrdering place (InferType (columnType definition)))
-
--- | 拒绝尚未注册能力的复合类型
-requireOrdering :: String -> InferredType -> Either String InferredType
-requireOrdering place inferred@(InferType ty)
-    | typeClassOf ty == RuntimeClass = Left (place ++ ": runtime type capability is not registered")
+-- | 统一检查已注册能力并保留 NULL 传播
+requireCapability :: TypeCapability -> String -> InferredType -> Either String InferredType
+requireCapability capability place inferred@(InferType ty)
+    | not (hasTypeCapability capability ty) = Left (place ++ ": type capability is not registered: " ++ show capability)
     | otherwise = Right inferred
-requireOrdering _ inferred = Right inferred
+requireCapability _ _ inferred = Right inferred
+
+-- | 只允许已提供排序能力的类型
+requireOrdering :: String -> InferredType -> Either String InferredType
+requireOrdering = requireCapability OrdCapability
+
+-- | 分组与去重同时要求相等和哈希能力
+requireHashing :: String -> InferredType -> Either String InferredType
+requireHashing place inferred =
+    requireCapability EqCapability place inferred >> requireCapability HashCapability place inferred
 
 -- | 解析投影、条件、排序与连接引用
 resolveQuery :: Database -> EnclosingScopes -> Statement -> [(String, Expr)] -> Either String Statement
@@ -957,11 +1003,13 @@ resolveQuery db outer q items = do
         qualifiedReference c =
             qualifiedReferenceIn db (selectFrom q) c
                 || ( any
-                       (any
-                          (\ (key, _)
-                             -> length (filter (== '.') key) == 1
-                                  && ("." ++ key) `isSuffixOf` c))
-                       outer
+                        ( any
+                            ( \(key, _) ->
+                                length (filter (== '.') key) == 1
+                                    && ("." ++ key) `isSuffixOf` c
+                            )
+                        )
+                        outer
                         && (not (any (elem '.' . fst) db) || any (\(table, _) -> (table ++ ".") `isPrefixOf` c) db)
                    )
         -- \| 换算一个投影项：带别名时保留别名做输出列名
@@ -981,13 +1029,13 @@ resolveQuery db outer q items = do
     condition <- mapM (resolveExpr db env outer (name "WHERE")) (selectWhere q)
     grouping <- mapM (name "GROUP BY") (selectGroupBy q)
     having <- mapM (resolveExpr db env outer (name "HAVING")) (selectHaving q)
-    -- | 整项名称可用输出别名，复合表达式只查来源
+    -- \| 整项名称可用输出别名，复合表达式只查来源
     let orderKey key@(OrderColumn column)
             | column `elem` map fst projected = key <$ orderExpression projected key
             | otherwise = OrderColumn <$> name "ORDER BY" column
         orderKey key@(OrderPosition _) = key <$ orderPosition (length projected) key
         orderKey (OrderExpression expression) = OrderExpression <$> resolveExpr db env outer (name "ORDER BY") expression
-    ordering <- mapM (\(key, direction) -> (, direction) <$> orderKey key) (selectOrderBy q)
+    ordering <- mapM (\(key, direction) -> (,direction) <$> orderKey key) (selectOrderBy q)
     pure (Select projected source condition grouping having ordering (selectLimit q))
 
 -- | 收集没有别名遮蔽的来源表名

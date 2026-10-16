@@ -1,9 +1,9 @@
 module ChuSQL.Core.Engine.Runtime.SQL (resolveSQLFunction, sqlResultType, invokeSQLFunction, sqlType, constructSQLValue) where
 
-import Control.Monad (zipWithM_)
 import ChuSQL.Core.Engine.Runtime.Functions
 import ChuSQL.Core.Engine.Runtime.Types
 import ChuSQL.Core.Model (ColumnType (..), Value (..))
+import Control.Monad (zipWithM_)
 
 -- SQL 现有标量表示与已解析运行时函数之间的类型边界。
 
@@ -54,7 +54,9 @@ invokeSQLFunction fid expected values = do
                 then Left "function argument count mismatch"
                 else do
                     zipWithM_
-                      validateArgument (signatureArguments sig) values
+                        validateArgument
+                        (signatureArguments sig)
+                        values
                     if VNull `elem` values
                         then Right VNull
                         else do

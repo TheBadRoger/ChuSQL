@@ -1,23 +1,34 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE OverloadedStrings #-}
 
-module ChuSQL.Server.ObjectACL
-    ( objectAuthorize, objectGrant, objectRevoke, objectRevokeGrantOption, objectViews, objectClaim
-    , objectSelfViews, objectReconcile, objectAffected, objectOwner, objectConnect, objectPrepareCreate, objectUsers
-    ) where
+module ChuSQL.Server.ObjectACL (
+    objectAuthorize,
+    objectGrant,
+    objectRevoke,
+    objectRevokeGrantOption,
+    objectViews,
+    objectClaim,
+    objectSelfViews,
+    objectReconcile,
+    objectAffected,
+    objectOwner,
+    objectConnect,
+    objectPrepareCreate,
+    objectUsers,
+) where
 
-import Data.Either (fromRight)
-import Control.Monad (void)
 import ChuSQL.Core.Protocol (Account (..), TableInfo (..))
 import ChuSQL.Interface.Protocol (Grant (..))
 import ChuSQL.Server.Accounts (Principal, principalIsRoot, principalName)
 import ChuSQL.Server.Backend (Backend (..))
-import ChuSQL.Server.Catalog (Catalog, readIdentities, readMembers, readGrants, readGrantOptions)
+import ChuSQL.Server.Catalog (Catalog, readGrantOptions, readGrants, readIdentities, readMembers)
+import Control.Monad (void)
 import Data.Aeson (FromJSON, ToJSON)
 import qualified Data.Aeson as A
 import qualified Data.Aeson.Key as K
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString.Lazy.Char8 as BL
+import Data.Either (fromRight)
 import Data.List (nub)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -26,35 +37,40 @@ import GHC.Generics (Generic)
 
 -- 稳定对象权限目录：保存所有者、授予来源并计算有效授权链。
 
-data Target = Target { targetDatabase :: Text, targetTable :: Maybe Text, targetKind :: Text, targetName :: Text }
+data Target = Target {targetDatabase :: Text, targetTable :: Maybe Text, targetKind :: Text, targetName :: Text}
     deriving (Eq, Show, Generic)
 instance ToJSON Target
 instance FromJSON Target
 
-data Edge = Edge { edgeRole :: Text, edgeGrantor :: Text, edgeTarget :: Target, edgePrivilege :: Text, edgeOption :: Bool, edgeRoot :: Bool }
+data Edge = Edge {edgeRole :: Text, edgeGrantor :: Text, edgeTarget :: Target, edgePrivilege :: Text, edgeOption :: Bool, edgeRoot :: Bool}
     deriving (Eq, Show, Generic)
 instance ToJSON Edge
 instance FromJSON Edge
 
-data Owner = Owner { ownerRole :: Text, ownerTarget :: Target }
+data Owner = Owner {ownerRole :: Text, ownerTarget :: Target}
     deriving (Eq, Show, Generic)
 instance ToJSON Owner
 instance FromJSON Owner
 
-data Pending = Pending { pendingRole :: Text, pendingDatabase :: Text, pendingName :: Text }
+data Pending = Pending {pendingRole :: Text, pendingDatabase :: Text, pendingName :: Text}
     deriving (Eq, Show, Generic)
 instance ToJSON Pending
 instance FromJSON Pending
 
-data ACL = ACL { aclVersion :: Int, aclEdges :: [Edge], aclOwners :: [Owner], aclClosed :: [Text], aclPending :: [Pending] }
+data ACL = ACL {aclVersion :: Int, aclEdges :: [Edge], aclOwners :: [Owner], aclClosed :: [Text], aclPending :: [Pending]}
     deriving (Eq, Show, Generic)
 instance ToJSON ACL
 instance FromJSON ACL where
     -- 读取权限快照并兼容无声明的旧记录。
-    parseJSON = A.withObject "ACL" $ \fields -> ACL <$> fields A..: "aclVersion" <*> fields A..: "aclEdges"
-        <*> fields A..: "aclOwners" <*> fields A..: "aclClosed" <*> (fields A..:? "aclPending" A..!= [])
+    parseJSON = A.withObject "ACL" $ \fields ->
+        ACL
+            <$> fields A..: "aclVersion"
+            <*> fields A..: "aclEdges"
+            <*> fields A..: "aclOwners"
+            <*> fields A..: "aclClosed"
+            <*> (fields A..:? "aclPending" A..!= [])
 
-data Context = Context { contextIdentities :: [Account], contextMembers :: [(Text, Text)], contextTargets :: [Target] }
+data Context = Context {contextIdentities :: [Account], contextMembers :: [(Text, Text)], contextTargets :: [Target]}
 
 -- 解析存储响应并保留明确错误。
 request :: Backend -> A.Value -> IO (Either String A.Value)
@@ -85,18 +101,20 @@ resolve backend database raw = do
             | "database:" `T.isPrefixOf` object = (T.drop 9 object, Nothing, "database", object)
             | object == "*" || ".*" `T.isSuffixOf` object =
                 let scope = if object == "*" then database else T.dropEnd 2 object
-                in (scope, Nothing, "tables", scope <> ".*")
+                 in (scope, Nothing, "tables", scope <> ".*")
             | otherwise = case T.splitOn "." object of
                 [name] -> (database, Just name, "table", database <> "." <> name)
                 [db, name] -> (db, Just name, "table", object)
                 _ -> ("", Just "", "table", object)
-    if T.null selected then pure (Left "no database selected") else do
-        result <- request backend (A.object (["method" A..= ("resolve_object" :: Text), "database" A..= selected] ++ maybe [] (\name -> ["table" A..= name]) table))
-        pure $ do
-            value <- result
-            dbId <- field "database_id" value >>= identifier
-            tableId <- case table of Nothing -> Right Nothing; Just _ -> Just <$> (field "object_id" value >>= identifier)
-            if selected == "system" then Left "system objects cannot be granted" else Right (Target dbId tableId kind label)
+    if T.null selected
+        then pure (Left "no database selected")
+        else do
+            result <- request backend (A.object (["method" A..= ("resolve_object" :: Text), "database" A..= selected] ++ maybe [] (\name -> ["table" A..= name]) table))
+            pure $ do
+                value <- result
+                dbId <- field "database_id" value >>= identifier
+                tableId <- case table of Nothing -> Right Nothing; Just _ -> Just <$> (field "object_id" value >>= identifier)
+                if selected == "system" then Left "system objects cannot be granted" else Right (Target dbId tableId kind label)
 
 -- 展开当前 catalog 中的稳定业务对象。
 targets :: Backend -> IO (Either String [Target])
@@ -152,28 +170,33 @@ knownRole env value = value `elem` ["0", "public"] || any (\account -> T.pack (s
 roles :: Context -> Text -> [Text]
 roles env value = nub ("public" : go [value])
   where
-    pairs = [(parent, child) |
-               (parentName, childName) <- contextMembers env,
-               Right parent <- [roleId env parentName],
-               active env parent,
-               Right child <- [roleId env childName],
-               active env child]
+    pairs =
+        [ (parent, child)
+        | (parentName, childName) <- contextMembers env
+        , Right parent <- [roleId env parentName]
+        , active env parent
+        , Right child <- [roleId env childName]
+        , active env child
+        ]
     -- 展开成员关系的向上闭包。
-    go known = let more = [parent | (parent, child) <- pairs, child `elem` known, parent `notElem` known]
-               in if null more then known else go (nub (known ++ more))
+    go known =
+        let more = [parent | (parent, child) <- pairs, child `elem` known, parent `notElem` known]
+         in if null more then known else go (nub (known ++ more))
 
 -- 判断一个对象范围是否覆盖目标。
 covers :: Target -> Target -> Bool
-covers source target = targetDatabase source == targetDatabase target &&
-    (targetKind source == "tables" && targetKind target `elem` ["tables", "table"] || targetKind source == targetKind target && targetTable source == targetTable target)
+covers source target =
+    targetDatabase source == targetDatabase target
+        && (targetKind source == "tables" && targetKind target `elem` ["tables", "table"] || targetKind source == targetKind target && targetTable source == targetTable target)
 
 -- 判断稳定对象当前是否存在。
 exists :: Context -> Target -> Bool
 exists env target = any same (contextTargets env)
   where
     -- 核对数据库或表的稳定编号。
-    same current = targetDatabase current == targetDatabase target &&
-        (targetKind target == "tables" && targetKind current == "database" || targetKind current == targetKind target && targetTable current == targetTable target)
+    same current =
+        targetDatabase current == targetDatabase target
+            && (targetKind target == "tables" && targetKind current == "database" || targetKind current == targetKind target && targetTable current == targetTable target)
 
 -- 判断身份是否拥有指定对象。
 owns :: Context -> ACL -> Text -> Target -> Bool
@@ -181,14 +204,15 @@ owns env acl identity target = any (\owner -> ownerRole owner `elem` roles env i
 
 -- 计算仍有合法授予来源的授权闭包。
 effective :: Context -> ACL -> ACL
-effective env acl = acl {aclOwners = owners, aclEdges = grow roots, aclClosed = [value | value <- aclClosed acl, any (\target -> targetKind target == "database" && targetDatabase target == value) (contextTargets env)]}
+effective env acl = acl{aclOwners = owners, aclEdges = grow roots, aclClosed = [value | value <- aclClosed acl, any (\target -> targetKind target == "database" && targetDatabase target == value) (contextTargets env)]}
   where
     owners = [owner | owner <- aclOwners acl, knownRole env (ownerRole owner), exists env (ownerTarget owner)]
     candidates = [edge | edge <- aclEdges acl, knownRole env (edgeRole edge), knownRole env (edgeGrantor edge), exists env (edgeTarget edge)]
     roots = [edge | edge <- candidates, edgeRoot edge]
     -- 从独立授予根展开转授权链。
-    grow known = let more = [edge | edge <- candidates, edge `notElem` known, supported known edge]
-                 in if null more then known else grow (known ++ more)
+    grow known =
+        let more = [edge | edge <- candidates, edge `notElem` known, supported known edge]
+         in if null more then known else grow (known ++ more)
     -- 检查授予者的所有权或有效转授权。
     supported known edge = active env (edgeGrantor edge) && (owns env acl{aclOwners = owners} (edgeGrantor edge) (edgeTarget edge) || any (\source -> active env (edgeRole source) && edgeOption source && edgeRole source `elem` roles env (edgeGrantor edge) && edgePrivilege source == edgePrivilege edge && covers (edgeTarget source) (edgeTarget edge)) known)
 
@@ -201,16 +225,16 @@ readACL backend = do
         rows <- field "rows" value
         case rows of
             A.Array values -> case foldr (:) [] values of
-              [] -> Right (Nothing, Nothing)
-              [row] -> do
-                payload <- field "payload" row
-                case payload of
-                    A.String text -> case A.eitherDecodeStrict (TE.encodeUtf8 text) of
-                        Left err -> Left ("invalid object ACL: " ++ err)
-                        Right acl | aclVersion acl == 1 -> Right (Just text, Just acl)
-                        Right _ -> Left "unsupported object ACL version"
-                    _ -> Left "invalid object ACL payload"
-              _ -> Left "invalid object ACL rows"
+                [] -> Right (Nothing, Nothing)
+                [row] -> do
+                    payload <- field "payload" row
+                    case payload of
+                        A.String text -> case A.eitherDecodeStrict (TE.encodeUtf8 text) of
+                            Left err -> Left ("invalid object ACL: " ++ err)
+                            Right acl | aclVersion acl == 1 -> Right (Just text, Just acl)
+                            Right _ -> Left "unsupported object ACL version"
+                        _ -> Left "invalid object ACL payload"
+                _ -> Left "invalid object ACL rows"
             _ -> Left "invalid object ACL rows"
 
 -- 原子写入权限快照并检查并发版本。
@@ -230,8 +254,10 @@ migrate backend catalog env = do
     one options grant = case roleId env (grantRole grant) of
         Left _ -> pure (Right [])
         Right identity -> do
-            objects <- if grantObject grant == "*" then pure (Right [target | target <- contextTargets env, targetKind target == "table"])
-                else fmap (fmap (: [])) (resolve backend "" (grantObject grant))
+            objects <-
+                if grantObject grant == "*"
+                    then pure (Right [target | target <- contextTargets env, targetKind target == "table"])
+                    else fmap (fmap (: [])) (resolve backend "" (grantObject grant))
             let option = any (\row -> grantRole row == grantRole grant && grantPrivilege row == grantPrivilege grant && grantObject row == grantObject grant) options
             pure $ case objects of
                 Left "unknown table" -> Right []
@@ -248,8 +274,14 @@ load backend catalog = do
         Left err -> pure (Left err)
         Right (current, (previous, Just acl)) | null (aclPending acl) -> pure (Right (current, previous, effective current acl))
         Right (current, (previous, Just acl)) -> do
-            let recovered = [Owner (pendingRole pending) target | pending <- aclPending acl, target <- contextTargets current,
-                    targetKind target == "table", targetDatabase target == pendingDatabase pending, targetName target == pendingName pending]
+            let recovered =
+                    [ Owner (pendingRole pending) target
+                    | pending <- aclPending acl
+                    , target <- contextTargets current
+                    , targetKind target == "table"
+                    , targetDatabase target == pendingDatabase pending
+                    , targetName target == pendingName pending
+                    ]
                 next = acl{aclPending = [], aclOwners = recovered ++ [owner | owner <- aclOwners acl, ownerTarget owner `notElem` map ownerTarget recovered]}
             written <- writeACL backend previous (effective current next)
             case written of Left err -> pure (Left err); Right () -> load backend catalog
@@ -266,9 +298,10 @@ load backend catalog = do
 
 -- 检查作用域权限或所有权。
 allowed :: Context -> ACL -> Text -> Target -> Text -> Bool -> Bool
-allowed env acl identity target privilege option = owns env acl identity target ||
-    (not option && privilege == "connect" && targetKind target == "database" && targetDatabase target `notElem` aclClosed acl) ||
-    any (\edge -> active env (edgeRole edge) && edgeRole edge `elem` roles env identity && edgePrivilege edge == privilege && covers (edgeTarget edge) target && (not option || edgeOption edge)) (aclEdges acl)
+allowed env acl identity target privilege option =
+    owns env acl identity target
+        || (not option && privilege == "connect" && targetKind target == "database" && targetDatabase target `notElem` aclClosed acl)
+        || any (\edge -> active env (edgeRole edge) && edgeRole edge `elem` roles env identity && edgePrivilege edge == privilege && covers (edgeTarget edge) target && (not option || edgeOption edge)) (aclEdges acl)
 
 -- 按对象类型展开和校验权限名称。
 privileges :: Target -> [Text] -> Either String [Text]
@@ -276,10 +309,14 @@ privileges target names =
     if all (`elem` supported) expanded then Right expanded else Left "invalid privilege for object scope"
   where
     supported = if targetKind target == "database" then ["connect", "create"] else ["select", "insert", "update", "delete"]
-    expanded = nub (concatMap
-                      ((\ name -> if name == "all" then supported else [name])
-                         . T.toLower)
-                      names)
+    expanded =
+        nub
+            ( concatMap
+                ( (\name -> if name == "all" then supported else [name])
+                    . T.toLower
+                )
+                names
+            )
 
 -- 检查一组稳定对象上的业务权限。
 objectAuthorize :: Backend -> Catalog -> Principal -> Text -> [(Text, Text)] -> IO (Either String ())
@@ -310,18 +347,19 @@ objectGrant backend catalog principal database names object role option = do
             recipient <- roleId env role
             items <- privileges target names
             grantor <- if principalIsRoot principal then Right (fromRight "0" (roleId env (principalName principal))) else roleId env (principalName principal)
-            case [item |
-                    not (principalIsRoot principal),
-                    item <- items,
-                    not (allowed env acl grantor target item True)] of
+            case [ item
+                 | not (principalIsRoot principal)
+                 , item <- items
+                 , not (allowed env acl grantor target item True)
+                 ] of
                 item : _ -> Left ("grant option required: " ++ T.unpack (T.toUpper item <> " ON " <> object))
                 [] -> Right (recipient, grantor, items) of
-                    Left err -> pure (Left err)
-                    Right (recipient, grantor, items) -> do
-                        let edges = [Edge recipient grantor target item option (principalIsRoot principal) | item <- items]
-                            remaining = [edge | edge <- aclEdges acl, not (any (same edge) edges)]
-                            promoted = [edge {edgeOption = edgeOption edge || any (\old -> same old edge && edgeOption old) (aclEdges acl)} | edge <- edges]
-                        writeACL backend previous acl{aclEdges = remaining ++ promoted, aclClosed = if recipient == "public" && "connect" `elem` items then filter (/= targetDatabase target) (aclClosed acl) else aclClosed acl}
+            Left err -> pure (Left err)
+            Right (recipient, grantor, items) -> do
+                let edges = [Edge recipient grantor target item option (principalIsRoot principal) | item <- items]
+                    remaining = [edge | edge <- aclEdges acl, not (any (same edge) edges)]
+                    promoted = [edge{edgeOption = edgeOption edge || any (\old -> same old edge && edgeOption old) (aclEdges acl)} | edge <- edges]
+                writeACL backend previous acl{aclEdges = remaining ++ promoted, aclClosed = if recipient == "public" && "connect" `elem` items then filter (/= targetDatabase target) (aclClosed acl) else aclClosed acl}
   where
     -- 比较同一授予来源的授权键。
     same one other = edgeRole one == edgeRole other && edgeGrantor one == edgeGrantor other && edgeTarget one == edgeTarget other && edgePrivilege one == edgePrivilege other
@@ -350,7 +388,8 @@ revokeObject optionOnly backend catalog principal database names object role = d
                     next = acl{aclEdges = if optionOnly then map removeOption (aclEdges acl) else filter (not . matches) (aclEdges acl), aclClosed = if not optionOnly && recipient == "public" && "connect" `elem` items then nub (targetDatabase target : aclClosed acl) else aclClosed acl}
                     -- 保留基础权限并移除匹配来源的转授权。
                     removeOption edge = if matches edge then edge{edgeOption = False} else edge
-                if recipient == "public" && "connect" `elem` items && not manager then pure (Left "administrator required")
+                if recipient == "public" && "connect" `elem` items && not manager
+                    then pure (Left "administrator required")
                     else writeACL backend previous (effective env next)
 
 -- 返回公开名称形式的有效授权。
@@ -373,10 +412,12 @@ objectSelfViews backend catalog principal = do
         if active env identity then Right () else Left "permission denied: disabled identity"
         -- 使用当前权限闭包判断普通及转授权权限。
         let permitted target privilege option = principalIsRoot principal || allowed env acl identity target privilege option
-        Right [Grant (principalName principal) privilege (targetName target) (permitted target privilege True)
+        Right
+            [ Grant (principalName principal) privilege (targetName target) (permitted target privilege True)
             | target <- contextTargets env
             , privilege <- if targetKind target == "database" then ["connect", "create"] else ["select", "insert", "update", "delete"]
-            , permitted target privilege False]
+            , permitted target privilege False
+            ]
 
 -- 登记新对象的创建者为所有者。
 objectClaim :: Backend -> Catalog -> Principal -> Text -> Text -> IO (Either String ())
@@ -400,7 +441,8 @@ objectPrepareCreate backend catalog principal database raw = do
             Left err -> pure (Left err)
             Right identity -> do
                 let name = if "." `T.isInfixOf` raw then T.toLower raw else database <> "." <> T.toLower raw
-                if any ((== name) . targetName) (contextTargets env) then pure (Right ())
+                if any ((== name) . targetName) (contextTargets env)
+                    then pure (Right ())
                     else writeACL backend previous acl{aclPending = [Pending identity (targetDatabase target) name]}
 
 -- 清理失效身份、成员来源和已删除对象。
@@ -417,8 +459,9 @@ objectAffected backend catalog names = do
         (env, _, acl) <- loaded
         let edges = [(roleName env (edgeGrantor edge), roleName env (edgeRole edge)) | edge <- aclEdges acl] ++ contextMembers env
             -- 展开成员和转授权的受影响身份。
-            walk seen = let more = [child | (parent, child) <- edges, parent `elem` seen, child `notElem` seen, not (T.null child)]
-                        in if null more then seen else walk (nub (seen ++ more))
+            walk seen =
+                let more = [child | (parent, child) <- edges, parent `elem` seen, child `notElem` seen, not (T.null child)]
+                 in if null more then seen else walk (nub (seen ++ more))
         let normalized = map (T.toLower . T.strip) names
         Right (if "public" `elem` normalized then nub (walk normalized ++ map accountUser (filter (not . accountIsSuperuser) (contextIdentities env))) else walk normalized)
 
@@ -441,7 +484,8 @@ objectUsers backend catalog database object = do
     case (,) <$> loaded <*> resolved of
         Left err -> pure (Left err)
         Right ((env, _, acl), target) -> do
-            let related = [edgeRole edge | edge <- aclEdges acl, if targetKind target == "database" then targetDatabase (edgeTarget edge) == targetDatabase target else covers (edgeTarget edge) target]
-                    ++ [ownerRole owner | owner <- aclOwners acl, ownerTarget owner == target]
+            let related =
+                    [edgeRole edge | edge <- aclEdges acl, if targetKind target == "database" then targetDatabase (edgeTarget edge) == targetDatabase target else covers (edgeTarget edge) target]
+                        ++ [ownerRole owner | owner <- aclOwners acl, ownerTarget owner == target]
             result <- objectAffected backend catalog (nub (map (roleName env) related))
             pure (fmap (filter (\name -> not (any (\account -> accountUser account == name && accountIsSuperuser account) (contextIdentities env)))) result)

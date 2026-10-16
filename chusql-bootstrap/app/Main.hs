@@ -2,19 +2,19 @@
 
 module Main (main) where
 
-import Data.Maybe (fromMaybe)
-import ChuSQL.Core.Engine.Storage.IPC (closeConnection, localStorageLink, sendRawRequest, setStorageLink)
 import ChuSQL.Bootstrap (preinstalledTypes, runBootstrap)
 import ChuSQL.Core.Engine.Storage.FFI (maintainStorage)
+import ChuSQL.Core.Engine.Storage.IPC (closeConnection, localStorageLink, sendRawRequest, setStorageLink)
 import ChuSQL.Interface.Auth (hashPassword)
 import ChuSQL.Interface.Config (loadWebConfigAt, rootUserName)
 import ChuSQL.Interface.TOML (resolveConfigPath)
+import Control.Exception (finally)
 import qualified Data.Aeson as A
 import qualified Data.ByteString.Lazy.Char8 as BL
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
-import Control.Exception (finally)
 import System.Environment (getArgs)
 import System.Exit (exitFailure)
 import System.IO (BufferMode (LineBuffering), hSetBuffering, stdout)
@@ -46,7 +46,7 @@ emptyOptions =
 parseArgs :: [String] -> Either String Options
 parseArgs = go emptyOptions
   where
-    -- | 逐条消费参数列表
+    -- \| 逐条消费参数列表
     go opts [] = Right opts
     go opts (command : rest)
         | command `elem` ["repair", "recover", "recovery", "reset"] = case optMode opts of
@@ -156,8 +156,9 @@ send request = do
 readPassword :: Options -> IO (Either String Text)
 readPassword opts
     | optPasswordless opts = pure (Right "")
-    | optPasswordStdin opts = do Right . T.dropWhileEnd (\ c -> c == '\r' || c == '\n')
-                                   <$> TIO.getLine
+    | optPasswordStdin opts = do
+        Right . T.dropWhileEnd (\c -> c == '\r' || c == '\n')
+            <$> TIO.getLine
     | otherwise = pure (Left "pass --password-stdin or --passwordless")
 
 -- | 打印错误并退出 1

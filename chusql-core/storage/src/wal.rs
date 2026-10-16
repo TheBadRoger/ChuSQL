@@ -26,12 +26,30 @@ const OP_CREATE_TABLE: u8 = 11;
 const OP_DROP_TABLE: u8 = 12;
 const OP_CREATE_INDEX: u8 = 13;
 const OP_DROP_INDEX: u8 = 14;
+const OP_MIGRATE: u8 = 15;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum WalOp {
-    HideColumn { table: String, column: String, schema_version: Option<u64> },
-    Compact { table: String, rows: Vec<Row> },
-    Accounts { accounts: Vec<Account>, removed: Vec<String>, migrate_roles: bool },
+    Migrate {
+        table: String,
+        object_id: u64,
+        source: String,
+        target: String,
+    },
+    HideColumn {
+        table: String,
+        column: String,
+        schema_version: Option<u64>,
+    },
+    Compact {
+        table: String,
+        rows: Vec<Row>,
+    },
+    Accounts {
+        accounts: Vec<Account>,
+        removed: Vec<String>,
+        migrate_roles: bool,
+    },
     Insert {
         table: String,
         row: Row,
@@ -78,6 +96,28 @@ pub enum WalOp {
     },
     /// 一组写操作的提交标记；没有标记的组算未提交
     Commit,
+}
+
+impl WalOp {
+    /// 返回单表操作的目标，账号组另行展开
+    pub(crate) fn table(&self) -> Option<&str> {
+        match self {
+            Self::Migrate { table, .. }
+            | Self::HideColumn { table, .. }
+            | Self::Compact { table, .. }
+            | Self::Insert { table, .. }
+            | Self::InsertBatch { table, .. }
+            | Self::DeleteKeys { table, .. }
+            | Self::ReplaceAll { table, .. }
+            | Self::DropColumn { table, .. }
+            | Self::ReplaceSchema { table, .. }
+            | Self::CreateTable { table, .. }
+            | Self::DropTable { table }
+            | Self::CreateIndex { table, .. }
+            | Self::DropIndex { table, .. } => Some(table),
+            Self::Accounts { .. } | Self::Commit => None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -255,13 +295,11 @@ impl Wal {
     /// 读当前 WAL 的第一条操作；空则 None
     pub fn read(&self) -> io::Result<Option<WalOp>> {
         let scan = self.read_all()?;
-        Ok(scan.records.into_iter().find_map(|(_, op)| {
-            if op == WalOp::Commit {
-                None
-            } else {
-                Some(op)
-            }
-        }))
+        Ok(scan.records.into_iter().find_map(
+            |(_, op)| {
+                if op == WalOp::Commit { None } else { Some(op) }
+            },
+        ))
     }
 
     /// 读全部记录，撕裂或损坏的尾巴按长度截断
@@ -287,9 +325,12 @@ impl Wal {
         let mut frames = Vec::new();
         let mut offset = 0usize;
         while offset + 4 <= buf.len() {
-            let body_len =
-                u32::from_le_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]])
-                    as usize;
+            let body_len = u32::from_le_bytes([
+                buf[offset],
+                buf[offset + 1],
+                buf[offset + 2],
+                buf[offset + 3],
+            ]) as usize;
             let end = offset + 4 + body_len;
             if end > buf.len() {
                 break;
@@ -324,7 +365,10 @@ impl Wal {
         }
         let bytes = std::fs::read(&path)?;
         if bytes.len() != 8 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid WAL checkpoint length"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid WAL checkpoint length",
+            ));
         }
         let mut raw = [0u8; 8];
         raw.copy_from_slice(&bytes[..8]);
@@ -342,10 +386,14 @@ impl Wal {
             if let Some((lsn, _, _, _)) = frames.last() {
                 base = base.max(*lsn);
             }
-            *slot = base.checked_add(1).ok_or_else(|| io::Error::other("WAL LSN exhausted"))?;
+            *slot = base
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("WAL LSN exhausted"))?;
         }
         let lsn = *slot;
-        *slot = slot.checked_add(1).ok_or_else(|| io::Error::other("WAL LSN exhausted"))?;
+        *slot = slot
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("WAL LSN exhausted"))?;
         Ok(lsn)
     }
 
@@ -392,6 +440,7 @@ fn truncate(f: &mut File) -> io::Result<()> {
 /// 把操作编成字节
 fn encode(op: &WalOp, lsn: u64) -> io::Result<Vec<u8>> {
     let (op_type, table, payload) = match op {
+        WalOp::Migrate { table, .. } => (OP_MIGRATE, table.clone(), serde_json::to_vec(op).map_err(io::Error::other)?),
         WalOp::HideColumn { table, column, schema_version } => (OP_HIDE_COLUMN, table.clone(),
             serde_json::to_vec(&serde_json::json!({"column":column,"schema_version":schema_version})).map_err(io::Error::other)?),
         WalOp::Compact { table, rows } => {
@@ -487,6 +536,25 @@ fn decode_body(body: &[u8]) -> Result<(u64, WalOp), String> {
     let payload = &body[11 + table_len..];
 
     let op = match op_type {
+        OP_MIGRATE => {
+            let op: WalOp = serde_json::from_slice(payload)
+                .map_err(|e| format!("bad migration payload: {e}"))?;
+            match &op {
+                WalOp::Migrate {
+                    table: name,
+                    source,
+                    target,
+                    ..
+                } if name == &table
+                    && crate::catalog::valid_generation(source)
+                    && !target.is_empty()
+                    && crate::catalog::valid_generation(target) =>
+                {
+                    op
+                }
+                _ => return Err("invalid migration WAL".into()),
+            }
+        }
         OP_COMMIT => WalOp::Commit,
         OP_HIDE_COLUMN => {
             let value: serde_json::Value = serde_json::from_slice(payload)
@@ -498,28 +566,61 @@ fn decode_body(body: &[u8]) -> Result<(u64, WalOp), String> {
                     .map_err(|e| format!("bad hide_column payload: {e}"))?;
                 (p.column, p.schema_version)
             };
-            WalOp::HideColumn { table, column, schema_version }
+            WalOp::HideColumn {
+                table,
+                column,
+                schema_version,
+            }
         }
         OP_COMPACT => {
-            let rows: Vec<Row> = serde_json::from_slice(payload)
-                .map_err(|e| format!("bad compact payload: {e}"))?;
+            let rows: Vec<Row> =
+                serde_json::from_slice(payload).map_err(|e| format!("bad compact payload: {e}"))?;
             WalOp::Compact { table, rows }
         }
         OP_ACCOUNTS => {
-            if table != USERS_TABLE { return Err("invalid account WAL table".into()); }
-            let value: serde_json::Value = serde_json::from_slice(payload).map_err(|e| format!("bad account payload: {e}"))?;
+            if table != USERS_TABLE {
+                return Err("invalid account WAL table".into());
+            }
+            let value: serde_json::Value =
+                serde_json::from_slice(payload).map_err(|e| format!("bad account payload: {e}"))?;
             let (accounts, removed, migrate_roles) = if value.is_array() {
-                (serde_json::from_value(value).map_err(|e| format!("bad account payload: {e}"))?, Vec::new(), false)
+                (
+                    serde_json::from_value(value)
+                        .map_err(|e| format!("bad account payload: {e}"))?,
+                    Vec::new(),
+                    false,
+                )
             } else {
-                (serde_json::from_value(value.get("accounts").cloned().ok_or("missing account payload")?).map_err(|e| format!("bad account payload: {e}"))?,
-                    serde_json::from_value(value.get("removed").cloned().ok_or("missing identity cleanup")?).map_err(|e| format!("bad account cleanup: {e}"))?,
-                    value.get("migrate_roles").and_then(serde_json::Value::as_bool).ok_or("missing role migration flag")?)
+                (
+                    serde_json::from_value(
+                        value
+                            .get("accounts")
+                            .cloned()
+                            .ok_or("missing account payload")?,
+                    )
+                    .map_err(|e| format!("bad account payload: {e}"))?,
+                    serde_json::from_value(
+                        value
+                            .get("removed")
+                            .cloned()
+                            .ok_or("missing identity cleanup")?,
+                    )
+                    .map_err(|e| format!("bad account cleanup: {e}"))?,
+                    value
+                        .get("migrate_roles")
+                        .and_then(serde_json::Value::as_bool)
+                        .ok_or("missing role migration flag")?,
+                )
             };
-            WalOp::Accounts { accounts, removed, migrate_roles }
+            WalOp::Accounts {
+                accounts,
+                removed,
+                migrate_roles,
+            }
         }
         OP_INSERT => {
-            let row: Row =
-                serde_json::from_slice(payload).map_err(|e| format!("bad insert payload: {}", e))?;
+            let row: Row = serde_json::from_slice(payload)
+                .map_err(|e| format!("bad insert payload: {}", e))?;
             WalOp::Insert { table, row }
         }
         OP_INSERT_BATCH => {

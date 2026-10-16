@@ -1,8 +1,8 @@
 module ChuSQL.Core.Engine.Algebra.Sort (sortRows, sortBoundRows, compareValue) where
 
-import ChuSQL.Core.Model
-import ChuSQL.Core.Engine.Syntax.AST
 import ChuSQL.Core.Engine.Algebra.Expr (evalExpr)
+import ChuSQL.Core.Engine.Syntax.AST
+import ChuSQL.Core.Model
 import Data.List (sortBy)
 
 -- 排序：按多列规格排出结果行，每列可升可降。
@@ -34,9 +34,9 @@ sortRows :: [(String, SortDir)] -> [Row] -> [Row]
 sortRows [] rows = rows
 sortRows spec rows = map snd (sortBy cmp (map decorate rows))
   where
-    -- | 取键并带上原行
+    -- \| 取键并带上原行
     decorate row = (sortKey spec row, row)
-    -- | 比较两个带键的行
+    -- \| 比较两个带键的行
     cmp (k1, _) (k2, _) = compareKeys (map snd spec) k1 k2
 
 -- | 用绑定槽位取键并稳定排序
@@ -47,9 +47,9 @@ sortBoundRows spec outer rows = do
     Right (map snd (sortBy compareRows decorated))
   where
     directions = map snd spec
-    -- | 每行只计算一次绑定排序键
+    -- \| 每行只计算一次绑定排序键
     decorate row = do
         keys <- mapM (\(expression, _) -> evalExpr expression (row ++ outer)) spec
         Right (map Just keys, row)
-    -- | 比较排序键并保留同键行序
+    -- \| 比较排序键并保留同键行序
     compareRows (left, _) (right, _) = compareKeys directions left right

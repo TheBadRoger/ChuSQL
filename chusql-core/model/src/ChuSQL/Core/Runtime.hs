@@ -1,19 +1,45 @@
-module ChuSQL.Core.Runtime
-    ( TypeConstructorId (..), TypeId, TypeExpr (..), Kind (..)
-    , TypeRegistry, TypeDescriptor (..), PhysicalType (..), RuntimeValue (..)
-    , builtinTypes, resolveType, describeType, typeExpression
-    , intType, doubleType, boolType, stringType, listType, maybeType, tupleType, renderTypeExpr, parseTypeExpr, renderRuntimeValue
-    , validateValue, encodeValue, decodeValue, encodeType, decodeType, runtimeToJSON, runtimeFromJSON
-    ) where
+module ChuSQL.Core.Runtime (
+    TypeConstructorId (..),
+    TypeId,
+    TypeExpr (..),
+    Kind (..),
+    TypeRegistry,
+    TypeDescriptor (..),
+    TypeCapability (..),
+    PhysicalType (..),
+    RuntimeValue (..),
+    builtinTypes,
+    resolveType,
+    describeType,
+    typeExpression,
+    intType,
+    doubleType,
+    boolType,
+    stringType,
+    listType,
+    maybeType,
+    tupleType,
+    renderTypeExpr,
+    parseTypeExpr,
+    renderRuntimeValue,
+    validateValue,
+    encodeValue,
+    decodeValue,
+    encodeType,
+    decodeType,
+    runtimeToJSON,
+    runtimeFromJSON,
+) where
 
 import Control.Monad (zipWithM, zipWithM_)
 import Data.Aeson (Value (..), eitherDecode, encode)
 import Data.Aeson.Types (Parser, parseEither)
 import qualified Data.ByteString.Lazy as BS
+import Data.Char (isAlphaNum, toLower)
+import Data.Hashable (Hashable (..))
 import Data.Scientific (floatingOrInteger)
 import qualified Data.Text as T
 import qualified Data.Vector as V
-import Data.Char (isAlphaNum, toLower)
 import qualified Text.ParserCombinators.ReadP as P
 
 -- 运行时类型身份、构造器注册及版本化物理编码。
@@ -31,30 +57,66 @@ newtype TypeId = TypeId TypeExpr deriving (Show, Eq, Ord)
 data Kind = TypeKind | TypeArrow Kind Kind | ProductKind deriving (Show, Eq)
 
 -- | 描述独立的物理表示
-data PhysicalType = SignedInteger | FloatingPoint | Boolean | Utf8 | Sequence PhysicalType
-    | Optional PhysicalType | Product [PhysicalType] deriving (Show, Eq)
+data PhysicalType
+    = SignedInteger
+    | FloatingPoint
+    | Boolean
+    | Utf8
+    | Sequence PhysicalType
+    | Optional PhysicalType
+    | Product [PhysicalType]
+    deriving (Show, Eq)
+
+-- | 类型实例可提供的值运算
+data TypeCapability = EqCapability | OrdCapability | HashCapability deriving (Show, Eq)
 
 -- | 保存类型实例描述
 data TypeDescriptor = TypeDescriptor
-    { descriptorId :: TypeId, descriptorName :: String, descriptorPhysical :: PhysicalType
-    } deriving (Show, Eq)
+    { descriptorId :: TypeId
+    , descriptorName :: String
+    , descriptorPhysical :: PhysicalType
+    , descriptorCapabilities :: [TypeCapability]
+    }
+    deriving (Show, Eq)
 
 -- | 保存构造器元数据
 newtype TypeRegistry = TypeRegistry [(TypeConstructorId, String, Kind)] deriving (Show, Eq)
 
 -- | 表达运行时值
-data RuntimeValue = RInt Int | RDouble Double | RBool Bool | RString String
-    | RList [RuntimeValue] | RMaybe (Maybe RuntimeValue) | RTuple [RuntimeValue]
-    deriving (Show, Eq)
+data RuntimeValue
+    = RInt Int
+    | RDouble Double
+    | RBool Bool
+    | RString String
+    | RList [RuntimeValue]
+    | RMaybe (Maybe RuntimeValue)
+    | RTuple [RuntimeValue]
+    deriving (Show, Eq, Ord)
+
+-- | 递归哈希结构并统一浮点正负零
+instance Hashable RuntimeValue where
+    -- \| 根据构造器和子值混合哈希
+    hashWithSalt salt value = case value of
+        RInt n -> hashWithSalt (hashWithSalt salt (1 :: Int)) n
+        RDouble n -> hashWithSalt (hashWithSalt salt (2 :: Int)) (if n == 0 then 0 else n)
+        RBool flag -> hashWithSalt (hashWithSalt salt (3 :: Int)) flag
+        RString text -> hashWithSalt (hashWithSalt salt (4 :: Int)) text
+        RList values -> hashWithSalt (hashWithSalt salt (5 :: Int)) values
+        RMaybe optional -> hashWithSalt (hashWithSalt salt (6 :: Int)) optional
+        RTuple values -> hashWithSalt (hashWithSalt salt (7 :: Int)) values
 
 -- | 恢复固定编号的内建构造器
 builtinTypes :: TypeRegistry
-builtinTypes = TypeRegistry
-    [(TypeConstructorId 1, "Int", TypeKind), (TypeConstructorId 2, "Double", TypeKind)
-    ,(TypeConstructorId 3, "Bool", TypeKind), (TypeConstructorId 4, "String", TypeKind)
-    ,(TypeConstructorId 5, "List", TypeArrow TypeKind TypeKind)
-    ,(TypeConstructorId 6, "Maybe", TypeArrow TypeKind TypeKind)
-    ,(TypeConstructorId 7, "Tuple", ProductKind)]
+builtinTypes =
+    TypeRegistry
+        [ (TypeConstructorId 1, "Int", TypeKind)
+        , (TypeConstructorId 2, "Double", TypeKind)
+        , (TypeConstructorId 3, "Bool", TypeKind)
+        , (TypeConstructorId 4, "String", TypeKind)
+        , (TypeConstructorId 5, "List", TypeArrow TypeKind TypeKind)
+        , (TypeConstructorId 6, "Maybe", TypeArrow TypeKind TypeKind)
+        , (TypeConstructorId 7, "Tuple", ProductKind)
+        ]
 
 -- | 构造整数类型表达式
 intType :: TypeExpr
@@ -96,7 +158,7 @@ renderTypeExpr ty@(TypeApply cid arguments) = case (cid, arguments) of
     (TypeConstructorId 7, fields) -> "(" ++ joinTypes fields ++ ")"
     _ -> show ty
   where
-    -- | 连接元组字段类型
+    -- \| 连接元组字段类型
     joinTypes [] = ""
     joinTypes [field] = renderTypeExpr field
     joinTypes (field : fields) = renderTypeExpr field ++ ", " ++ joinTypes fields
@@ -107,25 +169,28 @@ parseTypeExpr source = case P.readP_to_S (P.skipSpaces *> expression <* P.skipSp
     [(ty, "")] -> Right ty
     _ -> Left "invalid runtime type expression"
   where
-    -- | 解析类型原子和构造器应用
-    expression = (intType <$ token "int") P.<++ (doubleType <$ token "double")
-        P.<++ (boolType <$ token "bool") P.<++ (stringType <$ token "string")
-        P.<++ (listType <$> between "[" "]" expression)
-        P.<++ (listType <$> (token "list" *> expression))
-        P.<++ (maybeType <$> (token "maybe" *> expression))
-        P.<++ (tupleType <$> between "(" ")" (P.sepBy expression (symbol ",")))
-    -- | 解析具有名称边界的类型关键字
+    -- \| 解析类型原子和构造器应用
+    expression =
+        (intType <$ token "int")
+            P.<++ (doubleType <$ token "double")
+            P.<++ (boolType <$ token "bool")
+            P.<++ (stringType <$ token "string")
+            P.<++ (listType <$> between "[" "]" expression)
+            P.<++ (listType <$> (token "list" *> expression))
+            P.<++ (maybeType <$> (token "maybe" *> expression))
+            P.<++ (tupleType <$> between "(" ")" (P.sepBy expression (symbol ",")))
+    -- \| 解析具有名称边界的类型关键字
     token word = do
         mapM_ character word
         rest <- P.look
         case rest of
             c : _ | isAlphaNum c || c == '_' -> P.pfail
             _ -> P.skipSpaces
-    -- | 不区分大小写匹配关键字字符
+    -- \| 不区分大小写匹配关键字字符
     character c = P.satisfy ((== c) . toLower)
-    -- | 解析类型分隔符
+    -- \| 解析类型分隔符
     symbol text = P.string text <* P.skipSpaces
-    -- | 解析括号包围的类型
+    -- \| 解析括号包围的类型
     between open close = P.between (symbol open) (symbol close)
 
 -- | 渲染运行时值的可读文本
@@ -165,7 +230,12 @@ resolveType registry@(TypeRegistry constructors) expression@(TypeApply cid args)
         (TypeConstructorId 6, TypeArrow TypeKind TypeKind, [child]) -> Right (Optional child)
         (TypeConstructorId 7, ProductKind, fields) -> Right (Product fields)
         _ -> Left ("invalid type constructor application: " ++ name)
-    Right (TypeDescriptor (TypeId expression) name physical)
+    let capabilities =
+            [ capability
+            | capability <- [EqCapability, OrdCapability, HashCapability]
+            , all (elem capability . descriptorCapabilities) children
+            ]
+    Right (TypeDescriptor (TypeId expression) name physical capabilities)
 
 -- | 按身份查询类型描述
 describeType :: TypeRegistry -> TypeId -> Either String TypeDescriptor
@@ -216,10 +286,12 @@ decodeValue registry expected bytes = do
     json <- eitherDecode bytes
     (expression, payload) <- parseEither parseEnvelope json
     descriptor <- resolveType registry expression
-    if descriptorId descriptor /= expected then Left "encoded value type identity mismatch" else do
-        value <- parseEither (parseValue (descriptorPhysical descriptor)) payload
-        validateValue registry expected value
-        Right value
+    if descriptorId descriptor /= expected
+        then Left "encoded value type identity mismatch"
+        else do
+            value <- parseEither (parseValue (descriptorPhysical descriptor)) payload
+            validateValue registry expected value
+            Right value
 
 -- | 编码版本化类型身份
 encodeType :: TypeId -> BS.ByteString

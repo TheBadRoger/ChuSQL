@@ -1,6 +1,6 @@
-{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TupleSections #-}
 
 module ChuSQL.Server.TCP (
     ServerConfig (..),
@@ -16,18 +16,17 @@ module ChuSQL.Server.TCP (
     isLocalPeer,
 ) where
 
+import qualified ChuSQL.Core.Engine.Error as E
+import ChuSQL.Core.Protocol (Account (..), Request (ReqIdentityInitialize))
 import ChuSQL.Interface.Config (ServerConfig (..), defaultServerConfig, loadServerConfigAt)
-import ChuSQL.Interface.Sudo (SudoCredential, createSudoCredential, removeSudoCredential, sudoChallenge, validSudoChallenge, isLocalPeer)
-import Data.Time.Clock (UTCTime, getCurrentTime)
 import ChuSQL.Interface.Policy (PasswordPolicy (..))
 import ChuSQL.Interface.Protocol (ClientRequest (..), ServerResponse (..), decodeRequest, encodeResponse, protocolVersion)
 import ChuSQL.Interface.RateLimit (RateLimiter, rateLimitBlock, rateLimitClear, rateLimitRecord)
-import qualified ChuSQL.Core.Engine.Error as E
-import ChuSQL.Core.Protocol (Account (..), Request (ReqIdentityInitialize))
+import ChuSQL.Interface.Sudo (SudoCredential, createSudoCredential, isLocalPeer, removeSudoCredential, sudoChallenge, validSudoChallenge)
 import ChuSQL.Server.Backend (Backend (..))
-import ChuSQL.Server.Session (QueryResult (..), Session, SessionError (..), accounts, authenticateSessionCoded, authenticateSudoSessionCoded, isPlainIdentifier, catalog, databases, newSessionWith, policyOf, reloadPolicy, roleViews, analyzeNormalizationCoded, runStatementCoded, runStorageCoded, sessionIsAdmin, sessionUser)
-import ChuSQL.Server.Security (writeSecurity)
 import ChuSQL.Server.Privileges (newPrivileges, reconcileObjects)
+import ChuSQL.Server.Security (writeSecurity)
+import ChuSQL.Server.Session (QueryResult (..), Session, SessionError (..), accounts, analyzeNormalizationCoded, authenticateSessionCoded, authenticateSudoSessionCoded, catalog, closeSession, databases, isPlainIdentifier, newSessionWith, policyOf, reloadPolicy, roleViews, runStatementCoded, runStorageCoded, sessionIsAdmin, sessionUser)
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar)
 import Control.Exception (IOException, bracket, finally, onException, try)
@@ -39,6 +38,7 @@ import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isNothing)
 import Data.Text (Text)
 import qualified Data.Text as T
+import Data.Time.Clock (UTCTime, getCurrentTime)
 import Network.Socket (
     AddrInfo (..),
     AddrInfoFlag (AI_PASSIVE),
@@ -54,13 +54,13 @@ import Network.Socket (
     defaultHints,
     defaultProtocol,
     getAddrInfo,
-    getSocketName,
     getPeerName,
+    getSocketName,
     listen,
     setSocketOption,
     socket,
     socketToHandle,
-  )
+ )
 import System.IO (BufferMode (LineBuffering), Handle, IOMode (ReadWriteMode), hClose, hFlush, hPutStrLn, hSetBuffering, hSetNewlineMode, noNewlineTranslation, stderr)
 import System.IO.Error (eofErrorType, isEOFError, mkIOError)
 
@@ -106,11 +106,11 @@ dropConnectionsOf live names = do
     mapM_ markDropped hits
     pure (length hits)
   where
-    -- | 这条连接登录的账号在名单里吗
+    -- \| 这条连接登录的账号在名单里吗
     isOf wanted entry = do
         current <- readIORef (leWho entry)
         pure (maybe False (\name -> T.toLower name `elem` wanted) current)
-    -- | 只做标记：连接在下一次请求应答后收工
+    -- \| 只做标记：连接在下一次请求应答后收工
     markDropped entry = writeIORef (leDropped entry) True
 
 -- 服务器
@@ -163,10 +163,12 @@ runServer :: ServerEnv -> (Int -> IO ()) -> IO ()
 runServer env announce = bracket (listenSocket (scHost (srvConfig env)) (scPort (srvConfig env))) close $ \sock -> do
     port <- actualPort sock
     enableSudo env port
-    (do
-        announce port
-        stopped <- newMVar False
-        acceptLoop env sock stopped) `finally` disableSudo env
+    ( do
+            announce port
+            stopped <- newMVar False
+            acceptLoop env sock stopped
+        )
+        `finally` disableSudo env
 
 -- 为显式配置的本机身份映射创建凭据。
 enableSudo :: ServerEnv -> Int -> IO ()
@@ -174,14 +176,15 @@ enableSudo env port
     | T.null user = pure ()
     | not (isPlainIdentifier user) = ioError (userError "sudo_auth_user must be a plain identity name")
     | otherwise = modifyMVar_ (srvSudo env) $ \case
-                                                Just _
-                                                  -> ioError (userError "sudo authentication is already running")
-                                                Nothing
-                                                  -> do credential <- createSudoCredential port
-                                                        hPutStrLn
-                                                          stderr
-                                                          ("sudo_auth enabled: local elevated identity -> " ++ T.unpack user)
-                                                        pure (Just (port, user, credential))
+        Just _ ->
+            ioError (userError "sudo authentication is already running")
+        Nothing ->
+            do
+                credential <- createSudoCredential port
+                hPutStrLn
+                    stderr
+                    ("sudo_auth enabled: local elevated identity -> " ++ T.unpack user)
+                pure (Just (port, user, credential))
   where
     user = scSudoUser (srvConfig env)
 
@@ -227,7 +230,7 @@ actualPort sock = do
 acceptLoop :: ServerEnv -> Socket -> MVar Bool -> IO ()
 acceptLoop env sock stopped = loop
   where
-    -- | 等下一个连接
+    -- \| 等下一个连接
     loop = do
         stop <- readMVar stopped
         if stop
@@ -260,13 +263,13 @@ serveConnection env conn = do
     entry <- newLiveEntry (isLocalPeer peer)
     unregister <- registerConnection (srvLive env) entry
     session <- newSessionWith (srvBackend env) (srvRootName env) (srvSettingsFile env) (void . dropConnectionsOf (srvLive env))
-    outcome <- try (loop h session entry BSC.empty `finally` unregister) :: IO (Either IOException ())
+    outcome <- try (loop h session entry BSC.empty `finally` (closeSession session `finally` unregister)) :: IO (Either IOException ())
     case outcome of
         Left err | not (isEOFError err) -> hPutStrLn stderr ("connection error: " ++ show err)
         _ -> pure ()
     void (try (hClose h) :: IO (Either IOException ()))
   where
-    -- | 逐行读请求并应答
+    -- \| 逐行读请求并应答
     loop h session entry pending = do
         frame <- readRequestLine h (scMaxMessage (srvConfig env)) pending
         case frame of
@@ -281,7 +284,7 @@ serveConnection env conn = do
                             (response, keepGoing) <- dispatch env session entry request
                             send h response
                             when keepGoing $ loop h session entry remaining
-    -- | 发一条响应并冲缓冲
+    -- \| 发一条响应并冲缓冲
     send h response = do
         BLC.hPutStr h (encodeResponse response)
         BLC.hPutStr h "\n"
@@ -291,7 +294,7 @@ serveConnection env conn = do
 readRequestLine :: Handle -> Int -> BSC.ByteString -> IO (Maybe (BSC.ByteString, BSC.ByteString))
 readRequestLine handle limit = collect [] 0
   where
-    -- | 按块读取至换行、超限或 EOF
+    -- \| 按块读取至换行、超限或 EOF
     collect parts total bytes = case BSC.elemIndex '\n' bytes of
         Just offset -> finish (BSC.take offset bytes : parts) (BSC.drop (offset + 1) bytes)
         Nothing
@@ -299,13 +302,14 @@ readRequestLine handle limit = collect [] 0
             | otherwise -> do
                 next <- BSC.hGetSome handle (max 1 (min 4094 (limit - used) + 2))
                 if BSC.null next
-                    then if used == 0
-                        then ioError (mkIOError eofErrorType "read request" (Just handle) Nothing)
-                        else finish (bytes : parts) BSC.empty
+                    then
+                        if used == 0
+                            then ioError (mkIOError eofErrorType "read request" (Just handle) Nothing)
+                            else finish (bytes : parts) BSC.empty
                     else collect (bytes : parts) used next
           where
             used = total + BSC.length bytes
-    -- | 合并并校验一行的有效长度
+    -- \| 合并并校验一行的有效长度
     finish parts remaining = do
         let line = BSC.dropWhileEnd (== '\r') (BSC.concat (reverse parts))
         pure (if BSC.length line > limit then Nothing else Just (line, remaining))
@@ -387,10 +391,13 @@ sudoLogin env session entry user proof = do
     who <- sessionUser session
     let key = T.toLower (T.strip user)
         mapped = maybe "" (\(_, name, _) -> name) configured
-        valid = leLocal entry && isNothing who && key == mapped
-            && case configured of
-                Just (_, _, credential) -> validSudoChallenge credential now challenge key proof
-                Nothing -> False
+        valid =
+            leLocal entry
+                && isNothing who
+                && key == mapped
+                && case configured of
+                    Just (_, _, credential) -> validSudoChallenge credential now challenge key proof
+                    Nothing -> False
     blocked <- rateLimitBlock (srvLimiter env) key
     response <- case blocked of
         Just _ -> pure (RespError "too_many_attempts" "too many failed sudo logins")
@@ -408,8 +415,15 @@ sudoLogin env session entry user proof = do
                     writeIORef (leWho entry) (Just key)
                     admin <- sessionIsAdmin session
                     pure (RespLogin key admin)
-    hPutStrLn stderr ("sudo_auth attempt: mapped_user=" ++ T.unpack mapped
-        ++ " local=" ++ show (leLocal entry) ++ " result=" ++ auditResult response)
+    hPutStrLn
+        stderr
+        ( "sudo_auth attempt: mapped_user="
+            ++ T.unpack mapped
+            ++ " local="
+            ++ show (leLocal entry)
+            ++ " result="
+            ++ auditResult response
+        )
     pure response
   where
     -- 提取不包含凭据的认证审计结果。
@@ -463,5 +477,5 @@ trimResult limit result
     | otherwise = result
 
 -- | show 成 Text
-tshow :: Show a => a -> Text
+tshow :: (Show a) => a -> Text
 tshow = T.pack . show

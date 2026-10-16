@@ -1,23 +1,43 @@
-module ChuSQL.Core.Engine.Runtime.Binding
-    ( Expression (..), TypedExpression, expressionType, bindExpression, evaluateExpression
-    , Plan (..), TypedPlan, planSchema, bindPlan, executePlan
-    ) where
+module ChuSQL.Core.Engine.Runtime.Binding (
+    Expression (..),
+    TypedExpression,
+    expressionType,
+    bindExpression,
+    evaluateExpression,
+    Plan (..),
+    TypedPlan,
+    planSchema,
+    bindPlan,
+    executePlan,
+) where
 
-import ChuSQL.Core.Engine.Runtime.Types
 import ChuSQL.Core.Engine.Runtime.Functions
+import ChuSQL.Core.Engine.Runtime.Types
 import Control.Monad (filterM)
 import Data.List (nub, sort)
 
 -- 仅依据 schema 绑定表达式与查询，执行已解析的类型和函数身份。
 
 -- | 表达未绑定的类型化语言
-data Expression = Literal TypeExpr RuntimeValue | Reference String | Apply String [Expression]
-    | ListLiteral TypeExpr [Expression] | NothingLiteral TypeExpr | JustLiteral Expression
-    | TupleLiteral [Expression] deriving (Show, Eq)
+data Expression
+    = Literal TypeExpr RuntimeValue
+    | Reference String
+    | Apply String [Expression]
+    | ListLiteral TypeExpr [Expression]
+    | NothingLiteral TypeExpr
+    | JustLiteral Expression
+    | TupleLiteral [Expression]
+    deriving (Show, Eq)
 
 -- | 保存绑定后的表达式节点
-data ExpressionNode = Constant RuntimeValue | BoundReference Int String | BoundApply FunctionId [TypedExpression]
-    | BoundList [TypedExpression] | BoundNothing | BoundJust TypedExpression | BoundTuple [TypedExpression]
+data ExpressionNode
+    = Constant RuntimeValue
+    | BoundReference Int String
+    | BoundApply FunctionId [TypedExpression]
+    | BoundList [TypedExpression]
+    | BoundNothing
+    | BoundJust TypedExpression
+    | BoundTuple [TypedExpression]
     deriving (Show, Eq)
 
 -- | 保存表达式的确定类型
@@ -56,9 +76,9 @@ bindExpression types functions env expression = case expression of
         bound <- mapM bind arguments
         compound (tupleType (map (typeExpression . expressionType) bound)) (BoundTuple bound)
   where
-    -- | 绑定当前作用域的子表达式
+    -- \| 绑定当前作用域的子表达式
     bind = bindExpression types functions env
-    -- | 校验并构造复合表达式
+    -- \| 校验并构造复合表达式
     compound ty node = do
         tid <- descriptorId <$> resolveType types ty
         Right (TypedExpression tid node)
@@ -80,16 +100,24 @@ evaluateExpression types functions row (TypedExpression tid node) = do
     validateValue types tid value
     Right value
   where
-    -- | 执行当前行的子表达式
+    -- \| 执行当前行的子表达式
     evaluate = evaluateExpression types functions row
 
 -- | 表达未绑定的关系计划
-data Plan = TableScan String | SingleRow | Projection [(String, Expression)] Plan
-    | Selection Expression Plan deriving (Show, Eq)
+data Plan
+    = TableScan String
+    | SingleRow
+    | Projection [(String, Expression)] Plan
+    | Selection Expression Plan
+    deriving (Show, Eq)
 
 -- | 保存绑定后的关系节点
-data PlanNode = BoundScan String | BoundSingleRow | BoundProjection [(String, TypedExpression)] TypedPlan
-    | BoundSelection TypedExpression TypedPlan deriving (Show, Eq)
+data PlanNode
+    = BoundScan String
+    | BoundSingleRow
+    | BoundProjection [(String, TypedExpression)] TypedPlan
+    | BoundSelection TypedExpression TypedPlan
+    deriving (Show, Eq)
 
 -- | 保存输出 schema 和关系节点
 data TypedPlan = TypedPlan [(String, TypeId)] PlanNode deriving (Show, Eq)
@@ -122,13 +150,13 @@ bindPlan types functions catalog plan = case plan of
             then Right (TypedPlan (planSchema child) (BoundSelection predicate child))
             else Left "selection predicate must be Bool"
   where
-    -- | 绑定子计划
+    -- \| 绑定子计划
     bind = bindPlan types functions catalog
-    -- | 解析 schema 列的类型身份
+    -- \| 解析 schema 列的类型身份
     bindColumn (name, ty) = do
         tid <- descriptorId <$> resolveType types ty
         Right (name, tid)
-    -- | 绑定投影项
+    -- \| 绑定投影项
     bindItem env (name, value) = do
         bound <- bindExpression types functions env value
         Right (name, bound)
@@ -140,8 +168,12 @@ uniqueNames names
     | otherwise = Left "duplicate schema column"
 
 -- | 执行绑定计划并校验存储返回值
-executePlan :: TypeRegistry -> FunctionRegistry -> (String -> Either String [[(String, RuntimeValue)]])
-    -> TypedPlan -> Either String [[(String, RuntimeValue)]]
+executePlan ::
+    TypeRegistry ->
+    FunctionRegistry ->
+    (String -> Either String [[(String, RuntimeValue)]]) ->
+    TypedPlan ->
+    Either String [[(String, RuntimeValue)]]
 executePlan types functions scan (TypedPlan output node) = do
     rows <- case node of
         BoundScan name -> scan name
@@ -155,23 +187,23 @@ executePlan types functions scan (TypedPlan output node) = do
     mapM_ (validateRow output) rows
     Right [[(name, value) | (name, _) <- output, Just value <- [lookup name row]] | row <- rows]
   where
-    -- | 计算一行的投影项
+    -- \| 计算一行的投影项
     project items row = mapM (projectItem row) items
-    -- | 计算命名输出项
+    -- \| 计算命名输出项
     projectItem row (name, expression) = do
         value <- evaluateExpression types functions row expression
         Right (name, value)
-    -- | 计算选择条件
+    -- \| 计算选择条件
     keep condition row = do
         value <- evaluateExpression types functions row condition
         case value of
             RBool result -> Right result
             _ -> Left "bound predicate returned a non-Bool value"
-    -- | 校验存储行的完整 schema
+    -- \| 校验存储行的完整 schema
     validateRow columns row
         | sort (map fst row) /= sort (map fst columns) = Left "storage row schema mismatch"
         | otherwise = mapM_ (validateColumn row) columns
-    -- | 按列名校验返回值的类型
+    -- \| 按列名校验返回值的类型
     validateColumn row (name, tid) = case lookup name row of
         Just value -> validateValue types tid value
         Nothing -> Left ("missing bound column: " ++ name)

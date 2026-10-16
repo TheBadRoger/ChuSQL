@@ -1,9 +1,9 @@
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE LambdaCase #-}
 
 module Main where
 
-import Data.Either (fromRight)
+import ChuSQL.Core.Engine
 import ChuSQL.Core.Engine.Algebra.Cost (rangeRows, selectivityOf)
 import ChuSQL.Core.Engine.Algebra.Eval (evalRelOp, evalRelOpM)
 import ChuSQL.Core.Engine.Algebra.Expr (colsInExpr, evalExpr)
@@ -13,37 +13,43 @@ import ChuSQL.Core.Engine.Algebra.Planner (translate)
 import ChuSQL.Core.Engine.Algebra.Sort (sortRows)
 import ChuSQL.Core.Engine.Builtin
 import ChuSQL.Core.Engine.Error
-import ChuSQL.Core.Engine
-import qualified ChuSQL.Core.Engine.Runtime.Query as Bound
 import ChuSQL.Core.Engine.Parallel (poolRun, workerPool)
-import ChuSQL.Core.Model
+import qualified ChuSQL.Core.Engine.Runtime.Query as Bound
 import ChuSQL.Core.Engine.Semantic (prepare)
 import ChuSQL.Core.Engine.Storage (IndexResult (..), MonadStorage (..))
-import ChuSQL.Core.Engine.Storage.Memory (MemoryStorage (runMemoryStorage))
 import ChuSQL.Core.Engine.Storage.FFI (closeStorage, maintainStorage, openStorage)
 import ChuSQL.Core.Engine.Storage.IPC (IPCStorage (..), StorageLink (..), closeConnection, defaultEnv, doListTables, envForDatabase, getDatabaseName, localStorageLink, runIPCStorage, sendRawRequest, setDatabaseName, setStorageLink)
+import ChuSQL.Core.Engine.Storage.Memory (MemoryStorage (runMemoryStorage))
 import ChuSQL.Core.Engine.Syntax.AST
 import ChuSQL.Core.Engine.Syntax.Parser
+import ChuSQL.Core.Model
 import Control.Concurrent (forkFinally, forkIO, killThread, threadDelay)
 import Control.Concurrent.Chan (newChan, readChan, writeChan)
 import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, readMVar, takeMVar, tryPutMVar)
-import Control.Monad (replicateM_, void, when)
 import Control.Exception (ErrorCall, IOException, bracket_, finally, try)
-import Data.Hashable (hash)
+import Control.Monad (replicateM_, void, when, (>=>))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
+import Data.Either (fromRight)
+import Data.Hashable (hash)
 import Data.List (isInfixOf, sortOn)
 import Data.Unique (hashUnique, newUnique)
 import GHC.IO.Encoding (getForeignEncoding, latin1, setForeignEncoding)
+import qualified NormalizationSpec
+import qualified RuntimeSpec
 import System.CPUTime (getCPUTime)
 import System.Directory (createDirectoryIfMissing, getTemporaryDirectory, removePathForcibly, renameFile)
 import System.FilePath ((</>))
 import System.Timeout (timeout)
 import Test.Hspec
-import qualified NormalizationSpec
-import qualified RuntimeSpec
 
 -- 引擎层的 hspec 测试：语法、执行、优化器与存储链路行为。
+
+-- | 经实际 IPC 解析并执行领域测试语句
+ipcDomainSql :: String -> IO (Either String [Row])
+ipcDomainSql sql = case parseStatement sql of
+    Left err -> pure (Left err)
+    Right statement -> runIPCStorage (runStatementM statement)
 
 -- | 测试表 users：id / name / age
 users :: Table
@@ -123,7 +129,7 @@ chainDB = [("a", chainA), ("b", chainB), ("c", chainC)]
 
 -- | 同一个连接链测试库，但没有统计
 chainDBWithoutStats :: Database
-chainDBWithoutStats = [(n, t { tableMeta = Nothing }) | (n, t) <- chainDB]
+chainDBWithoutStats = [(n, t{tableMeta = Nothing}) | (n, t) <- chainDB]
 
 -- | 顺序执行命名类型测试语句
 domainSql :: Database -> [String] -> Either String (Database, [Row])
@@ -169,24 +175,29 @@ main = hspec $ do
             rowsOf (parseStatement "SELECT DISTINCT user_id + 1 AS k FROM orders ORDER BY 1 DESC" >>= runStatement testDB)
                 `shouldBe` Right [[("k", VInt 3)], [("k", VInt 2)]]
         it "rejects zero and positions beyond the output" $ do
-            mapM_ (\sql -> (parseStatement sql >>= runStatement testDB) `shouldSatisfy` either (isInfixOf "outside the select list") (const False))
+            mapM_
+                (\sql -> (parseStatement sql >>= runStatement testDB) `shouldSatisfy` either (isInfixOf "outside the select list") (const False))
                 ["SELECT id FROM users ORDER BY 0", "SELECT id FROM users ORDER BY 2"]
         it "keeps NULL and equal-key row order when mixing ordinals and aliases" $ do
-            let rows = [[("id", VInt n), ("name", VStr "same"), ("age", value)]
-                    | (n, value) <- [(1, VInt 2), (2, VNull), (3, VInt 2)]]
-                db = [("users", users { tableRows = rows })]
+            let rows =
+                    [ [("id", VInt n), ("name", VStr "same"), ("age", value)]
+                    | (n, value) <- [(1, VInt 2), (2, VNull), (3, VInt 2)]
+                    ]
+                db = [("users", users{tableRows = rows})]
                 sql = "SELECT id AS x, age AS x, name AS tag FROM users ORDER BY 2, tag"
             rowsOf (parseStatement sql >>= runStatement db)
-                `shouldBe` Right [[("x", VInt 2), ("x", VNull), ("tag", VStr "same")]
+                `shouldBe` Right
+                    [ [("x", VInt 2), ("x", VNull), ("tag", VStr "same")]
                     , [("x", VInt 1), ("x", VInt 2), ("tag", VStr "same")]
-                    , [("x", VInt 3), ("x", VInt 2), ("tag", VStr "same")]]
-            (parseStatement "SELECT LIST<Int>(1) AS x, id AS x FROM users ORDER BY 1" >>= runStatement testDB)
-                `shouldSatisfy` either (isInfixOf "capability is not registered") (const False)
+                    , [("x", VInt 3), ("x", VInt 2), ("tag", VStr "same")]
+                    ]
+            fmap (map (drop 1 . map snd) . snd) (parseStatement "SELECT LIST<Int>(1) AS x, id AS x FROM users ORDER BY 1" >>= runStatement testDB)
+                `shouldBe` Right [[VInt 1], [VInt 2], [VInt 3]]
             (parseStatement "SELECT age AS x, id AS x FROM users ORDER BY 1, x" >>= runStatement testDB)
                 `shouldSatisfy` either (isInfixOf "ambiguous projection alias") (const False)
     describe "SELECT DISTINCT" $ do
         it "deduplicates projected values before ordering and limiting" $ do
-            let db = [("orders", orders { tableRows = tableRows orders ++ tableRows orders })]
+            let db = [("orders", orders{tableRows = tableRows orders ++ tableRows orders})]
             rowsOf (parseStatement "SELECT DISTINCT user_id FROM orders ORDER BY user_id DESC LIMIT 2" >>= runStatement db)
                 `shouldBe` Right [[("user_id", VInt 2)], [("user_id", VInt 1)]]
             rowsOf (parseStatement "SELECT DISTINCT user_id + 1 AS k FROM orders ORDER BY k LIMIT 2" >>= runStatement db)
@@ -195,7 +206,7 @@ main = hspec $ do
                 `shouldBe` Right (map (filter ((== "user_id") . fst)) (tableRows orders ++ tableRows orders))
         it "merges NULL and equal numeric values while retaining first rows" $ do
             evalRelOp [] (Distinct Unit) `shouldBe` Right [[]]
-            let t = users { tableRows = [[("id", v), ("name", VStr "a"), ("age", VInt 1)] | v <- [VNull, VNull, VInt 1, VFloat 1, VInt 2]] }
+            let t = users{tableRows = [[("id", v), ("name", VStr "a"), ("age", VInt 1)] | v <- [VNull, VNull, VInt 1, VFloat 1, VInt 2]]}
             evalRelOp [("users", t)] (Distinct (Project ["id"] (Scan Nothing "users" Nothing)))
                 `shouldBe` Right [[("id", VNull)], [("id", VInt 1)], [("id", VInt 2)]]
         it "keeps all distinct columns when an outer query projects fewer" $ do
@@ -210,9 +221,9 @@ main = hspec $ do
                 `shouldBe` Right []
             rowsOf (parseStatement "SELECT DISTINCT user_id AS k FROM orders ORDER BY user_id" >>= runStatement testDB)
                 `shouldBe` Right [[("k", VInt 1)], [("k", VInt 2)]]
-        it "rejects composite values without equality capability" $ do
-            (parseStatement "SELECT DISTINCT LIST<Int>(1) AS xs" >>= runStatement [])
-                `shouldSatisfy` either (isInfixOf "capability is not registered") (const False)
+        it "accepts composite values with derived equality and hash capabilities" $ do
+            let result = parseStatement "SELECT DISTINCT LIST<Int>(1) AS xs" >>= runStatement []
+            fmap (length . snd) result `shouldBe` Right 1
         it "evaluates correlated DISTINCT subqueries with the outer binding" $ do
             rowsOf (parseStatement "SELECT u.id FROM users u WHERE u.id IN (SELECT DISTINCT o.user_id FROM orders o WHERE o.user_id = u.id)" >>= runStatement testDB)
                 `shouldBe` Right [[("u.id", VInt 1)], [("u.id", VInt 2)]]
@@ -222,32 +233,40 @@ main = hspec $ do
 
     describe "Storage read failures" $ do
         it "rejects storage that silently ignores a bound read guard" $ do
-            setStorageLink StorageLink
-                { slRequest = \_ -> pure (Right (BSC.pack "{\"status\":\"rows\",\"rows\":[]}"))
-                , slClose = pure ()
-                }
-            (runIPCStorage (withSchemaGuard [] (scan "ignored"))
-                `shouldReturn` Left "storage did not confirm bound schema guard") `finally` closeConnection
+            setStorageLink
+                StorageLink
+                    { slRequest = \_ -> pure (Right (BSC.pack "{\"status\":\"rows\",\"rows\":[]}"))
+                    , slClose = pure ()
+                    }
+            ( runIPCStorage (withSchemaGuard [] (scan "ignored"))
+                    `shouldReturn` Left "storage did not confirm bound schema guard"
+                )
+                `finally` closeConnection
         it "rejects an ignored write handshake before sending the mutation" $ do
             requests <- newMVar []
-            setStorageLink StorageLink
-                { slRequest = \payload -> do
-                    modifyMVar_ requests (pure . (payload :))
-                    pure (Right (BSC.pack "{\"status\":\"ok\"}"))
-                , slClose = pure ()
-                }
+            setStorageLink
+                StorageLink
+                    { slRequest = \payload -> do
+                        modifyMVar_ requests (pure . (payload :))
+                        pure (Right (BSC.pack "{\"status\":\"ok\"}"))
+                    , slClose = pure ()
+                    }
             flip finally closeConnection $ do
-                runIPCStorage (withWriteSchemaGuard [("ignored", users)]
-                    (insert "ignored" [("id", VInt 1)]))
+                runIPCStorage
+                    ( withWriteSchemaGuard
+                        [("ignored", users)]
+                        (insert "ignored" [("id", VInt 1)])
+                    )
                     `shouldReturn` Left "storage did not confirm bound schema guard"
                 sent <- readMVar requests
                 length sent `shouldBe` 1
                 head sent `shouldSatisfy` BS.isInfixOf (BSC.pack "\"method\":\"validate_write\"")
         it "propagates catalog failures through snapshot, schema and SQL" $ do
-            setStorageLink StorageLink
-                { slRequest = \_ -> pure (Right (BSC.pack "{\"status\":\"error\",\"message\":\"catalog unavailable\"}"))
-                , slClose = pure ()
-                }
+            setStorageLink
+                StorageLink
+                    { slRequest = \_ -> pure (Right (BSC.pack "{\"status\":\"error\",\"message\":\"catalog unavailable\"}"))
+                    , slClose = pure ()
+                    }
             flip finally closeConnection $ do
                 fmap (fmap (map fst)) (runIPCStorage snapshot) `shouldReturn` Left "catalog unavailable"
                 fmap (fmap (map fst)) (runIPCStorage schema) `shouldReturn` Left "catalog unavailable"
@@ -255,13 +274,17 @@ main = hspec $ do
                     `shouldReturn` Left "catalog unavailable"
 
         it "rejects the entire snapshot when a table scan fails" $ do
-            setStorageLink StorageLink
-                { slRequest = \payload -> pure $ Right $ BSC.pack $
-                    if BSC.pack "list_catalog" `BS.isInfixOf` payload
-                        then "{\"status\":\"catalog\",\"schemas\":[{\"table\":\"broken\",\"columns\":[],\"row_count\":1}]}"
-                        else "{\"status\":\"error\",\"message\":\"data page unreadable\"}"
-                , slClose = pure ()
-                }
+            setStorageLink
+                StorageLink
+                    { slRequest = \payload ->
+                        pure $
+                            Right $
+                                BSC.pack $
+                                    if BSC.pack "list_catalog" `BS.isInfixOf` payload
+                                        then "{\"status\":\"catalog\",\"schemas\":[{\"table\":\"broken\",\"columns\":[],\"row_count\":1}]}"
+                                        else "{\"status\":\"error\",\"message\":\"data page unreadable\"}"
+                    , slClose = pure ()
+                    }
             (fmap (fmap (map fst)) (runIPCStorage snapshot) `shouldReturn` Left "data page unreadable") `finally` closeConnection
 
     describe "Storage lifecycle and cancellation" $ do
@@ -271,10 +294,11 @@ main = hspec $ do
             finished <- newChan
             closing <- newEmptyMVar
             closed <- newEmptyMVar
-            setStorageLink StorageLink
-                { slRequest = \_ -> writeChan started () >> readMVar release >> pure (Right BS.empty)
-                , slClose = putMVar closed ()
-                }
+            setStorageLink
+                StorageLink
+                    { slRequest = \_ -> writeChan started () >> readMVar release >> pure (Right BS.empty)
+                    , slClose = putMVar closed ()
+                    }
             flip finally (void (tryPutMVar release ()) >> closeConnection) $ do
                 replicateM_ 2 (void (forkIO (sendRawRequest BS.empty >>= writeChan finished)))
                 timeout 1000000 (replicateM_ 2 (readChan started)) `shouldReturn` Just ()
@@ -305,10 +329,11 @@ main = hspec $ do
             release <- newEmptyMVar
             finished <- newEmptyMVar
             closed <- newEmptyMVar
-            setStorageLink StorageLink
-                { slRequest = \_ -> putMVar started () >> takeMVar release >> pure (Right BS.empty)
-                , slClose = putMVar closed ()
-                }
+            setStorageLink
+                StorageLink
+                    { slRequest = \_ -> putMVar started () >> takeMVar release >> pure (Right BS.empty)
+                    , slClose = putMVar closed ()
+                    }
             thread <- forkFinally (sendRawRequest BS.empty) (const (putMVar finished ()))
             flip finally (killThread thread >> closeConnection) $ do
                 timeout 1000000 (takeMVar started) `shouldReturn` Just ()
@@ -334,10 +359,165 @@ main = hspec $ do
             prepare [] (AlterIdentity "worker" [("login", True), ("login", False)]) `shouldSatisfy` isLeft
     describe "ChuSQL.Core.Engine (DOMAIN)" $ do
         it "parses domain commands and named columns" $ do
-            parseStatement "CREATE DOMAIN amount AS DECIMAL(12,2)" `shouldBe` Right (CreateDomain "amount" (CDecimal 12 2))
+            parseStatement "CREATE DOMAIN amount AS DECIMAL(12,2)" `shouldBe` Right (CreateDomain "amount" (DomainDefinition (plainColumn (CDecimal 12 2)) []))
             parseStatement "DROP DOMAIN amount" `shouldBe` Right (DropDomain "amount")
             parseStatement "SHOW DOMAINS" `shouldBe` Right ShowDomains
             parseStatement "CREATE TABLE items (price amount)" `shouldBe` Right (CreateTable "items" [("price", plainColumn (CDomain "amount" CStr))])
+        it "inherits defaults and non-null across nested domains without freezing column declarations" $ do
+            let setup =
+                    [ "CREATE DOMAIN positive AS INT DEFAULT 3 NOT NULL CHECK (VALUE > 0)"
+                    , "CREATE DOMAIN small AS positive DEFAULT 4 CHECK (VALUE < 10)"
+                    , "CREATE TABLE items (id INT, qty small, own small DEFAULT 6)"
+                    , "INSERT INTO items (id) VALUES (1)"
+                    , "ALTER DOMAIN small SET DEFAULT 5"
+                    , "INSERT INTO items (id) VALUES (2)"
+                    , "ALTER DOMAIN small DROP DEFAULT"
+                    , "INSERT INTO items (id) VALUES (3)"
+                    ]
+            fmap snd (domainSql [] (setup ++ ["SELECT qty, own FROM items ORDER BY id"]))
+                `shouldBe` Right [[("qty", VInt 4), ("own", VInt 6)], [("qty", VInt 5), ("own", VInt 6)], [("qty", VInt 3), ("own", VInt 6)]]
+            case domainSql [] setup of
+                Left err -> expectationFailure err
+                Right (db, _) ->
+                    mapM_
+                        (\sql -> domainSql db [sql] `shouldSatisfy` isLeft)
+                        [ "INSERT INTO items (qty) VALUES (NULL)"
+                        , "INSERT INTO items (qty) VALUES (0)"
+                        , "INSERT INTO items (qty) VALUES (10)"
+                        , "UPDATE items SET qty = 0"
+                        ]
+        it "accepts UNKNOWN in domain checks and checks explicit null separately from defaults" $ do
+            fmap
+                snd
+                ( domainSql
+                    []
+                    [ "CREATE DOMAIN positive AS INT DEFAULT 2 CHECK (VALUE > 0)"
+                    , "CREATE TABLE items (qty positive)"
+                    , "INSERT INTO items (qty) VALUES (NULL)"
+                    , "ALTER DOMAIN positive SET NOT NULL"
+                    ]
+                )
+                `shouldSatisfy` isLeft
+            fmap
+                snd
+                ( domainSql
+                    []
+                    [ "CREATE DOMAIN positive AS INT DEFAULT 2 CHECK (VALUE > 0)"
+                    , "CREATE TABLE items (qty positive)"
+                    , "INSERT INTO items (qty) VALUES (NULL)"
+                    , "SELECT qty FROM items"
+                    ]
+                )
+                `shouldBe` Right [[("qty", VNull)]]
+            fmap
+                snd
+                ( domainSql
+                    []
+                    [ "CREATE DOMAIN positive AS INT NOT NULL"
+                    , "ALTER DOMAIN positive DROP NOT NULL"
+                    , "CREATE TABLE items (qty positive)"
+                    , "INSERT INTO items (qty) VALUES (NULL)"
+                    , "SELECT qty FROM items"
+                    ]
+                )
+                `shouldBe` Right [[("qty", VNull)]]
+        it "validates definitions even for unused domains and empty tables" $ do
+            mapM_
+                (\statements -> domainSql [] statements `shouldSatisfy` isLeft)
+                [ ["CREATE DOMAIN bad AS INT DEFAULT 0 CHECK (VALUE > 0)"]
+                , ["CREATE DOMAIN bad AS INT DEFAULT NULL NOT NULL"]
+                , ["CREATE DOMAIN bad AS INT CHECK (missing > 0)"]
+                , ["CREATE DOMAIN bad AS INT CHECK (VALUE + 1)"]
+                , ["CREATE DOMAIN bad AS INT CHECK (COUNT(*) > 0)"]
+                , ["CREATE DOMAIN bad AS INT CHECK (VALUE > (SELECT 1))"]
+                , ["CREATE DOMAIN bad AS INT CHECK (unknown_fn(VALUE))"]
+                , ["CREATE DOMAIN bad AS INT CONSTRAINT same CHECK (VALUE > 0) CONSTRAINT SAME CHECK (VALUE < 9)"]
+                , ["CREATE DOMAIN positive AS INT CHECK (VALUE > 0)", "CREATE TABLE items (qty positive DEFAULT 0)"]
+                , ["CREATE DOMAIN positive AS INT CHECK (VALUE > 0)", "CREATE DOMAIN child AS positive DEFAULT 0"]
+                ]
+        it "fills added columns from inherited defaults and validates retyped values" $ do
+            let setup =
+                    [ "CREATE DOMAIN positive AS INT DEFAULT 7 NOT NULL CHECK (VALUE > 0)"
+                    , "CREATE TABLE items (id INT)"
+                    , "INSERT INTO items (id) VALUES (1)"
+                    , "ALTER TABLE items ADD COLUMN qty positive"
+                    ]
+            fmap snd (domainSql [] (setup ++ ["SELECT qty FROM items"])) `shouldBe` Right [[("qty", VInt 7)]]
+            domainSql
+                []
+                [ "CREATE DOMAIN positive AS INT CHECK (VALUE > 0)"
+                , "CREATE TABLE items (id INT)"
+                , "INSERT INTO items (id) VALUES (0)"
+                , "ALTER TABLE items ALTER COLUMN id TYPE positive"
+                ]
+                `shouldSatisfy` isLeft
+        it "checks existing rows, dependent defaults and all nested constraints before publication" $ do
+            let setup =
+                    [ "CREATE DOMAIN base AS INT"
+                    , "CREATE DOMAIN child AS base DEFAULT 8"
+                    , "CREATE TABLE items (id INT, qty child)"
+                    , "INSERT INTO items (id, qty) VALUES (1, 4)"
+                    ]
+            case domainSql [] setup of
+                Left err -> expectationFailure err
+                Right (db, _) -> do
+                    mapM_
+                        (\sql -> domainSql db [sql] `shouldSatisfy` isLeft)
+                        [ "ALTER DOMAIN base ADD CONSTRAINT large CHECK (VALUE > 5)"
+                        , "ALTER DOMAIN base ADD CHECK (VALUE < 7)"
+                        ]
+                    fmap
+                        snd
+                        ( domainSql
+                            db
+                            [ "ALTER DOMAIN base ADD CONSTRAINT positive CHECK (VALUE > 0)"
+                            , "ALTER DOMAIN child SET DEFAULT 0"
+                            ]
+                        )
+                        `shouldSatisfy` isLeft
+                    fmap snd (domainSql db ["SELECT qty FROM items"]) `shouldBe` Right [[("qty", VInt 4)]]
+        it "preserves named constraints, drops one at a time and invalidates bound plans" $ do
+            case domainSql
+                []
+                [ "CREATE DOMAIN qty AS INT CONSTRAINT positive CHECK (VALUE > 0) CHECK (VALUE < 10)"
+                , "CREATE TABLE items (qty qty)"
+                , "INSERT INTO items (qty) VALUES (4)"
+                ] of
+                Left err -> expectationFailure err
+                Right (db, _) -> do
+                    Right statement <- pure (parseStatement "INSERT INTO items (qty) VALUES (5)")
+                    Right bound <- pure (bindWrite db statement)
+                    Right query <- pure (parseStatement "SELECT qty FROM items")
+                    Right boundQuery <- pure (Bound.bindQuery db query)
+                    Right (changed, _) <- pure (domainSql db ["ALTER DOMAIN qty DROP CONSTRAINT positive"])
+                    runMemoryStorage (executeWriteM bound) changed `shouldSatisfy` either (const False) (isLeft . fst)
+                    runMemoryStorage (Bound.executeQueryM boundQuery) changed `shouldSatisfy` either (const False) (isLeft . fst)
+                    domainSql changed ["INSERT INTO items (qty) VALUES (0)"] `shouldSatisfy` either (const False) (const True)
+                    domainSql changed ["INSERT INTO items (qty) VALUES (10)"] `shouldSatisfy` isLeft
+                    domainSql changed ["ALTER DOMAIN qty DROP CONSTRAINT missing"] `shouldSatisfy` isLeft
+                    fmap
+                        snd
+                        ( domainSql
+                            changed
+                            [ "ALTER DOMAIN qty DROP CONSTRAINT domain_check_1"
+                            , "INSERT INTO items (qty) VALUES (10)"
+                            , "SELECT qty FROM items"
+                            ]
+                        )
+                        `shouldBe` Right [[("qty", VInt 4)], [("qty", VInt 10)]]
+        it "parses signed numeric defaults without changing their signs" $ do
+            fmap
+                snd
+                ( domainSql
+                    []
+                    [ "CREATE DOMAIN plus AS DOUBLE DEFAULT 1.25"
+                    , "CREATE DOMAIN minus AS DOUBLE DEFAULT -1.25"
+                    , "CREATE TABLE items (id INT, a plus, b minus)"
+                    , "INSERT INTO items (id) VALUES (-2)"
+                    , "SELECT id, a, b FROM items"
+                    ]
+                )
+                `shouldBe` Right [[("id", VInt (-2)), ("a", VFloat 1.25), ("b", VFloat (-1.25))]]
         it "keeps a named type while applying its base semantics" $ do
             let result = domainSql [] ["CREATE DOMAIN label AS VARCHAR(3)", "CREATE TABLE items (name label)", "INSERT INTO items (name) VALUES ('abc')"]
             case result of
@@ -347,7 +527,8 @@ main = hspec $ do
                     fmap snd (domainSql db ["SELECT name FROM items"]) `shouldBe` Right [[("name", VStr "abc")]]
                     domainSql db ["INSERT INTO items (name) VALUES ('long')"] `shouldSatisfy` isLeft
         it "rejects unknown, duplicate and built-in domains" $ do
-            mapM_ (\sql -> domainSql [] sql `shouldSatisfy` isLeft)
+            mapM_
+                (\sql -> domainSql [] sql `shouldSatisfy` isLeft)
                 [ ["CREATE TABLE items (name missing)"]
                 , ["CREATE DOMAIN INT AS INT"]
                 , ["CREATE DOMAIN a AS INT", "CREATE DOMAIN A AS INT"]
@@ -373,7 +554,7 @@ main = hspec $ do
             case domainSql [] ["CREATE DOMAIN a AS INT", "CREATE DOMAIN b AS a"] of
                 Left err -> expectationFailure err
                 Right (db, _) -> do
-                    let cyclic = map (\(name, table) -> if name == domainTableName "a" then (name, table {tableCols = [("base", plainColumn (CDomain "b" CStr))]}) else (name, table)) db
+                    let cyclic = map (\(name, table) -> if name == domainTableName "a" then (name, table{tableCols = [("base", plainColumn (CDomain "b" CStr))]}) else (name, table)) db
                     fmap snd (domainSql cyclic ["CREATE TABLE items (id b)"]) `shouldBe` Left "cyclic domain definition: b"
         it "prevents dropping a domain until its columns are removed" $ do
             domainSql [] ["CREATE DOMAIN code AS INT", "CREATE TABLE items (code code)", "DROP DOMAIN code"] `shouldSatisfy` isLeft
@@ -574,6 +755,10 @@ main = hspec $ do
     describe "ChuSQL.Core.Engine (事务)" $ do
         it "parses transaction control statements" $ do
             parseStatement "BEGIN" `shouldBe` Right BeginTransaction
+            parseStatement "BEGIN ISOLATION LEVEL SERIALIZABLE" `shouldBe` Right BeginSerializableTransaction
+            parseStatement "START TRANSACTION ISOLATION LEVEL SERIALIZABLE" `shouldBe` Right BeginSerializableTransaction
+            parseStatement "BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE" `shouldBe` Right BeginSerializableTransaction
+            parseStatement "BEGIN ISOLATION LEVEL READ COMMITTED" `shouldSatisfy` isLeft
             parseStatement "BEGIN TRANSACTION" `shouldBe` Right BeginTransaction
             parseStatement "START TRANSACTION" `shouldBe` Right BeginTransaction
             parseStatement "begin transaction" `shouldBe` Right BeginTransaction
@@ -860,8 +1045,8 @@ main = hspec $ do
             executeOperator OpNe [VInt 1, VFloat 1.0] `shouldBe` Right (VBool False)
 
         it "rewrites >= and <= into an inclusive index range" $ do
-            let stat rows distinct
-                  = TableMeta rows [(c, d, False) | (c, d) <- distinct] []
+            let stat rows distinct =
+                    TableMeta rows [(c, d, False) | (c, d) <- distinct] []
                 dbWith m = [("users", Table "users" [("id", TInt), ("name", TStr)] [] (Just m) Nothing Nothing)]
                 indexed = dbWith (stat 10000 [("id", 10000)] ["id"])
                 low = Filter (GtE (Col "id") (LitInt 2)) (Scan Nothing "users" Nothing)
@@ -1138,8 +1323,8 @@ main = hspec $ do
                 Right (_, _) -> do
                     rowsOf (runStatement testDB (makeSelect ["name"] "users" Nothing))
                         `shouldSatisfy` \case
-                                          Right rows -> length rows == 3
-                                          Left _ -> False
+                            Right rows -> length rows == 3
+                            Left _ -> False
 
         it "returns Left when column count does not match value count" $ do
             runStatement testDB (Insert "users" ["name", "age"] [[LitStr "Dave"]])
@@ -1635,7 +1820,7 @@ main = hspec $ do
                     ]
 
         it "emits NULL rows even when the right table is empty" $ do
-            let db = [("users", users), ("orders", orders {tableRows = []})]
+            let db = [("users", users), ("orders", orders{tableRows = []})]
             (parseStatement "SELECT u.name, o.product FROM users u LEFT JOIN orders o ON u.id = o.user_id" >>= rowsOf . runStatement db)
                 `shouldBe` Right
                     [ [("u.name", VStr "Alice"), ("o.product", VNull)]
@@ -1803,14 +1988,26 @@ main = hspec $ do
 
     describe "semi joins" $ do
         let keysDB =
-                [ ("left_keys", users {tableName = "left_keys", tableCols = [("k", TInt)],
-                    tableRows = [[("k", value)] | value <- [VInt 1, VInt 1, VInt 2, VNull, VInt 3]]})
-                , ("right_keys", users {tableName = "right_keys", tableCols = [("k", TInt)],
-                    tableRows = [[("k", value)] | value <- [VInt 1, VInt 1, VNull]]})
+                [
+                    ( "left_keys"
+                    , users
+                        { tableName = "left_keys"
+                        , tableCols = [("k", TInt)]
+                        , tableRows = [[("k", value)] | value <- [VInt 1, VInt 1, VInt 2, VNull, VInt 3]]
+                        }
+                    )
+                ,
+                    ( "right_keys"
+                    , users
+                        { tableName = "right_keys"
+                        , tableCols = [("k", TInt)]
+                        , tableRows = [[("k", value)] | value <- [VInt 1, VInt 1, VNull]]
+                        }
+                    )
                 ]
-            -- | 在键边界数据上执行查询
+            -- \| 在键边界数据上执行查询
             sql input = fmap (map (map snd)) (rowsOf (parseStatement input >>= runStatement keysDB))
-            -- | 检查经过语义解析的优化计划
+            -- \| 检查经过语义解析的优化计划
             plan input = renderPlan . optimize testDB <$> (parseStatement input >>= prepare testDB >>= translate)
 
         it "keeps left duplicates without multiplying right matches" $ do
@@ -1834,9 +2031,11 @@ main = hspec $ do
                 `shouldBe` Right [[VInt 1], [VInt 1], [VInt 2], [VNull], [VInt 3]]
 
         it "plans eligible predicates as semi joins and scans the right once" $ do
-            mapM_ (\query -> do
-                plan query `shouldSatisfy` either (const False) (isInfixOf "SemiJoin")
-                sameResultAsUnoptimized query)
+            mapM_
+                ( \query -> do
+                    plan query `shouldSatisfy` either (const False) (isInfixOf "SemiJoin")
+                    sameResultAsUnoptimized query
+                )
                 [ "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders)"
                 , "SELECT name FROM users WHERE id NOT IN (SELECT user_id FROM orders)"
                 , "SELECT o.product FROM orders o WHERE EXISTS (SELECT 1 FROM users u WHERE u.id = o.user_id)"
@@ -1846,7 +2045,8 @@ main = hspec $ do
             scanTimes "users" scans `shouldBe` 1
 
         it "keeps complex correlation and risky left keys on the original path" $ do
-            mapM_ (\query -> plan query `shouldSatisfy` either (const False) (not . isInfixOf "SemiJoin"))
+            mapM_
+                (\query -> plan query `shouldSatisfy` either (const False) (not . isInfixOf "SemiJoin"))
                 [ "SELECT name FROM users WHERE 1 / (id - 1) IN (SELECT id FROM orders)"
                 , "SELECT u.name FROM users u WHERE EXISTS (SELECT 1 / 0 FROM orders o WHERE o.user_id = u.id)"
                 , "SELECT u.name FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id > u.id)"
@@ -1865,10 +2065,22 @@ main = hspec $ do
 
         it "retains mixed numeric comparison at the floating precision boundary" $ do
             let db =
-                    [ ("big", users {tableName = "big", tableCols = [("id", TInt)],
-                        tableRows = [[("id", VInt value)] | value <- [9007199254740995, 9007199254740996, 9007199254740997, 9007199254740998]]})
-                    , ("floats", users {tableName = "floats", tableCols = [("value", plainColumn CFloat)],
-                        tableRows = [[("value", VFloat 9007199254740996)]]})
+                    [
+                        ( "big"
+                        , users
+                            { tableName = "big"
+                            , tableCols = [("id", TInt)]
+                            , tableRows = [[("id", VInt value)] | value <- [9007199254740995, 9007199254740996, 9007199254740997, 9007199254740998]]
+                            }
+                        )
+                    ,
+                        ( "floats"
+                        , users
+                            { tableName = "floats"
+                            , tableCols = [("value", plainColumn CFloat)]
+                            , tableRows = [[("value", VFloat 9007199254740996)]]
+                            }
+                        )
                     ]
                 result = do
                     statement <- parseStatement "SELECT id FROM big WHERE id IN (SELECT value FROM floats)"
@@ -1889,7 +2101,8 @@ main = hspec $ do
             scanTimes "orders" scans `shouldBe` 1
 
         it "preserves grouping, DISTINCT, ordering and LIMIT around semi joins" $ do
-            mapM_ sameResultAsUnoptimized
+            mapM_
+                sameResultAsUnoptimized
                 [ "SELECT DISTINCT user_id FROM orders WHERE user_id IN (SELECT id FROM users) ORDER BY user_id DESC LIMIT 1"
                 , "SELECT user_id, COUNT(*) FROM orders WHERE user_id IN (SELECT id FROM users) GROUP BY user_id HAVING COUNT(*) > 1 ORDER BY COUNT(*) DESC"
                 , "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders ORDER BY id LIMIT 1) ORDER BY age + 1"
@@ -1900,11 +2113,12 @@ main = hspec $ do
 
         it "executes semi and anti joins with NULL through storage IPC" $
             withTestSession $ \srv -> withServerEnv srv $ do
-                -- | 在真实存储执行半连接查询
+                -- \| 在真实存储执行半连接查询
                 let query input = case parseStatement input of
                         Left err -> pure (Left err)
                         Right statement -> runIPCStorage (runStatementM statement)
-                mapM_ (\input -> query input `shouldReturn` Right [])
+                mapM_
+                    (\input -> query input `shouldReturn` Right [])
                     [ "CREATE TABLE semi_left (k int)"
                     , "CREATE TABLE semi_right (k int)"
                     , "INSERT INTO semi_left (k) VALUES (1), (1), (2), (NULL)"
@@ -1919,7 +2133,7 @@ main = hspec $ do
                     `shouldReturn` Right [[("k", VInt 1)], [("k", VInt 1)], [("k", VInt 2)], [("k", VNull)]]
 
     describe "NULL membership in empty subqueries" $ do
-        -- | 在测试库运行并取值
+        -- \| 在测试库运行并取值
         let values input = fmap (map (map snd)) (rowsOf (parseStatement input >>= runStatement testDB))
         it "uses the same empty-set rule for membership and quantified comparison" $ do
             inValues VNull [] `shouldBe` Right (VBool False)
@@ -1929,7 +2143,8 @@ main = hspec $ do
             values "SELECT NULL IN (SELECT id FROM orders), NULL NOT IN (SELECT id FROM orders), NULL IN (NULL), NULL NOT IN (NULL)"
                 `shouldBe` Right [[VNull, VNull, VNull, VNull]]
         it "keeps optimized filtering identical to the original plan" $ do
-            mapM_ sameResultAsUnoptimized
+            mapM_
+                sameResultAsUnoptimized
                 [ "SELECT name FROM users WHERE NULL IN (SELECT id FROM orders WHERE id < 0)"
                 , "SELECT name FROM users WHERE NULL NOT IN (SELECT id FROM orders WHERE id < 0)"
                 ]
@@ -1986,7 +2201,7 @@ main = hspec $ do
             case parseStatement "SELECT (SELECT COUNT(*) FROM orders) AS n" >>= Bound.bindQuery testDB of
                 Left err -> expectationFailure err
                 Right bound -> do
-                    -- | 两次执行之间修改来源数据
+                    -- \| 两次执行之间修改来源数据
                     let action = do
                             first <- Bound.executeQueryM bound
                             changed <- replaceAll "orders" []
@@ -2007,7 +2222,7 @@ main = hspec $ do
 
         it "executes repeated CTE references through real storage" $
             withTestSession $ \srv -> withServerEnv srv $ do
-                -- | 在实际存储执行数据和查询语句
+                -- \| 在实际存储执行数据和查询语句
                 let query input = case parseStatement input of
                         Left err -> pure (Left err)
                         Right statement -> runIPCStorage (runStatementM statement)
@@ -2028,7 +2243,7 @@ main = hspec $ do
             vals "SELECT COUNT(*) FROM users" `shouldBe` Right [[VInt 3]]
 
         it "counts only the non-null values of a column" $ do
-            let db = [(n, if n == "users" then t {tableRows = [[("id", VInt 1), ("name", VStr "a"), ("age", VNull)]]} else t) | (n, t) <- testDB]
+            let db = [(n, if n == "users" then t{tableRows = [[("id", VInt 1), ("name", VStr "a"), ("age", VNull)]]} else t) | (n, t) <- testDB]
             fmap (map (map snd)) (sqlDb db "SELECT COUNT(age), COUNT(*) FROM users")
                 `shouldBe` Right [[VInt 0, VInt 1]]
 
@@ -2037,7 +2252,7 @@ main = hspec $ do
                 `shouldBe` Right [[VInt 72, VFloat 24, VInt 17, VInt 30]]
 
         it "ignores nulls in the aggregates that skip them" $ do
-            let db = [(n, if n == "users" then t {tableRows = [[("id", VInt 1), ("name", VStr "a"), ("age", VNull)], [("id", VInt 2), ("name", VStr "b"), ("age", VInt 4)]]} else t) | (n, t) <- testDB]
+            let db = [(n, if n == "users" then t{tableRows = [[("id", VInt 1), ("name", VStr "a"), ("age", VNull)], [("id", VInt 2), ("name", VStr "b"), ("age", VInt 4)]]} else t) | (n, t) <- testDB]
             fmap (map (map snd)) (sqlDb db "SELECT SUM(age), AVG(age), MIN(age), MAX(age) FROM users")
                 `shouldBe` Right [[VInt 4, VFloat 4, VInt 4, VInt 4]]
 
@@ -2062,12 +2277,12 @@ main = hspec $ do
                         other -> expectationFailure ("unexpected plan: " ++ renderPlan other)
 
         it "returns one row with null sum for an empty table" $ do
-            let empty = [(n, if n == "users" then t {tableRows = []} else t) | (n, t) <- testDB]
+            let empty = [(n, if n == "users" then t{tableRows = []} else t) | (n, t) <- testDB]
             fmap (map (map snd)) (sqlDb empty "SELECT COUNT(*), SUM(age) FROM users")
                 `shouldBe` Right [[VInt 0, VNull]]
 
         it "returns no groups for an empty table when grouping" $ do
-            let empty = [(n, if n == "users" then t {tableRows = []} else t) | (n, t) <- testDB]
+            let empty = [(n, if n == "users" then t{tableRows = []} else t) | (n, t) <- testDB]
             sqlDb empty "SELECT age, COUNT(*) FROM users GROUP BY age" `shouldBe` Right []
 
         it "rejects a bare column that is not grouped" $ do
@@ -2110,7 +2325,7 @@ main = hspec $ do
                     evalRelOp testDB (optimize testDB plan) `shouldBe` evalRelOp testDB plan
 
     describe "HAVING and expression ordering" $ do
-        -- | 在固定测试库执行查询
+        -- \| 在固定测试库执行查询
         let sql text = rowsOf (parseStatement text >>= runStatement testDB)
         it "filters groups using aggregates absent from the projection" $ do
             sql "SELECT user_id FROM orders GROUP BY user_id HAVING COUNT(*) > 1 ORDER BY SUM(id) DESC"
@@ -2125,7 +2340,8 @@ main = hspec $ do
             sql "SELECT COUNT(*) FROM users HAVING FALSE" `shouldBe` Right []
 
         it "checks grouping, boolean predicates and nested aggregates" $ do
-            mapM_ (\query -> sql query `shouldSatisfy` isLeft)
+            mapM_
+                (\query -> sql query `shouldSatisfy` isLeft)
                 [ "SELECT name FROM users HAVING TRUE"
                 , "SELECT COUNT(*) FROM users HAVING age > 20"
                 , "SELECT COUNT(*) FROM users HAVING 1"
@@ -2171,7 +2387,8 @@ main = hspec $ do
                 `shouldBe` Right [[("u.name", VStr "Alice")], [("u.name", VStr "Bob")], [("u.name", VStr "Carol")]]
 
         it "preserves semantics through optimizer rewrites" $ do
-            mapM_ sameResultAsUnoptimized
+            mapM_
+                sameResultAsUnoptimized
                 [ "SELECT user_id FROM orders GROUP BY user_id HAVING COUNT(*) > 1 ORDER BY SUM(id) + 1 LIMIT 1"
                 , "SELECT name FROM users ORDER BY age + 1 DESC, name LIMIT 2"
                 , "SELECT DISTINCT age + 1 FROM users ORDER BY age + 1"
@@ -2179,7 +2396,7 @@ main = hspec $ do
 
         it "executes grouped HAVING and expression sorting through storage IPC" $
             withTestSession $ \srv -> withServerEnv srv $ do
-                -- | 通过真实存储执行 SQL
+                -- \| 通过真实存储执行 SQL
                 let query text = case parseStatement text of
                         Left err -> pure (Left err)
                         Right statement -> runIPCStorage (runStatementM statement)
@@ -2316,8 +2533,8 @@ main = hspec $ do
                 `shouldBe` Right (Just (LitBool False))
 
         it "picks the index only when the statistics make it cheaper" $ do
-            let stat rows distinct
-                  = TableMeta rows [(c, d, False) | (c, d) <- distinct] []
+            let stat rows distinct =
+                    TableMeta rows [(c, d, False) | (c, d) <- distinct] []
                 dbWith m = [("users", Table "users" [("id", TInt), ("name", TStr)] [] (Just m) Nothing Nothing)]
                 unknown = [("users", Table "users" [("id", TInt), ("name", TStr)] [] Nothing Nothing Nothing)]
                 point = Filter (Eq (Col "id") (LitInt 1)) (Scan Nothing "users" Nothing)
@@ -2632,7 +2849,7 @@ main = hspec $ do
             stamp <- uniqueStamp
             pool <- workerPool 4
             let paths = [tmp </> ("missing-ffi-" ++ stamp ++ "-" ++ show n) | n <- [1 .. 16 :: Int]]
-                -- | 检查打开失败并归还意外成功的句柄
+                -- \| 检查打开失败并归还意外成功的句柄
                 checkOpen path = do
                     opened <- openStorage (Just path)
                     case opened of
@@ -2645,7 +2862,7 @@ main = hspec $ do
         it "returns FFI input errors from workers and remains usable" $ do
             withTestSession $ \srv -> do
                 pool <- workerPool 4
-                -- | 检查无效 UTF-8 的请求与维护错误
+                -- \| 检查无效 UTF-8 的请求与维护错误
                 let checkErrors = do
                         requested <- sendRawRequest (BS.pack [255])
                         requested `shouldSatisfy` either (isInfixOf "request is not valid UTF-8") (const False)
@@ -2657,7 +2874,7 @@ main = hspec $ do
 
         it "executes bound writes and CHECKs through real storage" $ do
             withTestSession $ \srv -> withServerEnv srv $ do
-                -- | 解析并通过真实存储执行写语句
+                -- \| 解析并通过真实存储执行写语句
                 let query source = case parseStatement source of
                         Left err -> expectationFailure err >> pure (Left err)
                         Right statement -> runIPCStorage (runStatementM statement)
@@ -2667,8 +2884,9 @@ main = hspec $ do
                 query "INSERT INTO bound_writes (id, name) VALUES (1, 'abc'), (2, 'def')" `shouldReturn` Right []
                 rejectedInsert <- query "INSERT INTO bound_writes (id, qty, qty, name) VALUES (99, 1, 9, 'ok')"
                 rejectedInsert `shouldSatisfy` either (isInfixOf "INSERT: duplicate target column: qty") (const False)
-                query "SELECT id, qty FROM bound_writes" `shouldReturn` Right
-                    [[("id", VInt 1), ("qty", VInt 2)], [("id", VInt 2), ("qty", VInt 2)]]
+                query "SELECT id, qty FROM bound_writes"
+                    `shouldReturn` Right
+                        [[("id", VInt 1), ("qty", VInt 2)], [("id", VInt 2), ("qty", VInt 2)]]
                 query "UPDATE bound_writes SET qty = qty + (SELECT MIN(id) FROM bound_writes) WHERE id = 1"
                     `shouldReturn` Right []
                 query "UPDATE bound_writes SET qty = qty + 1, qty = qty + id WHERE id = 1"
@@ -2676,12 +2894,13 @@ main = hspec $ do
                 rejected <- query "UPDATE bound_writes SET qty = qty + 10, name = 'x' WHERE id = 1"
                 rejected `shouldSatisfy` either (isInfixOf "CHECK on name failed") (const False)
                 query "DELETE FROM bound_writes WHERE qty = 2" `shouldReturn` Right []
-                query "SELECT id, qty, name FROM bound_writes" `shouldReturn` Right
-                    [[("id", VInt 1), ("qty", VInt 5), ("name", VStr "abc")]]
+                query "SELECT id, qty, name FROM bound_writes"
+                    `shouldReturn` Right
+                        [[("id", VInt 1), ("qty", VInt 5), ("name", VStr "abc")]]
 
         it "keeps enclosing scopes distinct through real storage" $ do
             withTestSession $ \srv -> withServerEnv srv $ do
-                -- | 解析并通过真实存储执行相关查询
+                -- \| 解析并通过真实存储执行相关查询
                 let query source = case parseStatement source of
                         Left err -> expectationFailure err >> pure (Left err)
                         Right statement -> runIPCStorage (runStatementM statement)
@@ -2690,12 +2909,40 @@ main = hspec $ do
                 query "INSERT INTO scope_far (id) VALUES (1), (2)" `shouldReturn` Right []
                 query "INSERT INTO scope_near (id) VALUES (10), (11)" `shouldReturn` Right []
                 query "SELECT o.id, (SELECT (SELECT id) FROM scope_near n WHERE n.id = o.id + 9) AS nearest FROM scope_far o"
-                    `shouldReturn` Right [[("o.id", VInt 1), ("nearest", VInt 10)]
-                        , [("o.id", VInt 2), ("nearest", VInt 11)]]
+                    `shouldReturn` Right
+                        [ [("o.id", VInt 1), ("nearest", VInt 10)]
+                        , [("o.id", VInt 2), ("nearest", VInt 11)]
+                        ]
+
+        it "keeps composite comparisons, hashes and join fallback consistent after restart" $ do
+            withTestSession $ \srv -> do
+                withServerEnv srv $
+                    mapM_
+                        (\source -> ipcDomainSql source `shouldReturn` Right [])
+                        [ "CREATE DOMAIN int_list AS [Int]"
+                        , "CREATE TABLE composite_keys (id int_list, xs [Double])"
+                        , "INSERT INTO composite_keys (id, xs) VALUES (LIST<Int>(10), LIST<Double>(-0.0)), (LIST<Int>(2), LIST<Double>(0.0)), (LIST<Int>(2), LIST<Double>(0.0))"
+                        ]
+                closeConnection
+                openSessionIn (dataDir srv)
+                withServerEnv srv $ do
+                    ipcDomainSql "SELECT COUNT(*) AS n FROM composite_keys a INNER JOIN composite_keys b ON a.id = b.id"
+                        `shouldReturn` Right [[("n", VInt 5)]]
+                    ipcDomainSql "SELECT COUNT(*) AS n FROM composite_keys WHERE id = LIST<Int>(2)"
+                        `shouldReturn` Right [[("n", VInt 2)]]
+                    ipcDomainSql "SELECT COUNT(*) AS n FROM composite_keys GROUP BY id ORDER BY id"
+                        `shouldReturn` Right [[("n", VInt 2)], [("n", VInt 1)]]
+                    ipcDomainSql "SELECT COUNT(*) AS n FROM (SELECT DISTINCT xs FROM composite_keys) d"
+                        `shouldReturn` Right [[("n", VInt 1)]]
+                    ipcDomainSql "UPDATE composite_keys SET xs = LIST<Double>(2.5) WHERE id = LIST<Int>(10)"
+                        `shouldReturn` Right []
+                    ipcDomainSql "DELETE FROM composite_keys WHERE id = LIST<Int>(2)" `shouldReturn` Right []
+                    ipcDomainSql "SELECT COUNT(*) AS n FROM composite_keys" `shouldReturn` Right [[("n", VInt 1)]]
+                    ipcDomainSql "CREATE INDEX ON composite_keys (id)" >>= (`shouldSatisfy` isLeft)
 
         it "persists runtime type identities and nested values across restart" $ do
             withTestSession $ \srv -> do
-                -- | 解析并通过真实存储执行 SQL
+                -- \| 解析并通过真实存储执行 SQL
                 let query source = case parseStatement source of
                         Left err -> expectationFailure err >> pure (Left err)
                         Right statement -> runIPCStorage (runStatementM statement)
@@ -2733,7 +2980,8 @@ main = hspec $ do
                 let query sql = case parseStatement sql of
                         Left err -> expectationFailure err >> pure (Left err)
                         Right stmt -> runIPCStorage (runStatementM stmt)
-                mapM_ (\sql -> query sql `shouldReturn` Right [])
+                mapM_
+                    (\sql -> query sql `shouldReturn` Right [])
                     [ "CREATE TABLE reused (id int, secret str)"
                     , "INSERT INTO reused (id, secret) VALUES (1, 'old')"
                     , "ALTER TABLE reused DROP COLUMN secret"
@@ -2837,15 +3085,21 @@ main = hspec $ do
                 Right catalog <- runIPCStorage schema
                 closeConnection
                 Right link <- localStorageLink (Just (dataDir srv ++ ".toml"))
-                setStorageLink link {slRequest = \payload -> do
-                    when (BSC.pack "schema_guard" `BS.isInfixOf` payload)
-                      $ do changed <- slRequest
-                                        link
-                                        (BSC.pack
-                                           "{\"method\":\"replace_schema\",\"database\":\"ipctest\",\"table\":\"raced\",\"columns\":[{\"name\":\"id\",\"ty\":\"int\"},{\"name\":\"extra\",\"ty\":\"str\"}],\"rows\":[]}")
-                           changed
-                             `shouldSatisfy` either (const False) (BS.isInfixOf (BSC.pack "ok"))
-                    slRequest link payload}
+                setStorageLink
+                    link
+                        { slRequest = \payload -> do
+                            when (BSC.pack "schema_guard" `BS.isInfixOf` payload) $
+                                do
+                                    changed <-
+                                        slRequest
+                                            link
+                                            ( BSC.pack
+                                                "{\"method\":\"replace_schema\",\"database\":\"ipctest\",\"table\":\"raced\",\"columns\":[{\"name\":\"id\",\"ty\":\"int\"},{\"name\":\"extra\",\"ty\":\"str\"}],\"rows\":[]}"
+                                            )
+                                    changed
+                                        `shouldSatisfy` either (const False) (BS.isInfixOf (BSC.pack "ok"))
+                            slRequest link payload
+                        }
                 case parseStatement "SELECT id FROM raced" >>= Bound.bindQuery catalog of
                     Left err -> expectationFailure err
                     Right query -> do
@@ -2853,25 +3107,33 @@ main = hspec $ do
                         result `shouldSatisfy` either (isInfixOf "bound query schema changed") (const False)
 
         it "rejects restored-schema races at the actual INSERT UPDATE DELETE and ALTER write" $ do
-            mapM_ (\(method, sql) -> withTestSession $ \srv -> withServerEnv srv $ do
-                runIPCStorage (createTable "write_race" [("id", TInt), ("qty", TInt)]) `shouldReturn` Right ()
-                runIPCStorage (insert "write_race" [("id", VInt 1), ("qty", VInt 5)]) `shouldReturn` Right ()
-                closeConnection
-                Right link <- localStorageLink (Just (dataDir srv ++ ".toml"))
-                setStorageLink link {slRequest = \payload -> do
-                    when (BSC.pack "schema_guard" `BS.isInfixOf` payload
-                        && BSC.pack ("\"method\":\"" ++ method ++ "\"") `BS.isInfixOf` payload) $ do
-                        added <- slRequest link (BSC.pack "{\"method\":\"replace_schema\",\"database\":\"ipctest\",\"table\":\"write_race\",\"columns\":[{\"name\":\"id\",\"ty\":\"int\"},{\"name\":\"qty\",\"ty\":\"int\"},{\"name\":\"extra\",\"ty\":\"str\"}],\"rows\":[{\"id\":1,\"qty\":5,\"extra\":\"x\"}]}")
-                        added `shouldSatisfy` either (const False) (BS.isInfixOf (BSC.pack "ok"))
-                        restored <- slRequest link (BSC.pack "{\"method\":\"replace_schema\",\"database\":\"ipctest\",\"table\":\"write_race\",\"columns\":[{\"name\":\"id\",\"ty\":\"int\"},{\"name\":\"qty\",\"ty\":\"int\"}],\"rows\":[{\"id\":1,\"qty\":5}]}")
-                        restored `shouldSatisfy` either (const False) (BS.isInfixOf (BSC.pack "ok"))
-                    slRequest link payload}
-                case parseStatement sql of
-                    Left err -> expectationFailure err
-                    Right statement -> do
-                        result <- runIPCStorage (runStatementM statement)
-                        result `shouldSatisfy` either (isInfixOf "bound query schema changed") (const False)
-                        runIPCStorage (scan "write_race") `shouldReturn` Right [[("id", VInt 1), ("qty", VInt 5)]])
+            mapM_
+                ( \(method, sql) -> withTestSession $ \srv -> withServerEnv srv $ do
+                    runIPCStorage (createTable "write_race" [("id", TInt), ("qty", TInt)]) `shouldReturn` Right ()
+                    runIPCStorage (insert "write_race" [("id", VInt 1), ("qty", VInt 5)]) `shouldReturn` Right ()
+                    closeConnection
+                    Right link <- localStorageLink (Just (dataDir srv ++ ".toml"))
+                    setStorageLink
+                        link
+                            { slRequest = \payload -> do
+                                when
+                                    ( BSC.pack "schema_guard" `BS.isInfixOf` payload
+                                        && BSC.pack ("\"method\":\"" ++ method ++ "\"") `BS.isInfixOf` payload
+                                    )
+                                    $ do
+                                        added <- slRequest link (BSC.pack "{\"method\":\"replace_schema\",\"database\":\"ipctest\",\"table\":\"write_race\",\"columns\":[{\"name\":\"id\",\"ty\":\"int\"},{\"name\":\"qty\",\"ty\":\"int\"},{\"name\":\"extra\",\"ty\":\"str\"}],\"rows\":[{\"id\":1,\"qty\":5,\"extra\":\"x\"}]}")
+                                        added `shouldSatisfy` either (const False) (BS.isInfixOf (BSC.pack "ok"))
+                                        restored <- slRequest link (BSC.pack "{\"method\":\"replace_schema\",\"database\":\"ipctest\",\"table\":\"write_race\",\"columns\":[{\"name\":\"id\",\"ty\":\"int\"},{\"name\":\"qty\",\"ty\":\"int\"}],\"rows\":[{\"id\":1,\"qty\":5}]}")
+                                        restored `shouldSatisfy` either (const False) (BS.isInfixOf (BSC.pack "ok"))
+                                slRequest link payload
+                            }
+                    case parseStatement sql of
+                        Left err -> expectationFailure err
+                        Right statement -> do
+                            result <- runIPCStorage (runStatementM statement)
+                            result `shouldSatisfy` either (isInfixOf "bound query schema changed") (const False)
+                            runIPCStorage (scan "write_race") `shouldReturn` Right [[("id", VInt 1), ("qty", VInt 5)]]
+                )
                 [ ("insert_batch", "INSERT INTO write_race (id, qty) VALUES (2, 9)")
                 , ("replace_all", "UPDATE write_race SET qty = qty + 1")
                 , ("delete_keys", "DELETE FROM write_race WHERE id = 1")
@@ -2887,12 +3149,18 @@ main = hspec $ do
                 runIPCStorage (insert "write_source.source" [("id", VInt 2)]) `shouldReturn` Right ()
                 closeConnection
                 Right link <- localStorageLink (Just (dataDir srv ++ ".toml"))
-                setStorageLink link {slRequest = \payload -> do
-                    when (BSC.pack "schema_guard" `BS.isInfixOf` payload
-                        && BSC.pack "\"method\":\"replace_all\"" `BS.isInfixOf` payload) $ do
-                        changed <- slRequest link (BSC.pack "{\"method\":\"replace_schema\",\"database\":\"write_source\",\"table\":\"source\",\"columns\":[{\"name\":\"id\",\"ty\":\"bigint\"}],\"rows\":[{\"id\":2}]}")
-                        changed `shouldSatisfy` either (const False) (BS.isInfixOf (BSC.pack "ok"))
-                    slRequest link payload}
+                setStorageLink
+                    link
+                        { slRequest = \payload -> do
+                            when
+                                ( BSC.pack "schema_guard" `BS.isInfixOf` payload
+                                    && BSC.pack "\"method\":\"replace_all\"" `BS.isInfixOf` payload
+                                )
+                                $ do
+                                    changed <- slRequest link (BSC.pack "{\"method\":\"replace_schema\",\"database\":\"write_source\",\"table\":\"source\",\"columns\":[{\"name\":\"id\",\"ty\":\"bigint\"}],\"rows\":[{\"id\":2}]}")
+                                    changed `shouldSatisfy` either (const False) (BS.isInfixOf (BSC.pack "ok"))
+                            slRequest link payload
+                        }
                 case parseStatement "UPDATE ipctest.write_target SET id = (SELECT id FROM write_source.source)" of
                     Left err -> expectationFailure err
                     Right statement -> do
@@ -2902,16 +3170,22 @@ main = hspec $ do
 
         it "guards newly referenced DOMAIN definitions during ALTER" $ do
             withTestSession $ \srv -> withServerEnv srv $ do
-                runIPCStorage (runStatementM (CreateDomain "new_quantity" CInt)) `shouldReturn` Right []
+                runIPCStorage (runStatementM (CreateDomain "new_quantity" (DomainDefinition (plainColumn CInt) []))) `shouldReturn` Right []
                 runIPCStorage (createTable "domain_target" [("id", TInt)]) `shouldReturn` Right ()
                 closeConnection
                 Right link <- localStorageLink (Just (dataDir srv ++ ".toml"))
-                setStorageLink link {slRequest = \payload -> do
-                    when (BSC.pack "schema_guard" `BS.isInfixOf` payload
-                        && BSC.pack "\"method\":\"replace_schema\"" `BS.isInfixOf` payload) $ do
-                        changed <- slRequest link (BSC.pack "{\"method\":\"replace_schema\",\"database\":\"ipctest\",\"table\":\"__system_domain_new_quantity\",\"columns\":[{\"name\":\"base\",\"ty\":\"bigint\"}],\"rows\":[]}")
-                        changed `shouldSatisfy` either (const False) (BS.isInfixOf (BSC.pack "ok"))
-                    slRequest link payload}
+                setStorageLink
+                    link
+                        { slRequest = \payload -> do
+                            when
+                                ( BSC.pack "schema_guard" `BS.isInfixOf` payload
+                                    && BSC.pack "\"method\":\"replace_schema\"" `BS.isInfixOf` payload
+                                )
+                                $ do
+                                    changed <- slRequest link (BSC.pack "{\"method\":\"replace_schema\",\"database\":\"ipctest\",\"table\":\"__system_domain_new_quantity\",\"columns\":[{\"name\":\"base\",\"ty\":\"bigint\"}],\"rows\":[]}")
+                                    changed `shouldSatisfy` either (const False) (BS.isInfixOf (BSC.pack "ok"))
+                            slRequest link payload
+                        }
                 case parseStatement "ALTER TABLE domain_target ADD COLUMN qty new_quantity" of
                     Left err -> expectationFailure err
                     Right statement -> do
@@ -2938,11 +3212,82 @@ main = hspec $ do
                 runIPCStorageIn (scan "iso") alpha `shouldReturn` Right [[("id", VInt 1)]]
                 runIPCStorageIn (scan "iso") beta `shouldReturn` Right [[("id", VInt 2)]]
 
+        it "persists altered domain defaults and inherited checks through actual FFI" $ do
+            withTestSession $ \srv -> do
+                withServerEnv srv $ do
+                    mapM_
+                        (\sql -> ipcDomainSql sql `shouldReturn` Right [])
+                        [ "CREATE DOMAIN quantity AS INT DEFAULT 2 CHECK (VaLuE > 0)"
+                        , "CREATE DOMAIN child AS quantity NOT NULL"
+                        , "CREATE TABLE items (id INT, qty child)"
+                        , "INSERT INTO items (id) VALUES (1)"
+                        , "ALTER DOMAIN quantity SET DEFAULT 3"
+                        , "ALTER DOMAIN QUANTITY ADD CONSTRAINT BOUNDED CHECK (VALUE < 10)"
+                        ]
+                    ipcDomainSql "ALTER DOMAIN quantity ADD CHECK (VALUE > 5)" >>= (`shouldSatisfy` isLeft)
+                closeConnection
+                openSessionIn (dataDir srv)
+                withServerEnv srv $ do
+                    ipcDomainSql "INSERT INTO items (id) VALUES (2)" `shouldReturn` Right []
+                    ipcDomainSql "SELECT qty FROM items ORDER BY id"
+                        `shouldReturn` Right [[("qty", VInt 2)], [("qty", VInt 3)]]
+                    mapM_
+                        (ipcDomainSql >=> (`shouldSatisfy` isLeft))
+                        [ "UPDATE items SET qty = 10"
+                        , "INSERT INTO items (qty) VALUES (NULL)"
+                        , "ALTER DOMAIN quantity SET DEFAULT 0"
+                        ]
+                    ipcDomainSql "ALTER DOMAIN QUANTITY DROP CONSTRAINT BOUNDED" `shouldReturn` Right []
+                    ipcDomainSql "UPDATE items SET qty = 10" `shouldReturn` Right []
+        it "rejects domain alteration when a writer changes the validated snapshot" $ do
+            withTestSession $ \srv -> withServerEnv srv $ do
+                mapM_
+                    (\sql -> ipcDomainSql sql `shouldReturn` Right [])
+                    [ "CREATE DOMAIN quantity AS INT"
+                    , "CREATE TABLE items (qty quantity)"
+                    , "INSERT INTO items (qty) VALUES (4)"
+                    ]
+                closeConnection
+                Right link <- localStorageLink (Just (dataDir srv ++ ".toml"))
+                setStorageLink
+                    link
+                        { slRequest = \payload -> do
+                            when (BSC.pack "\"method\":\"alter_domain\"" `BS.isInfixOf` payload) $ do
+                                written <- slRequest link (BSC.pack "{\"method\":\"insert\",\"database\":\"ipctest\",\"table\":\"items\",\"row\":{\"qty\":0}}")
+                                written `shouldSatisfy` either (const False) (BS.isInfixOf (BSC.pack "ok"))
+                            slRequest link payload
+                        }
+                result <- ipcDomainSql "ALTER DOMAIN quantity ADD CHECK (VALUE > 0)"
+                fmap errorCode (either Right (const (Left "expected conflict")) result) `shouldBe` Right "serialization_failure"
+                ipcDomainSql "SELECT qty FROM items"
+                    `shouldReturn` Right [[("qty", VInt 4)], [("qty", VInt 0)]]
+                ipcDomainSql "INSERT INTO items (qty) VALUES (-1)" `shouldReturn` Right []
+        it "guards domain constraints while creating a dependent table" $ do
+            withTestSession $ \srv -> withServerEnv srv $ do
+                ipcDomainSql "CREATE DOMAIN quantity AS INT" `shouldReturn` Right []
+                closeConnection
+                Right link <- localStorageLink (Just (dataDir srv ++ ".toml"))
+                setStorageLink
+                    link
+                        { slRequest = \payload -> do
+                            when
+                                ( BSC.pack "schema_guard" `BS.isInfixOf` payload
+                                    && BSC.pack "\"method\":\"create_table\"" `BS.isInfixOf` payload
+                                )
+                                $ do
+                                    changed <- slRequest link (BSC.pack "{\"method\":\"replace_schema\",\"database\":\"ipctest\",\"table\":\"__system_domain_quantity\",\"columns\":[{\"name\":\"base\",\"ty\":\"int\",\"nullable\":false}],\"rows\":[]}")
+                                    changed `shouldSatisfy` either (const False) (BS.isInfixOf (BSC.pack "ok"))
+                            slRequest link payload
+                        }
+                result <- ipcDomainSql "CREATE TABLE items (qty quantity DEFAULT NULL)"
+                result `shouldSatisfy` either (isInfixOf "bound query schema changed") (const False)
+                runIPCStorage (scan "items") >>= (`shouldSatisfy` isLeft)
+
         it "persists nested domains and named columns across restart" $ do
             withTestSession $ \srv -> do
                 withServerEnv srv $ do
-                    runIPCStorage (runStatementM (CreateDomain "label" (CVarchar 3))) `shouldReturn` Right []
-                    runIPCStorage (runStatementM (CreateDomain "product_label" (CDomain "label" CStr))) `shouldReturn` Right []
+                    runIPCStorage (runStatementM (CreateDomain "label" (DomainDefinition (plainColumn (CVarchar 3)) []))) `shouldReturn` Right []
+                    runIPCStorage (runStatementM (CreateDomain "product_label" (DomainDefinition (plainColumn (CDomain "label" CStr)) []))) `shouldReturn` Right []
                     runIPCStorage (runStatementM (CreateTable "typed" [("name", plainColumn (CDomain "product_label" CStr))])) `shouldReturn` Right []
                     runIPCStorage (runStatementM (Insert "typed" ["name"] [[LitStr "abc"]])) `shouldReturn` Right []
                 closeConnection
@@ -2997,8 +3342,8 @@ main = hspec $ do
                             )
                         )
                 result `shouldBe` Right [[("name", VStr "Zoe")]]
-                -- 存储层的日志现在直接打在本进程的输出里，没有单独的 debug.log 可读；
-                -- 「走索引而不是全表扫」由下面 CREATE INDEX 那组用例与 Rust 侧 runtime 测试覆盖。
+        -- 存储层的日志现在直接打在本进程的输出里，没有单独的 debug.log 可读；
+        -- 「走索引而不是全表扫」由下面 CREATE INDEX 那组用例与 Rust 侧 runtime 测试覆盖。
 
         it "keeps correlated outer references out of physical scan columns" $ do
             withTestSession $ \srv -> withServerEnv srv $ do
@@ -3204,13 +3549,15 @@ main = hspec $ do
     describe "ChuSQL.Core.Engine (TYPES)" $ do
         it "checks rounded decimal precision, finite values and domains" $ do
             coerceValue (CDecimal 4 2) (VFloat 99.994) `shouldBe` Right (VFloat 99.99)
-            mapM_ (\value -> coerceValue (CDecimal 4 2) value `shouldSatisfy` isLeft)
+            mapM_
+                (\value -> coerceValue (CDecimal 4 2) value `shouldSatisfy` isLeft)
                 [VFloat 99.995, VFloat (-99.995), VInt 100, VFloat (0 / 0), VFloat (1 / 0)]
             coerceValue (CDecimal 2 0) (VFloat 2.5) `shouldBe` Right (VFloat 2)
             coerceValue (CDomain "amount" (CDecimal 4 2)) (VInt 100) `shouldSatisfy` isLeft
             coerceValue (CDecimal 309 0) (VInt 1) `shouldSatisfy` isLeft
         it "rejects invalid decimal definitions and overflowing defaults" $ do
-            mapM_ (\query -> (parseStatement query >>= runStatement testDB) `shouldSatisfy` isLeft)
+            mapM_
+                (\query -> (parseStatement query >>= runStatement testDB) `shouldSatisfy` isLeft)
                 ["CREATE TABLE bad (v DECIMAL(2,3))", "CREATE TABLE bad (v DECIMAL(309,0))", "CREATE TABLE bad (v DECIMAL(2,0) DEFAULT 100)"]
         it "does not expose password input in syntax errors" $ do
             let query = "ALTER USER alice IDENTIFIED BY 'never-expose-this' trailing"
@@ -3218,10 +3565,12 @@ main = hspec $ do
         it "rejects arbitrary prefixes for unqualified schema columns" $ do
             resolveColumn "intruder.id" [("id", TInt)] `shouldSatisfy` isLeft
             resolveColumn "wrong.u.id" [("id", TInt)] `shouldSatisfy` isLeft
-            mapM_ (\query -> (parseStatement query >>= runStatement testDB) `shouldSatisfy` isLeft)
+            mapM_
+                (\query -> (parseStatement query >>= runStatement testDB) `shouldSatisfy` isLeft)
                 ["SELECT wrong.users.id FROM users", "SELECT wrong.u.id FROM users u", "SELECT users.id FROM users JOIN orders ON wrong.users.id = orders.user_id"]
         it "preserves untyped NULL through derived tables and CTEs" $ do
-            mapM_ (\query -> rowsOf (parseStatement query >>= runStatement testDB) `shouldBe` Right [[("answer", VNull)]])
+            mapM_
+                (\query -> rowsOf (parseStatement query >>= runStatement testDB) `shouldBe` Right [[("answer", VNull)]])
                 [ "SELECT d.n + 1 AS answer FROM (SELECT NULL AS n) d"
                 , "SELECT d.n AND TRUE AS answer FROM (SELECT NULL AS n) d"
                 , "WITH t AS (SELECT NULL AS n) SELECT t.n + 1 AS answer FROM t"
@@ -3308,7 +3657,8 @@ main = hspec $ do
             vals (step db "INSERT INTO ck (age) VALUES (5)") "SELECT age FROM ck" `shouldBe` Right [[VInt 5]]
 
         it "validates CHECK types and row-only expressions before creating an empty table" $ do
-            mapM_ (\ddl -> (parseStatement ddl >>= runStatement testDB) `shouldSatisfy` isLeft)
+            mapM_
+                (\ddl -> (parseStatement ddl >>= runStatement testDB) `shouldSatisfy` isLeft)
                 [ "CREATE TABLE invalid_ck (age int CHECK (age + 1))"
                 , "CREATE TABLE invalid_ck (age int CHECK (length(age) > 0))"
                 , "CREATE TABLE invalid_ck (age int CHECK (missing(age) > 0))"
@@ -3371,13 +3721,16 @@ main = hspec $ do
         it "rejects structural changes that invalidate CHECKs even on empty tables" $ do
             let empty = withTable "CREATE TABLE checked_ddl (name text, qty int CHECK (qty > length(name)))"
                 filled = step empty "INSERT INTO checked_ddl (name, qty) VALUES ('ab', 3)"
-            mapM_ (\(db, expected) -> do
-                run db "ALTER TABLE checked_ddl DROP COLUMN name" `shouldSatisfy` isLeft
-                run db "ALTER TABLE checked_ddl RENAME COLUMN name TO label" `shouldSatisfy` isLeft
-                run db "ALTER TABLE checked_ddl ALTER COLUMN name TYPE int" `shouldSatisfy` isLeft
-                run db "ALTER TABLE checked_ddl ALTER COLUMN qty TYPE text" `shouldSatisfy` isLeft
-                vals db "SELECT name, qty FROM checked_ddl"
-                    `shouldBe` Right expected) [(empty, []), (filled, [[VStr "ab", VInt 3]])]
+            mapM_
+                ( \(db, expected) -> do
+                    run db "ALTER TABLE checked_ddl DROP COLUMN name" `shouldSatisfy` isLeft
+                    run db "ALTER TABLE checked_ddl RENAME COLUMN name TO label" `shouldSatisfy` isLeft
+                    run db "ALTER TABLE checked_ddl ALTER COLUMN name TYPE int" `shouldSatisfy` isLeft
+                    run db "ALTER TABLE checked_ddl ALTER COLUMN qty TYPE text" `shouldSatisfy` isLeft
+                    vals db "SELECT name, qty FROM checked_ddl"
+                        `shouldBe` Right expected
+                )
+                [(empty, []), (filled, [[VStr "ab", VInt 3]])]
             case run filled "ALTER TABLE checked_ddl DROP COLUMN qty" of
                 Left err -> expectationFailure err
                 Right (remaining, _) -> vals remaining "SELECT name FROM checked_ddl" `shouldBe` Right [[VStr "ab"]]
@@ -3621,7 +3974,7 @@ emptyDB :: Database
 emptyDB = [(n, t{tableRows = []}) | (n, t) <- testDB]
 
 -- | 一次进程内存储会话：进程内直连存储动态库
-data StorageSession = StorageSession
+newtype StorageSession = StorageSession
     { dataDir :: FilePath
     }
 
@@ -3731,7 +4084,7 @@ delayed micros value = threadDelay micros >> pure value
 newProbe :: Table -> Int -> IO Probe
 newProbe table width = do
     calls <- newMVar []
-    pure Probe {probeTable = table, probeCalls = calls, probeWidth = width}
+    pure Probe{probeTable = table, probeCalls = calls, probeWidth = width}
 
 -- | 记一条存储调用
 recordCall :: Probe -> String -> IO ()
@@ -3751,16 +4104,16 @@ rowShards width rows
     | width <= 1 = [rows]
     | otherwise = go rows
   where
-    -- | 每片行数
+    -- \| 每片行数
     chunk = (length rows + width - 1) `div` width
-    -- | 反复切出前一片
+    -- \| 反复切出前一片
     go rest
         | null rest = []
         | otherwise = let (part, more) = splitAt chunk rest in part : go more
 
 -- | 声明 1000 行的大表
 bigTable :: Table
-bigTable = users {tableName = "big", tableMeta = Just (TableMeta 1000 [("id", 1000, False)] [] ["id"])}
+bigTable = users{tableName = "big", tableMeta = Just (TableMeta 1000 [("id", 1000, False)] [] ["id"])}
 
 -- | 只装大表的库
 bigDB :: Database
@@ -3790,7 +4143,8 @@ instance Monad ProbeStorage where
 instance MonadStorage ProbeStorage where
     -- \| 测试视图不支持并发结构变更
     withSchemaGuard _ action = action
-    -- | 测试视图不支持并发结构变更
+
+    -- \| 测试视图不支持并发结构变更
     withWriteSchemaGuard _ action = action
     scan table = ProbeStorage $ \probe -> do
         recordCall probe ("scan:" ++ table)
@@ -3839,7 +4193,7 @@ filterPushedIntoLeft _ = False
 -- | 左侧子树里出现了下推下来的谓词（点查 / 范围 / 过滤）
 pushedIntoLeft :: RelOp -> Bool
 pushedIntoLeft (Filter _ _) = True
-pushedIntoLeft (Range {}) = True
+pushedIntoLeft (Range{}) = True
 pushedIntoLeft (Project _ x) = pushedIntoLeft x
 pushedIntoLeft _ = False
 
@@ -3904,9 +4258,9 @@ firstFilterCond (Limit _ x) = firstFilterCond x
 firstFilterCond (Join _ l r _) = case firstFilterCond l of
     Just p -> Just p
     Nothing -> firstFilterCond r
-firstFilterCond (Scan {}) = Nothing
-firstFilterCond (Lookup {}) = Nothing
-firstFilterCond (Range {}) = Nothing
+firstFilterCond (Scan{}) = Nothing
+firstFilterCond (Lookup{}) = Nothing
+firstFilterCond (Range{}) = Nothing
 firstFilterCond (Derived _ x) = firstFilterCond x
 
 -- | 判断计划里是否还有过滤节点
@@ -3922,9 +4276,9 @@ anyFilter (Sort _ x) = anyFilter x
 anyFilter (BoundSort _ x) = anyFilter x
 anyFilter (Limit _ x) = anyFilter x
 anyFilter (Join _ l r _) = anyFilter l || anyFilter r
-anyFilter (Scan {}) = False
-anyFilter (Lookup {}) = False
-anyFilter (Range {}) = False
+anyFilter (Scan{}) = False
+anyFilter (Lookup{}) = False
+anyFilter (Range{}) = False
 anyFilter (Derived _ x) = anyFilter x
 
 -- | 去掉计划里的投影节点
@@ -3979,7 +4333,7 @@ planRoot (Project _ x) = planRoot x
 planRoot x = x
 
 -- | 记下扫过哪些表的存储：语义与内存实现一致，只是扫描多记一笔
-data Counting a = Counting {runCounting :: Database -> Either String (a, Database, [String])}
+newtype Counting a = Counting {runCounting :: Database -> Either String (a, Database, [String])}
 
 instance Functor Counting where
     fmap f (Counting m) = Counting $ \db -> fmap (\(a, db', log') -> (f a, db', log')) (m db)
@@ -4034,24 +4388,33 @@ memReplaceSchema = replaceSchema
 instance MonadStorage Counting where
     -- \| 纯测试状态在求值期间保持稳定
     withSchemaGuard _ action = action
-    -- | 纯测试状态不受外部结构变更影响
+
+    -- \| 纯测试状态不受外部结构变更影响
     withWriteSchemaGuard _ action = action
+
     -- \| 扫描：记一笔表名，其余走内存实现
     scan t = Counting $ \db -> case runMemoryStorage (memScan t) db of
         Left e -> Left e
         Right (r, db') -> Right (r, db', [t])
+
     -- \| 插入：走内存实现
     insert t r = memory (memInsert t r)
+
     -- \| 整表替换：走内存实现
     replaceAll t rs = memory (memReplaceAll t rs)
+
     -- \| 建表：走内存实现
     createTable name cols = memory (memCreateTable name cols)
+
     -- \| 删表：走内存实现
     dropTable name = memory (memDropTable name)
+
     -- \| 删列：走内存实现
     dropColumn name col = memory (memDropColumn name col)
+
     -- \| 换结构：走内存实现
     replaceSchema name cols rows = memory (memReplaceSchema name cols rows)
+
     -- \| 快照：把当前库原样交出去
     snapshot = Counting $ \db -> Right (Right db, db, [])
 

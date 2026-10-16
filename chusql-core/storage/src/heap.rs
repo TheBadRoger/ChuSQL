@@ -1,8 +1,8 @@
+use serde::Deserializer;
+use serde::de::{IgnoredAny, MapAccess, Visitor};
 use std::collections::HashSet;
 use std::io;
 use std::path::Path;
-use serde::de::{IgnoredAny, MapAccess, Visitor};
-use serde::Deserializer;
 
 use crate::btree::DiskBTree;
 use crate::page::PageId;
@@ -11,12 +11,18 @@ use crate::protocol::Row;
 
 // 堆表：行按插入顺序进页，支持全表扫描、按索引取行、行级删除。
 
+pub(crate) const DUPLICATE_ID: &str = "duplicate value on the id index";
+
 const HEADER_SIZE: usize = 2;
 const SLOT_SIZE: usize = 8;
 const SLOT_DIR_START: usize = HEADER_SIZE;
 
 /// 未选字段只校验并跳过，不分配值。
-fn decode_row(bytes: &[u8], columns: Option<&[String]>, hidden: &HashSet<String>) -> io::Result<Row> {
+fn decode_row(
+    bytes: &[u8],
+    columns: Option<&[String]>,
+    hidden: &HashSet<String>,
+) -> io::Result<Row> {
     struct RowVisitor<'a>(Option<&'a [String]>, &'a HashSet<String>);
     impl<'de> Visitor<'de> for RowVisitor<'_> {
         type Value = Row;
@@ -38,7 +44,9 @@ fn decode_row(bytes: &[u8], columns: Option<&[String]>, hidden: &HashSet<String>
         }
     }
     let mut decoder = serde_json::Deserializer::from_slice(bytes);
-    let row = decoder.deserialize_map(RowVisitor(columns, hidden)).map_err(io::Error::other)?;
+    let row = decoder
+        .deserialize_map(RowVisitor(columns, hidden))
+        .map_err(io::Error::other)?;
     decoder.end().map_err(io::Error::other)?;
     Ok(row)
 }
@@ -93,7 +101,7 @@ fn row_int(row: &Row, column: &str) -> Option<i64> {
 }
 
 /// i64 键 → 8 字节大端（保序，负数也在前）
-fn key_of(value: i64) -> [u8; 8] {
+pub(crate) fn key_of(value: i64) -> [u8; 8] {
     (value as u64 ^ (1u64 << 63)).to_be_bytes()
 }
 
@@ -108,8 +116,21 @@ fn value_key(v: &serde_json::Value) -> Option<Vec<u8>> {
 }
 
 /// 取行里某一列的索引键；NULL 与缺列不入索引
-fn row_key(row: &Row, column: &str) -> Option<Vec<u8>> {
+pub(crate) fn row_key(row: &Row, column: &str) -> Option<Vec<u8>> {
     row.get(column).and_then(value_key)
+}
+
+/// 按实际键编码校验一列的索引容量
+pub(crate) fn check_index_key(
+    row: &Row,
+    column: &str,
+    page_size: usize,
+    order: usize,
+) -> io::Result<()> {
+    if let Some(key) = row_key(row, column) {
+        DiskBTree::check_key(&key, page_size, order)?;
+    }
+    Ok(())
 }
 
 pub struct HeapPage;
@@ -312,7 +333,7 @@ impl HeapTable {
                 Ok(()) => {}
                 Err(err) if err.kind() == io::ErrorKind::InvalidData => {
                     // 格式不兼容（例如上一版落的索引文件）：删掉重开
-                    let _ = std::fs::remove_file(p);
+                    crate::page_wal::remove(p)?;
                     t.attach_index(col, p, page_size, btree_order, pool_size)?;
                 }
                 Err(err) => return Err(err),
@@ -373,6 +394,7 @@ impl HeapTable {
             let Some(k) = row_key(&r, column) else {
                 continue;
             };
+            DiskBTree::check_key(&k, page_size, btree_order)?;
             // 行身份索引仍然唯一；其余列允许重复值
             if column == "id" && !seen.insert(k.clone()) {
                 return Err(io::Error::new(
@@ -450,10 +472,11 @@ impl HeapTable {
             let Some(k) = row_key(row, &idx.column) else {
                 continue;
             };
+            idx.tree.validate_key(&k)?;
             if idx.column == "id" && idx.tree.get(&k)?.is_some() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "duplicate value on the id index".to_string(),
+                    DUPLICATE_ID.to_string(),
                 ));
             }
             pending.push((i, k));
@@ -509,6 +532,16 @@ impl HeapTable {
         let slot = HeapPage::insert_tuple(&mut p, &tuple).expect("pre-checked fits");
         self.file.write_page(&p)?;
         Ok((page_id, slot))
+    }
+
+    /// 读取身份索引中同键行数供提交预检
+    pub(crate) fn id_key_count(&mut self, key: &[u8]) -> io::Result<usize> {
+        let index = self
+            .indexes
+            .iter_mut()
+            .find(|index| index.column == "id")
+            .ok_or_else(|| io::Error::other("missing id index"))?;
+        Ok(index.tree.get_all(key)?.len())
     }
 
     /// 按 `id` 取一行
@@ -577,13 +610,21 @@ impl HeapTable {
         let mut rows = Vec::new();
         for (key, pos) in pairs {
             if let Some((bound, inclusive)) = &lo_bound {
-                let outside = if *inclusive { &key < bound } else { &key <= bound };
+                let outside = if *inclusive {
+                    &key < bound
+                } else {
+                    &key <= bound
+                };
                 if outside {
                     continue;
                 }
             }
             if let Some((bound, inclusive)) = &hi_bound {
-                let outside = if *inclusive { &key > bound } else { &key >= bound };
+                let outside = if *inclusive {
+                    &key > bound
+                } else {
+                    &key >= bound
+                };
                 if outside {
                     continue;
                 }
@@ -699,7 +740,10 @@ impl HeapTable {
     }
 
     /// 全表扫描，带位置与列投影
-    fn scan_projected_with_positions(&mut self, columns: Option<&[String]>) -> io::Result<Vec<(PageId, u16, Row)>> {
+    fn scan_projected_with_positions(
+        &mut self,
+        columns: Option<&[String]>,
+    ) -> io::Result<Vec<(PageId, u16, Row)>> {
         let n = self.file.num_pages()?;
         self.scan_pages_with_positions(columns, 0, n)
     }
@@ -729,6 +773,14 @@ impl HeapTable {
 
     /// 整表改写并重建所有索引
     pub fn replace_all(&mut self, rows: &[Row]) -> io::Result<()> {
+        for row in rows {
+            Self::encode_row(row, self.file.page_size())?;
+            for index in &self.indexes {
+                if let Some(key) = row_key(row, &index.column) {
+                    index.tree.validate_key(&key)?;
+                }
+            }
+        }
         self.file.truncate()?;
         for idx in &mut self.indexes {
             idx.tree.clear()?;
@@ -743,6 +795,14 @@ impl HeapTable {
             }
         }
         Ok(())
+    }
+
+    /// 同时标记堆页与索引页的提交点
+    pub(crate) fn set_lsn(&mut self, lsn: u64) {
+        self.file.set_lsn(lsn);
+        for index in &mut self.indexes {
+            index.tree.set_lsn(lsn);
+        }
     }
 
     /// 把脏页写回（索引也一起）
@@ -767,11 +827,19 @@ impl HeapTable {
     }
 
     /// 当前缓存页数
-    pub fn cached_pages(&self) -> usize { self.file.cached_pages() }
+    pub fn cached_pages(&self) -> usize {
+        self.file.cached_pages()
+    }
     /// 命中次数
-    pub fn hits(&self) -> u64 { self.file.hits() }
+    pub fn hits(&self) -> u64 {
+        self.file.hits()
+    }
     /// 未命中次数
-    pub fn misses(&self) -> u64 { self.file.misses() }
+    pub fn misses(&self) -> u64 {
+        self.file.misses()
+    }
     /// 命中率
-    pub fn hit_rate(&self) -> f64 { self.file.hit_rate() }
+    pub fn hit_rate(&self) -> f64 {
+        self.file.hit_rate()
+    }
 }

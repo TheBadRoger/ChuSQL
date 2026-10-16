@@ -2,7 +2,7 @@
 
 module Main where
 
-import Data.Either (lefts)
+import ChuSQL.Core.Model (Value (..))
 import ChuSQL.Core.Protocol (QueryResult (..), TableInfo (..))
 import ChuSQL.Interface.Link (Client, clientPing, closeClient, connectClient)
 import ChuSQL.Interface.Session (
@@ -13,12 +13,12 @@ import ChuSQL.Interface.Session (
     runStatement,
     switchDatabase,
  )
-import Control.Concurrent (forkIO, forkFinally, threadDelay)
+import Control.Concurrent (forkFinally, forkIO, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (IOException, bracket, evaluate, throwIO, try)
-import Control.Monad (forM_, replicateM, unless, when, void)
+import Control.Monad (forM_, replicateM, unless, void, when)
+import Data.Either (lefts)
 import Data.List (intercalate, sort)
-import ChuSQL.Core.Model (Value (..))
 import Data.Text (Text)
 import qualified Data.Text as T
 import GHC.Clock (getMonotonicTime)
@@ -32,8 +32,8 @@ import System.Directory (
 import System.Environment (getArgs)
 import System.Exit (ExitCode (..), exitFailure)
 import System.FilePath ((</>))
+import System.IO (BufferMode (LineBuffering), Handle, hGetLine, hSetBuffering, stdout)
 import System.Info (os)
-import System.IO (Handle, hGetLine, hSetBuffering, BufferMode (LineBuffering), stdout)
 import System.Process (
     CreateProcess (std_err, std_out),
     ProcessHandle,
@@ -188,7 +188,7 @@ runBatch bench sqls = do
 chunked :: Int -> Int -> [[Int]]
 chunked size n = go [1 .. n]
   where
-    -- | 递归切分
+    -- \| 递归切分
     go [] = []
     go xs = let (a, b) = splitAt size xs in a : go b
 
@@ -337,7 +337,7 @@ prepareDatabase session = do
                 Left e -> die ("cannot select the benchmark database: " ++ T.unpack e)
                 Right () -> pure ()
   where
-    -- | 报错退出
+    -- \| 报错退出
     die message = do
         putStrLn message
         exitFailure
@@ -386,11 +386,11 @@ portFromBanner line
 isInfixOf :: String -> String -> Bool
 isInfixOf needle haystack = any (prefix needle) (tails haystack)
   where
-    -- | 前缀匹配
+    -- \| 前缀匹配
     prefix [] _ = True
     prefix _ [] = False
     prefix (x : xs) (y : ys) = x == y && prefix xs ys
-    -- | 所有后缀
+    -- \| 所有后缀
     tails [] = [[]]
     tails s@(_ : rest) = s : tails rest
 
@@ -498,7 +498,7 @@ main = do
     printf "timing   : wall clock (monotonic); every statement runs the full chain over TCP\n"
     printf "note     : the client no longer links the engine or the storage library\n"
     bracket
-        (do
+        ( do
             t1 <- getMonotonicTime
             bench <- startBench
             t2 <- getMonotonicTime
@@ -545,14 +545,14 @@ latencies label rows times = do
     let ordered = sort times
         count = length times
         total = sum times
-        -- | 按最近秩取分位数
+        -- \| 按最近秩取分位数
         percentile fraction = ordered !! (ceiling (fraction * fromIntegral count) - 1)
     printf "CASE %-24s n=%d rows=%d mean_ms=%.3f p50_ms=%.3f p95_ms=%.3f max_ms=%.3f ops_s=%.2f\n" label count rows (total / fromIntegral count) (percentile (0.5 :: Double)) (percentile (0.95 :: Double)) (last ordered) (fromIntegral count * 1000 / total)
 
 -- | 预热后反复测量并校验结果行数
 sampleQuery :: Bench -> String -> String -> Int -> IO ()
 sampleQuery bench label statement expected = do
-    -- | 执行一次并校验结果数量
+    -- \| 执行一次并校验结果数量
     let action = do
             result <- runSql bench statement
             case result of
@@ -610,33 +610,44 @@ pressureScenarios bench u o = do
 -- | 用多条独立会话同步开始点查
 concurrentLookup :: Bench -> Int -> IO ()
 concurrentLookup bench workers = do
-    completions <- replicateM
-                     workers
-                     (do start <- newEmptyMVar
-                         done <- newEmptyMVar
-                         client <- connectClient "127.0.0.1" (bPort bench)
-                                     >>= either (ioError . userError . T.unpack) pure
-                         session <- newSession client
-                         authenticateSession session "admin" ""
-                           >>= either (ioError . userError . T.unpack) pure
-                         switchDatabase session "bench"
-                           >>= either (ioError . userError . T.unpack) pure
-                         _ <- forkFinally
-                                (takeMVar start
-                                   >>
-                                     bracket
-                                       (pure client) closeClient
-                                       (\ _
-                                          -> replicateM
-                                               100
-                                               (fst
-                                                  <$>
-                                                    measure
-                                                      (do result <- runStatement
-                                                                      session "SELECT id FROM users WHERE id = 1"
-                                                          unless (fmap qrRows result == Right [[VInt 1]]) (ioError (userError "concurrent lookup mismatch"))))))
-                                (putMVar done)
-                         pure (start, done))
+    completions <-
+        replicateM
+            workers
+            ( do
+                start <- newEmptyMVar
+                done <- newEmptyMVar
+                client <-
+                    connectClient "127.0.0.1" (bPort bench)
+                        >>= either (ioError . userError . T.unpack) pure
+                session <- newSession client
+                authenticateSession session "admin" ""
+                    >>= either (ioError . userError . T.unpack) pure
+                switchDatabase session "bench"
+                    >>= either (ioError . userError . T.unpack) pure
+                _ <-
+                    forkFinally
+                        ( takeMVar start
+                            >> bracket
+                                (pure client)
+                                closeClient
+                                ( \_ ->
+                                    replicateM
+                                        100
+                                        ( fst
+                                            <$> measure
+                                                ( do
+                                                    result <-
+                                                        runStatement
+                                                            session
+                                                            "SELECT id FROM users WHERE id = 1"
+                                                    unless (fmap qrRows result == Right [[VInt 1]]) (ioError (userError "concurrent lookup mismatch"))
+                                                )
+                                        )
+                                )
+                        )
+                        (putMVar done)
+                pure (start, done)
+            )
     (milliseconds, results) <- measure $ do
         mapM_ (\(start, _) -> putMVar start ()) completions
         mapM (takeMVar . snd) completions
