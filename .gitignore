@@ -103,3 +103,10 @@ learning
 !/.agents/skills/chusql-type-system/
 /.agents/context/prompt.txt
 /skills-lock.json
+
+# Docker 部署口令仅保存在本机。
+/secrets/
+/.env
+/.env.*
+
+examples

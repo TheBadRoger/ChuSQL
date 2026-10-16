@@ -1,0 +1,9 @@
+# Web 经 Compose 网络连接数据库，不挂载或打开数据库目录。
+[server]
+listen_host = "server"
+port = 7777
+
+[web]
+listen_host = "0.0.0.0"
+port = 7778
+cookie_secure = false

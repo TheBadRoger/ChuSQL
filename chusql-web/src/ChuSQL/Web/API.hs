@@ -1,5 +1,5 @@
-{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TupleSections #-}
 
 module ChuSQL.Web.API (
     AppEnv (..),
@@ -21,10 +21,9 @@ module ChuSQL.Web.API (
     newAppEnvAt,
 ) where
 
-import Data.Either (fromRight)
-import ChuSQL.Core.Model (Row, Value (..))
 import ChuSQL.Core.Engine.Syntax.AST (Statement (BeginTransaction, CommitTransaction, RollbackTransaction))
 import ChuSQL.Core.Engine.Syntax.Parser (parseStatement)
+import ChuSQL.Core.Model (Row, Value (..))
 import ChuSQL.Core.Protocol (Account (..), QueryResult (..), SchemaColumn (..), TableInfo (..), valueToJSON)
 import ChuSQL.Interface.AccountTable (accountColumns, accountTableName, isAccountTable, passwordColumn, systemTableInfo)
 import ChuSQL.Interface.Actions (
@@ -103,7 +102,7 @@ import ChuSQL.Interface.Settings (
     writeSettingsFile,
  )
 import ChuSQL.Interface.TOML (defaultConfigFile)
-import ChuSQL.Web.Secure (bodyLimitDynamic, sameOriginOnly, securityHeaders, contentSecurityPolicy)
+import ChuSQL.Web.Secure (bodyLimitDynamic, contentSecurityPolicy, sameOriginOnly, securityHeaders)
 import ChuSQL.Web.Static (contentTypeOf, readStatic, safeRelative)
 import ChuSQL.Web.UISettings (
     readUISettings,
@@ -112,22 +111,23 @@ import ChuSQL.Web.UISettings (
     validateUISettings,
     writeUISettings,
  )
-import Control.Concurrent.MVar (MVar, modifyMVar, newMVar, withMVar)
 import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent.MVar (MVar, modifyMVar, newMVar, withMVar)
 import Control.Exception (IOException, try)
-import Control.Monad (forever, when, unless)
+import Control.Monad (forever, unless, when)
 import Data.Aeson (FromJSON (..), eitherDecode, object, withObject, (.:), (.=))
 import qualified Data.Aeson as A
 import qualified Data.Aeson.Key as K
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
+import Data.Either (fromRight)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (nub, sortBy)
 import qualified Data.Map.Strict as Map
-import qualified Data.Set as Set
 import Data.Maybe (catMaybes, fromMaybe, isJust)
 import Data.Scientific (fromFloatDigits)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -291,7 +291,7 @@ serializeSessions locks app req respond = case sessionKey req of
         lock <- lockFor locks key
         withMVar lock (const (app req respond))
   where
-    -- | 取请求所属的会话令牌
+    -- \| 取请求所属的会话令牌
     sessionKey _ = do
         rawCookie <- lookup "Cookie" (requestHeaders req)
         parseCookieHeader sessionCookieName (TE.decodeUtf8With TEE.lenientDecode rawCookie)
@@ -360,13 +360,17 @@ withDatabase env action = do
                 else do
                     editing <- header "X-ChuSQL-Edit"
                     req <- request
-                    let snapshotRead = isJust editing && ((requestMethod req == "GET" && take 2 (pathInfo req) == ["api", "tables"])
-                            || (requestMethod req == "POST" && pathInfo req == ["api", "normalization", "analyze"]))
+                    let snapshotRead =
+                            isJust editing
+                                && ( (requestMethod req == "GET" && take 2 (pathInfo req) == ["api", "tables"])
+                                        || (requestMethod req == "POST" && pathInfo req == ["api", "normalization", "analyze"])
+                                   )
                     console <- liftIO (readIORef (wsConsole ws))
                     caller <- consoleOwner
                     case console of
-                        Just (owner, database) | not snapshotRead &&
-                            (pathInfo req `notElem` [["api", "query"], ["api", "normalization", "analyze"]] || caller /= owner || (not (T.null chosen) && chosen /= database)) ->
+                        Just (owner, database)
+                            | not snapshotRead
+                                && (pathInfo req `notElem` [["api", "query"], ["api", "normalization", "analyze"]] || caller /= owner || (not (T.null chosen) && chosen /= database)) ->
                                 apiError "conflict" "another SQL console owns this connection transaction; commit or rollback there first"
                         _ -> pure ()
                     current <- liftIO (sessionDatabase (wsSession ws))
@@ -395,14 +399,16 @@ requireSession env = do
             editHeader <- fmap TL.toStrict <$> header "X-ChuSQL-Edit"
             req <- request
             case editHeader of
-                Just editId | (requestMethod req == "GET" && take 2 (pathInfo req) == ["api", "tables"])
-                    || (requestMethod req == "POST" && pathInfo req == ["api", "normalization", "analyze"]) -> do
-                    active <- liftIO (readIORef (wsEdit ws))
-                    database <- maybe "" (T.toLower . TL.toStrict) <$> header "X-ChuSQL-Database"
-                    case active of
-                        Just (owner, name) | owner == editId && name == database ->
-                            pure ws {wsSession = wsEditor ws, wsClient = wsEditorClient ws}
-                        _ -> apiError "conflict" "the editing snapshot is no longer available; rollback and reload"
+                Just editId
+                    | (requestMethod req == "GET" && take 2 (pathInfo req) == ["api", "tables"])
+                        || (requestMethod req == "POST" && pathInfo req == ["api", "normalization", "analyze"]) -> do
+                        active <- liftIO (readIORef (wsEdit ws))
+                        database <- maybe "" (T.toLower . TL.toStrict) <$> header "X-ChuSQL-Database"
+                        case active of
+                            Just (owner, name)
+                                | owner == editId && name == database ->
+                                    pure ws{wsSession = wsEditor ws, wsClient = wsEditorClient ws}
+                            _ -> apiError "conflict" "the editing snapshot is no longer available; rollback and reload"
                 _ -> pure ws
 
 -- | 关闭网页会话的两个服务端连接。
@@ -472,19 +478,22 @@ indexH env = do
             setHeader "Content-Security-Policy" (TL.fromStrict (contentSecurityPolicy (Just nonce)))
             setHeader "Content-Type" "text/html; charset=utf-8"
             raw (BL.fromStrict pageHtml)
+
 -- | 静态文件：白名单之外一律 404
 staticH :: AppEnv -> ActionM ()
 staticH env = do
     rel <- pathParam "file"
-    if rel == "index.html" then indexH env else case safeRelative rel of
-        Nothing -> reply404
-        Just _ -> do
-            content <- liftIO (readStatic (aeStaticDir env) (T.unpack rel))
-            case content of
-                Nothing -> reply404
-                Just page -> do
-                    setHeader "Content-Type" (TL.fromStrict (contentTypeOf (T.unpack rel)))
-                    raw (BL.fromStrict page)
+    if rel == "index.html"
+        then indexH env
+        else case safeRelative rel of
+            Nothing -> reply404
+            Just _ -> do
+                content <- liftIO (readStatic (aeStaticDir env) (T.unpack rel))
+                case content of
+                    Nothing -> reply404
+                    Just page -> do
+                        setHeader "Content-Type" (TL.fromStrict (contentTypeOf (T.unpack rel)))
+                        raw (BL.fromStrict page)
 
 -- | 统一的 JSON 404
 reply404 :: ActionM ()
@@ -748,7 +757,7 @@ accountRoute ws name
 accountRowsOf :: [Account] -> [Row]
 accountRowsOf = map accountRow
   where
-    -- | 一个账号转成一行
+    -- \| 一个账号转成一行
     accountRow a =
         [ ("id", VInt (fromIntegral (accountId a)))
         , ("user", VStr (T.unpack (accountUser a)))
@@ -768,7 +777,7 @@ systemTableJson count =
         , "columns" .= map accountColumnJson accountColumns
         ]
   where
-    -- | 一列转成线上 JSON
+    -- \| 一列转成线上 JSON
     accountColumnJson sc =
         object
             [ "name" .= scName sc
@@ -836,11 +845,11 @@ sortAccountRows Nothing rows = rows
 sortAccountRows (Just (column, ascending)) rows =
     sortBy compareUser rows
   where
-    -- | 比两个账号单元
+    -- \| 比两个账号单元
     compareUser a b = case (accountCell a column, accountCell b column) of
         (Just x, Just y) -> if ascending then compare x y else compare y x
         _ -> EQ
-    -- | 取账号行里某列的文本值
+    -- \| 取账号行里某列的文本值
     accountCell row name = case lookup (T.unpack name) row of
         Just VNull -> Just ""
         Just (VStr s) -> Just s
@@ -853,7 +862,7 @@ filterAccountRows :: [(Text, Value)] -> [Row] -> [Row]
 filterAccountRows [] rows = rows
 filterAccountRows filters rows = [r | r <- rows, all (matches r) filters]
   where
-    -- | 行是否满足一条等值条件
+    -- \| 行是否满足一条等值条件
     matches row (column, wanted) = case lookup (T.unpack column) row of
         Just value -> value == wanted
         Nothing -> False
@@ -942,7 +951,7 @@ applyLiveKeys :: AppEnv -> Map.Map Text Text -> IO [Text]
 applyLiveKeys env updates = do
     before <- readLive env
     let wanted = [k | k <- liveKeys, Map.member k updates]
-        -- | 取热改项的整数值
+        -- \| 取热改项的整数值
         intOf key = case T.strip (Map.findWithDefault "" key updates) of
             "" -> intFromText (effectiveValueOf (aeEffective env) key)
             given -> intFromText given
@@ -983,9 +992,10 @@ tablesH env = do
         Left message -> serverError message
         Right infos -> do
             let tables = [info | info <- infos, not (isAccountTable (T.pack (tiTable info)))]
-            extra <- if current == systemDatabase && wsAdmin ws
-                then (: []) . systemTableJson . length <$> requireAccounts ws
-                else pure []
+            extra <-
+                if current == systemDatabase && wsAdmin ws
+                    then (: []) . systemTableJson . length <$> requireAccounts ws
+                    else pure []
             json (map tableInfoJson tables ++ extra)
 
 -- | 单表结构
@@ -1072,7 +1082,7 @@ parseFilters info (Just rawFilter)
         Left _ -> Left "filter must be a JSON array of {column, value}"
         Right specs -> catMaybes <$> mapM toPair specs
   where
-    -- | 一条过滤条件转成列与引擎值
+    -- \| 一条过滤条件转成列与引擎值
     toPair (RowFilter column rawValue)
         | T.null rawValue = Right Nothing
         | otherwise = do
@@ -1080,7 +1090,7 @@ parseFilters info (Just rawFilter)
             ty <- maybe (Left ("unsupported column type for: " <> column)) Right (columnTypeOf (T.pack (scType schema)))
             value <- either (Left . T.pack) Right (coerceValue ty (A.String rawValue))
             pure (Just (column, value))
-    -- | 按列名找表结构里的列
+    -- \| 按列名找表结构里的列
     lookupColumn column = case [c | c <- tiColumns info, T.pack (scName c) == column] of
         (c : _) -> Just c
         [] -> Nothing
@@ -1102,7 +1112,7 @@ sortParam info = do
             | column `notElem` map (T.pack . scName) (tiColumns info) -> Left ("unknown column: " <> column)
             | otherwise -> Right (Just (column, dirOf rawDir))
   where
-    -- | dir 参数转排序方向
+    -- \| dir 参数转排序方向
     dirOf given = case fmap (T.toLower . T.strip) given of
         Just "desc" -> False
         _ -> True
@@ -1420,7 +1430,7 @@ settingsUpdates o = do
         then Left "no settings were given"
         else Map.fromList <$> mapM convert (KM.toList values)
   where
-    -- | 一个设置值转成文本
+    -- \| 一个设置值转成文本
     convert (k, v) = case v of
         A.String s -> Right (K.toText k, s)
         A.Number n -> Right (K.toText k, T.pack (show n))
@@ -1437,7 +1447,7 @@ decodeCreateTable o = do
         _ -> Left "columns must be an array"
     pure (CreateTableSpec name cols)
   where
-    -- | 一列 {name, type} 转成列结构
+    -- \| 一列 {name, type} 转成列结构
     decodeColumn (A.Object c) = ColumnSpec <$> textField "name" c <*> textField "type" c
     decodeColumn _ = Left "each column must be {name, type}"
 
@@ -1453,14 +1463,14 @@ readRowValues requireAll cols o = do
                 else Left ("missing columns: " <> T.intercalate ", " (map T.pack missing))
         else pure provided
   where
-    -- | 一个列值按结构转成引擎值
+    -- \| 一个列值按结构转成引擎值
     convert (k, v) = do
         let name = K.toString k
         schema <- maybe (Left ("unknown column: " <> T.pack name)) Right (lookupSchema name)
         ty <- maybe (Left ("unsupported column type for: " <> T.pack name)) Right (columnTypeOf (T.pack (scType schema)))
         value <- either (Left . T.pack) Right (coerceValue ty v)
         pure (name, value)
-    -- | 按列名找表结构里的列
+    -- \| 按列名找表结构里的列
     lookupSchema name = case [c | c <- cols, scName c == name] of
         (c : _) -> Just c
         [] -> Nothing
@@ -1571,9 +1581,17 @@ editFailure :: Text -> Text -> Maybe Int -> Bool -> ActionM ()
 editFailure stateName message index reload = do
     let code = errorCodeOf message
     status (if code == "unauthorized" then status401 else if reload || code == "serialization_failure" then status409 else statusOf code)
-    json (object ["ok" .= False, "applied" .= (0 :: Int), "state" .= stateName,
-        "reloadRequired" .= reload, "error" .= code, "message" .= message,
-        "errors" .= [object ["index" .= index, "message" .= message]]])
+    json
+        ( object
+            [ "ok" .= False
+            , "applied" .= (0 :: Int)
+            , "state" .= stateName
+            , "reloadRequired" .= reload
+            , "error" .= code
+            , "message" .= message
+            , "errors" .= [object ["index" .= index, "message" .= message]]
+            ]
+        )
 
 -- | 回退提交失败的暂存语句并保留快照。
 resetEditAfterFailure :: WebSession -> Maybe Int -> Text -> ActionM ()
@@ -1749,7 +1767,7 @@ parseCookieHeader name headerValue = case [v | part <- T.splitOn ";" headerValue
     (v : _) -> Just v
     [] -> Nothing
   where
-    -- | 从一段 Cookie 里取指定键的值
+    -- \| 从一段 Cookie 里取指定键的值
     valueOf key part =
         let (k, rest) = T.breakOn "=" part
             value = T.strip (T.drop 1 rest)
@@ -1804,7 +1822,7 @@ tableInfoJson info =
         , "columns" .= map columnJson (tiColumns info)
         ]
   where
-    -- | 一列转成线上 JSON
+    -- \| 一列转成线上 JSON
     columnJson sc =
         object
             [ "name" .= scName sc
@@ -1869,7 +1887,7 @@ reply500 message = do
 findTable :: Text -> [TableInfo] -> Maybe TableInfo
 findTable name = go
   where
-    -- | 顺序找表
+    -- \| 顺序找表
     go [] = Nothing
     go (i : is) = if tiTable i == T.unpack name then Just i else go is
 
@@ -1884,7 +1902,7 @@ instance FromJSON LoginRequest where
         LoginRequest <$> o .: "user" <*> o .: "password"
 
 -- | 查询请求体
-data QueryRequest = QueryRequest
+newtype QueryRequest = QueryRequest
     { qrSql :: Text
     }
 
@@ -1897,8 +1915,9 @@ normalizationH env = do
     ws <- requireSession env
     rawBody <- body
     case decodeNormalizationJSON rawBody of
-        Left message | BL.length rawBody > 65536 -> reply413
-                     | otherwise -> reply400 "bad_request" message
+        Left message
+            | BL.length rawBody > 65536 -> reply413
+            | otherwise -> reply400 "bad_request" message
         Right value -> case A.fromJSON value :: A.Result NormalizationRequest of
             A.Error message -> reply400 "bad_request" (T.pack message)
             A.Success payload -> do

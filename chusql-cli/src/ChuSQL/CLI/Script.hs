@@ -1,19 +1,19 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module ChuSQL.CLI.Script
-    ( Meta (..)
-    , parseMeta
-    , takeStatement
-    , statementComplete
-    , stripTerminator
-    , errorHint
-    , metaHelp
-    ) where
+module ChuSQL.CLI.Script (
+    Meta (..),
+    parseMeta,
+    takeStatement,
+    statementComplete,
+    stripTerminator,
+    errorHint,
+    metaHelp,
+) where
 
-import Data.Maybe (isJust)
-import ChuSQL.CLI.Normalization (normalizationArguments)
 import ChuSQL.CLI.Format (OutputFormat (..), formatName, parseFormat)
+import ChuSQL.CLI.Normalization (normalizationArguments)
 import Data.Char (isSpace)
+import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as T
 
@@ -49,7 +49,8 @@ parseMeta raw = do
         "list" -> MetaDatabases
         "dt" -> MetaTables
         "tables" -> MetaTables
-        "d" | T.null argument -> MetaTables
+        "d"
+            | T.null argument -> MetaTables
             | otherwise -> MetaDescribe argument
         "dr" -> MetaRoles
         "roles" -> MetaRoles
@@ -61,18 +62,18 @@ parseMeta raw = do
         "format" -> selectFormat argument
         other -> MetaUnknown other
   where
-    -- | 拼出切库命令
+    -- \| 拼出切库命令
     connectTo argument
         | T.null argument = MetaUnknown "c"
         | otherwise = MetaConnect argument
-    -- | 解析格式参数
+    -- \| 解析格式参数
     selectFormat argument = maybe (MetaUnknown "format") MetaSetFormat (parseFormat argument)
 
 -- | 取出第一条语句，忽略引号与注释里的分号
 takeStatement :: Text -> Maybe (Text, Text)
 takeStatement = go ScanNormal [] . T.unpack
   where
-    -- | 逐字符扫描语句边界
+    -- \| 逐字符扫描语句边界
     go _ _ [] = Nothing
     go ScanNormal acc (';' : rest) = Just (T.strip (T.pack (reverse acc)), T.pack rest)
     go ScanNormal acc ('-' : '-' : rest) = go ScanLineComment ('-' : '-' : acc) rest

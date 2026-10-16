@@ -2,7 +2,6 @@
 
 module Main (main) where
 
-import Control.Monad (when)
 import ChuSQL.Core.Engine.Storage.FFI (storageVersion)
 import ChuSQL.Core.Engine.Storage.IPC (closeConnection, localStorageLink, setStorageLink)
 import ChuSQL.Interface.Config (
@@ -23,7 +22,8 @@ import ChuSQL.Server.TCP (
     newServerEnv,
     runServer,
  )
-import Control.Exception (IOException, try, bracket_)
+import Control.Exception (IOException, bracket_, try)
+import Control.Monad (when)
 import qualified Data.Aeson as A
 import qualified Data.Aeson.KeyMap as KM
 import Data.Text (Text)
@@ -64,7 +64,7 @@ emptyOptions =
 parseArgs :: [String] -> Either String Options
 parseArgs = go emptyOptions
   where
-    -- | 逐条消费参数列表
+    -- \| 逐条消费参数列表
     go opts [] = Right opts
     go opts ("--help" : rest) = go opts{optHelp = True} rest
     go opts ("-h" : rest) = go opts{optHelp = True} rest
@@ -76,7 +76,7 @@ parseArgs = go emptyOptions
     go opts ("--max-rows" : v : rest) = withInt "--max-rows" v (\n -> go opts{optMaxRows = Just n} rest)
     go _ (a : _) = Left ("unrecognized argument or missing value: " ++ a)
 
-    -- | 把参数值读成整数，读不出就报错
+    -- \| 把参数值读成整数，读不出就报错
     withInt :: String -> String -> (Int -> Either String Options) -> Either String Options
     withInt name v k = maybe (Left (name ++ " needs an integer, got: " ++ v)) k (readMaybe v)
 
@@ -179,7 +179,9 @@ run opts = do
             env <- newServerEnv backend rootName configPath config limiter
             let announce port = putStrLn ("listening:    tcp://" ++ scHost config ++ ":" ++ show port)
             bracket_
-              (pure link) closeConnection (serve env announce)
+                (pure link)
+                closeConnection
+                (serve env announce)
 
 -- | 起 TCP 服务并处理绑定失败
 serve :: ServerEnv -> (Int -> IO ()) -> IO ()
@@ -205,7 +207,7 @@ checkInitialized backend = do
             putStrLn "!! For a damaged existing system catalog, stop all processes and try csql-bootstrap repair or recover."
             exitFailure
   where
-    -- | 应答里的 initialized 是不是 true
+    -- \| 应答里的 initialized 是不是 true
     statusInitialized (A.Object fields) = KM.lookup "initialized" fields == Just (A.Bool True)
     statusInitialized _ = False
 
@@ -213,17 +215,19 @@ checkInitialized backend = do
 reportCredential :: Backend -> Text -> Bool -> IO ()
 reportCredential backend rootName legacy = do
     putStrLn ("administrator: " ++ T.unpack rootName)
-    when legacy
-      $ do putStrLn
-             "  !! the [web] section still carries a plaintext password key; it is ignored now"
-           putStrLn
-             "  !! remove it: the administrator password lives in the __system_users system table"
+    when legacy $
+        do
+            putStrLn
+                "  !! the [web] section still carries a plaintext password key; it is ignored now"
+            putStrLn
+                "  !! remove it: the administrator password lives in the __system_users system table"
     passwordless <- administratorPasswordless backend rootName
-    when passwordless
-      $ do putStrLn
-             "  !! the administrator has no password yet: sign in with an empty password, then set one"
-           putStrLn
-             "  !!   ALTER USER root IDENTIFIED BY '...'   (or use the account page in the Web UI)"
+    when passwordless $
+        do
+            putStrLn
+                "  !! the administrator has no password yet: sign in with an empty password, then set one"
+            putStrLn
+                "  !!   ALTER USER root IDENTIFIED BY '...'   (or use the account page in the Web UI)"
 
 -- | 探测存储是否可用，答不上 ping 就退出
 checkStorage :: Backend -> IO ()

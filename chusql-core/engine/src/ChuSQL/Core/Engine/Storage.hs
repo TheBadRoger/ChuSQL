@@ -118,6 +118,10 @@ class (Monad m) => MonadStorage m where
     -- \| ALTER 用：整表换列定义与全部行
     replaceSchema :: String -> [(String, Column)] -> [Row] -> m (Either String ())
 
+    -- | 校验完整快照后原子修改领域定义
+    alterDomain :: String -> (Database -> Either String [(String, Column)]) -> m (Either String ())
+    alterDomain _ _ = pure (Left "atomic domain alteration is unavailable in this storage")
+
     -- \| 取全库快照（表名 + 列 + 全部行）
     snapshot :: m (Either String Database)
 

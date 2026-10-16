@@ -1,15 +1,26 @@
-module ChuSQL.Core.Engine.Syntax.AST (Statement (..), FromClause (..), JoinKind (..), Expr (..), Subquery (..), Quantifier (..), CompareOp (..), SortDir (..), OrderKey (..), makeSelect, distinctOrdering, orderPosition, orderExpression, orderKeyExpression) where
+module ChuSQL.Core.Engine.Syntax.AST (Statement (..), DomainDefinition (..), DomainAlter (..), FromClause (..), JoinKind (..), Expr (..), Subquery (..), Quantifier (..), CompareOp (..), SortDir (..), OrderKey (..), makeSelect, distinctOrdering, orderPosition, orderExpression, orderKeyExpression) where
 
-import ChuSQL.Core.Model (Column (..), ColumnType, Value (..))
-import ChuSQL.Core.Engine.Runtime.Types (TypeId, TypeExpr, RuntimeValue)
 import ChuSQL.Core.Engine.Runtime.Functions (FunctionId)
+import ChuSQL.Core.Engine.Runtime.Types (RuntimeValue, TypeExpr, TypeId)
+import ChuSQL.Core.Model (Column (..), ColumnType, Value (..))
 
 -- 语法树：语句、数据来源、条件表达式、排序方向。
 
+-- | 领域的基础列属性及具名检查条件
+data DomainDefinition = DomainDefinition Column [(String, String)] deriving (Show, Eq)
+
+-- | 领域约束及默认值的结构变更
+data DomainAlter
+    = DomainDefault (Maybe Value)
+    | DomainNullable Bool
+    | DomainAddCheck (Maybe String) String
+    | DomainDropCheck String
+    deriving (Show, Eq)
+
 data Statement
     = Select
-        -- | 输出名称与投影表达式，普通列用 Col
         { selectItems :: [(String, Expr)]
+        -- ^ 输出名称与投影表达式，普通列用 Col
         , selectFrom :: FromClause
         , selectWhere :: Maybe Expr
         , selectGroupBy :: [String]
@@ -22,7 +33,8 @@ data Statement
     | Delete String (Maybe Expr)
     | Update String [(String, Expr)] (Maybe Expr)
     | CreateTable String [(String, Column)]
-    | CreateDomain String ColumnType
+    | CreateDomain String DomainDefinition
+    | AlterDomain String DomainAlter
     | DropDomain String
     | ShowDomains
     | DropTable String
@@ -40,35 +52,37 @@ data Statement
     | ShowGrants
     | ShowRoles
     | DropUser String
-    -- | 新角色：权限的载体，用户靠成员资格继承它的权限
-    | CreateRole String
-    -- | 删角色：连同它的授权与成员一起删
-    | DropRole String
-    -- | GRANT 权限 ON 表 TO 角色，末位表示带 WITH GRANT OPTION
-    | GrantPrivileges [String] String String Bool
-    -- | REVOKE 权限 ON 表 FROM 角色
-    | RevokePrivileges [String] String String
+    | -- | 新角色：权限的载体，用户靠成员资格继承它的权限
+      CreateRole String
+    | -- | 删角色：连同它的授权与成员一起删
+      DropRole String
+    | -- | GRANT 权限 ON 表 TO 角色，末位表示带 WITH GRANT OPTION
+      GrantPrivileges [String] String String Bool
+    | -- | REVOKE 权限 ON 表 FROM 角色
+      RevokePrivileges [String] String String
     | RevokeGrantOption [String] String String
-    -- | GRANT 角色 TO 用户：给用户加角色
-    | GrantRole String [String]
-    -- | REVOKE <角色> FROM <用户>[, ...]
-    | RevokeRole String [String]
+    | -- | GRANT 角色 TO 用户：给用户加角色
+      GrantRole String [String]
+    | -- | REVOKE <角色> FROM <用户>[, ...]
+      RevokeRole String [String]
     | CreateDatabase String
     | DropDatabase String
     | UseDatabase String
     | ShowDatabases
-    -- | 开事务：BEGIN / START TRANSACTION
-    | BeginTransaction
-    -- | 提交事务
-    | CommitTransaction
-    -- | 回滚事务
-    | RollbackTransaction
-    -- | 建保存点：SAVEPOINT 名字
-    | Savepoint String
-    -- | 回滚到保存点：ROLLBACK TO [SAVEPOINT] 名字
-    | RollbackToSavepoint String
-    -- | 释放保存点：RELEASE [SAVEPOINT] 名字
-    | ReleaseSavepoint String
+    | -- | 开事务：BEGIN / START TRANSACTION
+      BeginTransaction
+    | -- | 串行化快照事务
+      BeginSerializableTransaction
+    | -- | 提交事务
+      CommitTransaction
+    | -- | 回滚事务
+      RollbackTransaction
+    | -- | 建保存点：SAVEPOINT 名字
+      Savepoint String
+    | -- | 回滚到保存点：ROLLBACK TO [SAVEPOINT] 名字
+      RollbackToSavepoint String
+    | -- | 释放保存点：RELEASE [SAVEPOINT] 名字
+      ReleaseSavepoint String
     deriving (Show, Eq)
 
 -- | 连接类型：内连接与左外连接
@@ -86,15 +100,16 @@ data FromClause
     deriving (Show, Eq)
 
 -- | 子查询：语句，加上它对外层列的引用（自由变量，语义检查时填）
-data Subquery = Subquery
-    { subqueryStatement :: Statement
-    , subqueryRefs :: [String]
-    }
+data Subquery
+    = Subquery
+        { subqueryStatement :: Statement
+        , subqueryRefs :: [String]
+        }
     | BoundSubquery
-    { subqueryStatement :: Statement
-    , subqueryRefs :: [String]
-    , subquerySlots :: [(String, Expr)]
-    }
+        { subqueryStatement :: Statement
+        , subqueryRefs :: [String]
+        , subquerySlots :: [(String, Expr)]
+        }
     deriving (Show, Eq)
 
 -- | 量词：ANY 至少一行成立，ALL 每一行都成立
@@ -219,9 +234,9 @@ resolveDistinctOrdering :: Statement -> Either String [(OrderKey, SortDir)]
 resolveDistinctOrdering q = mapM resolve (selectOrderBy q)
   where
     items = case q of
-        Select { selectItems = projected } -> projected
+        Select{selectItems = projected} -> projected
         _ -> []
-    -- | 排序键必须出现在去重结果中
+    -- \| 排序键必须出现在去重结果中
     resolve (key, direction) = do
         position <- orderPosition (length items) key
         case position of
@@ -230,7 +245,7 @@ resolveDistinctOrdering q = mapM resolve (selectOrderBy q)
                 [slot] -> Right (OrderPosition slot, direction)
                 [] -> Left "DISTINCT: ORDER BY column must appear in the select list"
                 _ -> Left "DISTINCT: ambiguous ORDER BY column"
-    -- | 名称或完整表达式必须对应去重输出项
+    -- \| 名称或完整表达式必须对应去重输出项
     matches (OrderColumn column) label expression = label == column || expression == Col column
     matches (OrderExpression key) _ expression = key == expression
     matches (OrderPosition _) _ _ = False

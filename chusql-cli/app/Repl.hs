@@ -1,19 +1,19 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module Repl
-    ( runRepl
-    , runStatementOnce
-    , reportError
-    ) where
+module Repl (
+    runRepl,
+    runStatementOnce,
+    reportError,
+) where
 
-import ChuSQL.CLI.Normalization (runNormalizationOnce)
 import ChuSQL.CLI.Format (OutputFormat, formatName, renderResult, renderRows)
 import ChuSQL.CLI.History (historySettings, rememberStatement)
+import ChuSQL.CLI.Normalization (runNormalizationOnce)
 import ChuSQL.CLI.Script (Meta (..), errorHint, metaHelp, parseMeta, takeStatement)
-import ChuSQL.Interface.Session (Session, catalog, databases, roleViews, runStatement, sessionDatabase, switchDatabase)
 import ChuSQL.Core.Protocol (SchemaColumn (..), TableInfo (..))
 import ChuSQL.Interface.Protocol (Grant (..), RoleView (..))
-import Control.Monad (forM_, when, unless)
+import ChuSQL.Interface.Session (Session, catalog, databases, roleViews, runStatement, sessionDatabase, switchDatabase)
+import Control.Monad (forM_, unless, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef (IORef, readIORef, writeIORef)
 import Data.Text (Text)
@@ -138,7 +138,7 @@ listTables session = do
         Right tables -> outputStrLn (T.unpack (renderRows headers (map tableRow tables)))
   where
     headers = ["table", "columns", "rows", "indexes"]
-    -- | 把表信息排成一行
+    -- \| 把表信息排成一行
     tableRow info =
         [ T.pack (tiTable info)
         , tshow (length (tiColumns info))
@@ -158,9 +158,9 @@ describeTable session name = do
                 (info : _) -> outputStrLn (T.unpack (renderRows headers (map columnRow (tiColumns info))))
   where
     headers = ["column", "type", "primary", "unique", "nullable", "auto"]
-    -- | 表名忽略大小写比较
+    -- \| 表名忽略大小写比较
     matches wanted info = T.toLower (T.pack (tiTable info)) == T.toLower wanted
-    -- | 把列信息排成一行
+    -- \| 把列信息排成一行
     columnRow column =
         [ T.pack (scName column)
         , T.pack (scType column)
@@ -169,7 +169,7 @@ describeTable session name = do
         , yesNo (scNullable column)
         , yesNo (scAutoIncrement column)
         ]
-    -- | 布尔值转成 yes/no
+    -- \| 布尔值转成 yes/no
     yesNo True = "yes"
     yesNo False = "no"
 
@@ -181,17 +181,17 @@ listRoles session = do
         Left message -> liftIO (reportError message)
         Right roles -> outputStrLn (T.unpack (renderRows ["role", "grants", "members"] (map roleRow roles)))
   where
-    -- | 把角色信息排成一行
+    -- \| 把角色信息排成一行
     roleRow view =
         [ roleName view
         , if null (roleGrants view) then "-" else T.intercalate ", " (map grantText (roleGrants view))
         , if null (roleMembers view) then "-" else T.intercalate ", " (roleMembers view)
         ]
-    -- | 拼一条授权说明
+    -- \| 拼一条授权说明
     grantText grant = grantPrivilege grant <> " on " <> grantObject grant <> optionText grant
-    -- | 带转授权时补一段说明
+    -- \| 带转授权时补一段说明
     optionText grant = if grantable grant then " with grant option" else ""
 
 -- | 用 show 转成 Text
-tshow :: Show a => a -> Text
+tshow :: (Show a) => a -> Text
 tshow = T.pack . show

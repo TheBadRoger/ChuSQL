@@ -1,10 +1,16 @@
-module ChuSQL.Core.Engine.Runtime.Functions
-    ( FunctionId (..), FunctionSignature (..), FunctionRegistry
-    , builtinFunctions, resolveFunction, resolveNullableFunction, functionSignature, invokeFunction
-    ) where
+module ChuSQL.Core.Engine.Runtime.Functions (
+    FunctionId (..),
+    FunctionSignature (..),
+    FunctionRegistry,
+    builtinFunctions,
+    resolveFunction,
+    resolveNullableFunction,
+    functionSignature,
+    invokeFunction,
+) where
 
-import Control.Monad (zipWithM_)
 import ChuSQL.Core.Engine.Runtime.Types
+import Control.Monad (zipWithM_)
 import Data.Char (toLower)
 
 -- 内建函数的固定身份、签名解析和类型化调用。
@@ -14,9 +20,12 @@ newtype FunctionId = FunctionId Int deriving (Show, Eq, Ord)
 
 -- | 描述已解析的函数签名
 data FunctionSignature = FunctionSignature
-    { signatureId :: FunctionId, signatureName :: String
-    , signatureArguments :: [TypeId], signatureResult :: TypeId
-    } deriving (Show, Eq)
+    { signatureId :: FunctionId
+    , signatureName :: String
+    , signatureArguments :: [TypeId]
+    , signatureResult :: TypeId
+    }
+    deriving (Show, Eq)
 
 -- | 保存函数签名和实现
 newtype FunctionRegistry = FunctionRegistry [(FunctionSignature, [RuntimeValue] -> Either String RuntimeValue)]
@@ -27,9 +36,12 @@ builtinFunctions types = do
     int <- descriptorId <$> resolveType types intType
     bool <- descriptorId <$> resolveType types boolType
     string <- descriptorId <$> resolveType types stringType
-    Right (FunctionRegistry
-        [(FunctionSignature (FunctionId 1) "length" [string] int, stringLength)
-        ,(FunctionSignature (FunctionId 2) "not" [bool] bool, booleanNot)])
+    Right
+        ( FunctionRegistry
+            [ (FunctionSignature (FunctionId 1) "length" [string] int, stringLength)
+            , (FunctionSignature (FunctionId 2) "not" [bool] bool, booleanNot)
+            ]
+        )
 
 -- | 按名称和完整参数类型解析函数
 resolveFunction :: FunctionRegistry -> String -> [TypeId] -> Either String FunctionSignature
@@ -38,14 +50,17 @@ resolveFunction registry name arguments = resolveNullableFunction registry name 
 -- | 按可空 SQL 参数解析确定签名
 resolveNullableFunction :: FunctionRegistry -> String -> [Maybe TypeId] -> Either String FunctionSignature
 resolveNullableFunction (FunctionRegistry functions) name arguments =
-    case [sig | (sig, _) <- functions, map toLower (signatureName sig) == map toLower name
-              , length arguments == length (signatureArguments sig)
-              , and (zipWith matches arguments (signatureArguments sig))] of
+    case [ sig
+         | (sig, _) <- functions
+         , map toLower (signatureName sig) == map toLower name
+         , length arguments == length (signatureArguments sig)
+         , and (zipWith matches arguments (signatureArguments sig))
+         ] of
         [sig] -> Right sig
         [] -> Left ("no matching function signature: " ++ name)
         _ -> Left ("ambiguous function signature: " ++ name)
   where
-    -- | 匹配具体参数或未定型 NULL
+    -- \| 匹配具体参数或未定型 NULL
     matches Nothing _ = True
     matches (Just supplied) expected = supplied == expected
 
@@ -62,7 +77,9 @@ invokeFunction types (FunctionRegistry functions) fid values =
         [(sig, implementation)]
             | length values == length (signatureArguments sig) -> do
                 zipWithM_
-                  (validateValue types) (signatureArguments sig) values
+                    (validateValue types)
+                    (signatureArguments sig)
+                    values
                 result <- implementation values
                 validateValue types (signatureResult sig) result
                 Right result

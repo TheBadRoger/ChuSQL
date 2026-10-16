@@ -1,7 +1,7 @@
 module ChuSQL.Core.Engine.Algebra.Op (RelOp (..), SemiKind (..), relOpCols, renderPlan) where
 
+import ChuSQL.Core.Engine.Syntax.AST (Expr, JoinKind (..), SortDir, Statement)
 import ChuSQL.Core.Model
-import ChuSQL.Core.Engine.Syntax.AST (Expr, Statement, JoinKind (..), SortDir)
 
 -- 关系代数算子定义、输出列推导与算子树文本渲染。
 
@@ -23,8 +23,8 @@ data RelOp
     | BoundSort [(Expr, SortDir)] RelOp
     | Limit Int RelOp
     | Join JoinKind RelOp RelOp Expr
-    -- | 末项仅保存独立 IN 的物化身份
-    | SemiJoin SemiKind Expr Expr RelOp RelOp (Maybe Statement)
+    | -- | 末项仅保存独立 IN 的物化身份
+      SemiJoin SemiKind Expr Expr RelOp RelOp (Maybe Statement)
     | Derived (Maybe String) RelOp
     deriving (Show, Eq)
 
@@ -63,7 +63,7 @@ kindLabel LeftJoin = "LeftJoin"
 renderPlan :: RelOp -> String
 renderPlan = go 0
   where
-    -- | 按缩进渲染一个算子
+    -- \| 按缩进渲染一个算子
     go ind op = case op of
         Scan a t cols -> pad ++ "Scan " ++ show a ++ " " ++ show t ++ maybe "" ((" columns=" ++) . show) cols
         Lookup _ t c k -> pad ++ "Lookup " ++ show t ++ "." ++ show c ++ " = " ++ show k
@@ -80,15 +80,29 @@ renderPlan = go 0
                 ++ "\n"
                 ++ go (ind + 1) x
         Distinct x -> pad ++ "Distinct\n" ++ go (ind + 1) x
-        BoundAggregate keys aggs x -> pad ++ "BoundAggregate keys=" ++ show keys
-            ++ " aggs=" ++ show aggs ++ "\n" ++ go (ind + 1) x
+        BoundAggregate keys aggs x ->
+            pad
+                ++ "BoundAggregate keys="
+                ++ show keys
+                ++ " aggs="
+                ++ show aggs
+                ++ "\n"
+                ++ go (ind + 1) x
         Unit -> pad ++ "Unit"
         Sort s x -> pad ++ "Sort " ++ show s ++ "\n" ++ go (ind + 1) x
         BoundSort s x -> pad ++ "BoundSort " ++ show s ++ "\n" ++ go (ind + 1) x
         Limit n x -> pad ++ "Limit " ++ show n ++ "\n" ++ go (ind + 1) x
         Join k l r c -> pad ++ kindLabel k ++ " on " ++ show c ++ "\n" ++ go (ind + 1) l ++ "\n" ++ go (ind + 1) r
-        SemiJoin k left right l r _ -> pad ++ "SemiJoin " ++ show k ++ " keys=" ++ show (left, right)
-            ++ "\n" ++ go (ind + 1) l ++ "\n" ++ go (ind + 1) r
+        SemiJoin k left right l r _ ->
+            pad
+                ++ "SemiJoin "
+                ++ show k
+                ++ " keys="
+                ++ show (left, right)
+                ++ "\n"
+                ++ go (ind + 1) l
+                ++ "\n"
+                ++ go (ind + 1) r
         Derived a x -> pad ++ "Derived " ++ show a ++ "\n" ++ go (ind + 1) x
       where
         pad = replicate (ind * 2) ' '

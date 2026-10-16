@@ -3,7 +3,6 @@
 
 module Main (main) where
 
-import Data.Either (lefts)
 import ChuSQL.Core.Engine.Storage.IPC (
     Account (..),
     Request (ReqAccountCreate, ReqAccountReset, ReqAccountsList, ReqIdentityAlter),
@@ -13,20 +12,28 @@ import ChuSQL.Core.Engine.Storage.IPC (
     setStorageLink,
  )
 import ChuSQL.Core.Engine.Syntax.AST (Statement)
-import ChuSQL.Interface.Normalization
-import ChuSQL.Server.Normalization (normalizationBudget, normalizationReport, schemaFingerprint)
-import ChuSQL.Core.Protocol (SchemaColumn (..))
-import Data.IORef (newIORef, readIORef, writeIORef)
 import ChuSQL.Core.Engine.Syntax.Parser (parseStatement)
 import ChuSQL.Core.Model (Database, Histogram (..), Row, Table (..), TableIdentity (..), Value (..), pattern TInt, pattern TStr)
+import ChuSQL.Core.Protocol (SchemaColumn (..), TxnOp (..))
 import ChuSQL.Interface.Auth (hashPasswordWith)
-import ChuSQL.Interface.Protocol (ClientRequest (..), Grant (..), RoleView (..), ServerResponse (..), decodeRequest, encodeResponse, encodeRequest, decodeResponse)
+import ChuSQL.Interface.Link (clientQuery, clientSudoLogin, closeClient, connectClient)
+import ChuSQL.Interface.Normalization
+import ChuSQL.Interface.Protocol (ClientRequest (..), Grant (..), RoleView (..), ServerResponse (..), decodeRequest, decodeResponse, encodeRequest, encodeResponse)
 import ChuSQL.Interface.RateLimit (newRateLimiter)
-import ChuSQL.Interface.Link (connectClient, closeClient, clientSudoLogin, clientQuery)
-import ChuSQL.Interface.Sudo (SudoCredential, newSudoCredential, sudoProof, verifySudoProof, validSudoChallenge,
-    createSudoCredential, removeSudoCredential, readSudoCredential, sudoPrivileged)
+import ChuSQL.Interface.Sudo (
+    SudoCredential,
+    createSudoCredential,
+    newSudoCredential,
+    readSudoCredential,
+    removeSudoCredential,
+    sudoPrivileged,
+    sudoProof,
+    validSudoChallenge,
+    verifySudoProof,
+ )
 import ChuSQL.Server.Accounts (Principal (..), ensureRootAccount)
-import ChuSQL.Server.Backend (Backend (..), StatementResult (..), ipcBackend, memoryBackend)
+import ChuSQL.Server.Backend (Backend (..), StatementResult (..), applyTransactionMemory, ipcBackend, memoryBackend)
+import ChuSQL.Server.Normalization (normalizationBudget, normalizationReport, schemaFingerprint)
 import ChuSQL.Server.Privileges (
     PrivilegeCommand (..),
     PrivilegeError (..),
@@ -35,29 +42,28 @@ import ChuSQL.Server.Privileges (
     authorize,
     authorizeConnect,
     claimObject,
-    prepareObject,
     listRoleViews,
     listSelfGrants,
     newPrivileges,
+    prepareObject,
     runPrivilegeCommand,
  )
-import ChuSQL.Server.Session (QueryResult (..), Session, SessionError (..), newSession, runStatementCoded, runStorageCoded, authenticateSessionCoded)
+import ChuSQL.Server.Security (databaseSecurity, writeSecurity)
+import ChuSQL.Server.Session (QueryResult (..), Session, SessionError (..), authenticateSessionCoded, newSession, runStatementCoded, runStorageCoded)
 import ChuSQL.Server.TCP (
     ServerConfig (..),
     ServerEnv (..),
     ServerHandle (..),
     defaultServerConfig,
+    isLocalPeer,
     loadServerConfigAt,
     newServerEnv,
     startServer,
-    isLocalPeer,
  )
-import Control.Concurrent (forkIO, forkFinally, killThread, threadDelay)
+import Control.Concurrent (forkFinally, forkIO, killThread, threadDelay)
 import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, takeMVar)
-import System.Timeout (timeout)
-import Control.Exception (IOException, bracket, finally, try)
-import Control.Monad (replicateM_, void, (>=>), when)
-import Data.List (sort)
+import Control.Exception (IOException, bracket, evaluate, finally, try)
+import Control.Monad (forM_, replicateM_, void, when, (>=>))
 import Data.Aeson (decode)
 import qualified Data.Aeson as A
 import qualified Data.Aeson.Key as K
@@ -65,16 +71,17 @@ import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import qualified Data.ByteString.Lazy as BL
+import Data.Either (lefts)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.List (sort)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
-import qualified Data.Vector as V
 import Data.Time.Clock (addUTCTime, diffUTCTime, getCurrentTime)
+import qualified Data.Vector as V
 import Network.Socket (
     AddrInfo (..),
     SockAddr (..),
-    tupleToHostAddress,
-    tupleToHostAddress6,
     SocketType (Stream),
     addrAddress,
     addrFamily,
@@ -84,6 +91,8 @@ import Network.Socket (
     getAddrInfo,
     socket,
     socketToHandle,
+    tupleToHostAddress,
+    tupleToHostAddress6,
     withSocketsDo,
  )
 import System.Directory (createDirectoryIfMissing, doesFileExist, getTemporaryDirectory, removeFile, removePathForcibly)
@@ -99,6 +108,8 @@ import System.IO (
     hSetNewlineMode,
     noNewlineTranslation,
  )
+import System.Mem.StableName (makeStableName)
+import System.Timeout (timeout)
 import Test.Hspec hiding (after, before)
 
 -- TCP 服务器测试：协议编解码、配置读取与真连服务器的端到端用例。
@@ -129,16 +140,19 @@ spec = do
                 connected <- connectClient "127.0.0.1" (shPort handle)
                 case connected of
                     Left message -> expectationFailure (T.unpack message)
-                    Right client -> (do
-                        clientSudoLogin client credential "local_user" >>= (`shouldBe` Right False)
-                        result <- clientQuery client "select 1"
-                        result `shouldSatisfy` isRightResult) `finally` closeClient client
+                    Right client ->
+                        ( do
+                            clientSudoLogin client credential "local_user" >>= (`shouldBe` Right False)
+                            result <- clientQuery client "select 1"
+                            result `shouldSatisfy` isRightResult
+                        )
+                            `finally` closeClient client
         it "only treats kernel loopback addresses as local" $ do
             isLocalPeer (SockAddrInet 7777 (tupleToHostAddress (127, 0, 0, 1))) `shouldBe` True
             isLocalPeer (SockAddrInet 7777 (tupleToHostAddress (192, 168, 1, 2))) `shouldBe` False
-            isLocalPeer (SockAddrInet6 7777 0 (tupleToHostAddress6 (0,0,0,0,0,0,0,1)) 0) `shouldBe` True
-            isLocalPeer (SockAddrInet6 7777 0 (tupleToHostAddress6 (0,0,0,0,0,65535,32512,1)) 0) `shouldBe` True
-            isLocalPeer (SockAddrInet6 7777 0 (tupleToHostAddress6 (0,0,0,0,0,65535,49320,1)) 0) `shouldBe` False
+            isLocalPeer (SockAddrInet6 7777 0 (tupleToHostAddress6 (0, 0, 0, 0, 0, 0, 0, 1)) 0) `shouldBe` True
+            isLocalPeer (SockAddrInet6 7777 0 (tupleToHostAddress6 (0, 0, 0, 0, 0, 65535, 32512, 1)) 0) `shouldBe` True
+            isLocalPeer (SockAddrInet6 7777 0 (tupleToHostAddress6 (0, 0, 0, 0, 0, 65535, 49320, 1)) 0) `shouldBe` False
         it "binds proofs to the instance, challenge, account and expiration" $ do
             credential <- newSudoCredential
             other <- newSudoCredential
@@ -153,18 +167,19 @@ spec = do
             validSudoChallenge credential now Nothing "local_user" proof `shouldBe` False
         it "requires an OS elevated identity to provision or read credentials" $ do
             privileged <- sudoPrivileged
-            if privileged then do
-                bracket (createSudoCredential 65534) (const (removeSudoCredential 65534)) $ \credential -> do
-                    stored <- readSudoCredential 65534
-                    case stored of
-                        Left message -> expectationFailure (T.unpack message)
-                        Right restored -> sudoProof restored "native" "local_user" `shouldBe` sudoProof credential "native" "local_user"
-                    duplicate <- try (createSudoCredential 65534) :: IO (Either IOException SudoCredential)
-                    duplicate `shouldSatisfy` isLeftResult
-            else do
-                created <- try (createSudoCredential 65534) :: IO (Either IOException SudoCredential)
-                created `shouldSatisfy` isLeftResult
-                readSudoCredential 65534 >>= (`shouldSatisfy` isLeftResult)
+            if privileged
+                then do
+                    bracket (createSudoCredential 65534) (const (removeSudoCredential 65534)) $ \credential -> do
+                        stored <- readSudoCredential 65534
+                        case stored of
+                            Left message -> expectationFailure (T.unpack message)
+                            Right restored -> sudoProof restored "native" "local_user" `shouldBe` sudoProof credential "native" "local_user"
+                        duplicate <- try (createSudoCredential 65534) :: IO (Either IOException SudoCredential)
+                        duplicate `shouldSatisfy` isLeftResult
+                else do
+                    created <- try (createSudoCredential 65534) :: IO (Either IOException SudoCredential)
+                    created `shouldSatisfy` isLeftResult
+                    readSudoCredential 65534 >>= (`shouldSatisfy` isLeftResult)
         it "logs in an ordinary mapped identity without elevating its privileges" $
             withTestSudo $ \_ handle credential -> withConnection handle $ \client -> do
                 answer <- tcpSudo client credential "local_user"
@@ -202,7 +217,8 @@ spec = do
         it "rejects disabled and NOLOGIN identities" $
             withTestSudo $ \_ handle credential -> withConnection handle $ \admin -> do
                 _ <- tcpLogin admin testRootName testRootPassword
-                mapM_ (checkSudoDisabled admin handle credential)
+                mapM_
+                    (checkSudoDisabled admin handle credential)
                     ["alter user local_user disabled", "alter user local_user enabled nologin"]
         it "does not inherit sudo authentication from a role" $
             withTestSudo $ \_ handle credential -> withConnection handle $ \admin -> do
@@ -224,6 +240,7 @@ spec = do
     tcpServerSpec
     privilegeSpec
     objectPrivilegeSpec
+    databaseGateSpec
     transactionSpec
     ipcConcurrencySpec
     identitySpec
@@ -245,9 +262,10 @@ identitySpec = describe "unified identities" $ do
             asText (at "status" shown) `shouldBe` "result"
             switched <- tcpQuery manager "use system"
             asText (at "status" switched) `shouldBe` "result"
-            mapM_ (tcpQuery manager
-                     >=>
-                       (\ reply -> asText (at "code" reply) `shouldBe` "forbidden"))
+            mapM_
+                ( tcpQuery manager
+                    >=> (\reply -> asText (at "code" reply) `shouldBe` "forbidden")
+                )
                 ["alter user manager superuser", "alter user managed system_catalog_manager", "alter user managed allow_sudo_auth", "alter user admin identified by 'Another-Pass123!'", "create database forbidden"]
     it "does not inherit catalog management through role membership" $ withTcpServer defaultServerConfig $ \_ handle ->
         withConnection handle $ \admin -> withConnection handle $ \worker -> do
@@ -312,9 +330,10 @@ identitySpec = describe "unified identities" $ do
     it "protects the last enabled login superuser" $ withTcpServer defaultServerConfig $ \_ handle ->
         withConnection handle $ \h -> do
             _ <- tcpLogin h "admin" "s3cret"
-            mapM_ (tcpQuery h
-                     >=>
-                       (\ reply -> asText (at "code" reply) `shouldBe` "bad_request"))
+            mapM_
+                ( tcpQuery h
+                    >=> (\reply -> asText (at "code" reply) `shouldBe` "bad_request")
+                )
                 ["alter user admin disabled", "alter role admin nologin", "alter user admin nosuperuser", "drop user admin", "drop role admin"]
             shown <- tcpQuery h "show roles"
             asText (at "status" shown) `shouldBe` "result"
@@ -383,22 +402,28 @@ testDatabaseName = "test"
 -- | users 5 行 + orders 1 行
 testDb :: Database
 testDb =
-    [ ( "users"
-      , Table
+    [
+        ( "users"
+        , Table
             "users"
             [("id", TInt), ("name", TStr), ("age", TInt)]
             [ [("id", VInt i), ("name", VStr ("user" ++ show i)), ("age", VInt (20 + i))]
             | i <- [1 .. 5]
             ]
-            Nothing Nothing Nothing
-      )
-    , ( "orders"
-      , Table
+            Nothing
+            Nothing
+            Nothing
+        )
+    ,
+        ( "orders"
+        , Table
             "orders"
             [("id", TInt), ("user_id", TInt)]
             [[("id", VInt 1), ("user_id", VInt 1)]]
-            Nothing Nothing Nothing
-      )
+            Nothing
+            Nothing
+            Nothing
+        )
     ]
 
 -- | 测试管理员名字
@@ -466,8 +491,8 @@ tempSettingsPath name = do
 removeIfExists :: FilePath -> IO ()
 removeIfExists path = do
     there <- doesFileExist path
-    when there
-      $ void (try (removeFile path) :: IO (Either IOException ()))
+    when there $
+        void (try (removeFile path) :: IO (Either IOException ()))
 
 -- | 起一台内存后端的测试服务器：管理员已设口令 `s3cret`
 withTcpServer :: ServerConfig -> (ServerEnv -> ServerHandle -> IO a) -> IO a
@@ -493,11 +518,11 @@ withTcpServerAs password config body = do
 withConnection :: ServerHandle -> (Handle -> IO a) -> IO a
 withConnection handle = bracket open closeQuietly
   where
-    -- | 关连接，忽略异常
+    -- \| 关连接，忽略异常
     closeQuietly h = do
         _ <- try (hClose h) :: IO (Either IOException ())
         pure ()
-    -- | 建连接并配成行缓冲句柄
+    -- \| 建连接并配成行缓冲句柄
     open = withSocketsDo $ do
         infos <- getAddrInfo (Just defaultHints{addrSocketType = Stream}) (Just "127.0.0.1") (Just (show (shPort handle)))
         info <- case infos of
@@ -1023,6 +1048,9 @@ privilegeSpec = describe "server privileges" $ do
 
     it "requires administrator privileges for domain commands" $ withPrivileges $ \service root -> do
         authorizeSql service root "CREATE DOMAIN code AS INT" `shouldReturn` Right ()
+        authorizeSql service root "ALTER DOMAIN code SET NOT NULL" `shouldReturn` Right ()
+        authorizeSql service (Ordinary testAccount) "ALTER DOMAIN code SET NOT NULL"
+            `shouldReturn` Left (PrivilegeError "forbidden" "administrator required")
         authorizeSql service (Ordinary testAccount) "CREATE DOMAIN code AS INT"
             `shouldReturn` Left (PrivilegeError "forbidden" "administrator required")
 
@@ -1071,8 +1099,11 @@ privilegeSpec = describe "server privileges" $ do
         _ <- runPrivilegeCommand service root testDatabase (CreateRoleCommand "reader")
         _ <- runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "reader" False)
         _ <- runPrivilegeCommand service root testDatabase (GrantRoleCommand "reader" ["alice"])
-        mapM_ (\sql -> authorizeSql service (Ordinary testAccount) sql
-            `shouldReturn` Left (PrivilegeError "forbidden" "permission denied: SELECT ON orders"))
+        mapM_
+            ( \sql ->
+                authorizeSql service (Ordinary testAccount) sql
+                    `shouldReturn` Left (PrivilegeError "forbidden" "permission denied: SELECT ON orders")
+            )
             [ "SELECT COUNT(*) FROM users HAVING COUNT(*) > (SELECT COUNT(*) FROM orders)"
             , "SELECT name FROM users ORDER BY (SELECT COUNT(*) FROM orders) + id"
             ]
@@ -1172,8 +1203,9 @@ objectPrivilegeSpec = describe "stable object privileges" $ do
         mustRun (beStatement (beWithDatabase backend "test") "CREATE TABLE personal_owned (id INT)")
         claimObject service (Ordinary testAccount) testDatabase "personal_owned" `shouldReturn` Right ()
         grants <- listSelfGrants service (Ordinary testAccount)
-        fmap (filter ((== "test.personal_owned") . grantObject)) grants `shouldBe` Right
-            [Grant "alice" privilege "test.personal_owned" True | privilege <- ["select", "insert", "update", "delete"]]
+        fmap (filter ((== "test.personal_owned") . grantObject)) grants
+            `shouldBe` Right
+                [Grant "alice" privilege "test.personal_owned" True | privilege <- ["select", "insert", "update", "delete"]]
         grants `shouldSatisfy` either (const False) (not . any ((== "test.users") . grantObject))
 
     it "checks DISTINCT table reads and nested subqueries" $ withObjectPrivileges $ \_ service root -> do
@@ -1217,10 +1249,16 @@ objectPrivilegeSpec = describe "stable object privileges" $ do
         release <- newEmptyMVar
         finished <- newEmptyMVar
         revoked <- newEmptyMVar
-        let slow = backend{beWithDatabase = \name -> (beWithDatabase backend name){beStatement = \sql -> do
-                when (sql == "SELECT * FROM users")
-                  $ putMVar started () >> takeMVar release
-                beStatement (beWithDatabase backend name) sql}}
+        let slow =
+                backend
+                    { beWithDatabase = \name ->
+                        (beWithDatabase backend name)
+                            { beStatement = \sql -> do
+                                when (sql == "SELECT * FROM users") $
+                                    putMVar started () >> takeMVar release
+                                beStatement (beWithDatabase backend name) sql
+                            }
+                    }
         settings <- tempSettingsPath "permission-race"
         reader <- newSession slow testRootName settings
         admin <- newSession backend testRootName settings
@@ -1528,9 +1566,159 @@ failureCode = either sessCode (const "")
 intValues :: [[Value]] -> [Int]
 intValues rows = [n | row <- rows, Just (VInt n) <- [nth 0 row]]
 
+-- 数据库执行门的并行、等待与取消回归。
+databaseGateSpec :: Spec
+databaseGateSpec = describe "database execution gates" $ do
+    it "lets another database write while preserving same-database exclusion" $ do
+        entered <- newEmptyMVar
+        release <- newEmptyMVar
+        done <- newEmptyMVar
+        bracket (forkFinally (databaseSecurity [("gate_a", True)] (putMVar entered () >> takeMVar release)) (putMVar done)) killThread $ \_ -> do
+            takeMVar entered
+            timeout 1000000 (databaseSecurity [("gate_b", True)] (pure ())) `shouldReturn` Just ()
+            timeout 50000 (databaseSecurity [("gate_a", False)] (pure ())) `shouldReturn` Nothing
+            timeout 50000 (writeSecurity (pure ())) `shouldReturn` Nothing
+            putMVar release ()
+            result <- timeout 1000000 (takeMVar done)
+            case result of Just (Right ()) -> pure (); _ -> expectationFailure "database writer failed to finish"
+        timeout 1000000 (databaseSecurity [("gate_a", True)] (pure ())) `shouldReturn` Just ()
+        timeout 1000000 (writeSecurity (pure ())) `shouldReturn` Just ()
+
+    it "orders opposite dependency lists and releases cancelled waiters" $ do
+        entered <- newEmptyMVar
+        release <- newEmptyMVar
+        done <- newEmptyMVar
+        bracket (forkFinally (databaseSecurity [("gate_y", True), ("gate_x", False)] (putMVar entered () >> takeMVar release)) (putMVar done)) killThread $ \_ -> do
+            takeMVar entered
+            timeout 50000 (databaseSecurity [("gate_x", True), ("gate_y", False)] (pure ())) `shouldReturn` Nothing
+            putMVar release ()
+            result <- timeout 1000000 (takeMVar done)
+            case result of Just (Right ()) -> pure (); _ -> expectationFailure "ordered writer failed to finish"
+        timeout 1000000 (databaseSecurity [("gate_x", True), ("gate_y", True)] (pure ())) `shouldReturn` Just ()
+
 -- | 显式事务用例
 transactionSpec :: Spec
 transactionSpec = describe "server transactions" $ do
+    it "previews legacy duplicate deletion exactly as storage does" $ do
+        let old = Table "legacy" [("id", TInt), ("name", TStr)] [[("id", VInt 1), ("name", VStr "first")], [("id", VInt 1), ("name", VStr "second")]] Nothing Nothing Nothing
+        case applyTransactionMemory [TxnDelete "legacy" [1, 1]] [("legacy", old)] of
+            Left err -> expectationFailure err
+            Right db -> fmap tableRows (lookup "legacy" db) `shouldBe` Just [[("id", VInt 1), ("name", VStr "second")]]
+
+    it "rechecks UNIQUE on merged rows before publishing any table" $ withTwoSessions $ \first second -> do
+        _ <- mustSql first "CREATE TABLE registrations (id INT PRIMARY KEY, username TEXT UNIQUE)"
+        _ <- mustSql first "BEGIN"
+        _ <- mustSql second "BEGIN"
+        _ <- mustSql first "INSERT INTO registrations (id, username) VALUES (1, 'same')"
+        _ <- mustSql second "INSERT INTO registrations (id, username) VALUES (2, 'same')"
+        _ <- mustSql second "UPDATE users SET age = 99 WHERE id = 1"
+        _ <- mustSql first "COMMIT"
+        denied <- runStatementCoded second "COMMIT"
+        failureCode denied `shouldBe` "serialization_failure"
+        failureMessage denied `shouldBe` "UNIQUE: duplicate value in column username"
+        _ <- mustSql second "ROLLBACK"
+        sessionAge first 1 `shouldReturn` Just 21
+        rows <- mustSql first "SELECT id FROM registrations"
+        qrRows rows `shouldBe` [[VInt 1]]
+
+    it "allows distinct unique values and multiple NULLs after merging" $ withTwoSessions $ \first second -> do
+        _ <- mustSql first "CREATE TABLE registrations (id INT PRIMARY KEY, username TEXT UNIQUE)"
+        forM_ [first, second] $ \session -> void (mustSql session "BEGIN")
+        _ <- mustSql first "INSERT INTO registrations (id, username) VALUES (1, 'one'), (3, NULL)"
+        _ <- mustSql second "INSERT INTO registrations (id, username) VALUES (2, 'two'), (4, NULL)"
+        _ <- mustSql first "COMMIT"
+        _ <- mustSql second "COMMIT"
+        rows <- mustSql first "SELECT COUNT(*) FROM registrations"
+        qrRows rows `shouldBe` [[VInt 4]]
+
+    forM_ ["SELECT id FROM test.users WHERE id = 1", "SELECT id FROM users WHERE EXISTS (SELECT id FROM users WHERE age > 0)"] $ \readSql ->
+        it ("protects serializable read dependencies: " ++ T.unpack readSql) $ withTwoSessions $ \first second -> do
+            _ <- mustSql first "CREATE TABLE actions (id INT PRIMARY KEY)"
+            _ <- mustSql first "BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE"
+            _ <- mustSql first readSql
+            _ <- mustSql first "INSERT INTO actions (id) VALUES (1)"
+            _ <- mustSql second "INSERT INTO users (id, name, age) VALUES (7, 'new', 20)"
+            denied <- runStatementCoded first "COMMIT"
+            failureCode denied `shouldBe` "serialization_failure"
+            _ <- mustSql first "ROLLBACK"
+            rows <- mustSql second "SELECT COUNT(*) FROM actions"
+            qrRows rows `shouldBe` [[VInt 0]]
+
+    it "forgets rolled-back reads and ignores unrelated table changes" $ withTwoSessions $ \first second -> do
+        _ <- mustSql first "CREATE TABLE actions (id INT PRIMARY KEY)"
+        _ <- mustSql first "START TRANSACTION ISOLATION LEVEL SERIALIZABLE"
+        _ <- mustSql first "SAVEPOINT before_read"
+        _ <- mustSql first "SELECT * FROM users"
+        _ <- mustSql first "ROLLBACK TO before_read"
+        _ <- mustSql first "INSERT INTO actions (id) VALUES (1)"
+        _ <- mustSql second "UPDATE users SET age = 99 WHERE id = 1"
+        _ <- mustSql first "COMMIT"
+        rows <- mustSql second "SELECT COUNT(*) FROM actions"
+        qrRows rows `shouldBe` [[VInt 1]]
+
+    it "allows a serializable read-only snapshot to finish" $ withTwoSessions $ \first second -> do
+        _ <- mustSql first "BEGIN ISOLATION LEVEL SERIALIZABLE"
+        _ <- mustSql first "SELECT * FROM users"
+        _ <- mustSql second "UPDATE users SET age = 99 WHERE id = 1"
+        void (mustSql first "COMMIT")
+
+    forM_ [("another commit", True), ("an autocommit update", False)] $ \(label, transactional) ->
+        it ("excludes " ++ label ++ " between conflict checking and publication") $ do
+            db <- newMVar testDb
+            settings <- tempSettingsPath "transaction-publication"
+            removeIfExists settings
+            armed <- newIORef False
+            snapshots <- newIORef (0 :: Int)
+            captured <- newEmptyMVar
+            release <- newEmptyMVar
+            secondSnapshot <- newEmptyMVar
+            let
+                -- 在首次提交取得快照后暂停发布。
+                pausedBackend original =
+                    original
+                        { beWithDatabase = pausedBackend . beWithDatabase original
+                        , beStatement = \sql -> do
+                            enabled <- readIORef armed
+                            when (enabled && not transactional && sql == "UPDATE users SET age = 32 WHERE id = 1") (putMVar secondSnapshot ())
+                            beStatement original sql
+                        , beSnapshot = do
+                            result <- beSnapshot original
+                            enabled <- readIORef armed
+                            when enabled $ do
+                                n <- atomicModifyIORef' snapshots (\count -> (count + 1, count))
+                                when (n == 0) (putMVar captured () >> takeMVar release)
+                                when (n == 1) (putMVar secondSnapshot ())
+                            pure result
+                        }
+                backend = pausedBackend (memoryBackend testDatabaseName db)
+            first <- newSession backend (T.pack testDatabaseName) settings
+            second <- newSession backend (T.pack testDatabaseName) settings
+            mapM_ (`mustSql` "USE test") [first, second]
+            _ <- mustSql first "BEGIN"
+            when transactional $ do
+                _ <- mustSql second "BEGIN"
+                void (mustSql second "UPDATE users SET age = 32 WHERE id = 1")
+            _ <- mustSql first "UPDATE users SET age = 31 WHERE id = 1"
+            writeIORef armed True
+            firstDone <- newEmptyMVar
+            secondDone <- newEmptyMVar
+            bracket (forkFinally (runStatementCoded first "COMMIT") (putMVar firstDone)) killThread $ \_ -> do
+                timeout 2000000 (takeMVar captured) `shouldReturn` Just ()
+                bracket (forkFinally (runStatementCoded second (if transactional then "COMMIT" else "UPDATE users SET age = 32 WHERE id = 1")) (putMVar secondDone)) killThread $ \_ -> do
+                    entered <- timeout 200000 (takeMVar secondSnapshot)
+                    putMVar release ()
+                    firstResult <- timeout 2000000 (takeMVar firstDone)
+                    secondResult <- timeout 2000000 (takeMVar secondDone)
+                    entered `shouldBe` Nothing
+                    case firstResult of
+                        Just (Right result) -> failureCode result `shouldBe` ""
+                        _ -> expectationFailure "first commit did not complete"
+                    case secondResult of
+                        Just (Right result) -> failureCode result `shouldBe` (if transactional then "serialization_failure" else "")
+                        _ -> expectationFailure "second commit did not complete"
+            when transactional $ void (mustSql second "ROLLBACK")
+            sessionAge first 1 `shouldReturn` Just (if transactional then 31 else 32)
+
     it "executes DISTINCT against the connection snapshot with output columns" $ withMemorySession $ \session -> do
         _ <- mustSql session "CREATE TABLE distinct_values (id INT, value INT)"
         _ <- mustSql session "INSERT INTO distinct_values (id,value) VALUES (1,7),(2,7),(3,8)"
@@ -1575,7 +1763,7 @@ transactionSpec = describe "server transactions" $ do
         updated <- beStatement backend "UPDATE users SET id = 3"
         void updated `shouldBe` Right ()
         snapshot <- beSnapshot (memoryBackend "other" ref)
-        fmap (map (tableRows . snd)) snapshot `shouldBe` Right [[[ ("id", VInt 2) ]]]
+        fmap (map (tableRows . snd)) snapshot `shouldBe` Right [[[("id", VInt 2)]]]
     it "keeps catalog and snapshot identities stable across system views and replacements" $ do
         ref <- newMVar [("test.users", Table "users" [("id", TInt)] [] Nothing Nothing Nothing)]
         let backend = memoryBackend "test" ref
@@ -1601,9 +1789,11 @@ transactionSpec = describe "server transactions" $ do
         fmap (map tiSchemaVersion) current `shouldBe` Right [Just 3]
         fmap (map (tableSchemaVersion . snd)) snapshot `shouldBe` Right [Just 3]
     it "rejects cross-database reads and writes including nested queries" $ withMemorySession $ \session -> do
-        mapM_ (\query -> do
-            result <- runStatementCoded session query
-            failureMessage result `shouldSatisfy` T.isInfixOf "outside the current database")
+        mapM_
+            ( \query -> do
+                result <- runStatementCoded session query
+                failureMessage result `shouldSatisfy` T.isInfixOf "outside the current database"
+            )
             [ "SELECT DISTINCT age FROM other.users"
             , "SELECT * FROM other.users"
             , "UPDATE other.users SET age = 1"
@@ -1632,12 +1822,32 @@ transactionSpec = describe "server transactions" $ do
         _ <- mustSql session "create domain code as int"
         _ <- mustSql session "create table typed (id code)"
         _ <- mustSql session "begin"
+        alterDenied <- runStatementCoded session "alter domain code set not null"
+        failureMessage alterDenied `shouldBe` "DDL is not allowed in a transaction"
         denied <- runStatementCoded session "drop domain code"
         failureMessage denied `shouldBe` "DDL is not allowed in a transaction"
         _ <- mustSql session "insert into typed (id) values (7)"
         _ <- mustSql session "commit"
         rows <- mustSql session "select id from typed"
         intValues (qrRows rows) `shouldBe` [7]
+
+    it "rejects stale transaction writes after a domain constraint changes" $ withTwoSessions $ \writer administrator -> do
+        void (mustSql administrator "CREATE DOMAIN quantity AS INT")
+        void (mustSql administrator "CREATE DOMAIN nested AS quantity")
+        void (mustSql administrator "CREATE TABLE domain_items (id INT, qty nested)")
+        void (mustSql writer "BEGIN")
+        void (mustSql writer "INSERT INTO domain_items (id, qty) VALUES (1, 0)")
+        void (mustSql administrator "ALTER DOMAIN quantity ADD CHECK (VALUE > 0)")
+        refused <- runStatementCoded writer "COMMIT"
+        failureCode refused `shouldBe` "serialization_failure"
+        void (mustSql writer "ROLLBACK")
+        rows <- mustSql administrator "SELECT qty FROM domain_items"
+        qrRows rows `shouldBe` []
+        void (mustSql writer "BEGIN")
+        void (mustSql writer "INSERT INTO domain_items (id, qty) VALUES (2, 2)")
+        void (mustSql writer "COMMIT")
+        saved <- mustSql administrator "SELECT qty FROM domain_items"
+        intValues (qrRows saved) `shouldBe` [2]
 
     it "keeps uncommitted rows invisible to other sessions until COMMIT" $ withTwoSessions $ \writer reader -> do
         _ <- mustSql writer "begin"
@@ -1684,11 +1894,12 @@ transactionSpec = describe "server transactions" $ do
         ref <- newMVar testDb
         settings <- tempSettingsPath "snapshot-failure"
         let base = memoryBackend testDatabaseName ref
-            -- | 保留测试后端并让快照读取失败
-            failing name = (beWithDatabase base name)
-                { beSnapshot = pure (Left "data page unreadable")
-                , beWithDatabase = failing
-                }
+            -- \| 保留测试后端并让快照读取失败
+            failing name =
+                (beWithDatabase base name)
+                    { beSnapshot = pure (Left "data page unreadable")
+                    , beWithDatabase = failing
+                    }
         session <- newSession (failing testDatabaseName) (T.pack testDatabaseName) settings
         void (mustSql session "USE test")
         result <- runStatementCoded session "BEGIN"
@@ -1708,12 +1919,15 @@ transactionSpec = describe "server transactions" $ do
         _ <- mustSql session "CREATE TABLE constrained_updates (id INT PRIMARY KEY, qty INT NOT NULL UNIQUE)"
         _ <- mustSql session "INSERT INTO constrained_updates (id, qty) VALUES (1, 2), (2, 3)"
         _ <- mustSql session "BEGIN"
-        mapM_ (\(query, marker) -> do
-            result <- runStatementCoded session query
-            failureMessage result `shouldSatisfy` T.isInfixOf marker)
-            [("UPDATE constrained_updates SET qty = NULL WHERE id = 1", "NOT NULL")
+        mapM_
+            ( \(query, marker) -> do
+                result <- runStatementCoded session query
+                failureMessage result `shouldSatisfy` T.isInfixOf marker
+            )
+            [ ("UPDATE constrained_updates SET qty = NULL WHERE id = 1", "NOT NULL")
             , ("UPDATE constrained_updates SET qty = 3 WHERE id = 1", "UNIQUE")
-            , ("UPDATE constrained_updates SET id = 2 WHERE id = 1", "UNIQUE")]
+            , ("UPDATE constrained_updates SET id = 2 WHERE id = 1", "UNIQUE")
+            ]
         unchanged <- mustSql session "SELECT qty FROM constrained_updates ORDER BY id"
         intValues (qrRows unchanged) `shouldBe` [2, 3]
         _ <- mustSql session "UPDATE constrained_updates SET qty = qty + 1"
@@ -2005,6 +2219,26 @@ ipcConcurrencySpec = describe "server backend on the real storage" $ do
         intColumn "id" rowsA `shouldMatchList` [1 .. 20]
         intColumn "id" rowsB `shouldMatchList` [101 .. 120]
 
+    it "shares a committed snapshot and keeps old versions immutable" $ withIpcStorage $ do
+        base <- ipcBackend
+        mustRun (beStatement base "CREATE DATABASE alpha")
+        let alpha = beWithDatabase base "alpha"
+        mustRun (beStatement alpha "CREATE TABLE versions (id INT PRIMARY KEY, value INT)")
+        mustRun (beStatement alpha "INSERT INTO versions (id, value) VALUES (1, 10)")
+        first <- beSnapshot alpha >>= either fail pure
+        second <- beSnapshot alpha >>= either fail pure
+        firstName <- evaluate first >>= makeStableName
+        secondName <- evaluate second >>= makeStableName
+        (firstName == secondName) `shouldBe` True
+        mustRun (beStatement alpha "UPDATE versions SET value = 20 WHERE id = 1")
+        latest <- beSnapshot alpha >>= either fail pure
+        fmap tableRows (lookup "versions" first) `shouldBe` Just [[("id", VInt 1), ("value", VInt 10)]]
+        fmap tableRows (lookup "versions" latest) `shouldBe` Just [[("id", VInt 1), ("value", VInt 20)]]
+        mustRun (beStatement base "DROP DATABASE alpha")
+        mustRun (beStatement base "CREATE DATABASE alpha")
+        recreated <- beSnapshot alpha >>= either fail pure
+        map fst recreated `shouldNotContain` ["versions"]
+
     it "commits an explicit transaction to the real storage" $ withIpcStorage $ do
         base <- ipcBackend
         mustRun (beStatement base "CREATE DATABASE alpha")
@@ -2042,6 +2276,29 @@ ipcConcurrencySpec = describe "server backend on the real storage" $ do
         rows <- rowsOf (beStatement alpha "SELECT id FROM t")
         intColumn "id" rows `shouldBe` [1]
 
+    it "merges disjoint row writes while retaining the old snapshot" $ withIpcStorage $ do
+        base <- ipcBackend
+        mustRun (beStatement base "CREATE DATABASE alpha")
+        let alpha = beWithDatabase base "alpha"
+        mustRun (beStatement alpha "CREATE TABLE items (id int, value int)")
+        mustRun (beStatement alpha "INSERT INTO items (id, value) VALUES (1, 10), (2, 20)")
+        settings <- tempSettingsPath "transaction-ipc-rows"
+        removeIfExists settings
+        first <- newSession alpha "alpha" settings
+        second <- newSession alpha "alpha" settings
+        _ <- mustSql first "use alpha"
+        _ <- mustSql second "use alpha"
+        _ <- mustSql first "begin"
+        _ <- mustSql second "begin"
+        _ <- mustSql first "update items set value = 11 where id = 1"
+        _ <- mustSql second "update items set value = 22 where id = 2"
+        _ <- mustSql first "commit"
+        old <- mustSql second "select value from items where id = 1"
+        intValues (qrRows old) `shouldBe` [10]
+        _ <- mustSql second "commit"
+        rows <- rowsOf (beStatement alpha "SELECT value FROM items ORDER BY id")
+        intColumn "value" rows `shouldBe` [11, 22]
+
     it "refuses the second COMMIT on the real storage" $ withIpcStorage $ do
         base <- ipcBackend
         mustRun (beStatement base "CREATE DATABASE alpha")
@@ -2057,16 +2314,14 @@ ipcConcurrencySpec = describe "server backend on the real storage" $ do
         _ <- mustSql first "begin"
         _ <- mustSql second "begin"
         _ <- mustSql first "update users set age = 31 where id = 1"
-        _ <- mustSql second "update users set age = 42 where id = 1"
         _ <- mustSql first "commit"
-        denied <- runStatementCoded second "commit"
+        denied <- runStatementCoded second "update users set age = 42 where id = 1"
         failureCode denied `shouldBe` "serialization_failure"
-        failureMessage denied `shouldBe` "write conflict on table users, id 1"
+        failureMessage denied `shouldSatisfy` T.isInfixOf "row version changed"
         _ <- mustSql second "rollback"
         rows <- rowsOf (beStatement alpha "SELECT id, age FROM users")
         intColumn "id" rows `shouldBe` [1]
         intColumn "age" rows `shouldBe` [31]
-
 
 -- 判断明确错误返回。
 isLeftResult :: Either a b -> Bool
@@ -2094,8 +2349,16 @@ tcpSudo client credential user = do
 
 -- 发送本机认证证明。
 tcpSudoProof :: Handle -> Text -> Text -> IO A.Value
-tcpSudoProof client user proof = tcpTalk client (BL.toStrict (A.encode (A.object
-    ["method" A..= ("sudo_login" :: Text), "user" A..= user, "proof" A..= proof])))
+tcpSudoProof client user proof =
+    tcpTalk
+        client
+        ( BL.toStrict
+            ( A.encode
+                ( A.object
+                    ["method" A..= ("sudo_login" :: Text), "user" A..= user, "proof" A..= proof]
+                )
+            )
+        )
 
 -- 验证身份禁用或取消登录后拒绝本机认证。
 checkSudoDisabled :: Handle -> ServerHandle -> SudoCredential -> Text -> IO ()
@@ -2110,7 +2373,6 @@ checkSudoDisabled admin handle credential sql = do
 isRightResult :: Either a b -> Bool
 isRightResult (Right _) = True
 isRightResult _ = False
-
 
 -- 专用范式协议、权限、快照与预算回归。
 normalizationSpec :: Spec
@@ -2127,8 +2389,9 @@ normalizationSpec = describe "normalization endpoint" $ do
         let response = RespNormalization report
         decodeResponse (encodeResponse response) `shouldBe` Right response
         decodeResponse (encodeResponse (RespNormalization (A.object ["conditional" A..= True]))) `shouldSatisfy` either (const True) (const False)
-        mapM_ (\raw -> decodeNormalizationJSON raw `shouldSatisfy` either (T.isInfixOf "duplicate") (const False))
-            [ "{\"a\":1,\"a\":2}", "{\"a\":1,\"\\u0061\":2}", "{\"a\":[{\"b\":1,\"b\":2}]}" ]
+        mapM_
+            (\raw -> decodeNormalizationJSON raw `shouldSatisfy` either (T.isInfixOf "duplicate") (const False))
+            ["{\"a\":1,\"a\":2}", "{\"a\":1,\"\\u0061\":2}", "{\"a\":[{\"b\":1,\"b\":2}]}"]
         let unknown = A.object ["api_version" A..= (1 :: Int), "database" A..= ("test" :: Text), "table" A..= ("users" :: Text), "declaration" A..= nrDeclaration normalizationPayload, "ignored" A..= True]
         (A.fromJSON unknown :: A.Result NormalizationRequest) `shouldSatisfy` isJSONFailure
         decodeRequest (BL.toStrict (encodeRequest (ReqNormalization normalizationPayload{nrVersion = 2}))) `shouldSatisfy` either (const True) (const False)
@@ -2222,8 +2485,14 @@ normalizationSpec = describe "normalization endpoint" $ do
 
 -- 共用明确声明的用户表请求。
 normalizationPayload :: NormalizationRequest
-normalizationPayload = NormalizationRequest 1 "test" "users"
-    (NormalizationDeclaration [["id"]] [NormalizationDependency ["id"] ["name", "age"]] True (Just True)) Nothing Nothing
+normalizationPayload =
+    NormalizationRequest
+        1
+        "test"
+        "users"
+        (NormalizationDeclaration [["id"]] [NormalizationDependency ["id"] ["name", "age"]] True (Just True))
+        Nothing
+        Nothing
 
 -- 判断 JSON 类型校验失败。
 isJSONFailure :: A.Result a -> Bool

@@ -36,8 +36,7 @@ fn defaults_without_file() {
 fn file_overrides_only_written_keys() {
     let _guard = env_guard();
     let path = PathBuf::from("t.toml");
-    let loaded = config::resolve(Some("[page]\nsize = 8192\n"), Some(path.clone()))
-        .unwrap();
+    let loaded = config::resolve(Some("[page]\nsize = 8192\n"), Some(path.clone())).unwrap();
 
     assert_eq!(loaded.config.page_size, 8192);
     assert_eq!(loaded.config.btree_order, DEFAULT_BTREE_ORDER);
@@ -45,9 +44,17 @@ fn file_overrides_only_written_keys() {
     assert_eq!(loaded.config.log_files, PathBuf::from(DEFAULT_LOG_FILES));
     assert_eq!(loaded.config_path, Some(path.clone()));
 
-    let page = loaded.origins.iter().find(|(n, _, _)| *n == "page.size").unwrap();
+    let page = loaded
+        .origins
+        .iter()
+        .find(|(n, _, _)| *n == "page.size")
+        .unwrap();
     assert_eq!(page.2, Origin::File(path));
-    let order = loaded.origins.iter().find(|(n, _, _)| *n == "btree.order").unwrap();
+    let order = loaded
+        .origins
+        .iter()
+        .find(|(n, _, _)| *n == "btree.order")
+        .unwrap();
     assert_eq!(order.2, Origin::Default);
 }
 
@@ -110,7 +117,11 @@ fn default_config_path_follows_system_convention() {
     let path = config::default_config_path();
     assert_eq!(path.file_name().unwrap(), "settings.toml");
     assert_eq!(path.parent().unwrap().file_name().unwrap(), "ChuSQL");
-    assert!(path.ends_with(format!("ChuSQL{}settings.toml", std::path::MAIN_SEPARATOR)), "got {}", path.display());
+    assert!(
+        path.ends_with(format!("ChuSQL{}settings.toml", std::path::MAIN_SEPARATOR)),
+        "got {}",
+        path.display()
+    );
 
     // 本机 APPDATA 存在时必须是 %APPDATA%\ChuSQL\settings.toml
     #[cfg(windows)]
@@ -168,7 +179,11 @@ fn explicit_missing_path_is_an_error() {
         "got {}",
         err
     );
-    assert!(err.contains("chusql-no-such-config-9f21.toml"), "got {}", err);
+    assert!(
+        err.contains("chusql-no-such-config-9f21.toml"),
+        "got {}",
+        err
+    );
 }
 
 /// 不给 --config 且无配置文件时用内置默认

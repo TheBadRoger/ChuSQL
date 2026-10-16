@@ -37,6 +37,8 @@ pub struct TableSchema {
     #[serde(default)]
     pub object_id: u64,
     #[serde(default)]
+    pub file_generation: String,
+    #[serde(default)]
     // 0 表示旧目录尚无可验证的结构版本。
     pub schema_version: u64,
     #[serde(default)]
@@ -78,6 +80,13 @@ impl Catalog {
             return Ok(Catalog::default());
         }
         let mut catalog: Self = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+        if catalog
+            .tables
+            .values()
+            .any(|schema| !valid_generation(&schema.file_generation))
+        {
+            return Err(io::Error::other("invalid physical file generation"));
+        }
         catalog.upgrade_object_ids()?;
         Ok(catalog)
     }
@@ -94,7 +103,9 @@ impl Catalog {
         }
         for schema in self.tables.values_mut() {
             if schema.object_id == 0 {
-                self.object_high_water = self.object_high_water.checked_add(1)
+                self.object_high_water = self
+                    .object_high_water
+                    .checked_add(1)
                     .ok_or_else(|| io::Error::other("catalog object id exhausted"))?;
                 schema.object_id = self.object_high_water;
             }
@@ -102,9 +113,37 @@ impl Catalog {
         Ok(())
     }
 
+    /// 切换物理文件代次而不改变逻辑结构版本
+    pub(crate) fn set_generation(
+        &mut self,
+        table: &str,
+        object: u64,
+        source: &str,
+        target: &str,
+    ) -> io::Result<()> {
+        if !valid_generation(target) {
+            return Err(io::Error::other("invalid physical file generation"));
+        }
+        let schema = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| io::Error::other("migration table missing"))?;
+        if schema.object_id != object
+            || (schema.file_generation != source && schema.file_generation != target)
+        {
+            return Err(io::Error::other(
+                "serialization_failure: migration object changed",
+            ));
+        }
+        schema.file_generation = target.to_owned();
+        Ok(())
+    }
+
     /// 分配不复用的对象编号
     pub fn reserve_object_id(&mut self) -> io::Result<u64> {
-        self.object_high_water = self.object_high_water.checked_add(1)
+        self.object_high_water = self
+            .object_high_water
+            .checked_add(1)
             .ok_or_else(|| io::Error::other("catalog object id exhausted"))?;
         Ok(self.object_high_water)
     }
@@ -123,7 +162,11 @@ impl Catalog {
         file.sync_all()?;
         drop(file);
         std::fs::rename(pending, &path)?;
-        std::fs::OpenOptions::new().read(true).write(true).open(path)?.sync_all()
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?
+            .sync_all()
     }
 
     /// 一张表的 schema
@@ -149,7 +192,12 @@ impl Catalog {
     }
 
     /// 按日志中的编号建立表
-    pub fn create_table_with_id(&mut self, table: &str, columns: Vec<SchemaColumn>, object_id: Option<u64>) -> io::Result<()> {
+    pub fn create_table_with_id(
+        &mut self,
+        table: &str,
+        columns: Vec<SchemaColumn>,
+        object_id: Option<u64>,
+    ) -> io::Result<()> {
         if self.tables.contains_key(table) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -160,13 +208,17 @@ impl Catalog {
             Some(id) if id == 0 || self.tables.values().any(|schema| schema.object_id == id) => {
                 return Err(io::Error::other("invalid catalog object id"));
             }
-            Some(id) => { self.object_high_water = self.object_high_water.max(id); id }
+            Some(id) => {
+                self.object_high_water = self.object_high_water.max(id);
+                id
+            }
             None => self.reserve_object_id()?,
         };
         self.tables.insert(
             table.to_string(),
             TableSchema {
                 object_id,
+                file_generation: String::new(),
                 schema_version: 1,
                 system: false,
                 columns,
@@ -182,7 +234,9 @@ impl Catalog {
 
     /// 标记内部账号表
     pub fn mark_system(&mut self, table: &str) -> io::Result<()> {
-        let entry = self.tables.get_mut(table)
+        let entry = self
+            .tables
+            .get_mut(table)
             .ok_or_else(|| io::Error::other("missing system table"))?;
         entry.system = true;
         Ok(())
@@ -306,7 +360,10 @@ impl Catalog {
             ));
         }
         let version = next_schema_version(entry)?;
-        let mut entry = self.tables.remove(from).ok_or_else(|| io::Error::other("missing rename source"))?;
+        let mut entry = self
+            .tables
+            .remove(from)
+            .ok_or_else(|| io::Error::other("missing rename source"))?;
         entry.schema_version = version;
         self.seen.remove(from);
         self.tables.insert(to.to_string(), entry);
@@ -319,13 +376,19 @@ impl Catalog {
     }
 
     /// 用日志中的目标版本替换列定义
-    pub fn set_columns_version(&mut self, table: &str, columns: Vec<SchemaColumn>, version: Option<u64>) -> io::Result<()> {
-        let entry = self
-            .tables
-            .get_mut(table)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("unknown table: {}", table)))?;
+    pub fn set_columns_version(
+        &mut self,
+        table: &str,
+        columns: Vec<SchemaColumn>,
+        version: Option<u64>,
+    ) -> io::Result<()> {
+        let entry = self.tables.get_mut(table).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("unknown table: {}", table))
+        })?;
         if let Some(version) = version {
-            if version == 0 { return Err(io::Error::other("invalid WAL schema version")); }
+            if version == 0 {
+                return Err(io::Error::other("invalid WAL schema version"));
+            }
             entry.schema_version = version;
         } else if entry.columns != columns {
             entry.schema_version = next_schema_version(entry)?;
@@ -342,7 +405,11 @@ impl Catalog {
     pub fn normalize_types(&mut self) -> io::Result<bool> {
         let mut changed = false;
         for entry in self.tables.values_mut() {
-            if entry.columns.iter().any(|column| normalize_type(&column.ty) != column.ty) {
+            if entry
+                .columns
+                .iter()
+                .any(|column| normalize_type(&column.ty) != column.ty)
+            {
                 entry.schema_version = next_schema_version(entry)?;
             }
             for column in entry.columns.iter_mut() {
@@ -362,13 +429,19 @@ impl Catalog {
     }
 
     /// 用日志目标版本删除列定义
-    pub fn remove_column_version(&mut self, table: &str, column: &str, version: Option<u64>) -> io::Result<bool> {
-        let entry = self
-            .tables
-            .get_mut(table)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("unknown table: {}", table)))?;
+    pub fn remove_column_version(
+        &mut self,
+        table: &str,
+        column: &str,
+        version: Option<u64>,
+    ) -> io::Result<bool> {
+        let entry = self.tables.get_mut(table).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("unknown table: {}", table))
+        })?;
         if let Some(version) = version {
-            if version == 0 { return Err(io::Error::other("invalid WAL schema version")); }
+            if version == 0 {
+                return Err(io::Error::other("invalid WAL schema version"));
+            }
             entry.schema_version = version;
         } else if entry.columns.iter().any(|c| c.name == column) {
             entry.schema_version = next_schema_version(entry)?;
@@ -388,10 +461,9 @@ impl Catalog {
 
     /// 记住这一版已整理过（隐藏列名要留住）
     pub fn mark_compacted(&mut self, table: &str) -> io::Result<()> {
-        let entry = self
-            .tables
-            .get_mut(table)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("unknown table: {}", table)))?;
+        let entry = self.tables.get_mut(table).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("unknown table: {}", table))
+        })?;
         entry.compacted = true;
         self.seen.remove(table);
         Ok(())
@@ -399,7 +471,9 @@ impl Catalog {
 
     /// 这张表还有隐藏列字节吗
     pub fn has_dropped_columns(&self, table: &str) -> bool {
-        self.tables.get(table).is_some_and(|e| !e.dropped_columns.is_empty())
+        self.tables
+            .get(table)
+            .is_some_and(|e| !e.dropped_columns.is_empty())
     }
 
     /// 还有隐藏列字节待整理的表
@@ -413,10 +487,9 @@ impl Catalog {
 
     /// 记下一条索引定义
     pub fn add_index(&mut self, table: &str, column: &str) -> io::Result<()> {
-        let entry = self
-            .tables
-            .get_mut(table)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("unknown table: {}", table)))?;
+        let entry = self.tables.get_mut(table).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("unknown table: {}", table))
+        })?;
         if entry.indexes.iter().any(|i| i.column == column) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -431,10 +504,9 @@ impl Catalog {
 
     /// 去掉一条索引定义
     pub fn remove_index(&mut self, table: &str, column: &str) -> io::Result<()> {
-        let entry = self
-            .tables
-            .get_mut(table)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("unknown table: {}", table)))?;
+        let entry = self.tables.get_mut(table).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("unknown table: {}", table))
+        })?;
         match entry.indexes.iter().position(|i| i.column == column) {
             None => Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -450,11 +522,20 @@ impl Catalog {
 
 /// 把行里"字典还不知道的列"补进来；返回有没有变化
 fn add_missing_columns(entry: &mut TableSchema, row: &Row) -> io::Result<bool> {
-    let additions: Vec<_> = row.iter().filter(|(name, _)|
-        !entry.dropped_columns.contains(*name) && !entry.columns.iter().any(|c| &c.name == *name))
-        .filter_map(|(name, value)| infer_type(value).map(|ty| SchemaColumn {
-            name: name.clone(), ty, ..Default::default()
-        })).collect();
+    let additions: Vec<_> = row
+        .iter()
+        .filter(|(name, _)| {
+            !entry.dropped_columns.contains(*name)
+                && !entry.columns.iter().any(|c| &c.name == *name)
+        })
+        .filter_map(|(name, value)| {
+            infer_type(value).map(|ty| SchemaColumn {
+                name: name.clone(),
+                ty,
+                ..Default::default()
+            })
+        })
+        .collect();
     if additions.is_empty() {
         return Ok(false);
     }
@@ -465,7 +546,9 @@ fn add_missing_columns(entry: &mut TableSchema, row: &Row) -> io::Result<bool> {
 
 /// 递增结构版本，耗尽时拒绝变更
 fn next_schema_version(entry: &TableSchema) -> io::Result<u64> {
-    entry.schema_version.checked_add(1)
+    entry
+        .schema_version
+        .checked_add(1)
         .ok_or_else(|| io::Error::other("catalog schema version exhausted"))
 }
 
@@ -576,12 +659,22 @@ fn hist_add(stat: &mut ColumnStat, v: &serde_json::Value) {
 /// 从直方图里减掉一个值；值在区间外就不动
 fn hist_remove(stat: &mut ColumnStat, v: &serde_json::Value) {
     let Some(x) = v.as_f64() else { return };
-    let (Some(lo), Some(hi)) = (stat.lo, stat.hi) else { return };
+    let (Some(lo), Some(hi)) = (stat.lo, stat.hi) else {
+        return;
+    };
     if x < lo || x > hi || stat.hist.len() != HIST_BUCKETS {
         return;
     }
     let index = hist_index(lo, hi, x);
-    if let Some(bucket) = (0..stat.hist.len()).filter(|&i| stat.hist[i] > 0).min_by_key(|&i| i.abs_diff(index)) {
+    if let Some(bucket) = (0..stat.hist.len())
+        .filter(|&i| stat.hist[i] > 0)
+        .min_by_key(|&i| i.abs_diff(index))
+    {
         stat.hist[bucket] -= 1;
     }
+}
+
+/// 文件代次仅允许空值或固定长度十六进制
+pub(crate) fn valid_generation(value: &str) -> bool {
+    value.is_empty() || (value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }

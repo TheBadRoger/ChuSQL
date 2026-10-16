@@ -1,6 +1,6 @@
 use std::cell::RefCell;
-use std::ffi::{c_char, CStr};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::ffi::{CStr, c_char};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::slice;
 
@@ -42,7 +42,11 @@ pub unsafe extern "C" fn chusql_storage_open(config_path: *const c_char) -> *mut
             let text = unsafe { CStr::from_ptr(config_path) }
                 .to_str()
                 .map_err(|_| "config path is not valid UTF-8".to_string())?;
-            if text.is_empty() { None } else { Some(text.to_string()) }
+            if text.is_empty() {
+                None
+            } else {
+                Some(text.to_string())
+            }
         };
         Storage::open(path.as_deref()).map(Box::new)
     }));
@@ -78,27 +82,57 @@ pub unsafe extern "C" fn chusql_storage_close(handle: *mut Storage) {
 /// 输出指针可写且不与输入重叠；响应使用 free 释放。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn chusql_storage_maintenance(
-    config_path: *const c_char, request: *const u8, request_len: usize,
-    out: *mut *mut u8, out_len: *mut usize,
+    config_path: *const c_char,
+    request: *const u8,
+    request_len: usize,
+    out: *mut *mut u8,
+    out_len: *mut usize,
 ) -> i32 {
-    if !out.is_null() { unsafe { *out = ptr::null_mut(); } }
-    if !out_len.is_null() { unsafe { *out_len = 0; } }
-    if request.is_null() || out.is_null() || out_len.is_null() || request_len > isize::MAX as usize {
+    if !out.is_null() {
+        unsafe {
+            *out = ptr::null_mut();
+        }
+    }
+    if !out_len.is_null() {
+        unsafe {
+            *out_len = 0;
+        }
+    }
+    if request.is_null() || out.is_null() || out_len.is_null() || request_len > isize::MAX as usize
+    {
         set_error("invalid maintenance argument");
         return ERR;
     }
     let result = catch_unwind(AssertUnwindSafe(|| {
-        let path = if config_path.is_null() { None } else { Some(unsafe { CStr::from_ptr(config_path) }.to_str().map_err(|e| e.to_string())?) };
-        let text = std::str::from_utf8(unsafe { slice::from_raw_parts(request, request_len) }).map_err(|e| e.to_string())?;
+        let path = if config_path.is_null() {
+            None
+        } else {
+            Some(
+                unsafe { CStr::from_ptr(config_path) }
+                    .to_str()
+                    .map_err(|e| e.to_string())?,
+            )
+        };
+        let text = std::str::from_utf8(unsafe { slice::from_raw_parts(request, request_len) })
+            .map_err(|e| e.to_string())?;
         Storage::maintenance(path, text)
     }));
     let response = match result {
         Ok(Ok(response)) => response,
-        Ok(Err(err)) => { set_error(err); return ERR; }
-        Err(_) => { set_error("panic in system maintenance"); return ERR; }
+        Ok(Err(err)) => {
+            set_error(err);
+            return ERR;
+        }
+        Err(_) => {
+            set_error("panic in system maintenance");
+            return ERR;
+        }
     };
     let buffer = response.into_bytes().into_boxed_slice();
-    unsafe { *out_len = buffer.len(); *out = Box::into_raw(buffer) as *mut u8; }
+    unsafe {
+        *out_len = buffer.len();
+        *out = Box::into_raw(buffer) as *mut u8;
+    }
     OK
 }
 
@@ -121,7 +155,12 @@ pub unsafe extern "C" fn chusql_storage_request(
     if !out_len.is_null() {
         unsafe { *out_len = 0 };
     }
-    if handle.is_null() || request.is_null() || out.is_null() || out_len.is_null() || request_len > isize::MAX as usize {
+    if handle.is_null()
+        || request.is_null()
+        || out.is_null()
+        || out_len.is_null()
+        || request_len > isize::MAX as usize
+    {
         set_error("invalid argument");
         return ERR;
     }
@@ -178,6 +217,10 @@ pub unsafe extern "C" fn chusql_storage_last_error(out_len: *mut usize) -> *cons
         if !out_len.is_null() {
             unsafe { *out_len = bytes.len() };
         }
-        if bytes.is_empty() { ptr::null() } else { bytes.as_ptr() }
+        if bytes.is_empty() {
+            ptr::null()
+        } else {
+            bytes.as_ptr()
+        }
     })
 }

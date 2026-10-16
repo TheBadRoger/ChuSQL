@@ -1,57 +1,58 @@
 {-# LANGUAGE PatternSynonyms #-}
 
-module ChuSQL.Core.Model
-    ( ColumnType (..)
-    , Column (..)
-    , pattern TInt
-    , pattern TStr
-    , pattern TBool
-    , TypeClass (..)
-    , Value (..)
-    , Row
-    , TableMeta (..)
-    , Histogram (..)
-    , Table (..)
-    , TableIdentity (..)
-    , Database
-    , histogramOf
-    , histogramFor
-    , colNames
-    , colType
-    , lookupTable
-    , resolveTable
-    , lastTablePart
-    , deriveQualifier
-    , allColumns
-    , qualify
-    , unqualify
-    , resolveColumn
-    , plainColumn
-    , typeLabel
-    , typeName
-    , parseColumnType
-    , domainTableName
-    , isDomainTable
-    , typeClassOf
-    , assignable
-    , comparableTypes
-    , integerType
-    , numericType
-    , valueFits
-    , coerceValue
-    , canonicalValue
-    , compareValue
-    , valuesEqual
-    , hashValue
-    ) where
+module ChuSQL.Core.Model (
+    ColumnType (..),
+    Column (..),
+    pattern TInt,
+    pattern TStr,
+    pattern TBool,
+    TypeClass (..),
+    Value (..),
+    Row,
+    TableMeta (..),
+    Histogram (..),
+    Table (..),
+    TableIdentity (..),
+    Database,
+    histogramOf,
+    histogramFor,
+    colNames,
+    colType,
+    lookupTable,
+    resolveTable,
+    lastTablePart,
+    deriveQualifier,
+    allColumns,
+    qualify,
+    unqualify,
+    resolveColumn,
+    plainColumn,
+    typeLabel,
+    typeName,
+    parseColumnType,
+    domainTableName,
+    isDomainTable,
+    typeClassOf,
+    assignable,
+    comparableTypes,
+    hasTypeCapability,
+    integerType,
+    numericType,
+    valueFits,
+    coerceValue,
+    canonicalValue,
+    compareValue,
+    valuesEqual,
+    hashValue,
+) where
 
+import ChuSQL.Core.Runtime
+import qualified Data.ByteString.Lazy.Char8 as BS
 import Data.Char (isDigit, isSpace, toLower)
 import Data.Hashable (Hashable (..))
 import Data.List (isPrefixOf, isSuffixOf, stripPrefix)
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Word (Word64)
-import ChuSQL.Core.Runtime
-import qualified Data.ByteString.Lazy.Char8 as BS
 
 -- 数据模型：列类型、列约束、值、行、表、数据库，外加查表小工具。
 
@@ -94,20 +95,20 @@ plainColumn t = Column t True Nothing False False False Nothing
 -- | 普通整型列的匹配模式
 pattern TInt :: Column
 pattern TInt <- Column CInt _ _ _ _ _ _
-  where
-    TInt = plainColumn CInt
+    where
+        TInt = plainColumn CInt
 
 -- | 普通字符串列的匹配模式
 pattern TStr :: Column
 pattern TStr <- Column CStr _ _ _ _ _ _
-  where
-    TStr = plainColumn CStr
+    where
+        TStr = plainColumn CStr
 
 -- | 普通布尔列的匹配模式
 pattern TBool :: Column
 pattern TBool <- Column CBool _ _ _ _ _ _
-  where
-    TBool = plainColumn CBool
+    where
+        TBool = plainColumn CBool
 
 -- | 错误消息里用的类型名
 typeLabel :: ColumnType -> String
@@ -192,11 +193,11 @@ parseColumnType raw
         ("blob", []) -> Just CBlob
         _ -> either (const Nothing) (Just . CRuntime . descriptorId) (parseTypeExpr raw >>= resolveType builtinTypes)
   where
-    -- | 去掉空白的类型名
+    -- \| 去掉空白的类型名
     cleaned = map toLower (filter (not . isSpace) raw)
-    -- | 基础名与参数段
+    -- \| 基础名与参数段
     (base, rest) = span (/= '(') cleaned
-    -- | 括号里的参数表
+    -- \| 括号里的参数表
     args = case stripSuffixMaybe ")" (drop 1 rest) of
         Nothing -> []
         Just inner -> map (filter (not . isSpace)) (splitOn ',' inner)
@@ -265,6 +266,8 @@ typeClassOf CRuntime{} = RuntimeClass
 
 -- | 同大类可赋值；日期/时间列接受字符串字面量
 assignable :: ColumnType -> ColumnType -> Bool
+assignable (CDomain _ base) source = assignable base source
+assignable target (CDomain _ base) = assignable target base
 assignable target source
     | source == CNull = True
     | target == source = True
@@ -284,18 +287,28 @@ integerType _ = False
 
 -- | 比较用的类型族：同大类可比，日期时间与文本互比
 comparableTypes :: ColumnType -> ColumnType -> Bool
+comparableTypes (CDomain _ base) other = comparableTypes base other
+comparableTypes other (CDomain _ base) = comparableTypes other base
 comparableTypes a b
-    | typeClassOf a == RuntimeClass || typeClassOf b == RuntimeClass = False
+    | a == CNull || b == CNull = True
+    | typeClassOf a == RuntimeClass || typeClassOf b == RuntimeClass = a == b && hasTypeCapability EqCapability a
     | otherwise = a == CNull || b == CNull || sameClass || crossTemporal
   where
-    -- | 两个类型同属一个大类
+    -- \| 两个类型同属一个大类
     sameClass = typeClassOf a == typeClassOf b
-    -- | 时间与文本放在一起比
+    -- \| 时间与文本放在一起比
     crossTemporal = (temporal a && textual b) || (textual a && temporal b)
-    -- | 是不是时间类型
+    -- \| 是不是时间类型
     temporal t = typeClassOf t == TemporalClass
-    -- | 是不是文本类型
+    -- \| 是不是文本类型
     textual t = typeClassOf t == TextClass
+
+-- | 领域沿用基础类型的已注册值运算能力
+hasTypeCapability :: TypeCapability -> ColumnType -> Bool
+hasTypeCapability capability (CDomain _ base) = hasTypeCapability capability base
+hasTypeCapability capability (CRuntime tid) =
+    either (const False) (elem capability . descriptorCapabilities) (describeType builtinTypes tid)
+hasTypeCapability _ _ = True
 
 -- | 是不是数值类型
 numericType :: ColumnType -> Bool
@@ -380,9 +393,9 @@ toDecimal p s v
         VFloat d -> rounded d
         _ -> Left ("cannot put this value into " ++ typeLabel (CDecimal p s))
   where
-    -- | 缩放因子
+    -- \| 缩放因子
     scale = (10 :: Double) ^ s
-    -- | 按比例四舍五入
+    -- \| 按比例四舍五入
     rounded d
         | isNaN d || isInfinite d || isInfinite (d * scale) = Left "decimal value is not finite or exceeds precision"
         | abs result >= (10 :: Double) ^ (p - s) = Left "decimal value exceeds precision"
@@ -443,7 +456,6 @@ validTimeText t = case splitOn ':' t of
 allOf :: Int -> String -> Bool
 allOf n s = length s == n && all isDigit s
 
-
 -- | 引擎里的一行值
 data Value
     = VNull
@@ -480,7 +492,7 @@ compareValue a b = case (canonicalValue a, canonicalValue b) of
     (VFloat x, VFloat y) -> compare x y
     (VStr x, VStr y) -> compare x y
     (VBool x, VBool y) -> compare x y
-    (VRuntime tx x, VRuntime ty y) -> compare (encodeType tx, show (canonicalRuntime x)) (encodeType ty, show (canonicalRuntime y))
+    (VRuntime tx x, VRuntime ty y) -> compare (tx, x) (ty, y)
     (x, y) -> compare (valueRank x) (valueRank y)
 
 -- | 族的先后，只用来给异族值定序
@@ -504,7 +516,7 @@ hashValue v = case canonicalValue v of
     VFloat d -> hashWithSalt 1 d
     VStr t -> hashWithSalt 2 t
     VBool b -> hashWithSalt 3 b
-    VRuntime tid value -> hashWithSalt 4 (BS.unpack (encodeType tid), show (canonicalRuntime value))
+    VRuntime tid value -> hashWithSalt 4 (BS.unpack (encodeType tid), value)
 
 -- | 解析现有标量列的逻辑类型
 scalarTypeExpression :: ColumnType -> Maybe TypeExpr
@@ -525,14 +537,6 @@ scalarRuntimeValue (VFloat n) = Just (RDouble n)
 scalarRuntimeValue (VBool b) = Just (RBool b)
 scalarRuntimeValue (VStr text) = Just (RString text)
 scalarRuntimeValue _ = Nothing
-
--- | 统一复合值中的浮点零关键字
-canonicalRuntime :: RuntimeValue -> RuntimeValue
-canonicalRuntime (RDouble n) | n == 0 = RDouble 0
-canonicalRuntime (RList values) = RList (map canonicalRuntime values)
-canonicalRuntime (RMaybe value) = RMaybe (fmap canonicalRuntime value)
-canonicalRuntime (RTuple values) = RTuple (map canonicalRuntime values)
-canonicalRuntime value = value
 
 -- | 值按类型打散搅拌
 instance Hashable Value where
@@ -635,11 +639,11 @@ resolveTable db name = case lookup name db of
         | [(key, table)] <- suffixed -> Right (key, table)
         | otherwise -> Left (miss suffixed)
   where
-    -- | 引用里去掉库前缀的那一段
+    -- \| 引用里去掉库前缀的那一段
     bare = lastTablePart name
-    -- | schema 里以这个表名收尾的键：`sales.users` 能推出裸表名引用
+    -- \| schema 里以这个表名收尾的键：`sales.users` 能推出裸表名引用
     suffixed = [(key, table) | (key, table) <- db, ('.' : name) `isSuffixOf` key]
-    -- | 一个候选都没有就是查无此表，多于一个就是有歧义
+    -- \| 一个候选都没有就是查无此表，多于一个就是有歧义
     miss [] = "unknown table: " ++ name
     miss _ = "ambiguous table: " ++ name
 
@@ -664,6 +668,8 @@ resolveColumn name env = case [(k, v) | (k, v) <- env, matches k] of
     [] -> Left ("unknown column: " ++ name)
     _ -> Left ("ambiguous column: " ++ name)
   where
-    -- | 裸名匹配末段，库限定名只补一层前缀
-    matches k = k == name || ('.' : name) `isSuffixOf` k
-        || (length (filter (== '.') name) == 2 && length (filter (== '.') k) == 1 && ('.' : k) `isSuffixOf` name)
+    -- \| 裸名匹配末段，库限定名只补一层前缀
+    matches k =
+        k == name
+            || ('.' : name) `isSuffixOf` k
+            || (length (filter (== '.') name) == 2 && length (filter (== '.') k) == 1 && ('.' : k) `isSuffixOf` name)

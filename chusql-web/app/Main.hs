@@ -2,16 +2,14 @@
 
 module Main (main) where
 
-import Control.Monad (when)
-import ChuSQL.Web.API (AppEnv (..), Live (..), newAppEnvAt, setLive, webApp)
 import ChuSQL.Interface.Auth (SessionPolicy (..), setPayloadPolicy)
 import ChuSQL.Interface.Config (
     ServerConfig (..),
     WebConfig (..),
     defaultUser,
+    legacyPasswordKey,
     loadServerConfigAt,
     loadWebConfigAt,
-    legacyPasswordKey,
     resolveStaticDir,
     rootUserName,
     staticDirCandidates,
@@ -20,7 +18,9 @@ import ChuSQL.Interface.Link (clientPing, closeClient, connectClient)
 import ChuSQL.Interface.RateLimit (newRateLimiter)
 import ChuSQL.Interface.Settings (effectiveSettings)
 import ChuSQL.Interface.TOML (resolveConfigPath)
+import ChuSQL.Web.API (AppEnv (..), Live (..), newAppEnvAt, setLive, webApp)
 import Control.Exception (IOException, try)
+import Control.Monad (when)
 import Data.Char (toLower)
 import Data.String (fromString)
 import Data.Text (Text)
@@ -79,7 +79,7 @@ emptyOptions =
 parseArgs :: [String] -> Either String Options
 parseArgs = go emptyOptions
   where
-    -- | 逐个参数累加进 Options
+    -- \| 逐个参数累加进 Options
     go opts [] = Right opts
     go opts ("--help" : rest) = go opts{optHelp = True} rest
     go opts ("-h" : rest) = go opts{optHelp = True} rest
@@ -99,11 +99,11 @@ parseArgs = go emptyOptions
     go opts ("--cookie-secure" : v : rest) = go opts{optCookieSecure = Just (isTrue v)} rest
     go _ (a : _) = Left ("unrecognized argument or missing value: " ++ a)
 
-    -- | 解析一个整数参数
+    -- \| 解析一个整数参数
     withInt :: String -> String -> (Int -> Either String Options) -> Either String Options
     withInt name v k = maybe (Left (name ++ " needs an integer, got: " ++ v)) k (readMaybe v)
 
-    -- | 把 1/true/yes/on 认成真
+    -- \| 把 1/true/yes/on 认成真
     isTrue :: String -> Bool
     isTrue s = map toLower s `elem` ["1", "true", "yes", "on"]
 
@@ -161,7 +161,7 @@ applyOptions cfg opts =
         , wcMaxSqlLength = orElse (optMaxSqlLength opts) (wcMaxSqlLength cfg)
         }
   where
-    -- | 有就用新的，没有留旧值
+    -- \| 有就用新的，没有留旧值
     orElse :: Maybe a -> a -> a
     orElse (Just x) _ = x
     orElse Nothing y = y
@@ -249,11 +249,12 @@ serve settings app = do
 reportCredential :: WebConfig -> Bool -> IO ()
 reportCredential cfg legacy = do
     putStrLn ("administrator: " ++ T.unpack (rootUserName cfg))
-    when legacy
-      $ do putStrLn
-             "  !! the [web] section still carries a plaintext password key; it is ignored now"
-           putStrLn
-             "  !! remove it: the administrator password lives in the __system_users system table"
+    when legacy $
+        do
+            putStrLn
+                "  !! the [web] section still carries a plaintext password key; it is ignored now"
+            putStrLn
+                "  !! remove it: the administrator password lives in the __system_users system table"
 
 -- | ping 一次 server，报告它通不通
 checkServer :: Text -> Int -> IO ()

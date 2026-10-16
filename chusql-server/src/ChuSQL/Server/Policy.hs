@@ -1,5 +1,3 @@
-
-
 module ChuSQL.Server.Policy (
     configurePasswordPolicy,
     policyFromValues,

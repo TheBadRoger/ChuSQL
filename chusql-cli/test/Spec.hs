@@ -2,27 +2,27 @@
 
 module Main (main) where
 
-import ChuSQL.CLI.Normalization
-import ChuSQL.Interface.Normalization
-import ChuSQL.CLI.Format (OutputFormat (..), parseFormat, renderCsv, renderJson, renderTable, displayValue)
+import ChuSQL.CLI.Format (OutputFormat (..), displayValue, parseFormat, renderCsv, renderJson, renderTable)
 import ChuSQL.CLI.History (historySettings, rememberStatement)
+import ChuSQL.CLI.Normalization
 import ChuSQL.CLI.Password (readPasswordInput)
 import ChuSQL.CLI.Script (Meta (..), errorHint, parseMeta, statementComplete, stripTerminator, takeStatement)
 import ChuSQL.Core.Model (Value (..))
 import ChuSQL.Core.Protocol (QueryResult (..), queryResultJson)
 import ChuSQL.Core.Runtime
+import ChuSQL.Interface.Normalization
+import Control.Exception (bracket, finally)
+import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (decode)
 import qualified Data.Aeson as A
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.Text as T
 import Data.Text.Encoding (encodeUtf8)
-import Control.Exception (bracket, finally)
-import Control.Monad.IO.Class (liftIO)
+import System.Console.Haskeline (getHistory, getInputLine, runInputT, runInputTBehavior, useFileHandle)
+import System.Console.Haskeline.History (historyLines)
 import System.Directory (getTemporaryDirectory, removeFile)
 import System.IO (Handle, SeekMode (AbsoluteSeek), hClose, hPutStr, hSeek, hSetNewlineMode, noNewlineTranslation, openTempFile)
 import Test.Hspec
-import System.Console.Haskeline (getHistory, getInputLine, runInputT, runInputTBehavior, useFileHandle)
-import System.Console.Haskeline.History (historyLines)
 
 -- chusql-cli 测试：输出格式、语句缓冲、元命令与口令输入。
 
@@ -47,12 +47,15 @@ spec = do
 historySpec :: Spec
 historySpec = describe "CLI: SQL history" $ do
     it "does not automatically record unfinished input lines" $
-        withPasswordInput "CREATE USER alice IDENTIFIED BY\n'secret'\n" (\handle -> do
-            entries <- runInputTBehavior (useFileHandle handle) (historySettings Nothing) $ do
-                getInputLine "" >>= liftExpectation "CREATE USER alice IDENTIFIED BY"
-                getInputLine "" >>= liftExpectation "'secret'"
-                historyLines <$> getHistory
-            entries `shouldBe` [])
+        withPasswordInput
+            "CREATE USER alice IDENTIFIED BY\n'secret'\n"
+            ( \handle -> do
+                entries <- runInputTBehavior (useFileHandle handle) (historySettings Nothing) $ do
+                    getInputLine "" >>= liftExpectation "CREATE USER alice IDENTIFIED BY"
+                    getInputLine "" >>= liftExpectation "'secret'"
+                    historyLines <$> getHistory
+                entries `shouldBe` []
+            )
     it "keeps ordinary statements and excludes multiline or mixed-case passwords" $ do
         entries <- runInputT (historySettings Nothing) $ do
             rememberStatement "SELECT 1;"
@@ -66,18 +69,20 @@ historySpec = describe "CLI: SQL history" $ do
         entries `shouldBe` ["SELECT 1;"]
     it "persists only safe statements from a batch" $ do
         directory <- getTemporaryDirectory
-        bracket (openTempFile directory "csql-history-test")
+        bracket
+            (openTempFile directory "csql-history-test")
             (\(path, _) -> removeFile path)
-            (\(path, handle) -> do
+            ( \(path, handle) -> do
                 hClose handle
                 runInputT (historySettings (Just path)) $
                     rememberBatch "SELECT 1; CREATE USER alice IDENTIFIED BY 'secret'; SELECT 2;"
                 entries <- runInputT (historySettings (Just path)) (historyLines <$> getHistory)
-                entries `shouldBe` ["SELECT 2;", "SELECT 1;"])
+                entries `shouldBe` ["SELECT 2;", "SELECT 1;"]
+            )
   where
-    -- | 核对实际读取的输入行
+    -- \| 核对实际读取的输入行
     liftExpectation expected actual = liftIO (actual `shouldBe` Just expected)
-    -- | 按完整语句筛选批量输入
+    -- \| 按完整语句筛选批量输入
     rememberBatch input = case takeStatement input of
         Nothing -> pure ()
         Just (statement, rest) -> do
@@ -88,27 +93,33 @@ historySpec = describe "CLI: SQL history" $ do
 withPasswordInput :: String -> (Handle -> IO a) -> IO a
 withPasswordInput input action = do
     directory <- getTemporaryDirectory
-    bracket (openTempFile directory "csql-password-test")
+    bracket
+        (openTempFile directory "csql-password-test")
         (\(path, handle) -> hClose handle `finally` removeFile path)
-        (\(_, handle) -> do
+        ( \(_, handle) -> do
             hSetNewlineMode handle noNewlineTranslation
             hPutStr handle input
             hSeek handle AbsoluteSeek 0
-            action handle)
+            action handle
+        )
 
 -- | 管道口令的行尾与内容用例
 passwordSpec :: Spec
 passwordSpec = describe "CLI: password input" $ do
     it "reads LF, CRLF and unterminated passwords identically" $ do
-        mapM_ (\input -> withPasswordInput input (\handle -> readPasswordInput handle `shouldReturn` "secret"))
+        mapM_
+            (\input -> withPasswordInput input (\handle -> readPasswordInput handle `shouldReturn` "secret"))
             ["secret\n", "secret\r\n", "secret"]
     it "preserves password spaces and internal carriage returns" $
         withPasswordInput " a\rb \r\n" (\handle -> readPasswordInput handle `shouldReturn` " a\rb ")
     it "accepts an empty password and consumes only one line" $
-        withPasswordInput "\r\nsecond\n" (\handle -> do
-            readPasswordInput handle `shouldReturn` ""
-            readPasswordInput handle `shouldReturn` "second"
-            readPasswordInput handle `shouldReturn` "")
+        withPasswordInput
+            "\r\nsecond\n"
+            ( \handle -> do
+                readPasswordInput handle `shouldReturn` ""
+                readPasswordInput handle `shouldReturn` "second"
+                readPasswordInput handle `shouldReturn` ""
+            )
 
 -- | 输出格式的用例
 formatSpec :: Spec
@@ -191,7 +202,6 @@ sampleResult =
         , qrTruncated = False
         , qrDatabase = Nothing
         }
-
 
 -- 范式元命令、严格文件与显示格式回归。
 normalizationSpec :: Spec

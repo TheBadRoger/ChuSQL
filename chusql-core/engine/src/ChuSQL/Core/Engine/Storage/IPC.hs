@@ -1,5 +1,5 @@
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ImportQualifiedPost #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 module ChuSQL.Core.Engine.Storage.IPC (
@@ -29,10 +29,10 @@ module ChuSQL.Core.Engine.Storage.IPC (
     doDescribeTable,
     doDropTable,
     doListCatalog,
+    databaseSnapshot,
+    snapshotDatabase,
 ) where
 
-import Data.Foldable (for_)
-import Control.Monad (when)
 import ChuSQL.Core.Engine.Parallel (parallelShardLimit, poolRun, workerPool)
 import ChuSQL.Core.Engine.Storage
 import ChuSQL.Core.Engine.Storage.FFI (closeStorage, openStorage, storageRequest)
@@ -41,15 +41,42 @@ import ChuSQL.Core.Protocol (Account (..), Request (..), Response (..), SchemaCo
 import Control.Concurrent (getNumCapabilities)
 import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, putMVar, readMVar, takeMVar, withMVar)
 import Control.Exception (bracket, mask_)
+import Control.Monad (when)
 import Data.Aeson (eitherDecodeStrict, encode)
 import Data.Aeson qualified as A
 import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
+import Data.Foldable (for_)
 import Data.Maybe (fromMaybe)
 import System.IO.Unsafe (unsafePerformIO)
 
 -- IPC 存储实现：把 MonadStorage 的操作变成发给存储库的 JSON 请求。
+
+-- 复用相同提交点的不可变快照版本。
+databaseSnapshot :: Maybe (String, Database) -> Env -> IO (Either String (String, Database))
+databaseSnapshot previous env = do
+    response <- ask env "database_snapshot" (ReqDatabaseSnapshot (fst <$> previous)) Just
+    pure $ case response of
+        Left err -> Left err
+        Right (RespSnapshotUnchanged checkpoint) -> case previous of
+            Just cached | fst cached == checkpoint -> Right cached
+            _ -> Left "snapshot version does not match cached database"
+        Right (RespDomainSnapshot infos rows checkpoint) -> do
+            db <- snapshotDatabase infos rows
+            Right (checkpoint, db)
+        Right (RespError err) -> Left err
+        _ -> Left "unexpected database snapshot response"
+
+-- 从同一版本的结构和行集构建引擎数据库。
+snapshotDatabase :: [TableInfo] -> [(String, [Row])] -> Either String Database
+snapshotDatabase infos rows = mapM load infos
+  where
+    -- 布局、对象身份与数据必须来自同一版本。
+    load info = do
+        values <- maybe (Left "incomplete database snapshot") Right (lookup (tiTable info) rows)
+        let name = tiTable info
+        Right (name, Table name (schemaToColumns (tiColumns info)) values (Just (metaOf info)) (tiIdentity info) (tiSchemaVersion info))
 
 -- | 一条会话的存储环境：当前库名随会话走，不共享
 data Env = Env
@@ -146,15 +173,16 @@ closeConnection = modifyMVar_ linkRef $ \current -> withMVar (snd linkUsers) $ \
 -- | 发一条请求并解码应答；链路没装就报错，不崩
 sendRequest :: Request -> IO Response
 sendRequest req = withStorageLink $ \case
-                                      Nothing -> pure (RespError "storage not configured")
-                                      Just link
-                                        -> do raw <- slRequest link (BL.toStrict (encode req))
-                                              case raw of
-                                                Left e -> pure (RespError ("storage error: " ++ e))
-                                                Right bytes
-                                                  -> case eitherDecodeStrict (BS.dropWhileEnd (== 13) bytes) of
-                                                       Left e -> pure (RespError ("decode error: " ++ e))
-                                                       Right resp -> pure resp
+    Nothing -> pure (RespError "storage not configured")
+    Just link ->
+        do
+            raw <- slRequest link (BL.toStrict (encode req))
+            case raw of
+                Left e -> pure (RespError ("storage error: " ++ e))
+                Right bytes ->
+                    case eitherDecodeStrict (BS.dropWhileEnd (== 13) bytes) of
+                        Left e -> pure (RespError ("decode error: " ++ e))
+                        Right resp -> pure resp
 
 -- | 原样转发一条载荷给存储库
 sendRawRequest :: BS.ByteString -> IO (Either String BS.ByteString)
@@ -244,22 +272,22 @@ okOnly _ = Nothing
 -- | 发 Scan
 doScan :: Env -> String -> IO (Either String [Row])
 doScan env t = ask env "scan" (ReqScan t) $ \case
-                                              RespRows rows -> Just rows
-                                              _ -> Nothing
+    RespRows rows -> Just rows
+    _ -> Nothing
 
 -- | 发带投影的 Scan
 doScanColumns :: Env -> String -> [String] -> IO (Either String [Row])
 doScanColumns env t cols = ask env "scan" (ReqScanColumns t cols) $ \case
-                                                                      RespRows rows
-                                                                        -> Just
-                                                                             [[(c, v) | c <- cols, Just v <- [lookup c row]] | row <- rows]
-                                                                      _ -> Nothing
+    RespRows rows ->
+        Just
+            [[(c, v) | c <- cols, Just v <- [lookup c row]] | row <- rows]
+    _ -> Nothing
 
 -- | 发分片 Scan：只取第 shard 片
 doScanShard :: Env -> String -> Maybe [String] -> Int -> Int -> IO (Either String [Row])
 doScanShard env t cols shard shards = ask env "scan_shard" (ReqScanShard t cols shard shards) $ \case
-                                                                                                  RespRows rows -> Just rows
-                                                                                                  _ -> Nothing
+    RespRows rows -> Just rows
+    _ -> Nothing
 
 -- | 发 Insert（索引由存储层维护）
 doInsert :: Env -> String -> Row -> IO (Either String ())
@@ -276,21 +304,21 @@ doDeleteKeys env t ks = ask env "delete_keys" (ReqDeleteKeys t ks) okOnly
 -- | 发 ListTables
 doListTables :: Env -> IO (Either String [String])
 doListTables env = ask env "list_tables" ReqListTables $ \case
-                                                           RespTables ts -> Just ts
-                                                           _ -> Nothing
+    RespTables ts -> Just ts
+    _ -> Nothing
 
 -- | 一次拿全库 schema
 doListCatalog :: Env -> IO (Either String [TableInfo])
 doListCatalog env = ask env "list_catalog" ReqListCatalog $ \case
-                                                              RespCatalog xs -> Just xs
-                                                              _ -> Nothing
+    RespCatalog xs -> Just xs
+    _ -> Nothing
 
 -- | 按某一列的索引取一行（键可以是整数或字符串）
 doLookupByColumn :: Env -> String -> String -> Value -> IO (Either String IndexResult)
 doLookupByColumn env t c k = ask env "lookup_by_index" (ReqLookupByColumn t c k) $ \case
-                                                                                     RespRows rows -> Just (IndexRows rows)
-                                                                                     RespNoIndex -> Just NoIndex
-                                                                                     _ -> Nothing
+    RespRows rows -> Just (IndexRows rows)
+    RespNoIndex -> Just NoIndex
+    _ -> Nothing
 
 -- | 范围扫描：没有可用索引就回 Nothing，让上层退回扫描
 doScanRange ::
@@ -301,15 +329,15 @@ doScanRange ::
     Maybe (Value, Bool) ->
     IO (Either String (Maybe [Row]))
 doScanRange env t c lo hi = ask env "range_by_index" (ReqRangeByIndex t c lo hi) $ \case
-                                                                                     RespRows rows -> Just (Just rows)
-                                                                                     RespNoIndex -> Just Nothing
-                                                                                     _ -> Nothing
+    RespRows rows -> Just (Just rows)
+    RespNoIndex -> Just Nothing
+    _ -> Nothing
 
 -- | 发 DescribeTable
 doDescribeTable :: Env -> String -> IO (Either String TableInfo)
 doDescribeTable env t = ask env "describe_table" (ReqDescribeTable t) $ \case
-                                                                          RespSchema info -> Just info
-                                                                          _ -> Nothing
+    RespSchema info -> Just info
+    _ -> Nothing
 
 -- | 发 DropTable
 doDropTable :: Env -> String -> IO (Either String ())
@@ -353,7 +381,7 @@ instance MonadStorage IPCStorage where
     withSchemaGuard dependencies action = IPCStorage $ \env ->
         runIPCStorageIn action env{envSchemaGuard = Just dependencies}
 
-    -- | 写前握手，旧存储不能先写入后才报错
+    -- \| 写前握手，旧存储不能先写入后才报错
     withWriteSchemaGuard dependencies action = IPCStorage $ \env -> case dependencies of
         [] -> pure (Left "bound write requires a target schema guard")
         (target, _) : _ -> do
@@ -374,8 +402,8 @@ instance MonadStorage IPCStorage where
 
     -- \| 列出现有库
     listDatabases = IPCStorage $ \env -> ask env "list_databases" (ReqDatabase "list_databases" "") $ \case
-                                                                                                        RespTables names -> Just names
-                                                                                                        _ -> Nothing
+        RespTables names -> Just names
+        _ -> Nothing
 
     -- \| 发 Scan
     scan t = IPCStorage (`doScan` t)
@@ -430,30 +458,31 @@ instance MonadStorage IPCStorage where
     -- \| 删一列
     dropColumn t c = IPCStorage $ \env -> ask env "drop_column" (ReqDropColumn t c) okOnly
 
-    -- \| 列表 + 逐表扫描拼库
-    snapshot = IPCStorage $ \env -> do
-        result <- doListCatalog env
-        case result of
+    -- \| 校验一致快照并复查提交点后发布领域
+    alterDomain name validate = IPCStorage $ \env -> do
+        snapshotResult <- ask env "domain_snapshot" ReqDomainSnapshot $ \case
+            RespDomainSnapshot infos rows checkpoint -> Just (infos, rows, checkpoint)
+            _ -> Nothing
+        case snapshotResult of
             Left err -> pure (Left err)
-            Right xs -> fmap sequence (mapM (loadEntry env) xs)
+            Right (infos, rows, checkpoint) -> case mapM (loadDomainEntry rows) infos >>= validate of
+                Left err -> pure (Left err)
+                Right cols -> ask env "alter_domain" (ReqAlterDomain name (map toWire cols) checkpoint) okOnly
       where
-        -- \| 读取表数据并保留扫描错误
-        loadEntry env info = do
-            rows <- doScan env (tiTable info)
-            pure $
-                fmap
-                    ( \rs ->
-                        ( tiTable info
-                        , Table (tiTable info) (schemaToColumns (tiColumns info)) rs (Just (metaOf info)) (tiIdentity info) (tiSchemaVersion info)
-                        )
-                    )
-                    rows
+        -- \| 保留快照身份并拒绝缺失的表数据
+        loadDomainEntry rows info = do
+            values <- maybe (Left "incomplete domain snapshot") Right (lookup (tiTable info) rows)
+            let key = tiTable info
+            Right (key, Table key (schemaToColumns (tiColumns info)) values (Just (metaOf info)) (tiIdentity info) (tiSchemaVersion info))
+
+    -- 在存储读门内获取同一版本的完整快照。
+    snapshot = IPCStorage $ \env -> fmap (fmap snd) (databaseSnapshot Nothing env)
 
     -- \| 只问数据字典要结构，设了当前库只留它的表
     schema = IPCStorage $ \env -> do
         result <- ask env "all_catalogs" ReqAllCatalog $ \case
-                                                           RespCatalog infos -> Just infos
-                                                           _ -> Nothing
+            RespCatalog infos -> Just infos
+            _ -> Nothing
         pure (fmap (concatMap (visibleTables (envDatabase env))) result)
 
 -- | 线上表信息转引擎侧统计

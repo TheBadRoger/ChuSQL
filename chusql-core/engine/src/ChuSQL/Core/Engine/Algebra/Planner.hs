@@ -27,7 +27,7 @@ source fromC mWhere = do
 nameAggs :: [(String, Expr)] -> [(String, Expr)]
 nameAggs items = go (1 :: Int) [] (concatMap (aggregatesIn . snd) items)
   where
-    -- | 逐个聚合起名，重复的不再起名
+    -- \| 逐个聚合起名，重复的不再起名
     go :: Int -> [(String, Expr)] -> [Expr] -> [(String, Expr)]
     go _ acc [] = reverse acc
     go n acc (e : es)
@@ -63,7 +63,7 @@ rewriteAggs aggs e = case [label | (label, agg) <- aggs, agg == e] of
         IsNotNull a -> IsNotNull (go a)
         other -> other
   where
-    -- | 递归替换当前查询层的聚合引用
+    -- \| 递归替换当前查询层的聚合引用
     go = rewriteAggs aggs
 
 -- | 排序 + 截断
@@ -82,10 +82,10 @@ translate q = case q of
     SelectDistinct inner -> do
         ordering <- distinctOrdering inner
         plan <- case inner of
-            s@Select{} -> translate s { selectOrderBy = [], selectLimit = Nothing }
+            s@Select{} -> translate s{selectOrderBy = [], selectLimit = Nothing}
             _ -> Left "DISTINCT requires SELECT"
         let labels = case inner of
-                Select { selectItems = items } -> map fst items
+                Select{selectItems = items} -> map fst items
                 _ -> []
         keys <- mapM (distinctKey labels) ordering
         namedOrdering <- mapM (columnKey labels) ordering
@@ -97,32 +97,38 @@ translate q = case q of
     Select items fromC mWhere groupBy having orderBy mLimit -> do
         plan0 <- source fromC mWhere
         expressions <- mapM (orderExpression items . fst) orderBy
-        let aggs = nameAggs (items ++ [("having", expression) | expression <- maybe [] pure having]
-                ++ map ("order",) expressions)
+        let aggs =
+                nameAggs
+                    ( items
+                        ++ [("having", expression) | expression <- maybe [] pure having]
+                        ++ map ("order",) expressions
+                    )
             aggregate = not (null groupBy && null aggs && null having)
             grouped = if aggregate then Aggregate groupBy aggs plan0 else plan0
             plan = maybe grouped (\condition -> Filter (rewriteAggs aggs condition) grouped) having
             items' = [(label, rewriteAggs aggs expression) | (label, expression) <- items]
             ordering = zip (map (rewriteAggs aggs) expressions) (map snd orderBy)
-            -- | 简单列排序保留可优化的名称算子
+            -- \| 简单列排序保留可优化的名称算子
             named (Col column, direction) = Just (column, direction)
             named _ = Nothing
-            -- | 保持普通投影在 LIMIT 之后求值
+            -- \| 保持普通投影在 LIMIT 之后求值
             projected child
                 | all (\(label, expression) -> expression == Col label) items' = Project (map fst items') child
                 | otherwise = Compute items' child
-        Right (case mapM named ordering of
-            Just spec -> projected (limited spec mLimit plan)
-            Nothing -> orderedProjection items' ordering mLimit plan)
+        Right
+            ( case mapM named ordering of
+                Just spec -> projected (limited spec mLimit plan)
+                Nothing -> orderedProjection items' ordering mLimit plan
+            )
     _ -> Left "only SELECT is supported by translate"
   where
-    -- | 简单投影的序号映射到来源列
+    -- \| 简单投影的序号映射到来源列
     columnKey columns (column, direction) = do
         position <- orderPosition (length columns) column
         case position of
             Just slot -> Right (columns !! slot, direction)
             Nothing -> Left "DISTINCT: sorting requires an output position"
-    -- | 去重后按指定输出位置或唯一名称排序
+    -- \| 去重后按指定输出位置或唯一名称排序
     distinctKey columns (column, direction) = do
         position <- orderPosition (length columns) column
         case position of

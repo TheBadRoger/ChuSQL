@@ -1,5 +1,5 @@
 use chusql_core_storage::protocol::Row;
-use chusql_core_storage::wal::{committed_ops, records_after, Wal, WalOp};
+use chusql_core_storage::wal::{Wal, WalOp, committed_ops, records_after};
 use serde_json::json;
 
 // WAL 测试：追加、读取、清空、截断尾巴、LSN 与提交标记。
@@ -11,12 +11,32 @@ fn schema_versions_round_trip_and_legacy_hide_decodes() {
     let path = dir.path().join("wal.log");
     let wal = Wal::new(&path);
     let ops = [
-        WalOp::HideColumn { table: "t".into(), column: "name".into(), schema_version: Some(u64::MAX) },
-        WalOp::DropColumn { table: "t".into(), column: "name".into(), rows: vec![], schema_version: Some(3) },
-        WalOp::ReplaceSchema { table: "t".into(), columns: vec![], rows: vec![], schema_version: Some(4) },
+        WalOp::HideColumn {
+            table: "t".into(),
+            column: "name".into(),
+            schema_version: Some(u64::MAX),
+        },
+        WalOp::DropColumn {
+            table: "t".into(),
+            column: "name".into(),
+            rows: vec![],
+            schema_version: Some(3),
+        },
+        WalOp::ReplaceSchema {
+            table: "t".into(),
+            columns: vec![],
+            rows: vec![],
+            schema_version: Some(4),
+        },
     ];
     wal.append_group(&ops).unwrap();
-    assert_eq!(committed_ops(&wal.read_all().unwrap().records).into_iter().map(|(_, op)| op).collect::<Vec<_>>(), ops);
+    assert_eq!(
+        committed_ops(&wal.read_all().unwrap().records)
+            .into_iter()
+            .map(|(_, op)| op)
+            .collect::<Vec<_>>(),
+        ops
+    );
     drop(wal);
     let mut body = 1_u64.to_le_bytes().to_vec();
     body.push(8);
@@ -26,9 +46,14 @@ fn schema_versions_round_trip_and_legacy_hide_decodes() {
     let mut frame = (body.len() as u32).to_le_bytes().to_vec();
     frame.extend_from_slice(&body);
     std::fs::write(&path, frame).unwrap();
-    assert_eq!(Wal::new(&path).read().unwrap(), Some(WalOp::HideColumn {
-        table: "t".into(), column: "name".into(), schema_version: None,
-    }));
+    assert_eq!(
+        Wal::new(&path).read().unwrap(),
+        Some(WalOp::HideColumn {
+            table: "t".into(),
+            column: "name".into(),
+            schema_version: None,
+        })
+    );
 }
 
 /// 建表编号完整往返且兼容旧载荷
@@ -37,7 +62,11 @@ fn create_table_ids_round_trip_and_legacy_payloads_decode() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("wal.log");
     let wal = Wal::new(&path);
-    let op = WalOp::CreateTable { table: "t".into(), columns: vec![], object_id: Some(42) };
+    let op = WalOp::CreateTable {
+        table: "t".into(),
+        columns: vec![],
+        object_id: Some(42),
+    };
     wal.append(&op).unwrap();
     assert_eq!(wal.read_all().unwrap().records[0].1, op);
     drop(wal);
@@ -50,10 +79,15 @@ fn create_table_ids_round_trip_and_legacy_payloads_decode() {
     frame.extend_from_slice(&body);
     std::fs::write(&path, frame).unwrap();
     let wal = Wal::new(&path);
-    assert_eq!(wal.read_all().unwrap().records[0].1,
-        WalOp::CreateTable { table: "t".into(), columns: vec![], object_id: None });
+    assert_eq!(
+        wal.read_all().unwrap().records[0].1,
+        WalOp::CreateTable {
+            table: "t".into(),
+            columns: vec![],
+            object_id: None
+        }
+    );
 }
-
 
 /// 用键值对构造一行
 fn row(pairs: &[(&str, serde_json::Value)]) -> Row {
@@ -167,7 +201,10 @@ fn every_record_gets_an_increasing_lsn() {
     let scan = wal.read_all().unwrap();
     let lsns: Vec<u64> = scan.records.iter().map(|(lsn, _)| *lsn).collect();
     assert_eq!(lsns, vec![1, 2, 3]);
-    assert_eq!(scan.good_len as u64, std::fs::metadata(&path).unwrap().len());
+    assert_eq!(
+        scan.good_len as u64,
+        std::fs::metadata(&path).unwrap().len()
+    );
 
     let reopened = Wal::new(&path);
     reopened
@@ -254,7 +291,10 @@ fn trailing_torn_frame_can_be_truncated() {
     assert!(scan.good_len < full.len() - 3);
 
     wal.truncate_to(scan.good_len).unwrap();
-    assert_eq!(std::fs::metadata(&path).unwrap().len(), scan.good_len as u64);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        scan.good_len as u64
+    );
     assert_eq!(wal.read_all().unwrap().records.len(), 1);
 }
 
@@ -360,9 +400,21 @@ fn lsn_continues_from_the_checkpoint() {
 #[test]
 fn records_after_keeps_only_the_tail() {
     let records = vec![
-        (1u64, WalOp::Insert { table: "t".into(), row: row(&[("id", json!(1))]) }),
+        (
+            1u64,
+            WalOp::Insert {
+                table: "t".into(),
+                row: row(&[("id", json!(1))]),
+            },
+        ),
         (2, WalOp::Commit),
-        (3, WalOp::Insert { table: "t".into(), row: row(&[("id", json!(2))]) }),
+        (
+            3,
+            WalOp::Insert {
+                table: "t".into(),
+                row: row(&[("id", json!(2))]),
+            },
+        ),
         (4, WalOp::Commit),
     ];
     let kept = records_after(&records, 2);
@@ -371,4 +423,3 @@ fn records_after_keeps_only_the_tail() {
     assert_eq!(records_after(&records, 4).len(), 0);
     assert_eq!(records_after(&records, 0).len(), 4);
 }
-

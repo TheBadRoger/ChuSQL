@@ -17,24 +17,24 @@ module ChuSQL.Interface.Session (
     accounts,
 ) where
 
-import Data.Foldable (for_)
-import ChuSQL.Interface.Normalization
-import qualified Data.Aeson as A
 import ChuSQL.Core.Protocol (Account, QueryResult (..), TableInfo)
 import ChuSQL.Interface.Link (
     Client,
-    clientNormalization,
     clientAccounts,
     clientCatalog,
     clientDatabases,
     clientLogin,
-    clientSudoLogin,
+    clientNormalization,
     clientQuery,
     clientRoles,
+    clientSudoLogin,
  )
-import ChuSQL.Interface.Sudo (SudoCredential)
+import ChuSQL.Interface.Normalization
 import ChuSQL.Interface.Protocol (RoleView)
+import ChuSQL.Interface.Sudo (SudoCredential)
+import qualified Data.Aeson as A
 import Data.Char (isAlpha, isAlphaNum)
+import Data.Foldable (for_)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -94,7 +94,7 @@ switchDatabase session rawName
             Left message -> pure (Left message)
             Right _ -> pure (Right ())
   where
-    -- | 规范化后的库名
+    -- \| 规范化后的库名
     name = T.toLower (T.strip rawName)
 
 -- | 跑一条语句；结果集里带回的当前库口径跟着一起更新
@@ -105,7 +105,8 @@ runStatement session sql = do
         Left message -> pure (Left message)
         Right result -> do
             for_
-              (qrDatabase result) (writeIORef (ssCurrent session))
+                (qrDatabase result)
+                (writeIORef (ssCurrent session))
             pure (Right result)
 
 -- | 数据字典（\\dt 与 \\d 用）
@@ -128,5 +129,6 @@ accounts session = clientAccounts (ssClient session)
 analyzeNormalization :: Session -> NormalizationRequest -> IO (Either Text A.Value)
 analyzeNormalization session payload = do
     current <- sessionDatabase session
-    if current /= nrDatabase payload then pure (Left "bad_request: normalization database differs from the selected database")
+    if current /= nrDatabase payload
+        then pure (Left "bad_request: normalization database differs from the selected database")
         else clientNormalization (ssClient session) payload

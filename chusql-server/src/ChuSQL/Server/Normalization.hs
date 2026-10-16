@@ -2,7 +2,6 @@
 
 module ChuSQL.Server.Normalization (normalizationBudget, normalizationReport, schemaFingerprint) where
 
-import Data.Maybe (fromMaybe)
 import qualified ChuSQL.Core.Engine.Normalization as N
 import ChuSQL.Core.Model (Column (..), parseColumnType)
 import ChuSQL.Core.Protocol (SchemaColumn (..), valueToJSON)
@@ -11,10 +10,11 @@ import Control.Concurrent.MVar
 import Control.Concurrent.QSem
 import Control.Exception (bracket_, evaluate, mask)
 import Crypto.Hash (Digest, SHA256, hash)
+import Data.Aeson (object, (.=))
 import qualified Data.Aeson as A
-import Data.Aeson ((.=), object)
 import qualified Data.ByteString.Lazy as BL
 import Data.List (nub, sort)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import System.IO.Unsafe (unsafePerformIO)
@@ -32,8 +32,9 @@ normalizationBudget :: IO (Either (Text, Text) A.Value) -> IO (Either (Text, Tex
 normalizationBudget action = mask $ \restore -> do
     let (queued, slots) = analysisSlots
     admitted <- modifyMVar queued $ \count -> pure (if count < 8 then (count + 1, True) else (count, False))
-    if not admitted then pure (Left ("too_busy", "normalization queue is full")) else
-        bracket_ (pure ()) (modifyMVar_ queued (pure . subtract 1)) $ do
+    if not admitted
+        then pure (Left ("too_busy", "normalization queue is full"))
+        else bracket_ (pure ()) (modifyMVar_ queued (pure . subtract 1)) $ do
             result <- restore $ timeout 5000000 $ bracket_ (waitQSem slots) (signalQSem slots) $ do
                 outcome <- action
                 case outcome of
@@ -45,8 +46,17 @@ normalizationBudget action = mask $ \restore -> do
 
 -- 编码只影响语义的列信息。
 fingerprintColumn :: SchemaColumn -> A.Value
-fingerprintColumn c = A.toJSON [A.toJSON (scName c), A.toJSON (scType c), A.toJSON (scNullable c),
-    maybe A.Null valueToJSON (scDefault c), A.toJSON (scAutoIncrement c), A.toJSON (scPrimaryKey c), A.toJSON (scUnique c), A.toJSON (scCheck c)]
+fingerprintColumn c =
+    A.toJSON
+        [ A.toJSON (scName c)
+        , A.toJSON (scType c)
+        , A.toJSON (scNullable c)
+        , maybe A.Null valueToJSON (scDefault c)
+        , A.toJSON (scAutoIncrement c)
+        , A.toJSON (scPrimaryKey c)
+        , A.toJSON (scUnique c)
+        , A.toJSON (scCheck c)
+        ]
 
 -- 将稳定编号与列结构绑定到 SHA256。
 schemaFingerprint :: ObjectIdentity -> [SchemaColumn] -> Text
@@ -57,16 +67,29 @@ normalizationReport :: ObjectIdentity -> [SchemaColumn] -> Text -> Normalization
 normalizationReport identity columns view payload = do
     let fingerprint = schemaFingerprint identity columns
     if maybe False (/= identity) (nrExpectedObject payload) || maybe False (/= fingerprint) (nrExpectedSchema payload)
-        then Left ("conflict", "normalization object or schema has changed") else Right ()
+        then Left ("conflict", "normalization object or schema has changed")
+        else Right ()
     schema <- mapM column columns
     let declaration = nrDeclaration payload
         axioms = N.Declaration (ndKeys declaration) [N.Dependency a b | NormalizationDependency a b <- ndDependencies declaration] (ndComplete declaration) (ndAtomic declaration)
     analysis <- either (Left . (,) "bad_request" . T.pack) Right (N.analyzeNormalization schema axioms)
-    Right (object ["api_version" .= (1 :: Int), "database" .= nrDatabase payload, "table" .= last (T.splitOn "." (nrTable payload)),
-        "object" .= identity, "schema_fingerprint" .= fingerprint, "view" .= view, "schema" .= columns,
-        "declaration" .= canonicalDeclaration declaration, "candidate_keys" .= N.candidateKeys analysis,
-        "findings" .= map findingJSON (N.findings analysis), "suggestions" .= map decompositionJSON (N.suggestions analysis),
-        "conditional" .= True, "condition" .= ("Analysis is conditional on the declarations; SQL NULL, UNIQUE and bag semantics are not proofs of classical keys or lossless data migration." :: Text)])
+    Right
+        ( object
+            [ "api_version" .= (1 :: Int)
+            , "database" .= nrDatabase payload
+            , "table" .= last (T.splitOn "." (nrTable payload))
+            , "object" .= identity
+            , "schema_fingerprint" .= fingerprint
+            , "view" .= view
+            , "schema" .= columns
+            , "declaration" .= canonicalDeclaration declaration
+            , "candidate_keys" .= N.candidateKeys analysis
+            , "findings" .= map findingJSON (N.findings analysis)
+            , "suggestions" .= map decompositionJSON (N.suggestions analysis)
+            , "conditional" .= True
+            , "condition" .= ("Analysis is conditional on the declarations; SQL NULL, UNIQUE and bag semantics are not proofs of classical keys or lossless data migration." :: Text)
+            ]
+        )
   where
     -- 还原列类型及声明约束而不读取数据。
     column c = case parseColumnType (scType c) of
@@ -75,13 +98,21 @@ normalizationReport identity columns view payload = do
 
 -- 规范化经验证的声明属性集合。
 canonicalDeclaration :: NormalizationDeclaration -> NormalizationDeclaration
-canonicalDeclaration d = d {ndKeys = sort (nub (map N.canonical (ndKeys d))),
-    ndDependencies = [NormalizationDependency a b | (a, b) <- sort (nub [(N.canonical a, N.canonical b) | NormalizationDependency a b <- ndDependencies d])]}
+canonicalDeclaration d =
+    d
+        { ndKeys = sort (nub (map N.canonical (ndKeys d)))
+        , ndDependencies = [NormalizationDependency a b | (a, b) <- sort (nub [(N.canonical a, N.canonical b) | NormalizationDependency a b <- ndDependencies d])]
+        }
 
 -- 编码稳定范式标签及证据。
 findingJSON :: N.Finding -> A.Value
-findingJSON f = object ["normal_form" .= formTag (N.normalForm f), "verdict" .= verdictTag (N.verdict f),
-    "witnesses" .= [NormalizationDependency a b | N.Dependency a b <- N.witnesses f], "condition" .= N.condition f]
+findingJSON f =
+    object
+        [ "normal_form" .= formTag (N.normalForm f)
+        , "verdict" .= verdictTag (N.verdict f)
+        , "witnesses" .= [NormalizationDependency a b | N.Dependency a b <- N.witnesses f]
+        , "condition" .= N.condition f
+        ]
 
 -- 编码一次分解的理论结论。
 decompositionJSON :: N.Decomposition -> A.Value

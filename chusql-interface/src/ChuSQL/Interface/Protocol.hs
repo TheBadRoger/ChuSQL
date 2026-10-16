@@ -13,13 +13,13 @@ module ChuSQL.Interface.Protocol (
     RoleView (..),
 ) where
 
-import ChuSQL.Interface.Normalization
-import Data.Aeson.Types (parseEither)
 import ChuSQL.Core.Protocol (Account (..), QueryResult (..), TableInfo (..), queryResultJson)
-import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withObject, (.:), (.:?), (.!=), (.=))
+import ChuSQL.Interface.Normalization
+import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withObject, (.!=), (.:), (.:?), (.=))
 import qualified Data.Aeson as A
 import qualified Data.Aeson.Key as AK
 import qualified Data.Aeson.KeyMap as KM
+import Data.Aeson.Types (parseEither)
 import qualified Data.ByteString.Char8 as BSC
 import qualified Data.ByteString.Lazy as BL
 import Data.Maybe (fromMaybe)
@@ -233,7 +233,7 @@ decodeResponse raw = case A.eitherDecode raw of
         _ -> Left "response is missing status"
     Right _ -> Left "response is not a JSON object"
   where
-    -- | 按 status 字段分派
+    -- \| 按 status 字段分派
     decodeStatus status fields = case status of
         "hello" -> Right (RespHello (intOf "protocol" fields))
         "ok" -> Right (RespLogin (textOf "user" fields) (boolOf "admin" fields))
@@ -257,23 +257,23 @@ decodeResponse raw = case A.eitherDecode raw of
         "policy" -> Right (RespPolicy (intOf "minLength" fields) (intOf "classes" fields))
         other -> Left ("unexpected status: " <> other)
 
-    -- | 取一个字段解成目标类型
-    fromField :: A.FromJSON a => Text -> (a -> ServerResponse) -> A.Object -> Either Text ServerResponse
+    -- \| 取一个字段解成目标类型
+    fromField :: (A.FromJSON a) => Text -> (a -> ServerResponse) -> A.Object -> Either Text ServerResponse
     fromField key wrap fields = case A.fromJSON (fromMaybe A.Null (KM.lookup (AK.fromText key) fields)) of
         A.Success value -> Right (wrap value)
         A.Error message -> Left (T.pack message)
 
-    -- | 取一个整数字段
+    -- \| 取一个整数字段
     intOf key fields = case KM.lookup key fields of
         Just (A.Number number) -> truncate number
         _ -> 0
 
-    -- | 取一个文本字段
+    -- \| 取一个文本字段
     textOf key fields = case KM.lookup key fields of
         Just (A.String text) -> text
         _ -> ""
 
-    -- | 取一个布尔字段
+    -- \| 取一个布尔字段
     boolOf key fields = case KM.lookup key fields of
         Just (A.Bool flag) -> flag
         _ -> False

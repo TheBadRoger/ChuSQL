@@ -2,18 +2,18 @@
 
 module Main (main) where
 
-import Data.Maybe (fromMaybe)
 import ChuSQL.Bootstrap (preinstalledTypes, runBootstrap)
-import ChuSQL.Core.Protocol (Account (..))
-import ChuSQL.Core.Model (columnType, typeName)
+import ChuSQL.Core.Engine.Storage.IPC (closeConnection, localStorageLink, sendRawRequest, setStorageLink)
 import ChuSQL.Core.Engine.Syntax.AST (Statement (CreateTable))
 import ChuSQL.Core.Engine.Syntax.Parser (parseStatement)
-import ChuSQL.Core.Engine.Storage.IPC (closeConnection, localStorageLink, sendRawRequest, setStorageLink)
+import ChuSQL.Core.Model (columnType, typeName)
+import ChuSQL.Core.Protocol (Account (..))
 import Control.Exception (finally)
 import qualified Data.Aeson as A
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString.Lazy as BL
-import Data.IORef (newIORef, readIORef, modifyIORef')
+import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Unique (hashUnique, newUnique)
@@ -33,7 +33,8 @@ main = hspec $ do
             runBootstrap send "root" "new-hash" `shouldReturn` Right 18
             calls <- requests
             map (field "method") calls `shouldBe` map A.String ["bootstrap_system", "identity_initialize", "bootstrap_types"]
-        mapM_ (\(title, replies, err) -> it title (expectBootstrapFailure replies err))
+        mapM_
+            (\(title, replies, err) -> it title (expectBootstrapFailure replies err))
             [ ("stops on storage errors", [Left "storage unavailable"], "storage unavailable")
             , ("rejects an uninitialized system response", [Right (A.object ["status" A..= ("system" :: Text), "initialized" A..= False])], "system catalog is not initialized")
             , ("preserves a demoted identity and stops before type installation", [Right ready, Right (identity False)], "bootstrap identity is not an enabled login superuser; existing identities were preserved")
@@ -86,9 +87,9 @@ identity super = A.object ["status" A..= ("accounts" :: Text), "accounts" A..= [
 
 -- | 已写入编号的类型响应
 installed :: A.Value
-installed = A.object ["status" A..= ("rows" :: Text), "rows" A..= zipWith (curry numbered) [1 :: Int .. ] preinstalledTypes]
+installed = A.object ["status" A..= ("rows" :: Text), "rows" A..= zipWith (curry numbered) [1 :: Int ..] preinstalledTypes]
   where
-    -- | 给预装定义添加持久化编号
+    -- \| 给预装定义添加持久化编号
     numbered (n, A.Object fields) = A.Object (KM.insert "id" (A.toJSON n) fields)
     numbered (_, value) = value
 
@@ -103,7 +104,7 @@ mock replies = do
     calls <- newIORef []
     queuedReplies <- newIORef replies
     let
-        -- | 消费一条模拟响应
+        -- \| 消费一条模拟响应
         send request = do
             modifyIORef' calls (++ [request])
             remaining <- readIORef queuedReplies

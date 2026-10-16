@@ -33,7 +33,9 @@ pub fn default_config_path() -> PathBuf {
     {
         let appdata = std::env::var_os("APPDATA").filter(|v| !v.is_empty());
         if let Some(appdata) = appdata {
-            return PathBuf::from(appdata).join(APP_DIR_NAME).join(CONFIG_FILE_NAME);
+            return PathBuf::from(appdata)
+                .join(APP_DIR_NAME)
+                .join(CONFIG_FILE_NAME);
         }
     }
     #[cfg(not(windows))]
@@ -62,7 +64,9 @@ pub fn default_data_dir() -> PathBuf {
     }
     let roaming = std::env::var_os("APPDATA").filter(|v| !v.is_empty());
     if let Some(roaming) = roaming {
-        return PathBuf::from(roaming).join(APP_DIR_NAME).join(DATA_DIR_NAME);
+        return PathBuf::from(roaming)
+            .join(APP_DIR_NAME)
+            .join(DATA_DIR_NAME);
     }
     PathBuf::from(APP_DIR_NAME).join(DATA_DIR_NAME)
 }
@@ -210,9 +214,7 @@ pub fn resolve(text: Option<&str>, path: Option<PathBuf>) -> Result<Loaded, Stri
         })?,
     };
 
-    let file_origin = Origin::File(
-        path.clone().unwrap_or_else(default_config_path),
-    );
+    let file_origin = Origin::File(path.clone().unwrap_or_else(default_config_path));
 
     let (page_size, page_origin) = pick(
         file.page.and_then(|p| p.size),
@@ -250,8 +252,12 @@ pub fn resolve(text: Option<&str>, path: Option<PathBuf>) -> Result<Loaded, Stri
     let log_files = log_files.trim().to_string();
     let log_level = log_level.trim();
 
-    let log_level = Level::parse(log_level)
-        .ok_or_else(|| format!("log.level is not one of off/error/warn/info/debug: {}", log_level))?;
+    let log_level = Level::parse(log_level).ok_or_else(|| {
+        format!(
+            "log.level is not one of off/error/warn/info/debug: {}",
+            log_level
+        )
+    })?;
 
     if data_dir.is_empty() {
         return Err("storage.data_dir must not be empty".to_string());

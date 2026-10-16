@@ -25,11 +25,47 @@ fn delete_propagates_index_read_errors() {
     let original = row(&[("id", json!(1))]);
     t.insert_row(&original).unwrap();
     t.flush().unwrap();
-    let file = std::fs::OpenOptions::new().write(true).open(&index).unwrap();
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&index)
+        .unwrap();
     file.set_len(DEFAULT_PAGE_SIZE as u64).unwrap();
     let err = t.delete_by_keys(&[1]).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     assert_eq!(t.scan().unwrap(), vec![original]);
+}
+
+/// 索引键失败不得留下堆行或清空旧表
+#[test]
+fn invalid_index_keys_leave_heap_and_indexes_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut table = HeapTable::open(dir.path().join("t.db"), DEFAULT_PAGE_SIZE, 1).unwrap();
+    let original = row(&[("id", json!(1)), ("name", json!("old"))]);
+    table.insert_row(&original).unwrap();
+    table
+        .build_index(
+            "name",
+            &dir.path().join("t.name.idx"),
+            DEFAULT_PAGE_SIZE,
+            4,
+            1,
+        )
+        .unwrap();
+    let invalid = row(&[("id", json!(2)), ("name", json!("x".repeat(129)))]);
+    assert!(table.insert_row(&invalid).is_err());
+    assert_eq!(table.scan().unwrap(), vec![original.clone()]);
+    assert!(table.replace_all(&[invalid]).is_err());
+    assert_eq!(table.scan().unwrap(), vec![original.clone()]);
+    assert_eq!(
+        table.get_by_string_key("name", "old").unwrap(),
+        Some(original)
+    );
+    assert!(
+        table
+            .replace_all(&[row(&[("name", json!("x".repeat(10_000)))])])
+            .is_err()
+    );
+    assert_eq!(table.scan().unwrap().len(), 1);
 }
 
 /// 跨页投影与分片保持行序及隐藏列
@@ -38,7 +74,12 @@ fn projected_shards_preserve_order_and_hidden_columns() {
     let dir = tempfile::tempdir().unwrap();
     let mut t = HeapTable::open(dir.path().join("t.db"), 256, 1).unwrap();
     for i in 0..40 {
-        t.insert_row(&row(&[("id", json!(i)), ("name", json!("alice")), ("secret", json!(i))])).unwrap();
+        t.insert_row(&row(&[
+            ("id", json!(i)),
+            ("name", json!("alice")),
+            ("secret", json!(i)),
+        ]))
+        .unwrap();
     }
     t.set_hidden_columns(["secret".to_string()].into_iter().collect());
     let columns = vec!["id".to_string(), "secret".to_string()];
@@ -47,9 +88,15 @@ fn projected_shards_preserve_order_and_hidden_columns() {
     let pages = t.num_pages().unwrap();
     assert!(pages > 1);
     let mut shards = t.scan_columns_pages(Some(&columns), 0, pages / 2).unwrap();
-    shards.extend(t.scan_columns_pages(Some(&columns), pages / 2, pages + 1).unwrap());
+    shards.extend(
+        t.scan_columns_pages(Some(&columns), pages / 2, pages + 1)
+            .unwrap(),
+    );
     assert_eq!(shards, expected);
-    assert_eq!(t.read_at(0, 0).unwrap().unwrap(), row(&[("id", json!(0)), ("name", json!("alice"))]));
+    assert_eq!(
+        t.read_at(0, 0).unwrap().unwrap(),
+        row(&[("id", json!(0)), ("name", json!("alice"))])
+    );
 }
 
 /// 扫描与点读均返回行解码错误
@@ -78,15 +125,20 @@ fn empty_index_file_is_rebuilt_from_rows() {
     let data = dir.path().join("t.db");
     let index = dir.path().join("t.idx");
     {
-        let mut t = HeapTable::open_indexed(&data, &index, DEFAULT_PAGE_SIZE, 4, DEFAULT_POOL_SIZE).unwrap();
+        let mut t = HeapTable::open_indexed(&data, &index, DEFAULT_PAGE_SIZE, 4, DEFAULT_POOL_SIZE)
+            .unwrap();
         for i in 1..=5 {
             t.insert_row(&row(&[("id", json!(i))])).unwrap();
         }
         t.flush().unwrap();
     }
     std::fs::write(&index, b"").unwrap();
-    let mut t = HeapTable::open_indexed(&data, &index, DEFAULT_PAGE_SIZE, 4, DEFAULT_POOL_SIZE).unwrap();
-    assert!(t.get_by_column_key("id", 3).unwrap().is_some(), "空索引文件要从堆数据重建");
+    let mut t =
+        HeapTable::open_indexed(&data, &index, DEFAULT_PAGE_SIZE, 4, DEFAULT_POOL_SIZE).unwrap();
+    assert!(
+        t.get_by_column_key("id", 3).unwrap().is_some(),
+        "空索引文件要从堆数据重建"
+    );
     assert!(t.get_by_column_key("id", 9).unwrap().is_none());
 }
 
@@ -97,14 +149,24 @@ fn string_index_looks_up_by_value() {
     let data = dir.path().join("s.db");
     let index = dir.path().join("s.idx");
     let mut t = HeapTable::open(&data, DEFAULT_PAGE_SIZE, DEFAULT_POOL_SIZE).unwrap();
-    t.insert_row(&row(&[("id", json!(1)), ("name", json!("alice"))])).unwrap();
-    t.insert_row(&row(&[("id", json!(2)), ("name", json!("bob"))])).unwrap();
-    t.insert_row(&row(&[("id", json!(3)), ("name", json!(null))])).unwrap();
-    t.build_index("name", &index, DEFAULT_PAGE_SIZE, 4, DEFAULT_POOL_SIZE).unwrap();
+    t.insert_row(&row(&[("id", json!(1)), ("name", json!("alice"))]))
+        .unwrap();
+    t.insert_row(&row(&[("id", json!(2)), ("name", json!("bob"))]))
+        .unwrap();
+    t.insert_row(&row(&[("id", json!(3)), ("name", json!(null))]))
+        .unwrap();
+    t.build_index("name", &index, DEFAULT_PAGE_SIZE, 4, DEFAULT_POOL_SIZE)
+        .unwrap();
 
-    assert_eq!(t.get_by_string_key("name", "bob").unwrap().unwrap()["id"], json!(2));
+    assert_eq!(
+        t.get_by_string_key("name", "bob").unwrap().unwrap()["id"],
+        json!(2)
+    );
     assert!(t.get_by_string_key("name", "dave").unwrap().is_none());
-    assert!(t.get_by_string_key("name", "").unwrap().is_none(), "NULL 不入索引");
+    assert!(
+        t.get_by_string_key("name", "").unwrap().is_none(),
+        "NULL 不入索引"
+    );
 }
 
 /// 允许重复值建索引：点查把重复的行都取回来
@@ -114,9 +176,12 @@ fn duplicate_values_are_indexed_and_all_returned() {
     let data = dir.path().join("d.db");
     let index = dir.path().join("d.idx");
     let mut t = HeapTable::open(&data, DEFAULT_PAGE_SIZE, DEFAULT_POOL_SIZE).unwrap();
-    t.insert_row(&row(&[("id", json!(1)), ("name", json!("alice"))])).unwrap();
-    t.insert_row(&row(&[("id", json!(2)), ("name", json!("alice"))])).unwrap();
-    t.build_index("name", &index, DEFAULT_PAGE_SIZE, 4, DEFAULT_POOL_SIZE).unwrap();
+    t.insert_row(&row(&[("id", json!(1)), ("name", json!("alice"))]))
+        .unwrap();
+    t.insert_row(&row(&[("id", json!(2)), ("name", json!("alice"))]))
+        .unwrap();
+    t.build_index("name", &index, DEFAULT_PAGE_SIZE, 4, DEFAULT_POOL_SIZE)
+        .unwrap();
 
     let mut ids: Vec<i64> = t
         .get_all_by_string_key("name", "alice")
@@ -218,9 +283,15 @@ fn replace_all_rebuilds_index() {
     ])
     .unwrap();
 
-    assert!(t.get_by_key(1).unwrap().is_none(), "old key must be invalidated");
+    assert!(
+        t.get_by_key(1).unwrap().is_none(),
+        "old key must be invalidated"
+    );
     assert!(t.get_by_key(2).unwrap().is_none());
-    let got = t.get_by_key(7).unwrap().expect("new row should be indexed by id");
+    let got = t
+        .get_by_key(7)
+        .unwrap()
+        .expect("new row should be indexed by id");
     assert_eq!(got["name"], json!("Zoe"));
     assert_eq!(t.scan().unwrap().len(), 2);
 }
@@ -239,8 +310,11 @@ fn delete_by_keys_removes_rows() {
     .unwrap();
 
     for i in 1..=5 {
-        t.insert_row(&row(&[("id", json!(i)), ("name", json!(format!("u{}", i)))]))
-            .unwrap();
+        t.insert_row(&row(&[
+            ("id", json!(i)),
+            ("name", json!(format!("u{}", i))),
+        ]))
+        .unwrap();
     }
 
     let deleted = t.delete_by_keys(&[2, 4, 99]).unwrap();
@@ -254,7 +328,10 @@ fn delete_by_keys_removes_rows() {
         .collect();
     assert_eq!(ids, vec![1, 3, 5], "remaining rows must keep their order");
 
-    assert!(t.get_by_key(2).unwrap().is_none(), "index entry should be deleted too");
+    assert!(
+        t.get_by_key(2).unwrap().is_none(),
+        "index entry should be deleted too"
+    );
     assert!(t.get_by_key(4).unwrap().is_none());
     assert!(t.get_by_key(3).unwrap().is_some());
 
@@ -284,10 +361,7 @@ fn insert_rows_batch() {
     assert_eq!(t.scan().unwrap().len(), 20);
     assert_eq!(t.get_by_key(20).unwrap().unwrap()["name"], json!("u20"));
 
-    let dup = vec![
-        row(&[("id", json!(100))]),
-        row(&[("id", json!(100))]),
-    ];
+    let dup = vec![row(&[("id", json!(100))]), row(&[("id", json!(100))])];
     assert!(t.insert_rows(&dup).is_err());
 }
 
@@ -320,16 +394,23 @@ fn secondary_index_is_maintained() {
     )
     .unwrap();
     assert!(t.has_index("code"));
-    assert_eq!(t.get_by_column_key("code", 7002).unwrap().unwrap()["id"], json!(2));
+    assert_eq!(
+        t.get_by_column_key("code", 7002).unwrap().unwrap()["id"],
+        json!(2)
+    );
 
     t.insert_row(&row(&[("id", json!(3)), ("code", json!(7003))]))
         .unwrap();
-    assert_eq!(t.get_by_column_key("code", 7003).unwrap().unwrap()["id"], json!(3));
+    assert_eq!(
+        t.get_by_column_key("code", 7003).unwrap().unwrap()["id"],
+        json!(3)
+    );
 
     t.delete_by_keys(&[2]).unwrap();
     assert!(t.get_by_column_key("code", 7002).unwrap().is_none());
 
-    t.insert_row(&row(&[("id", json!(4)), ("code", json!(7001))])).unwrap();
+    t.insert_row(&row(&[("id", json!(4)), ("code", json!(7001))]))
+        .unwrap();
     let mut dup_ids: Vec<i64> = t
         .get_all_by_column_key("code", 7001)
         .unwrap()
@@ -339,7 +420,12 @@ fn secondary_index_is_maintained() {
     dup_ids.sort_unstable();
     assert_eq!(dup_ids, vec![1, 4], "duplicate index values keep both rows");
 
-    let mut t2 = HeapTable::open(dir.path().join("d.db"), DEFAULT_PAGE_SIZE, DEFAULT_POOL_SIZE).unwrap();
+    let mut t2 = HeapTable::open(
+        dir.path().join("d.db"),
+        DEFAULT_PAGE_SIZE,
+        DEFAULT_POOL_SIZE,
+    )
+    .unwrap();
     t2.insert_rows(&[
         row(&[("id", json!(1)), ("age", json!(30))]),
         row(&[("id", json!(2)), ("age", json!(30))]),
@@ -360,7 +446,6 @@ fn secondary_index_is_maintained() {
     );
 }
 
-
 /// 整表整理要收回删行留下的页内空洞
 #[test]
 fn compact_pages_reclaims_dead_space() {
@@ -370,7 +455,8 @@ fn compact_pages_reclaims_dead_space() {
 
     let pad = "x".repeat(200);
     for i in 0..10 {
-        t.insert_row(&row(&[("id", json!(i)), ("pad", json!(pad))])).unwrap();
+        t.insert_row(&row(&[("id", json!(i)), ("pad", json!(pad))]))
+            .unwrap();
     }
     let pages = t.num_pages().unwrap();
 
@@ -395,7 +481,8 @@ fn deletes_compact_pages_so_space_is_reused() {
 
     let pad = "y".repeat(80);
     for i in 0..30 {
-        t.insert_row(&row(&[("id", json!(i)), ("pad", json!(pad))])).unwrap();
+        t.insert_row(&row(&[("id", json!(i)), ("pad", json!(pad))]))
+            .unwrap();
     }
     assert_eq!(t.num_pages().unwrap(), 1, "30 行要先塞进一页");
 
@@ -404,7 +491,8 @@ fn deletes_compact_pages_so_space_is_reused() {
     t.delete_by_keys(&keys).unwrap();
 
     for i in 100..119 {
-        t.insert_row(&row(&[("id", json!(i)), ("pad", json!(pad))])).unwrap();
+        t.insert_row(&row(&[("id", json!(i)), ("pad", json!(pad))]))
+            .unwrap();
     }
     assert_eq!(t.num_pages().unwrap(), 1, "删掉的空间要能被复用");
     assert_eq!(t.scan().unwrap().len(), 30);
@@ -416,11 +504,13 @@ fn compact_pages_keeps_index_positions_valid() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("t.db");
     let index = dir.path().join("t.idx");
-    let mut t = HeapTable::open_indexed(&data, &index, DEFAULT_PAGE_SIZE, 4, DEFAULT_POOL_SIZE).unwrap();
+    let mut t =
+        HeapTable::open_indexed(&data, &index, DEFAULT_PAGE_SIZE, 4, DEFAULT_POOL_SIZE).unwrap();
 
     let pad = "z".repeat(80);
     for i in 0..30 {
-        t.insert_row(&row(&[("id", json!(i)), ("pad", json!(pad))])).unwrap();
+        t.insert_row(&row(&[("id", json!(i)), ("pad", json!(pad))]))
+            .unwrap();
     }
     let keys: Vec<i64> = (5..25).collect();
     t.delete_by_keys(&keys).unwrap();
@@ -428,9 +518,17 @@ fn compact_pages_keeps_index_positions_valid() {
 
     for i in [0, 1, 2, 3, 4, 25, 26, 27, 28, 29] {
         let found = t.get_by_column_key("id", i).unwrap();
-        assert_eq!(found.as_ref().map(|r| r["pad"].clone()), Some(json!(pad)), "整理后 id={} 仍要能点查", i);
+        assert_eq!(
+            found.as_ref().map(|r| r["pad"].clone()),
+            Some(json!(pad)),
+            "整理后 id={} 仍要能点查",
+            i
+        );
     }
     for i in 5..25 {
-        assert!(t.get_by_column_key("id", i).unwrap().is_none(), "删掉的行不该再查出来");
+        assert!(
+            t.get_by_column_key("id", i).unwrap().is_none(),
+            "删掉的行不该再查出来"
+        );
     }
 }

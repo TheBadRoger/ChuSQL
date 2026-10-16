@@ -1,12 +1,12 @@
 module ChuSQL.Core.Engine.Algebra.JoinOrder (reorderJoins) where
 
-import Data.Maybe (fromMaybe)
 import ChuSQL.Core.Engine.Algebra.Cost (pointRows, rangeRows, selectivityOf, tableMetaOf)
 import ChuSQL.Core.Engine.Algebra.Expr (colsInExpr, hasDivision, hasSubquery)
 import ChuSQL.Core.Engine.Algebra.Op (RelOp (..), relOpCols)
 import ChuSQL.Core.Engine.Syntax.AST (Expr (..), JoinKind (..))
 import ChuSQL.Core.Model
 import Data.List (partition)
+import Data.Maybe (fromMaybe)
 
 -- 内连接链顺序优化：按统计估算中间结果，只在行序不可观察处重排。
 
@@ -40,7 +40,7 @@ innerChain (Join InnerJoin l r c) = do
     (ls, lcs) <- innerChain l
     (rs, rcs) <- innerChain r
     pure (ls ++ rs, lcs ++ rcs ++ [c])
-innerChain (Join {}) = Nothing
+innerChain (Join{}) = Nothing
 innerChain op = Just ([op], [])
 
 -- | 叶子算子的估算行数，拿不到统计就是 Nothing
@@ -81,7 +81,7 @@ scaleRows db p x rows = case p of
     GtE _ _ -> quarter
     LtE _ _ -> quarter
     NotEq _ _ -> quarter
-    QuantCmp {} -> quarter
+    QuantCmp{} -> quarter
     And a b -> max 1 (min (scaleRows db a x rows) (scaleRows db b x rows))
     _ -> quarter
   where
@@ -89,7 +89,8 @@ scaleRows db p x rows = case p of
     pick k lo hi = case leafSource x of
         Just (alias, t)
             | Just m <- tableMetaOf db t
-            , Just s <- selectivityOf m (unqualify alias k) lo hi -> max 1 (round (fromIntegral rows * s))
+            , Just s <- selectivityOf m (unqualify alias k) lo hi ->
+                max 1 (round (fromIntegral rows * s))
         _ -> quarter
 
 -- | 叶子对应的别名与表名
@@ -103,9 +104,10 @@ leafSource _ = Nothing
 
 -- | 某列在叶子统计里的不同值数
 distinctOf :: Database -> RelOp -> String -> Maybe Int
-distinctOf db leaf col = do (alias, t) <- leafSource leaf
-                            m <- tableMetaOf db t
-                            lookup (unqualify alias col) [(c, n) | (c, n, _) <- metaDistinct m]
+distinctOf db leaf col = do
+    (alias, t) <- leafSource leaf
+    m <- tableMetaOf db t
+    lookup (unqualify alias col) [(c, n) | (c, n, _) <- metaDistinct m]
 
 -- | 若干叶子里某列最大的不同值数
 distinctOn :: Database -> [RelOp] -> String -> Maybe Int
@@ -121,12 +123,12 @@ keyDistinct db have x conds = case [v | Eq (Col a) (Col b) <- conds, Just v <- [
   where
     haveCols = concatMap (relOpCols db) have
     xCols = relOpCols db x
-    -- | 这一对列是不是两侧之间的等值键
+    -- \| 这一对列是不是两侧之间的等值键
     pair a b
         | a `elem` haveCols, b `elem` xCols = bigger (distinctOn db have a) (distinctOf db x b)
         | b `elem` haveCols, a `elem` xCols = bigger (distinctOn db have b) (distinctOf db x a)
         | otherwise = Nothing
-    -- | 两个可选统计取大的那个
+    -- \| 两个可选统计取大的那个
     bigger (Just a) (Just b) = Just (max a b)
     bigger (Just a) Nothing = Just a
     bigger Nothing (Just b) = Just b
@@ -144,7 +146,7 @@ stepRows db have acc x conds = case keyDistinct db have x conds of
 chainCost :: Database -> [RelOp] -> [Expr] -> Int
 chainCost db (l : ls) conds = go [l] (fromMaybe 1 (leafRows db l)) ls
   where
-    -- | 逐步接上后面的叶子
+    -- \| 逐步接上后面的叶子
     go _ _ [] = 0
     go have acc (x : xs) =
         let card = stepRows db have acc x conds
@@ -159,11 +161,11 @@ growOrder db leaves conds have rest = case rest of
         let next = pick rest
          in growOrder db leaves conds (have ++ [next]) (filter (/= next) rest)
   where
-    -- | 候选里成本最低的那个，同价取序号小的
+    -- \| 候选里成本最低的那个，同价取序号小的
     pick (i : is) = foldl cheaper i is
     pick [] = 0
     cheaper i j = if costOf j < costOf i then j else i
-    -- | 这个前缀的估算成本
+    -- \| 这个前缀的估算成本
     costOf i = chainCost db [leaves !! k | k <- have ++ [i]] conds
 
 -- | 每个起点贪心一遍，取最便宜的顺序
@@ -171,13 +173,13 @@ bestOrder :: Database -> [RelOp] -> [Expr] -> [RelOp]
 bestOrder db leaves conds = pick (map start [0 .. n - 1])
   where
     n = length leaves
-    -- | 从第 i 张表开始的贪心顺序
+    -- \| 从第 i 张表开始的贪心顺序
     start i = [leaves !! k | k <- growOrder db leaves conds [i] (filter (/= i) [0 .. n - 1])]
-    -- | 成本最低的那个
+    -- \| 成本最低的那个
     pick (o : os) = foldl cheaper o os
     pick [] = []
     cheaper o o' = if cost o' < cost o then o' else o
-    -- | 一个顺序的估算成本
+    -- \| 一个顺序的估算成本
     cost o = chainCost db o conds
 
 -- | 统计齐全、没有除法且确实更省时给出新顺序
@@ -188,7 +190,7 @@ cheaperOrder db leaves conds
     | bestCost < textCost = Just best
     | otherwise = Nothing
   where
-    -- | 这个叶子是不是拿不到统计
+    -- \| 这个叶子是不是拿不到统计
     unknown x = case leafRows db x of
         Just _ -> False
         Nothing -> True
@@ -200,13 +202,13 @@ cheaperOrder db leaves conds
 rebuildChain :: Database -> [RelOp] -> [Expr] -> RelOp
 rebuildChain db (l : ls) conds = go (relOpCols db l) l ls conds
   where
-    -- | 逐个接上后面的叶子
+    -- \| 逐个接上后面的叶子
     go _ acc [] rest = applyConds rest acc
     go have acc (x : xs) rest =
         let have' = have ++ relOpCols db x
             (now, later) = partition (\c -> colsInExpr c `subsetOf` have') rest
          in go have' (Join InnerJoin acc x (conjOf now)) xs later
-    -- | 若干条件用 AND 串起来
+    -- \| 若干条件用 AND 串起来
     conjOf [] = LitBool True
     conjOf (c : cs) = foldl And c cs
 rebuildChain _ [] _ = Unit

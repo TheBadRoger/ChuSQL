@@ -1,29 +1,29 @@
 module RuntimeSpec (spec) where
 
-import ChuSQL.Core.Engine.Runtime.Types
-import ChuSQL.Core.Engine.Runtime.Functions
-import ChuSQL.Core.Engine.Runtime.Binding
-import ChuSQL.Core.Engine.Runtime.Relation (bindRelOpColumns, bindWriteColumns)
-import qualified ChuSQL.Core.Engine.Algebra.Op as Rel
-import ChuSQL.Core.Engine.Algebra.Expr (evalExpr, subquerySlotsIn)
+import ChuSQL.Core.Engine (bindWrite, executeWriteM, rowsOf, runStatement, runStatementM)
 import ChuSQL.Core.Engine.Algebra.Eval (evalRelOp)
+import ChuSQL.Core.Engine.Algebra.Expr (evalExpr, subquerySlotsIn)
+import qualified ChuSQL.Core.Engine.Algebra.Op as Rel
 import ChuSQL.Core.Engine.Algebra.Sort (sortBoundRows)
-import ChuSQL.Core.Engine.Storage.Memory (runMemoryStorage)
+import ChuSQL.Core.Engine.Runtime.Binding
+import ChuSQL.Core.Engine.Runtime.Functions
 import qualified ChuSQL.Core.Engine.Runtime.Query as Query
-import ChuSQL.Core.Engine (rowsOf, runStatement, runStatementM, bindWrite, executeWriteM)
+import ChuSQL.Core.Engine.Runtime.Relation (bindRelOpColumns, bindWriteColumns)
+import ChuSQL.Core.Engine.Runtime.Types
 import ChuSQL.Core.Engine.Semantic (prepare, prepareRowExpression)
+import ChuSQL.Core.Engine.Storage.Memory (runMemoryStorage)
+import ChuSQL.Core.Engine.Syntax.AST (Expr (..), FromClause (..), SortDir (..), Statement (..), Subquery (..))
 import ChuSQL.Core.Engine.Syntax.Parser (parseStatement)
-import ChuSQL.Core.Engine.Syntax.AST (Expr (..), Statement (..), Subquery (..), FromClause (..), SortDir (..))
 import qualified ChuSQL.Core.Model as SQL
-import ChuSQL.Core.Protocol (valueToJSON, valueFromJSON, TableInfo (..))
+import ChuSQL.Core.Protocol (TableInfo (..), valueFromJSON, valueToJSON)
+import Control.Monad (foldM, when)
 import qualified Data.Aeson as A
-import Data.Word (Word64)
 import Data.Aeson.Types (parseEither)
-import Data.Hashable (hash)
-import Control.Monad (foldM)
-import qualified Data.ByteString.Lazy.Char8 as BS
-import Data.List (isInfixOf)
 import Data.Bifunctor (second)
+import qualified Data.ByteString.Lazy.Char8 as BS
+import Data.Hashable (hash)
+import Data.List (isInfixOf)
+import Data.Word (Word64)
 import Test.Hspec
 
 -- 运行时类型、函数绑定、物理编码和类型化查询测试。
@@ -32,10 +32,30 @@ import Test.Hspec
 sqlCatalog :: [String] -> Either String SQL.Database
 sqlCatalog = foldM apply []
   where
-    -- | 更新当前测试数据库
+    -- \| 更新当前测试数据库
     apply db source = do
         statement <- parseStatement source
         fst <$> runStatement db statement
+
+-- | 为复合值运算建立同一套有重复和空值的数据
+capabilityDatabase :: Either String SQL.Database
+capabilityDatabase =
+    sqlCatalog
+        [ "CREATE DOMAIN int_list AS [Int]"
+        , "CREATE TABLE compound (id INT, xs int_list, opt Maybe Int, pair (Int, String), ds [Double])"
+        , "INSERT INTO compound (id, xs, opt, pair, ds) VALUES (1, LIST<Int>(10), MAYBE<Int>(2), TUPLE<Int,String>(2,'a'), LIST<Double>(-0.0))"
+        , "INSERT INTO compound (id, xs, opt, pair, ds) VALUES (2, LIST<Int>(2,9), MAYBE<Int>(), TUPLE<Int,String>(2,'b'), LIST<Double>(0.0))"
+        , "INSERT INTO compound (id, xs, opt, pair, ds) VALUES (3, LIST<Int>(2), MAYBE<Int>(10), TUPLE<Int,String>(10,'a'), LIST<Double>(1.5))"
+        , "INSERT INTO compound (id, xs, opt, pair, ds) VALUES (4, LIST<Int>(2), MAYBE<Int>(), TUPLE<Int,String>(2,'b'), LIST<Double>(0.0))"
+        , "INSERT INTO compound (id) VALUES (5)"
+        ]
+
+-- | 用正式查询入口验证复合值的所有消费者
+capabilityQuery :: String -> Either String [[SQL.Value]]
+capabilityQuery source = do
+    db <- capabilityDatabase
+    statement <- parseStatement source
+    map (map snd) <$> rowsOf (runStatement db statement)
 
 -- | 检查运行时类型基础契约
 spec :: Spec
@@ -43,13 +63,16 @@ spec = do
     describe "bound write plans" $ do
         it "reuses INSERT targets and constraints while refreshing the auto counter" $ do
             let result = do
-                    db <- sqlCatalog ["CREATE DOMAIN cached_quantity AS INT"
-                        , "CREATE TABLE cached_insert (id INT AUTO_INCREMENT PRIMARY KEY, qty cached_quantity DEFAULT 2, tag TEXT CHECK (length(tag) > 1))"]
+                    db <-
+                        sqlCatalog
+                            [ "CREATE DOMAIN cached_quantity AS INT"
+                            , "CREATE TABLE cached_insert (id INT AUTO_INCREMENT PRIMARY KEY, qty cached_quantity DEFAULT 2, tag TEXT CHECK (length(tag) > 1))"
+                            ]
                     statement <- parseStatement "INSERT INTO cached_insert (tag) VALUES ('abc')"
                     bound <- bindWrite db statement
                     (first, inserted) <- runMemoryStorage (executeWriteM bound) db
                     first
-                    let reversed = [(name, table {SQL.tableRows = map reverse (SQL.tableRows table)}) | (name, table) <- inserted]
+                    let reversed = [(name, table{SQL.tableRows = map reverse (SQL.tableRows table)}) | (name, table) <- inserted]
                     (secondResult, final) <- runMemoryStorage (executeWriteM bound) reversed
                     secondResult
                     select <- parseStatement "SELECT id, qty, tag FROM cached_insert"
@@ -57,8 +80,11 @@ spec = do
             result `shouldBe` Right [[SQL.VInt 1, SQL.VInt 2, SQL.VStr "abc"], [SQL.VInt 2, SQL.VInt 2, SQL.VStr "abc"]]
         it "reuses ordered UPDATE targets and final-row uniqueness checks" $ do
             let result = do
-                    db <- sqlCatalog ["CREATE TABLE cached_update (id INT PRIMARY KEY, qty INT NOT NULL UNIQUE CHECK (qty < 10))"
-                        , "INSERT INTO cached_update (id, qty) VALUES (1, 1), (2, 8)"]
+                    db <-
+                        sqlCatalog
+                            [ "CREATE TABLE cached_update (id INT PRIMARY KEY, qty INT NOT NULL UNIQUE CHECK (qty < 10))"
+                            , "INSERT INTO cached_update (id, qty) VALUES (1, 1), (2, 8)"
+                            ]
                     statement <- parseStatement "UPDATE cached_update SET qty = qty + 1, qty = qty + id WHERE id = 1"
                     bound <- bindWrite db statement
                     duplicate <- parseStatement "UPDATE cached_update SET qty = 8 WHERE id = 1" >>= bindWrite db
@@ -67,8 +93,11 @@ spec = do
                     (secondResult, twice) <- runMemoryStorage (executeWriteM bound) updated
                     secondResult
                     (rejected, unchanged) <- runMemoryStorage (executeWriteM duplicate) twice
-                    Right (SQL.tableRows <$> lookup "cached_update" twice, rejected
-                        , SQL.tableRows <$> lookup "cached_update" unchanged)
+                    Right
+                        ( SQL.tableRows <$> lookup "cached_update" twice
+                        , rejected
+                        , SQL.tableRows <$> lookup "cached_update" unchanged
+                        )
                 rows = Just [[("id", SQL.VInt 1), ("qty", SQL.VInt 5)], [("id", SQL.VInt 2), ("qty", SQL.VInt 8)]]
             result `shouldBe` Right (rows, Left "UNIQUE: duplicate value in column qty", rows)
         it "defers assignment errors until a reused plan matches a current row" $ do
@@ -83,16 +112,18 @@ spec = do
                     Right (rejected, SQL.tableRows <$> lookup "deferred_write" final)
             result `shouldBe` Right (Left "division by zero", Just [[("id", SQL.VInt 9), ("qty", SQL.VInt 5)]])
         it "rejects stale INSERT UPDATE and DELETE plans before changing rows" $ do
-            mapM_ (\source -> do
-                let result = do
-                        db <- sqlCatalog ["CREATE TABLE saved_write (id INT, qty INT)", "INSERT INTO saved_write (id, qty) VALUES (1, 5)"]
-                        statement <- parseStatement source
-                        bound <- bindWrite db statement
-                        added <- parseStatement "ALTER TABLE saved_write ADD COLUMN extra TEXT" >>= runStatement db
-                        restored <- parseStatement "ALTER TABLE saved_write DROP COLUMN extra" >>= runStatement (fst added)
-                        (rejected, final) <- runMemoryStorage (executeWriteM bound) (fst restored)
-                        Right (rejected, SQL.tableRows <$> lookup "saved_write" final)
-                result `shouldBe` Right (Left "bound query schema changed: saved_write", Just [[("id", SQL.VInt 1), ("qty", SQL.VInt 5)]]))
+            mapM_
+                ( \source -> do
+                    let result = do
+                            db <- sqlCatalog ["CREATE TABLE saved_write (id INT, qty INT)", "INSERT INTO saved_write (id, qty) VALUES (1, 5)"]
+                            statement <- parseStatement source
+                            bound <- bindWrite db statement
+                            added <- parseStatement "ALTER TABLE saved_write ADD COLUMN extra TEXT" >>= runStatement db
+                            restored <- parseStatement "ALTER TABLE saved_write DROP COLUMN extra" >>= runStatement (fst added)
+                            (rejected, final) <- runMemoryStorage (executeWriteM bound) (fst restored)
+                            Right (rejected, SQL.tableRows <$> lookup "saved_write" final)
+                    result `shouldBe` Right (Left "bound query schema changed: saved_write", Just [[("id", SQL.VInt 1), ("qty", SQL.VInt 5)]])
+                )
                 [ "INSERT INTO saved_write (id, qty) VALUES (2, 8)"
                 , "UPDATE saved_write SET qty = qty + 1"
                 , "DELETE FROM saved_write WHERE id = 1"
@@ -114,16 +145,89 @@ spec = do
             let result = do
                     db <- sqlCatalog ["CREATE DOMAIN quantity AS INT", "CREATE TABLE dependent_write (id quantity)", "CREATE TABLE source_write (id INT)"]
                     statement <- parseStatement "UPDATE dependent_write SET id = (SELECT MAX(id) FROM source_write)"
-                    let identified = [(name, table {SQL.tableIdentity = Just (SQL.TableIdentity 1 1)}) | (name, table) <- db]
+                    let identified = [(name, table{SQL.tableIdentity = Just (SQL.TableIdentity 1 1)}) | (name, table) <- db]
                     bound <- bindWrite identified statement
-                    let replaced = [(name, if name == "dependent_write" then table {SQL.tableIdentity = Just (SQL.TableIdentity 1 2)} else table) | (name, table) <- identified]
-                        domainChanged = [(name, if name == SQL.domainTableName "quantity" then table {SQL.tableSchemaVersion = Just 2} else table) | (name, table) <- identified]
+                    let replaced = [(name, if name == "dependent_write" then table{SQL.tableIdentity = Just (SQL.TableIdentity 1 2)} else table) | (name, table) <- identified]
+                        domainChanged = [(name, if name == SQL.domainTableName "quantity" then table{SQL.tableSchemaVersion = Just 2} else table) | (name, table) <- identified]
                     changed <- parseStatement "ALTER TABLE source_write ADD COLUMN extra TEXT" >>= runStatement identified
                     target <- fst <$> runMemoryStorage (executeWriteM bound) replaced
                     dependency <- fst <$> runMemoryStorage (executeWriteM bound) (fst changed)
                     domain <- fst <$> runMemoryStorage (executeWriteM bound) domainChanged
                     Right (target, dependency, domain)
             result `shouldBe` Right (Left "bound query object changed: dependent_write", Left "bound query schema changed: source_write", Left "bound query schema changed: __system_domain_quantity")
+    describe "composite capabilities" $ do
+        it "derives capabilities through all nested arguments without changing encoding" $
+            withType (tupleType [listType (maybeType doubleType), stringType]) $ \tid -> do
+                fmap descriptorCapabilities (describeType builtinTypes tid)
+                    `shouldBe` Right [EqCapability, OrdCapability, HashCapability]
+                decodeType builtinTypes (encodeType tid) `shouldBe` Right tid
+        it "orders list elements numerically and shorter prefixes first, preserving ties" $ do
+            capabilityQuery "SELECT id FROM compound ORDER BY xs"
+                `shouldBe` Right (map (\n -> [SQL.VInt n]) [5, 3, 4, 2, 1])
+            capabilityQuery "SELECT id FROM compound ORDER BY xs DESC"
+                `shouldBe` Right (map (\n -> [SQL.VInt n]) [1, 2, 3, 4, 5])
+        it "orders Nothing before Just and tuples by their fields" $ do
+            capabilityQuery "SELECT id FROM compound ORDER BY opt"
+                `shouldBe` Right (map (\n -> [SQL.VInt n]) [5, 2, 4, 1, 3])
+            capabilityQuery "SELECT id FROM compound ORDER BY pair"
+                `shouldBe` Right (map (\n -> [SQL.VInt n]) [5, 1, 2, 4, 3])
+        it "groups and removes duplicates with the same equality and hash rules" $ do
+            capabilityQuery "SELECT COUNT(*) FROM compound GROUP BY xs ORDER BY xs"
+                `shouldBe` Right (map (\n -> [SQL.VInt n]) [1, 2, 1, 1])
+            capabilityQuery "SELECT COUNT(*) FROM (SELECT DISTINCT xs FROM compound) d" `shouldBe` Right [[SQL.VInt 4]]
+            capabilityQuery "SELECT COUNT(*) FROM (SELECT DISTINCT ds FROM compound) d" `shouldBe` Right [[SQL.VInt 3]]
+            capabilityQuery "SELECT COUNT(*) FROM compound GROUP BY ds ORDER BY ds"
+                `shouldBe` Right [[SQL.VInt 1], [SQL.VInt 3], [SQL.VInt 1]]
+        it "computes extrema while retaining domain and runtime identities" $ withType (listType intType) $ \tid -> do
+            capabilityQuery "SELECT MIN(xs), MAX(xs) FROM compound"
+                `shouldBe` Right [[SQL.VRuntime tid (RList [RInt 2]), SQL.VRuntime tid (RList [RInt 10])]]
+            capabilityQuery "SELECT MIN(xs) FROM compound WHERE id = 99" `shouldBe` Right [[SQL.VNull]]
+        it "uses structural equality for joins, membership and correlated existence" $ do
+            capabilityQuery "SELECT COUNT(*) FROM compound a INNER JOIN compound b ON a.xs = b.xs" `shouldBe` Right [[SQL.VInt 6]]
+            capabilityQuery "SELECT id FROM compound WHERE xs IN (SELECT xs FROM compound WHERE id = 3) ORDER BY id"
+                `shouldBe` Right [[SQL.VInt 3], [SQL.VInt 4]]
+            capabilityQuery "SELECT a.id FROM compound a WHERE EXISTS (SELECT b.id FROM compound b WHERE b.xs = a.xs AND b.id <> a.id) ORDER BY a.id"
+                `shouldBe` Right [[SQL.VInt 3], [SQL.VInt 4]]
+            capabilityQuery "SELECT id FROM compound WHERE xs NOT IN (SELECT xs FROM compound WHERE id = 5)" `shouldBe` Right []
+            capabilityQuery "SELECT id FROM compound WHERE xs < ANY (SELECT xs FROM compound WHERE id = 1) ORDER BY id"
+                `shouldBe` Right [[SQL.VInt 2], [SQL.VInt 3], [SQL.VInt 4]]
+            capabilityQuery "SELECT id FROM compound WHERE xs = ALL (SELECT xs FROM compound WHERE id = 3) ORDER BY id"
+                `shouldBe` Right [[SQL.VInt 3], [SQL.VInt 4]]
+        it "separates SQL NULL from Nothing and rejects different complete identities" $ do
+            sql "SELECT MAYBE<Int>() = MAYBE<Int>(), MAYBE<Int>() = NULL, LIST<Int>() < LIST<Int>(1)"
+                `shouldBe` Right [[SQL.VBool True, SQL.VNull, SQL.VBool True]]
+            mapM_
+                (\source -> sql source `shouldSatisfy` isFailure)
+                [ "SELECT LIST<Int>() = LIST<Double>()"
+                , "SELECT MAYBE<Int>() < MAYBE<String>()"
+                , "SELECT TUPLE<Int>(1) IN (TUPLE<Double>(1.0))"
+                , "SELECT SUM(LIST<Int>(1))"
+                ]
+        it "keeps compare equality and hashes consistent for nested finite values" $ do
+            withType (tupleType [listType doubleType, maybeType intType]) $ \tid -> do
+                let values =
+                        [ SQL.VRuntime tid (RTuple [RList [RDouble n], RMaybe optional])
+                        | n <- [-10, -0, 0, 2, 10]
+                        , optional <- [Nothing, Just (RInt 2), Just (RInt 10)]
+                        ]
+                mapM_
+                    ( \(left, right) -> do
+                        (SQL.compareValue left right == EQ) `shouldBe` SQL.valuesEqual left right
+                        when (SQL.valuesEqual left right) (hash left `shouldBe` hash right)
+                    )
+                    [(left, right) | left <- values, right <- values]
+        it "rejects malformed runtime values at expression boundaries" $ withType (listType doubleType) $ \tid -> do
+            mapM_
+                (\value -> evalExpr (Eq (RuntimeLiteral tid value) (RuntimeLiteral tid value)) [] `shouldSatisfy` isFailure)
+                [RList [RDouble (0 / 0)], RList [RDouble (1 / 0)], RList [RInt 1]]
+        it "keeps runtime indexes closed without a key codec" $ do
+            db <- either (fail . show) pure capabilityDatabase
+            mapM_
+                ( \source -> do
+                    statement <- either fail pure (parseStatement source)
+                    prepare db statement `shouldSatisfy` either (isInfixOf "index key encoding is not registered") (const False)
+                )
+                ["CREATE INDEX ON compound(xs)", "CREATE INDEX ON compound(ds)"]
     describe "runtime type registry" $ do
         it "keeps a fixed identity encoding across releases" $ withType (listType intType) $ \tid ->
             encodeType tid `shouldBe` BS.pack "[1,[5,[[1,[]]]]]"
@@ -149,16 +253,19 @@ spec = do
             let result = do
                     db <- sqlCatalog ["CREATE TABLE constraint_slots (id INT PRIMARY KEY, qty INT UNIQUE)"]
                     insert <- parseStatement "INSERT INTO constraint_slots (id, qty) VALUES (2, 3)"
-                    let damaged = [(name, table {SQL.tableRows = [[("qty", SQL.VInt 9)]]}) | (name, table) <- db]
+                    let damaged = [(name, table{SQL.tableRows = [[("qty", SQL.VInt 9)]]}) | (name, table) <- db]
                     Right (runStatement damaged insert)
             case result of
                 Right rejected -> rejected `shouldSatisfy` either (isInfixOf "missing bound column: id") (const False)
                 Left err -> expectationFailure err
         it "checks existing INSERT keys and ALTER constraints with reversed physical columns" $ do
             let result = do
-                    db <- sqlCatalog ["CREATE TABLE constraint_order (id INT PRIMARY KEY, qty INT UNIQUE)"
-                        , "INSERT INTO constraint_order (id, qty) VALUES (1, 2), (2, 3)"]
-                    let reversed = [(name, table {SQL.tableRows = map reverse (SQL.tableRows table)}) | (name, table) <- db]
+                    db <-
+                        sqlCatalog
+                            [ "CREATE TABLE constraint_order (id INT PRIMARY KEY, qty INT UNIQUE)"
+                            , "INSERT INTO constraint_order (id, qty) VALUES (1, 2), (2, 3)"
+                            ]
+                    let reversed = [(name, table{SQL.tableRows = map reverse (SQL.tableRows table)}) | (name, table) <- db]
                     insert <- parseStatement "INSERT INTO constraint_order (qty, id) VALUES (4, 3)"
                     (inserted, _) <- runStatement reversed insert
                     alter <- parseStatement "ALTER TABLE constraint_order ALTER COLUMN qty SET NOT NULL"
@@ -170,37 +277,52 @@ spec = do
             let result = do
                     db <- sqlCatalog ["CREATE TABLE altered_missing (id INT, qty INT UNIQUE)"]
                     alter <- parseStatement "ALTER TABLE altered_missing ALTER COLUMN qty SET NOT NULL"
-                    let damaged = [(name, table {SQL.tableRows = [[("id", SQL.VInt 1)]]}) | (name, table) <- db]
+                    let damaged = [(name, table{SQL.tableRows = [[("id", SQL.VInt 1)]]}) | (name, table) <- db]
                     Right (runStatement damaged alter)
             case result of
                 Right rejected -> rejected `shouldSatisfy` either (isInfixOf "missing bound column: qty") (const False)
                 Left err -> expectationFailure err
         it "rejects UPDATE nullability and final-row uniqueness violations" $ do
             let result = do
-                    db <- sqlCatalog ["CREATE TABLE update_constraints (id INT PRIMARY KEY, qty INT NOT NULL UNIQUE)"
-                        , "INSERT INTO update_constraints (id, qty) VALUES (1, 2), (2, 3)"]
+                    db <-
+                        sqlCatalog
+                            [ "CREATE TABLE update_constraints (id INT PRIMARY KEY, qty INT NOT NULL UNIQUE)"
+                            , "INSERT INTO update_constraints (id, qty) VALUES (1, 2), (2, 3)"
+                            ]
                     nullable <- parseStatement "UPDATE update_constraints SET qty = NULL WHERE id = 1"
                     duplicate <- parseStatement "UPDATE update_constraints SET qty = 3 WHERE id = 1"
                     primary <- parseStatement "UPDATE update_constraints SET id = 2 WHERE id = 1"
                     Right (db, [(nullable, "NOT NULL"), (duplicate, "UNIQUE"), (primary, "UNIQUE")])
             case result of
-                Right (db, statements) -> mapM_ (\(statement, marker) ->
-                    case runMemoryStorage (runStatementM statement) db of
-                        Right (Left err, unchanged) -> do
-                            err `shouldSatisfy` isInfixOf marker
-                            map (second SQL.tableRows) unchanged
-                                `shouldBe` map (second SQL.tableRows) db
-                        other -> expectationFailure (show other)) statements
+                Right (db, statements) ->
+                    mapM_
+                        ( \(statement, marker) ->
+                            case runMemoryStorage (runStatementM statement) db of
+                                Right (Left err, unchanged) -> do
+                                    err `shouldSatisfy` isInfixOf marker
+                                    map (second SQL.tableRows) unchanged
+                                        `shouldBe` map (second SQL.tableRows) db
+                                other -> expectationFailure (show other)
+                        )
+                        statements
                 Left err -> expectationFailure err
         it "checks UPDATE uniqueness after all rows rather than each replacement" $ do
             let result = do
-                    db <- sqlCatalog ["CREATE TABLE update_unique (id INT PRIMARY KEY, qty INT UNIQUE)"
-                        , "INSERT INTO update_unique (id, qty) VALUES (1, 2), (2, 3), (3, NULL), (4, NULL)"
-                        , "UPDATE update_unique SET qty = qty + 1 WHERE id < 3"]
+                    db <-
+                        sqlCatalog
+                            [ "CREATE TABLE update_unique (id INT PRIMARY KEY, qty INT UNIQUE)"
+                            , "INSERT INTO update_unique (id, qty) VALUES (1, 2), (2, 3), (3, NULL), (4, NULL)"
+                            , "UPDATE update_unique SET qty = qty + 1 WHERE id < 3"
+                            ]
                     select <- parseStatement "SELECT id, qty FROM update_unique"
                     map (map snd) <$> rowsOf (runStatement db select)
-            result `shouldBe` Right [[SQL.VInt 1, SQL.VInt 3], [SQL.VInt 2, SQL.VInt 4]
-                , [SQL.VInt 3, SQL.VNull], [SQL.VInt 4, SQL.VNull]]
+            result
+                `shouldBe` Right
+                    [ [SQL.VInt 1, SQL.VInt 3]
+                    , [SQL.VInt 2, SQL.VInt 4]
+                    , [SQL.VInt 3, SQL.VNull]
+                    , [SQL.VInt 4, SQL.VNull]
+                    ]
         it "rejects repeated INSERT targets instead of discarding later values" $ do
             let result = do
                     db <- sqlCatalog ["CREATE TABLE insert_targets (id INT, qty INT)"]
@@ -209,26 +331,36 @@ spec = do
             result `shouldSatisfy` either (isInfixOf "INSERT: duplicate target column: qty") (const False)
         it "binds reordered INSERT inputs while retaining defaults, NULL and auto numbering" $ do
             let result = do
-                    db <- sqlCatalog ["CREATE DOMAIN insert_label AS VARCHAR(4)"
-                        , "CREATE TABLE insert_slots (id INT AUTO_INCREMENT PRIMARY KEY, label insert_label DEFAULT 'ok', qty INT DEFAULT 7)"
-                        , "INSERT INTO insert_slots (qty, label, id) VALUES (NULL, 'ab', 10), (3, 'cd', NULL), (4, 'ef', 2)"
-                        , "INSERT INTO insert_slots (label) VALUES ('gh')"
-                        , "INSERT INTO insert_slots (qty) VALUES (8)"]
+                    db <-
+                        sqlCatalog
+                            [ "CREATE DOMAIN insert_label AS VARCHAR(4)"
+                            , "CREATE TABLE insert_slots (id INT AUTO_INCREMENT PRIMARY KEY, label insert_label DEFAULT 'ok', qty INT DEFAULT 7)"
+                            , "INSERT INTO insert_slots (qty, label, id) VALUES (NULL, 'ab', 10), (3, 'cd', NULL), (4, 'ef', 2)"
+                            , "INSERT INTO insert_slots (label) VALUES ('gh')"
+                            , "INSERT INTO insert_slots (qty) VALUES (8)"
+                            ]
                     select <- parseStatement "SELECT id, label, qty FROM insert_slots"
                     map (map snd) <$> rowsOf (runStatement db select)
-            result `shouldBe` Right [[SQL.VInt 10, SQL.VStr "ab", SQL.VNull]
-                , [SQL.VInt 11, SQL.VStr "cd", SQL.VInt 3]
-                , [SQL.VInt 2, SQL.VStr "ef", SQL.VInt 4]
-                , [SQL.VInt 12, SQL.VStr "gh", SQL.VInt 7]
-                , [SQL.VInt 13, SQL.VStr "ok", SQL.VInt 8]]
+            result
+                `shouldBe` Right
+                    [ [SQL.VInt 10, SQL.VStr "ab", SQL.VNull]
+                    , [SQL.VInt 11, SQL.VStr "cd", SQL.VInt 3]
+                    , [SQL.VInt 2, SQL.VStr "ef", SQL.VInt 4]
+                    , [SQL.VInt 12, SQL.VStr "gh", SQL.VInt 7]
+                    , [SQL.VInt 13, SQL.VStr "ok", SQL.VInt 8]
+                    ]
         it "binds write predicates and assignments to target schema positions" $ do
             let result = do
                     db <- sqlCatalog ["CREATE TABLE write_slots (id INT, qty INT)"]
                     statement <- parseStatement "UPDATE write_slots SET qty = qty + id WHERE id = 1"
                     prepare db statement >>= bindWriteColumns db
-            result `shouldBe` Right (Update "write_slots"
-                [("qty", Add (ColumnSlot 1 "qty") (ColumnSlot 0 "id"))]
-                (Just (Eq (ColumnSlot 0 "id") (LitInt 1))))
+            result
+                `shouldBe` Right
+                    ( Update
+                        "write_slots"
+                        [("qty", Add (ColumnSlot 1 "qty") (ColumnSlot 0 "id"))]
+                        (Just (Eq (ColumnSlot 0 "id") (LitInt 1)))
+                    )
         it "binds CHECK columns inside resolved function calls" $ do
             let columns = [("id", SQL.plainColumn SQL.CInt), ("name", SQL.plainColumn SQL.CStr)]
                 result = prepareRowExpression columns (Gt (FunctionCall "length" [Col "name"]) (LitInt 1))
@@ -237,9 +369,12 @@ spec = do
                 _ -> expectationFailure (show result)
         it "preserves sequential updates and row order with reversed physical columns" $ do
             let result = do
-                    db <- sqlCatalog ["CREATE TABLE write_slots (id INT, qty INT CHECK (qty >= 0))"
-                        , "INSERT INTO write_slots (id, qty) VALUES (1, 2), (2, 10), (3, 5)"]
-                    let reversed = [(name, table {SQL.tableRows = map reverse (SQL.tableRows table)}) | (name, table) <- db]
+                    db <-
+                        sqlCatalog
+                            [ "CREATE TABLE write_slots (id INT, qty INT CHECK (qty >= 0))"
+                            , "INSERT INTO write_slots (id, qty) VALUES (1, 2), (2, 10), (3, 5)"
+                            ]
+                    let reversed = [(name, table{SQL.tableRows = map reverse (SQL.tableRows table)}) | (name, table) <- db]
                     update <- parseStatement "UPDATE write_slots SET qty = qty + 1, qty = qty + id WHERE id = 1"
                     (updated, _) <- runStatement reversed update
                     delete <- parseStatement "DELETE FROM write_slots WHERE qty = 10"
@@ -249,9 +384,13 @@ spec = do
             result `shouldBe` Right [[SQL.VInt 1, SQL.VInt 4], [SQL.VInt 3, SQL.VInt 5]]
         it "keeps nested DOMAIN coercion, defaults and nullable writes" $ do
             let result = do
-                    db <- sqlCatalog ["CREATE DOMAIN short_label AS VARCHAR(4)", "CREATE DOMAIN label AS short_label"
-                        , "CREATE TABLE write_domains (id INT, name label CHECK (length(name) > 1), qty INT DEFAULT 2)"
-                        , "INSERT INTO write_domains (id, name) VALUES (1, 'abc')"]
+                    db <-
+                        sqlCatalog
+                            [ "CREATE DOMAIN short_label AS VARCHAR(4)"
+                            , "CREATE DOMAIN label AS short_label"
+                            , "CREATE TABLE write_domains (id INT, name label CHECK (length(name) > 1), qty INT DEFAULT 2)"
+                            , "INSERT INTO write_domains (id, name) VALUES (1, 'abc')"
+                            ]
                     select <- parseStatement "SELECT id, name, qty FROM write_domains"
                     original <- map (map snd) <$> rowsOf (runStatement db select)
                     update <- parseStatement "UPDATE write_domains SET qty = NULL WHERE id = 1"
@@ -267,10 +406,13 @@ spec = do
                 Left err -> expectationFailure err
         it "keeps correlated subqueries in bound assignments and DELETE predicates" $ do
             let result = do
-                    db <- sqlCatalog ["CREATE TABLE write_outer (id INT, qty INT)"
-                        , "CREATE TABLE write_inner (id INT)"
-                        , "INSERT INTO write_outer (id, qty) VALUES (1, 2), (2, 10)"
-                        , "INSERT INTO write_inner (id) VALUES (2)"]
+                    db <-
+                        sqlCatalog
+                            [ "CREATE TABLE write_outer (id INT, qty INT)"
+                            , "CREATE TABLE write_inner (id INT)"
+                            , "INSERT INTO write_outer (id, qty) VALUES (1, 2), (2, 10)"
+                            , "INSERT INTO write_inner (id) VALUES (2)"
+                            ]
                     update <- parseStatement "UPDATE write_outer SET qty = qty + (SELECT i.id FROM write_inner i WHERE i.id = qty) WHERE id = 1"
                     (updated, _) <- runStatement db update
                     select <- parseStatement "SELECT id, qty FROM write_outer"
@@ -279,13 +421,19 @@ spec = do
                     (remaining, _) <- runStatement updated delete
                     kept <- map (map snd) <$> rowsOf (runStatement remaining select)
                     Right (changed, kept)
-            result `shouldBe` Right ([[SQL.VInt 1, SQL.VInt 4], [SQL.VInt 2, SQL.VInt 10]]
-                , [[SQL.VInt 2, SQL.VInt 10]])
+            result
+                `shouldBe` Right
+                    ( [[SQL.VInt 1, SQL.VInt 4], [SQL.VInt 2, SQL.VInt 10]]
+                    , [[SQL.VInt 2, SQL.VInt 10]]
+                    )
         it "checks altered rows using schema order and keeps CHECK failures explicit" $ do
             let result = do
-                    db <- sqlCatalog ["CREATE TABLE write_checks (id INT, qty INT CHECK (qty > id))"
-                        , "INSERT INTO write_checks (id, qty) VALUES (1, 3)"]
-                    let reversed = [(name, table {SQL.tableRows = map reverse (SQL.tableRows table)}) | (name, table) <- db]
+                    db <-
+                        sqlCatalog
+                            [ "CREATE TABLE write_checks (id INT, qty INT CHECK (qty > id))"
+                            , "INSERT INTO write_checks (id, qty) VALUES (1, 3)"
+                            ]
+                    let reversed = [(name, table{SQL.tableRows = map reverse (SQL.tableRows table)}) | (name, table) <- db]
                     alter <- parseStatement "ALTER TABLE write_checks ADD COLUMN note TEXT DEFAULT 'ok'"
                     (altered, _) <- runStatement reversed alter
                     invalid <- parseStatement "UPDATE write_checks SET qty = 0 WHERE id = 1"
@@ -295,8 +443,11 @@ spec = do
                 other -> expectationFailure (show other)
         it "does not evaluate skipped assignments or empty DELETE predicates" $ do
             let result = do
-                    db <- sqlCatalog ["CREATE TABLE write_lazy (id INT, qty INT)"
-                        , "INSERT INTO write_lazy (id, qty) VALUES (1, 2)"]
+                    db <-
+                        sqlCatalog
+                            [ "CREATE TABLE write_lazy (id INT, qty INT)"
+                            , "INSERT INTO write_lazy (id, qty) VALUES (1, 2)"
+                            ]
                     update <- parseStatement "UPDATE write_lazy SET qty = 1 / 0 WHERE id = 99"
                     (updated, _) <- runStatement db update
                     delete <- parseStatement "DELETE FROM write_lazy"
@@ -305,11 +456,23 @@ spec = do
                     runStatement empty invalid
             result `shouldSatisfy` either (const False) (const True)
         it "rejects missing physical columns before a write" $ do
-            let db = [("write_missing", SQL.Table "write_missing"
-                    [("id", SQL.plainColumn SQL.CInt), ("qty", SQL.plainColumn SQL.CInt)]
-                    [[("id", SQL.VInt 1)]] Nothing Nothing Nothing)]
-            mapM_ (\source -> rowsOf (parseStatement source >>= runStatement db)
-                `shouldBe` Left "missing bound column: qty")
+            let db =
+                    [
+                        ( "write_missing"
+                        , SQL.Table
+                            "write_missing"
+                            [("id", SQL.plainColumn SQL.CInt), ("qty", SQL.plainColumn SQL.CInt)]
+                            [[("id", SQL.VInt 1)]]
+                            Nothing
+                            Nothing
+                            Nothing
+                        )
+                    ]
+            mapM_
+                ( \source ->
+                    rowsOf (parseStatement source >>= runStatement db)
+                        `shouldBe` Left "missing bound column: qty"
+                )
                 ["UPDATE write_missing SET id = 2", "DELETE FROM write_missing WHERE id = 1"]
     describe "runtime encoding" $ do
         it "round trips nested lists, optional values and tuples" $ do
@@ -345,8 +508,12 @@ spec = do
                 `shouldBe` Right (RBool True)
         it "uses the bound column slot and rejects reordered expression input" $ withFunctions $ \functions ->
             withType intType $ \int -> withType stringType $ \string -> do
-                let bound = bindExpression builtinTypes functions [("count", int), ("name", string)]
-                        (Apply "length" [Reference "name"])
+                let bound =
+                        bindExpression
+                            builtinTypes
+                            functions
+                            [("count", int), ("name", string)]
+                            (Apply "length" [Reference "name"])
                 (bound >>= evaluateExpression builtinTypes functions [("count", RInt 1), ("name", RString "abc")])
                     `shouldBe` Right (RInt 3)
                 (bound >>= evaluateExpression builtinTypes functions [("name", RString "abc"), ("count", RInt 1)])
@@ -359,15 +526,19 @@ spec = do
                     `shouldSatisfy` isFailure
         it "normalizes storage order at scan boundaries before evaluating slots" $ withFunctions $ \functions -> do
             let catalog = [("items", [("name", stringType), ("enabled", boolType)])]
-                query = Projection [("size", Apply "length" [Reference "name"])]
-                    (Selection (Reference "enabled") (TableScan "items"))
+                query =
+                    Projection
+                        [("size", Apply "length" [Reference "name"])]
+                        (Selection (Reference "enabled") (TableScan "items"))
                 scan _ = Right [[("enabled", RBool True), ("name", RString "abc")]]
             (bindPlan builtinTypes functions catalog query >>= executePlan builtinTypes functions scan)
                 `shouldBe` Right [[("size", RInt 3)]]
         it "rebinds slots to each projection output schema" $ withFunctions $ \functions -> do
             let catalog = [("items", [("name", stringType), ("enabled", boolType)])]
-                source = Projection [("enabled", Reference "enabled"), ("label", Reference "name")]
-                    (TableScan "items")
+                source =
+                    Projection
+                        [("enabled", Reference "enabled"), ("label", Reference "name")]
+                        (TableScan "items")
                 query = Projection [("size", Apply "length" [Reference "label"])] source
                 scan _ = Right [[("name", RString "abc"), ("enabled", RBool True)]]
             (bindPlan builtinTypes functions catalog query >>= executePlan builtinTypes functions scan)
@@ -386,11 +557,18 @@ spec = do
             bindExpression builtinTypes functions [] (ListLiteral intType [Literal doubleType (RDouble 1)]) `shouldSatisfy` isFailure
         it "binds queries using schema without reading storage" $ withFunctions $ \functions -> do
             let catalog = [("items", [("name", stringType), ("enabled", boolType)])]
-                query = Projection [("size", Apply "length" [Reference "name"])]
-                    (Selection (Reference "enabled") (TableScan "items"))
-                scan name = if name == "items" then Right
-                    [[("name", RString "甲乙"), ("enabled", RBool True)]
-                    ,[("name", RString "hidden"), ("enabled", RBool False)]] else Left "unknown storage table"
+                query =
+                    Projection
+                        [("size", Apply "length" [Reference "name"])]
+                        (Selection (Reference "enabled") (TableScan "items"))
+                scan name =
+                    if name == "items"
+                        then
+                            Right
+                                [ [("name", RString "甲乙"), ("enabled", RBool True)]
+                                , [("name", RString "hidden"), ("enabled", RBool False)]
+                                ]
+                        else Left "unknown storage table"
             (bindPlan builtinTypes functions catalog query >>= executePlan builtinTypes functions scan)
                 `shouldBe` Right [[("size", RInt 2)]]
         it "uses catalog existence even when storage could return rows" $ withFunctions $ \functions ->
@@ -398,20 +576,35 @@ spec = do
         it "rejects non-boolean filters" $ withFunctions $ \functions ->
             bindPlan builtinTypes functions [] (Selection (Literal intType (RInt 1)) SingleRow) `shouldSatisfy` isFailure
         it "rejects schema drift returned by storage" $ withFunctions $ \functions ->
-            (bindPlan builtinTypes functions [("t", [("x", intType)])] (TableScan "t")
-                >>= executePlan builtinTypes functions (const (Right [[("x", RString "wrong")]]))) `shouldSatisfy` isFailure
+            ( bindPlan builtinTypes functions [("t", [("x", intType)])] (TableScan "t")
+                >>= executePlan builtinTypes functions (const (Right [[("x", RString "wrong")]]))
+            )
+                `shouldSatisfy` isFailure
         it "propagates storage failures" $ withFunctions $ \functions ->
-            (bindPlan builtinTypes functions [("t", [])] (TableScan "t")
-                >>= executePlan builtinTypes functions (const (Left "storage unavailable"))) `shouldBe` Left "storage unavailable"
+            ( bindPlan builtinTypes functions [("t", [])] (TableScan "t")
+                >>= executePlan builtinTypes functions (const (Left "storage unavailable"))
+            )
+                `shouldBe` Left "storage unavailable"
     describe "SQL runtime functions" $ do
         it "validates transitive DOMAIN dependencies and ignores unrelated definitions" $ do
             let result = do
-                    db <- sqlCatalog ["CREATE DOMAIN amount AS INT", "CREATE DOMAIN total AS amount"
-                        , "CREATE DOMAIN unrelated AS TEXT", "CREATE TABLE amounts (value total)"]
+                    db <-
+                        sqlCatalog
+                            [ "CREATE DOMAIN amount AS INT"
+                            , "CREATE DOMAIN total AS amount"
+                            , "CREATE DOMAIN unrelated AS TEXT"
+                            , "CREATE TABLE amounts (value total)"
+                            ]
                     statement <- parseStatement "SELECT value FROM amounts"
                     bound <- Query.bindQuery db statement
-                    let change target = [(name, if name == target then table {SQL.tableCols = [("base", SQL.plainColumn SQL.CBool)]}
-                            else table) | (name, table) <- db]
+                    let change target =
+                            [ ( name
+                              , if name == target
+                                    then table{SQL.tableCols = [("base", SQL.plainColumn SQL.CBool)]}
+                                    else table
+                              )
+                            | (name, table) <- db
+                            ]
                     accepted <- fst <$> runMemoryStorage (Query.executeQueryM bound) (change "__system_domain_unrelated")
                     rejected <- fst <$> runMemoryStorage (Query.executeQueryM bound) (change "__system_domain_amount")
                     Right (accepted, rejected)
@@ -424,18 +617,24 @@ spec = do
             fmap tiIdentity (decode "{\"table\":\"items\",\"columns\":[],\"row_count\":0}") `shouldBe` Right Nothing
             fmap tiIdentity (decode "{\"table\":\"items\",\"columns\":[],\"row_count\":0,\"database_id\":0,\"object_id\":1}")
                 `shouldBe` Right (Just (SQL.TableIdentity 0 1))
-            mapM_ (\fields -> decode ("{\"table\":\"items\",\"columns\":[],\"row_count\":0," ++ fields ++ "}")
-                `shouldSatisfy` isFailure)
-                ["\"database_id\":1", "\"database_id\":1,\"object_id\":-1"
-                , "\"database_id\":1,\"object_id\":1.5", "\"database_id\":1,\"object_id\":\"18446744073709551616\""
-                , "\"database_id\":1,\"object_id\":1e99999999"]
+            mapM_
+                ( \fields ->
+                    decode ("{\"table\":\"items\",\"columns\":[],\"row_count\":0," ++ fields ++ "}")
+                        `shouldSatisfy` isFailure
+                )
+                [ "\"database_id\":1"
+                , "\"database_id\":1,\"object_id\":-1"
+                , "\"database_id\":1,\"object_id\":1.5"
+                , "\"database_id\":1,\"object_id\":\"18446744073709551616\""
+                , "\"database_id\":1,\"object_id\":1e99999999"
+                ]
         it "rejects a same-schema replacement or loss of object identity" $ do
             let result = do
                     db <- sqlCatalog ["CREATE TABLE bound_items (id INT)"]
-                    let identified = [(name, table {SQL.tableIdentity = Just (SQL.TableIdentity 1 1)}) | (name, table) <- db]
+                    let identified = [(name, table{SQL.tableIdentity = Just (SQL.TableIdentity 1 1)}) | (name, table) <- db]
                     statement <- parseStatement "SELECT id FROM bound_items"
                     bound <- Query.bindQuery identified statement
-                    let replaced = [(name, table {SQL.tableIdentity = Just (SQL.TableIdentity 1 2)}) | (name, table) <- db]
+                    let replaced = [(name, table{SQL.tableIdentity = Just (SQL.TableIdentity 1 2)}) | (name, table) <- db]
                     changed <- fst <$> runMemoryStorage (Query.executeQueryM bound) replaced
                     lost <- fst <$> runMemoryStorage (Query.executeQueryM bound) db
                     Right (changed, lost)
@@ -446,7 +645,8 @@ spec = do
             A.fromJSON (A.toJSON info) `shouldBe` A.Success info
             fmap tiSchemaVersion (decode "0") `shouldBe` Right Nothing
             fmap tiSchemaVersion (decode "7") `shouldBe` Right (Just 7)
-            mapM_ (\version -> decode version `shouldSatisfy` isFailure)
+            mapM_
+                (\version -> decode version `shouldSatisfy` isFailure)
                 ["-1", "1.5", "\"18446744073709551616\"", "\"+1\"", "1e99999999"]
         it "invalidates a bound query after restoring its original columns" $ do
             let result = do
@@ -462,8 +662,10 @@ spec = do
                     db <- sqlCatalog ["CREATE TABLE versioned (id INT)"]
                     statement <- parseStatement "SELECT id FROM versioned"
                     bound <- Query.bindQuery db statement
-                    fst <$> runMemoryStorage (Query.executeQueryM bound)
-                        [(name, table {SQL.tableSchemaVersion = Nothing}) | (name, table) <- db]
+                    fst
+                        <$> runMemoryStorage
+                            (Query.executeQueryM bound)
+                            [(name, table{SQL.tableSchemaVersion = Nothing}) | (name, table) <- db]
             result `shouldBe` Right (Left "bound query schema changed: versioned")
         it "ignores unrelated table changes but validates nested query dependencies" $ do
             let result = do
@@ -482,7 +684,8 @@ spec = do
                     bound <- parseStatement query >>= Query.bindQuery db
                     changed <- parseStatement "ALTER TABLE dependency_rows ADD COLUMN extra TEXT" >>= runStatement db
                     fst <$> runMemoryStorage (Query.executeQueryM bound) (fst changed)
-            mapM_ (\query -> result query `shouldBe` Right (Left "bound query schema changed: dependency_rows"))
+            mapM_
+                (\query -> result query `shouldBe` Right (Left "bound query schema changed: dependency_rows"))
                 [ "SELECT COUNT(*) FROM main_rows HAVING COUNT(*) > (SELECT COUNT(*) FROM dependency_rows)"
                 , "SELECT id FROM main_rows ORDER BY (SELECT COUNT(*) FROM dependency_rows) + id"
                 ]
@@ -500,15 +703,19 @@ spec = do
                     statement <- parseStatement "SELECT id FROM bound_items"
                     bound <- Query.bindQuery db statement
                     changed <- parseStatement "INSERT INTO bound_items (id) VALUES (7)" >>= runStatement db
-                    let current = [(name, table {SQL.tableMeta = Just (SQL.TableMeta 100 [] [] [])})
-                            | (name, table) <- fst changed]
+                    let current =
+                            [ (name, table{SQL.tableMeta = Just (SQL.TableMeta 100 [] [] [])})
+                            | (name, table) <- fst changed
+                            ]
                     fst <$> runMemoryStorage (Query.executeQueryM bound) current
             result `shouldBe` Right (Right [[("id", SQL.VInt 7)]])
         it "binds grouping keys and then sorting to the grouped output" $ do
             let source = Rel.Compute [("first", LitInt 1), ("key", LitInt 2)] Rel.Unit
                 plan = Rel.Sort [("key", Desc)] (Rel.Aggregate ["key"] [("n", CountAll)] source)
-                bound = Rel.BoundSort [(ColumnSlot 0 "key", Desc)]
-                    (Rel.BoundAggregate [("key", ColumnSlot 1 "key")] [("n", CountAll)] source)
+                bound =
+                    Rel.BoundSort
+                        [(ColumnSlot 0 "key", Desc)]
+                        (Rel.BoundAggregate [("key", ColumnSlot 1 "key")] [("n", CountAll)] source)
             bindRelOpColumns [] [] plan `shouldBe` Right bound
             evalRelOp [] bound `shouldBe` Right [[("key", SQL.VInt 2), ("n", SQL.VInt 1)]]
             evalRelOp [] (Rel.BoundAggregate [("key", ColumnSlot 0 "key")] [] source)
@@ -523,20 +730,32 @@ spec = do
                 `shouldBe` Left "bound column position mismatch: key"
         it "preserves NULL group order and empty-input global aggregates" $ do
             let result = do
-                    db <- sqlCatalog ["CREATE TABLE grouped_slots (id INT, tag TEXT)"
-                        , "INSERT INTO grouped_slots (id, tag) VALUES (1, 'b'), (2, NULL), (3, 'b')"]
+                    db <-
+                        sqlCatalog
+                            [ "CREATE TABLE grouped_slots (id INT, tag TEXT)"
+                            , "INSERT INTO grouped_slots (id, tag) VALUES (1, 'b'), (2, NULL), (3, 'b')"
+                            ]
                     grouped <- parseStatement "SELECT tag, COUNT(*) AS n FROM grouped_slots GROUP BY tag"
                     groups <- rowsOf (runStatement db grouped)
                     empty <- parseStatement "SELECT COUNT(*) AS n, SUM(id) AS total FROM grouped_slots WHERE id < 0"
                     aggregates <- rowsOf (runStatement db empty)
                     Right (map (map snd) groups, map (map snd) aggregates)
-            result `shouldBe` Right ([[SQL.VStr "b", SQL.VInt 2], [SQL.VNull, SQL.VInt 1]]
-                , [[SQL.VInt 0, SQL.VNull]])
+            result
+                `shouldBe` Right
+                    ( [[SQL.VStr "b", SQL.VInt 2], [SQL.VNull, SQL.VInt 1]]
+                    , [[SQL.VInt 0, SQL.VNull]]
+                    )
         it "binds SQL relation expressions to the optimized input slots" $ do
-            let plan = Rel.Compute [("value", Col "second")]
-                    (Rel.Compute [("first", LitInt 1), ("second", LitInt 2)] Rel.Unit)
-            bindRelOpColumns [] [] plan `shouldBe` Right (Rel.Compute [("value", ColumnSlot 1 "second")]
-                (Rel.Compute [("first", LitInt 1), ("second", LitInt 2)] Rel.Unit))
+            let plan =
+                    Rel.Compute
+                        [("value", Col "second")]
+                        (Rel.Compute [("first", LitInt 1), ("second", LitInt 2)] Rel.Unit)
+            bindRelOpColumns [] [] plan
+                `shouldBe` Right
+                    ( Rel.Compute
+                        [("value", ColumnSlot 1 "second")]
+                        (Rel.Compute [("first", LitInt 1), ("second", LitInt 2)] Rel.Unit)
+                    )
             bindRelOpColumns [] [] (Rel.Filter (Col "missing") Rel.Unit)
                 `shouldBe` Left "unknown column: missing"
         it "checks SQL slot position instead of searching another column" $ do
@@ -547,23 +766,35 @@ spec = do
         it "binds projections without losing repeated outputs or empty rows" $ do
             let source = Rel.Compute [("first", LitInt 1), ("second", LitInt 2)] Rel.Unit
             bindRelOpColumns [] [] (Rel.Project ["second", "first", "second"] source)
-                `shouldBe` Right (Rel.Compute [("second", ColumnSlot 1 "second")
-                    , ("first", ColumnSlot 0 "first"), ("second", ColumnSlot 1 "second")] source)
+                `shouldBe` Right
+                    ( Rel.Compute
+                        [ ("second", ColumnSlot 1 "second")
+                        , ("first", ColumnSlot 0 "first")
+                        , ("second", ColumnSlot 1 "second")
+                        ]
+                        source
+                    )
             bindRelOpColumns [] [] (Rel.Project [] source)
                 `shouldBe` Right (Rel.Compute [] source)
             bindRelOpColumns [] [] (Rel.Project ["*"] source)
                 `shouldBe` Right (Rel.Compute [("first", ColumnSlot 0 "first"), ("second", ColumnSlot 1 "second")] source)
         it "preserves repeated SQL outputs and correlated projection values" $ do
             let result = do
-                    db <- sqlCatalog ["CREATE TABLE slot_items (id INT)"
-                        , "INSERT INTO slot_items (id) VALUES (1), (2)"]
+                    db <-
+                        sqlCatalog
+                            [ "CREATE TABLE slot_items (id INT)"
+                            , "INSERT INTO slot_items (id) VALUES (1), (2)"
+                            ]
                     repeated <- parseStatement "SELECT id, id FROM slot_items"
                     repeatedRows <- rowsOf (runStatement db repeated)
                     correlated <- parseStatement "SELECT o.id, (SELECT o.id FROM slot_items i WHERE i.id = o.id) AS echoed FROM slot_items o"
                     correlatedRows <- rowsOf (runStatement db correlated)
                     Right (map (map snd) repeatedRows, map (map snd) correlatedRows)
-            result `shouldBe` Right ([[SQL.VInt 1, SQL.VInt 1], [SQL.VInt 2, SQL.VInt 2]]
-                , [[SQL.VInt 1, SQL.VInt 1], [SQL.VInt 2, SQL.VInt 2]])
+            result
+                `shouldBe` Right
+                    ( [[SQL.VInt 1, SQL.VInt 1], [SQL.VInt 2, SQL.VInt 2]]
+                    , [[SQL.VInt 1, SQL.VInt 1], [SQL.VInt 2, SQL.VInt 2]]
+                    )
         it "binds outer references after the local relation layout" $ do
             bindRelOpColumns [] ["outer.id"] (Rel.Compute [("id", Col "outer.id")] Rel.Unit)
                 `shouldBe` Right (Rel.Compute [("id", OuterColumnSlot 0 0 "outer.id")] Rel.Unit)
@@ -572,8 +803,12 @@ spec = do
                 query = Subquery statement ["parent.id"]
                 source = Rel.Compute [("id", LitInt 1)] Rel.Unit
                 plan = Rel.Compute [("value", ScalarSub query)] source
-            bindRelOpColumns [] [] plan `shouldBe` Right (Rel.Compute
-                [("value", ScalarSub (BoundSubquery statement ["parent.id"] [("parent.id", ColumnSlot 0 "id")]))] source)
+            bindRelOpColumns [] [] plan
+                `shouldBe` Right
+                    ( Rel.Compute
+                        [("value", ScalarSub (BoundSubquery statement ["parent.id"] [("parent.id", ColumnSlot 0 "id")]))]
+                        source
+                    )
             case bindRelOpColumns [] [] plan of
                 Left err -> expectationFailure err
                 Right bound -> evalRelOp [] bound `shouldBe` Right [[("value", SQL.VInt 1)]]
@@ -582,19 +817,39 @@ spec = do
                 query = Subquery statement ["parent.id"]
                 source = Rel.Compute [("id", LitInt 1)] Rel.Unit
             bindRelOpColumns [] ["parent.id"] (Rel.Compute [("value", ScalarSub query)] source)
-                `shouldBe` Right (Rel.Compute [("value", ScalarSub (BoundSubquery statement ["parent.id"]
-                    [("parent.id", OuterColumnSlot 1 0 "parent.id")]))] source)
+                `shouldBe` Right
+                    ( Rel.Compute
+                        [
+                            ( "value"
+                            , ScalarSub
+                                ( BoundSubquery
+                                    statement
+                                    ["parent.id"]
+                                    [("parent.id", OuterColumnSlot 1 0 "parent.id")]
+                                )
+                            )
+                        ]
+                        source
+                    )
         it "uses distinct bound positions when subqueries share a diagnostic name" $ do
             let statement = Select [("value", Col "x")] FromUnit Nothing [] Nothing [] Nothing
                 first = ScalarSub (BoundSubquery statement ["x"] [("x", ColumnSlot 0 "a")])
                 second = ScalarSub (BoundSubquery statement ["x"] [("x", ColumnSlot 1 "b")])
-                table = SQL.Table "slot_cache" [("a", SQL.plainColumn SQL.CInt), ("b", SQL.plainColumn SQL.CInt)]
-                    [[("a", SQL.VInt 1), ("b", SQL.VInt 2)], [("a", SQL.VInt 1), ("b", SQL.VInt 3)]] Nothing Nothing Nothing
+                table =
+                    SQL.Table
+                        "slot_cache"
+                        [("a", SQL.plainColumn SQL.CInt), ("b", SQL.plainColumn SQL.CInt)]
+                        [[("a", SQL.VInt 1), ("b", SQL.VInt 2)], [("a", SQL.VInt 1), ("b", SQL.VInt 3)]]
+                        Nothing
+                        Nothing
+                        Nothing
                 plan = Rel.Compute [("first", first), ("second", second)] (Rel.Scan Nothing "slot_cache" Nothing)
             subquerySlotsIn (Add first second) `shouldBe` [ColumnSlot 0 "a", ColumnSlot 1 "b"]
-            evalRelOp [("slot_cache", table)] plan `shouldBe` Right
-                [[("first", SQL.VInt 1), ("second", SQL.VInt 2)]
-                , [("first", SQL.VInt 1), ("second", SQL.VInt 3)]]
+            evalRelOp [("slot_cache", table)] plan
+                `shouldBe` Right
+                    [ [("first", SQL.VInt 1), ("second", SQL.VInt 2)]
+                    , [("first", SQL.VInt 1), ("second", SQL.VInt 3)]
+                    ]
         it "rejects bound subquery layout mismatches instead of looking up names" $ do
             let statement = Select [("value", Col "id")] FromUnit Nothing [] Nothing [] Nothing
                 query = BoundSubquery statement ["id"] [("id", ColumnSlot 0 "id")]
@@ -603,8 +858,18 @@ spec = do
                 `shouldBe` Left "bound column position mismatch: id"
             prepareRowExpression [] (ScalarSub query)
                 `shouldBe` Left "execution subquery cannot be used in semantic input"
-            bindRelOpColumns [] [] (Rel.Compute [("value", ScalarSub
-                (BoundSubquery statement ["id"] []))] Rel.Unit)
+            bindRelOpColumns
+                []
+                []
+                ( Rel.Compute
+                    [
+                        ( "value"
+                        , ScalarSub
+                            (BoundSubquery statement ["id"] [])
+                        )
+                    ]
+                    Rel.Unit
+                )
                 `shouldBe` Left "bound subquery references mismatch"
         it "preserves outer scope identity when rebinding beside a local name" $ do
             let source = Rel.Compute [("id", LitInt 1)] Rel.Unit
@@ -635,10 +900,18 @@ spec = do
                 `shouldBe` Left "bound column position mismatch: id"
             bindRelOpColumns [] ["id"] (Rel.Compute [("value", OuterColumnSlot (-1) 0 "id")] Rel.Unit)
                 `shouldBe` Left "bound column position mismatch: id"
-            bindRelOpColumns [] [] (Rel.Compute [("value", ColumnSlot 0 "id")]
-                (Rel.Compute [("other", LitInt 0), ("id", LitInt 9)] Rel.Unit))
-                `shouldBe` Right (Rel.Compute [("value", ColumnSlot 1 "id")]
-                    (Rel.Compute [("other", LitInt 0), ("id", LitInt 9)] Rel.Unit))
+            bindRelOpColumns
+                []
+                []
+                ( Rel.Compute
+                    [("value", ColumnSlot 0 "id")]
+                    (Rel.Compute [("other", LitInt 0), ("id", LitInt 9)] Rel.Unit)
+                )
+                `shouldBe` Right
+                    ( Rel.Compute
+                        [("value", ColumnSlot 1 "id")]
+                        (Rel.Compute [("other", LitInt 0), ("id", LitInt 9)] Rel.Unit)
+                    )
         it "keeps duplicate parent slots distinct through subquery rebinding and caching" $ do
             let statement = Select [("value", Col "x")] FromUnit Nothing [] Nothing [] Nothing
                 first = ScalarSub (BoundSubquery statement ["x"] [("x", ColumnSlot 0 "id")])
@@ -650,24 +923,37 @@ spec = do
                 `shouldBe` Right [[("first", SQL.VInt 1), ("second", SQL.VInt 9)]]
         it "keeps inner shadowing and multi-level correlated SQL references" $ do
             let result = do
-                    db <- sqlCatalog ["CREATE TABLE scoped_items (id INT)"
-                        , "INSERT INTO scoped_items (id) VALUES (1), (2)"]
+                    db <-
+                        sqlCatalog
+                            [ "CREATE TABLE scoped_items (id INT)"
+                            , "INSERT INTO scoped_items (id) VALUES (1), (2)"
+                            ]
                     statement <- parseStatement "SELECT o.id, (SELECT id FROM scoped_items i WHERE i.id = o.id) AS inner_id, (SELECT (SELECT o.id FROM scoped_items j WHERE j.id = i.id) FROM scoped_items i WHERE i.id = o.id) AS nested_id FROM scoped_items o"
                     rows <- rowsOf (runStatement db statement)
                     Right (map (map snd) rows)
             result `shouldBe` Right [[SQL.VInt 1, SQL.VInt 1, SQL.VInt 1], [SQL.VInt 2, SQL.VInt 2, SQL.VInt 2]]
         it "resolves the nearest of several enclosing column scopes" $ do
             let result = do
-                    db <- sqlCatalog ["CREATE TABLE scope_far (id INT)", "CREATE TABLE scope_near (id INT)"
-                        , "INSERT INTO scope_far (id) VALUES (1), (2)", "INSERT INTO scope_near (id) VALUES (10), (11)"]
+                    db <-
+                        sqlCatalog
+                            [ "CREATE TABLE scope_far (id INT)"
+                            , "CREATE TABLE scope_near (id INT)"
+                            , "INSERT INTO scope_far (id) VALUES (1), (2)"
+                            , "INSERT INTO scope_near (id) VALUES (10), (11)"
+                            ]
                     statement <- parseStatement "SELECT o.id, (SELECT (SELECT id) FROM scope_near n WHERE n.id = o.id + 9) AS nearest FROM scope_far o"
                     map (map snd) <$> rowsOf (runStatement db statement)
             result `shouldBe` Right [[SQL.VInt 1, SQL.VInt 10], [SQL.VInt 2, SQL.VInt 11]]
         it "keeps enclosing scopes separate when aliases and DOMAIN types overlap" $ withType stringType $ \tid -> do
             let result = do
-                    db <- sqlCatalog ["CREATE DOMAIN scope_label AS VARCHAR(4)"
-                        , "CREATE TABLE scope_far (value INT)", "CREATE TABLE scope_near (value scope_label)"
-                        , "INSERT INTO scope_far (value) VALUES (7)", "INSERT INTO scope_near (value) VALUES ('abc')"]
+                    db <-
+                        sqlCatalog
+                            [ "CREATE DOMAIN scope_label AS VARCHAR(4)"
+                            , "CREATE TABLE scope_far (value INT)"
+                            , "CREATE TABLE scope_near (value scope_label)"
+                            , "INSERT INTO scope_far (value) VALUES (7)"
+                            , "INSERT INTO scope_near (value) VALUES ('abc')"
+                            ]
                     statement <- parseStatement "SELECT (SELECT (SELECT length(s.value)) FROM scope_near s) AS size FROM scope_far s"
                     rows <- map (map snd) <$> rowsOf (runStatement db statement)
                     domain <- parseStatement "SELECT (SELECT (SELECT s.value) FROM scope_near s) AS label FROM scope_far s"
@@ -676,8 +962,13 @@ spec = do
             result `shouldBe` Right ([[SQL.VInt 3]], [("label", Query.DomainType "scope_label" (Query.RuntimeType tid))])
         it "skips empty or unrelated enclosing scopes and preserves NULL" $ do
             let result = do
-                    db <- sqlCatalog ["CREATE TABLE scope_far (id INT)", "CREATE TABLE scope_near (name TEXT)"
-                        , "INSERT INTO scope_far (id) VALUES (NULL), (4)", "INSERT INTO scope_near (name) VALUES ('n')"]
+                    db <-
+                        sqlCatalog
+                            [ "CREATE TABLE scope_far (id INT)"
+                            , "CREATE TABLE scope_near (name TEXT)"
+                            , "INSERT INTO scope_far (id) VALUES (NULL), (4)"
+                            , "INSERT INTO scope_near (name) VALUES ('n')"
+                            ]
                     statement <- parseStatement "SELECT (SELECT (SELECT (SELECT id)) FROM scope_near n) AS echoed FROM scope_far o"
                     map (map snd) <$> rowsOf (runStatement db statement)
             result `shouldBe` Right [[SQL.VNull], [SQL.VInt 4]]
@@ -689,40 +980,66 @@ spec = do
             result `shouldSatisfy` either (isInfixOf "ambiguous column") (const False)
         it "does not take a missing column from a shadowed source alias" $ do
             let result source = do
-                    db <- sqlCatalog ["CREATE TABLE source_far (id INT)", "CREATE TABLE source_near (other INT)"
-                        , "INSERT INTO source_far (id) VALUES (1)", "INSERT INTO source_near (other) VALUES (10)"]
+                    db <-
+                        sqlCatalog
+                            [ "CREATE TABLE source_far (id INT)"
+                            , "CREATE TABLE source_near (other INT)"
+                            , "INSERT INTO source_far (id) VALUES (1)"
+                            , "INSERT INTO source_near (other) VALUES (10)"
+                            ]
                     statement <- parseStatement source
                     rowsOf (runStatement db statement)
-            mapM_ (\source -> result source `shouldSatisfy` either (isInfixOf "unknown column") (const False))
-                ["SELECT (SELECT s.id FROM source_near s) FROM source_far s"
-                , "SELECT (SELECT (SELECT s.id) FROM source_near s) FROM source_far s"]
+            mapM_
+                (\source -> result source `shouldSatisfy` either (isInfixOf "unknown column") (const False))
+                [ "SELECT (SELECT s.id FROM source_near s) FROM source_far s"
+                , "SELECT (SELECT (SELECT s.id) FROM source_near s) FROM source_far s"
+                ]
         it "keeps bare far columns visible when the nearer alias has no such column" $ do
             let result = do
-                    db <- sqlCatalog ["CREATE TABLE source_far (id INT)", "CREATE TABLE source_near (other INT)"
-                        , "INSERT INTO source_far (id) VALUES (1), (2)", "INSERT INTO source_near (other) VALUES (10)"]
+                    db <-
+                        sqlCatalog
+                            [ "CREATE TABLE source_far (id INT)"
+                            , "CREATE TABLE source_near (other INT)"
+                            , "INSERT INTO source_far (id) VALUES (1), (2)"
+                            , "INSERT INTO source_near (other) VALUES (10)"
+                            ]
                     statement <- parseStatement "SELECT (SELECT (SELECT id) FROM source_near s) AS inherited FROM source_far s"
                     map (map snd) <$> rowsOf (runStatement db statement)
             result `shouldBe` Right [[SQL.VInt 1], [SQL.VInt 2]]
         it "uses lexical scopes in IN, EXISTS and quantified subqueries" $ do
             let result = do
-                    db <- sqlCatalog ["CREATE TABLE scope_far (id INT)", "CREATE TABLE scope_near (id INT)"
-                        , "INSERT INTO scope_far (id) VALUES (1)", "INSERT INTO scope_near (id) VALUES (10)"]
+                    db <-
+                        sqlCatalog
+                            [ "CREATE TABLE scope_far (id INT)"
+                            , "CREATE TABLE scope_near (id INT)"
+                            , "INSERT INTO scope_far (id) VALUES (1)"
+                            , "INSERT INTO scope_near (id) VALUES (10)"
+                            ]
                     statement <- parseStatement "SELECT (SELECT 10 IN (SELECT id) AND EXISTS (SELECT 1 WHERE id = 10) AND 10 = ALL (SELECT id) FROM scope_near n) AS matched FROM scope_far o"
                     map (map snd) <$> rowsOf (runStatement db statement)
             result `shouldBe` Right [[SQL.VBool True]]
         it "resolves JOIN conditions against the nearest enclosing scope" $ do
             let result = do
-                    db <- sqlCatalog ["CREATE TABLE scope_far (value INT)", "CREATE TABLE scope_near (value INT)"
-                        , "CREATE TABLE scope_join (id INT)", "INSERT INTO scope_far (value) VALUES (1)"
-                        , "INSERT INTO scope_near (value) VALUES (10)", "INSERT INTO scope_join (id) VALUES (10)"]
+                    db <-
+                        sqlCatalog
+                            [ "CREATE TABLE scope_far (value INT)"
+                            , "CREATE TABLE scope_near (value INT)"
+                            , "CREATE TABLE scope_join (id INT)"
+                            , "INSERT INTO scope_far (value) VALUES (1)"
+                            , "INSERT INTO scope_near (value) VALUES (10)"
+                            , "INSERT INTO scope_join (id) VALUES (10)"
+                            ]
                     statement <- parseStatement "SELECT (SELECT (SELECT a.id FROM scope_join a JOIN scope_join b ON a.id = value AND b.id = a.id) FROM scope_near n) AS matched FROM scope_far o"
                     map (map snd) <$> rowsOf (runStatement db statement)
             result `shouldBe` Right [[SQL.VInt 10]]
         it "executes SQL against reversed physical column order" $ do
             let result = do
-                    db <- sqlCatalog ["CREATE TABLE slot_items (id INT, name TEXT)"
-                        , "INSERT INTO slot_items (id, name) VALUES (1, 'abc'), (2, 'xy')"]
-                    let reordered = [(name, table {SQL.tableRows = map reverse (SQL.tableRows table)}) | (name, table) <- db]
+                    db <-
+                        sqlCatalog
+                            [ "CREATE TABLE slot_items (id INT, name TEXT)"
+                            , "INSERT INTO slot_items (id, name) VALUES (1, 'abc'), (2, 'xy')"
+                            ]
+                    let reordered = [(name, table{SQL.tableRows = map reverse (SQL.tableRows table)}) | (name, table) <- db]
                     statement <- parseStatement "SELECT length(name) AS size, id + 1 AS next FROM slot_items WHERE id > 0 ORDER BY size"
                     rowsOf (runStatement reordered statement)
             fmap (map (map snd)) result `shouldBe` Right [[SQL.VInt 2, SQL.VInt 3], [SQL.VInt 3, SQL.VInt 2]]
@@ -734,35 +1051,61 @@ spec = do
             fmap Query.queryTypes result `shouldBe` Right [("today", Query.CompatibilityType SQL.CDate)]
         it "retains nested DOMAIN identities through derived aliases and DISTINCT" $ withType intType $ \tid -> do
             let result = do
-                    db <- sqlCatalog ["CREATE DOMAIN quantity AS INT", "CREATE DOMAIN stock AS quantity"
-                        , "CREATE TABLE inventory (qty stock)", "INSERT INTO inventory (qty) VALUES (2), (NULL)"]
+                    db <-
+                        sqlCatalog
+                            [ "CREATE DOMAIN quantity AS INT"
+                            , "CREATE DOMAIN stock AS quantity"
+                            , "CREATE TABLE inventory (qty stock)"
+                            , "INSERT INTO inventory (qty) VALUES (2), (NULL)"
+                            ]
                     statement <- parseStatement "SELECT DISTINCT d.qty AS available FROM (SELECT qty FROM inventory) d"
                     bound <- Query.bindQuery db statement
                     rows <- rowsOf (runStatement db statement)
                     Right (Query.queryTypes bound, map (map snd) rows)
-            result `shouldBe` Right ([("available", Query.DomainType "stock"
-                (Query.DomainType "quantity" (Query.RuntimeType tid)))], [[SQL.VInt 2], [SQL.VNull]])
+            result
+                `shouldBe` Right
+                    (
+                        [
+                            ( "available"
+                            , Query.DomainType
+                                "stock"
+                                (Query.DomainType "quantity" (Query.RuntimeType tid))
+                            )
+                        ]
+                    , [[SQL.VInt 2], [SQL.VNull]]
+                    )
         it "preserves temporal and binary DOMAIN wrappers" $ do
             let result = do
-                    db <- sqlCatalog ["CREATE DOMAIN day AS DATE", "CREATE DOMAIN payload AS BLOB"
-                        , "CREATE TABLE documents (created day, contents payload)"]
+                    db <-
+                        sqlCatalog
+                            [ "CREATE DOMAIN day AS DATE"
+                            , "CREATE DOMAIN payload AS BLOB"
+                            , "CREATE TABLE documents (created day, contents payload)"
+                            ]
                     statement <- parseStatement "SELECT created, contents FROM documents"
                     Query.queryTypes <$> Query.bindQuery db statement
-            result `shouldBe` Right [("created", Query.DomainType "day" (Query.CompatibilityType SQL.CDate))
-                , ("contents", Query.DomainType "payload" (Query.CompatibilityType SQL.CBlob))]
+            result
+                `shouldBe` Right
+                    [ ("created", Query.DomainType "day" (Query.CompatibilityType SQL.CDate))
+                    , ("contents", Query.DomainType "payload" (Query.CompatibilityType SQL.CBlob))
+                    ]
         it "uses base function semantics without labeling function results as DOMAIN" $ withType intType $ \tid -> do
             let result = do
-                    db <- sqlCatalog ["CREATE DOMAIN label AS VARCHAR(3)", "CREATE TABLE names (name label)"
-                        , "INSERT INTO names (name) VALUES ('abc')"]
+                    db <-
+                        sqlCatalog
+                            [ "CREATE DOMAIN label AS VARCHAR(3)"
+                            , "CREATE TABLE names (name label)"
+                            , "INSERT INTO names (name) VALUES ('abc')"
+                            ]
                     statement <- parseStatement "SELECT length(name) AS size FROM names"
                     bound <- Query.bindQuery db statement
                     rows <- rowsOf (runStatement db statement)
                     Right (Query.queryTypes bound, map (map snd) rows)
             result `shouldBe` Right ([("size", Query.RuntimeType tid)], [[SQL.VInt 3]])
-        it "rejects composite ordering without an Ord implementation" $
-            sql "SELECT LIST<Int>(1) AS xs ORDER BY xs" `shouldSatisfy` isFailure
-        it "rejects composite extrema without an Ord implementation" $
-            sql "SELECT MIN(LIST<Int>(1))" `shouldSatisfy` isFailure
+        it "sorts composites with their registered ordering" $ withType (listType intType) $ \tid ->
+            sql "SELECT LIST<Int>(1) AS xs ORDER BY xs" `shouldBe` Right [[SQL.VRuntime tid (RList [RInt 1])]]
+        it "computes composite extrema with their registered ordering" $ withType (listType intType) $ \tid ->
+            sql "SELECT MIN(LIST<Int>(1))" `shouldBe` Right [[SQL.VRuntime tid (RList [RInt 1])]]
         it "rejects unique runtime columns without a key implementation" $
             (parseStatement "CREATE TABLE keyed (xs [Int] UNIQUE)" >>= runStatement []) `shouldSatisfy` isFailure
         it "rejects primary runtime keys without a key implementation" $
@@ -815,7 +1158,7 @@ spec = do
         it "binds calls before execution" $ do
             let bound = parseStatement "SELECT length('abc')" >>= prepare []
             case bound of
-                Right Select {selectItems = [(_, BoundFunction (FunctionId 1) _ [_])]} -> pure ()
+                Right Select{selectItems = [(_, BoundFunction (FunctionId 1) _ [_])]} -> pure ()
                 _ -> expectationFailure (show bound)
         it "rejects unknown SQL functions before scanning" $
             sql "SELECT missing('abc')" `shouldSatisfy` isFailure
@@ -847,10 +1190,21 @@ sql source = do
     rows <- rowsOf (runStatement database statement)
     Right (map (map snd) rows)
   where
-    -- | 提供函数调用测试表
-    database = [("t", SQL.Table "t" [("name", SQL.plainColumn SQL.CStr), ("enabled", SQL.plainColumn SQL.CBool)]
-        [[("name", SQL.VStr "ab"), ("enabled", SQL.VBool True)]
-        ,[("name", SQL.VStr "xyz"), ("enabled", SQL.VBool False)]] Nothing Nothing Nothing)]
+    -- \| 提供函数调用测试表
+    database =
+        [
+            ( "t"
+            , SQL.Table
+                "t"
+                [("name", SQL.plainColumn SQL.CStr), ("enabled", SQL.plainColumn SQL.CBool)]
+                [ [("name", SQL.VStr "ab"), ("enabled", SQL.VBool True)]
+                , [("name", SQL.VStr "xyz"), ("enabled", SQL.VBool False)]
+                ]
+                Nothing
+                Nothing
+                Nothing
+            )
+        ]
 
 -- | 判断结果是否明确失败
 isFailure :: Either a b -> Bool

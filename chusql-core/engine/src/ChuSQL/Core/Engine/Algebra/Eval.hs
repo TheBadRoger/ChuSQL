@@ -1,24 +1,26 @@
 {-# LANGUAGE TupleSections #-}
+
 module ChuSQL.Core.Engine.Algebra.Eval (evalRelOp, evalRelOpM, evalExprM, evalCondForRowM) where
 
 import ChuSQL.Core.Engine.Algebra.Cost (tableMetaOf)
-import ChuSQL.Core.Engine.Algebra.Expr (evalCondForRow, evalExpr, hasSubquery, quantifiedCompare, subquerySlotsIn, subqueryColumns)
-import ChuSQL.Core.Engine.Algebra.Optimize (optimize)
+import ChuSQL.Core.Engine.Algebra.Expr (evalCondForRow, evalExpr, hasSubquery, quantifiedCompare, subqueryColumns, subquerySlotsIn)
 import ChuSQL.Core.Engine.Algebra.Op
+import ChuSQL.Core.Engine.Algebra.Optimize (optimize)
 import ChuSQL.Core.Engine.Algebra.Planner (translate)
-import ChuSQL.Core.Engine.Algebra.Sort (sortRows, sortBoundRows)
+import ChuSQL.Core.Engine.Algebra.Sort (sortBoundRows, sortRows)
+import ChuSQL.Core.Engine.Builtin (aggregateArg, builtinOfExpr, inValues, invokeBuiltin, unsupportedAggregate)
 import ChuSQL.Core.Engine.Runtime.Relation (bindRelOpColumns, orderRow)
-import ChuSQL.Core.Engine.Builtin (aggregateArg, builtinOfExpr, invokeBuiltin, unsupportedAggregate, inValues)
-import ChuSQL.Core.Model
 import ChuSQL.Core.Engine.Storage (IndexResult (..), MonadStorage (..))
 import ChuSQL.Core.Engine.Storage.Memory (runMemoryStorage)
 import ChuSQL.Core.Engine.Syntax.AST (Expr (..), JoinKind (..), Subquery (..))
+import ChuSQL.Core.Model
 import Control.Monad (filterM)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.State.Strict (StateT, evalStateT, gets, modify')
+import Data.Bifunctor (first)
+import Data.HashMap.Strict qualified as HM
+import Data.HashSet qualified as HS
 import Data.List (nub)
-import qualified Data.HashMap.Strict as HM
-import qualified Data.HashSet as HS
 
 -- 执行：按算子树算出结果行，外层行供相关子查询引用。
 
@@ -26,7 +28,7 @@ import qualified Data.HashSet as HS
 type Execution m a = StateT (HM.HashMap String [Row]) m a
 
 -- | 首次使用时执行，成功结果供后续引用复用
-materialize :: Monad m => String -> Execution m (Either String [Row]) -> Execution m (Either String [Row])
+materialize :: (Monad m) => String -> Execution m (Either String [Row]) -> Execution m (Either String [Row])
 materialize key action = do
     cached <- gets (HM.lookup key)
     case cached of
@@ -46,7 +48,7 @@ project cs row = [(c, v) | c <- cs, Just v <- [lookup c row]]
 
 -- | 给列名加别名前缀
 addPrefix :: Maybe String -> Row -> Row
-addPrefix mAlias = map (\(k, v) -> (qualify mAlias k, v))
+addPrefix mAlias = map (first (qualify mAlias))
 
 -- | 给一批行加别名前缀
 prefixRows :: Maybe String -> [Row] -> [Row]
@@ -74,7 +76,7 @@ rangeCondition mAlias col lo hi = case (lo, hi) of
     (Nothing, Nothing) -> LitBool True
   where
     c = Col (qualify mAlias col)
-    -- | 一个端点的比较，闭端再加上等号
+    -- \| 一个端点的比较，闭端再加上等号
     bound rel (v, inclusive)
         | inclusive = Or (rel c (valueLiteral v)) (Eq c (valueLiteral v))
         | otherwise = rel c (valueLiteral v)
@@ -102,10 +104,18 @@ data EquiKeys = EquiKeys
 -- | 认出 a = b 这种两列等值条件，并且能分清谁在左谁在右
 equiKeys :: [String] -> [String] -> Expr -> Maybe EquiKeys
 equiKeys lcols rcols (Eq left right)
-    | Just a <- columnName left, Just b <- columnName right
-    , a /= b, a `elem` lcols, b `elem` rcols = Just (EquiKeys a b)
-    | Just a <- columnName left, Just b <- columnName right
-    , a /= b, b `elem` lcols, a `elem` rcols = Just (EquiKeys b a)
+    | Just a <- columnName left
+    , Just b <- columnName right
+    , a /= b
+    , a `elem` lcols
+    , b `elem` rcols =
+        Just (EquiKeys a b)
+    | Just a <- columnName left
+    , Just b <- columnName right
+    , a /= b
+    , b `elem` lcols
+    , a `elem` rcols =
+        Just (EquiKeys b a)
 equiKeys _ _ _ = Nothing
 
 -- | 提取执行列的诊断名称
@@ -144,26 +154,32 @@ semiRows kind left right outer leftRows rightRows = do
     let keys = HS.fromList [canonicalValue value | value <- values, value /= VNull]
         hasNull = VNull `elem` values
         hashSafe = all safeNumber values
-        -- | NULL 与数值边界沿用表达式比较规则
+        -- \| NULL 与数值边界沿用表达式比较规则
         keep row = do
             value <- evalExpr left (row ++ outer)
             if value == VNull
                 then Right (kind == NonMatching || kind == NotIn && null values)
-                else if hashSafe && safeNumber value
-                    then let found = HS.member (canonicalValue value) keys
-                         in Right (case kind of
-                             Matching -> found
-                             NonMatching -> not found
-                             NotIn -> not found && not hasNull)
-                    else do
-                        result <- inValues value values
-                        Right (case kind of
-                            Matching -> result == VBool True
-                            NonMatching -> result /= VBool True
-                            NotIn -> result == VBool False)
+                else
+                    if hashSafe && safeNumber value
+                        then
+                            let found = HS.member (canonicalValue value) keys
+                             in Right
+                                    ( case kind of
+                                        Matching -> found
+                                        NonMatching -> not found
+                                        NotIn -> not found && not hasNull
+                                    )
+                        else do
+                            result <- inValues value values
+                            Right
+                                ( case kind of
+                                    Matching -> result == VBool True
+                                    NonMatching -> result /= VBool True
+                                    NotIn -> result == VBool False
+                                )
     filterM keep leftRows
   where
-    -- | 大数混合比较退回既有逐值语义
+    -- \| 大数混合比较退回既有逐值语义
     safeNumber (VInt value) = abs (toInteger value) <= 9007199254740992
     safeNumber (VFloat value) = abs value <= 9007199254740992
     safeNumber _ = True
@@ -178,7 +194,7 @@ hashJoin :: JoinKind -> EquiKeys -> [String] -> [Row] -> [Row] -> [Row]
 hashJoin kind ks ncols lrows rrows = concatMap probe lrows
   where
     buckets = HM.fromListWith (flip (++)) [(v, [r]) | r <- rrows, Just v <- [joinKeyOf (ekRight ks) r]]
-    -- | 拿左行的键去桶里找
+    -- \| 拿左行的键去桶里找
     probe l =
         let miss = case kind of
                 InnerJoin -> []
@@ -204,7 +220,7 @@ filterPairsM ::
 filterPairsM db outer kind ncols cond lrows rrows = go lrows [] HM.empty
   where
     refs = subquerySlotsIn cond
-    -- | 逐左行配对，左连接没配上就补 NULL
+    -- \| 逐左行配对，左连接没配上就补 NULL
     go [] acc _ = pure (Right (reverse acc))
     go (l : ls) acc cache = do
         hits <- keep l rrows [] cache
@@ -215,7 +231,7 @@ filterPairsM db outer kind ncols cond lrows rrows = go lrows [] HM.empty
                         (LeftJoin, []) -> [l ++ nullRow]
                         _ -> hs
                 go ls (reverse hs' ++ acc) nextCache
-    -- | 拿一行右行去比条件
+    -- \| 拿一行右行去比条件
     keep _ [] acc cache = pure (Right (reverse acc, cache))
     keep l (r : rs) acc cache = do
         let env = l ++ r ++ outer
@@ -259,13 +275,18 @@ probeIndexJoin db outer kind mAlias t ks rcols cond l = case lookup (ekLeft ks) 
                         Left err -> pure (Left err)
                         Right ordered -> fmap (fmap Just) (joinRowsIn db outer kind rcols cond [l] ordered)
 
--- | 列与键都不是浮点时才敢用索引
+-- | 仅用已支持且无浮点歧义的索引键
 indexSafe :: Database -> String -> String -> Value -> Bool
 indexSafe db t col k = case lookupTable db t of
     Left _ -> False
     Right tbl -> case lookup col (tableCols tbl) of
         Nothing -> False
-        Just c -> not (floatType (columnType c)) && not (floatValue k)
+        Just c -> scalarKey k && not (floatType (columnType c)) && not (floatValue k)
+  where
+    -- \| 只有已实现编码的键可以点查
+    scalarKey VInt{} = True
+    scalarKey VStr{} = True
+    scalarKey _ = False
 
 -- | 是不是浮点列类型
 floatType :: ColumnType -> Bool
@@ -288,7 +309,7 @@ groupKey outer keys row = mapM (\key -> evalExpr key (row ++ outer)) keys
 groupRows :: Row -> [Expr] -> [Row] -> Either String [([Value], [Row])]
 groupRows outer keys rows = go rows (HM.empty, [])
   where
-    -- | 逐行塞进对应分组，并记住分组首次出现的顺序
+    -- \| 逐行塞进对应分组，并记住分组首次出现的顺序
     go [] (acc, order) = Right [(k, reverse (HM.lookupDefault [] k acc)) | k <- reverse order]
     go (r : rs) (acc, order) = do
         k <- groupKey outer keys r
@@ -342,7 +363,7 @@ bindingValue column env = case lookup column env of
 bindingSamples :: [Expr] -> Row -> [Row] -> Either String [(String, Row)]
 bindingSamples refs outer rows = go rows HM.empty []
   where
-    -- | 逐行按绑定键去重
+    -- \| 逐行按绑定键去重
     go [] _ acc = Right (reverse acc)
     go (r : rs) seen acc = do
         let env = r ++ outer
@@ -366,7 +387,7 @@ bindingsTableM db outer exprs rows = case bindingSamples refs outer rows of
         pure (fmap HM.fromList (sequence built))
   where
     refs = nub (concatMap subquerySlotsIn exprs)
-    -- | 一个绑定样本上把子查询全换成字面量
+    -- \| 一个绑定样本上把子查询全换成字面量
     swap (key, env) = do
         es <- mapM (\e -> substSubqueries db e env) exprs
         pure (fmap (key,) (sequence es))
@@ -391,7 +412,7 @@ boundExpr refs env table = do
 filterRowsM :: (Monad m) => (Row -> m (Either String Bool)) -> [Row] -> m (Either String [Row])
 filterRowsM p = go []
   where
-    -- | 逐行留下通过条件的
+    -- \| 逐行留下通过条件的
     go acc [] = pure (Right (reverse acc))
     go acc (r : rs) = do
         keep <- p r
@@ -404,7 +425,7 @@ filterRowsM p = go []
 computeM :: (MonadStorage m) => Database -> Row -> [(String, Expr)] -> Row -> Execution m (Either String Row)
 computeM db outer items row = go items []
   where
-    -- | 逐项求值并攒成一行
+    -- \| 逐项求值并攒成一行
     go [] acc = pure (Right (reverse acc))
     go ((label, e) : rest) acc = do
         v <- evalExprIn db e (row ++ outer)
@@ -417,7 +438,7 @@ evalExprM :: (MonadStorage m) => Database -> Expr -> Row -> m (Either String Val
 evalExprM db e env = evalStateT (evalExprIn db e env) HM.empty
 
 -- | 在当前执行中求值并共享子查询物化
-evalExprIn :: MonadStorage m => Database -> Expr -> Row -> Execution m (Either String Value)
+evalExprIn :: (MonadStorage m) => Database -> Expr -> Row -> Execution m (Either String Value)
 evalExprIn db e env = do
     e' <- substSubqueries db e env
     pure (e' >>= \x -> evalExpr x env)
@@ -427,7 +448,7 @@ evalCondForRowM :: (MonadStorage m) => Database -> Expr -> Row -> m (Either Stri
 evalCondForRowM db e env = evalStateT (evalCondIn db e env) HM.empty
 
 -- | 在当前执行中判定条件并共享物化
-evalCondIn :: MonadStorage m => Database -> Expr -> Row -> Execution m (Either String Bool)
+evalCondIn :: (MonadStorage m) => Database -> Expr -> Row -> Execution m (Either String Bool)
 evalCondIn db e env = do
     e' <- substSubqueries db e env
     pure (e' >>= \x -> evalCondForRow x env)
@@ -465,29 +486,35 @@ substSubqueries db e env = case e of
     InSub a sq negated -> do
         lhs <- substSubqueries db a env
         rows <- runSubqueryRows db sq env
-        pure (do
-            a' <- lhs
-            rs <- rows
-            vs <- mapM rowValue rs
-            Right (InList a' (map valueLiteral vs) negated))
+        pure
+            ( do
+                a' <- lhs
+                rs <- rows
+                vs <- mapM rowValue rs
+                Right (InList a' (map valueLiteral vs) negated)
+            )
     ExistsSub sq negated -> do
         rows <- runSubqueryRows db sq env
         pure (fmap (\rs -> LitBool (if negated then null rs else not (null rs))) rows)
     QuantCmp op a sq q -> do
         lhs <- substSubqueries db a env
         rows <- runSubqueryRows db sq env
-        pure (do
-            a' <- lhs
-            rs <- rows
-            vs <- mapM rowValue rs
-            Right (quantifiedCompare op a' (map valueLiteral vs) q))
+        pure
+            ( do
+                a' <- lhs
+                rs <- rows
+                vs <- mapM rowValue rs
+                Right (quantifiedCompare op a' (map valueLiteral vs) q)
+            )
     InList a es negated -> do
         lhs <- substSubqueries db a env
         es' <- mapM (\x -> substSubqueries db x env) es
-        pure (do
-            a' <- lhs
-            items <- sequence es'
-            Right (InList a' items negated))
+        pure
+            ( do
+                a' <- lhs
+                items <- sequence es'
+                Right (InList a' items negated)
+            )
     Add a b -> bin Add a b
     Sub a b -> bin Sub a b
     Mul a b -> bin Mul a b
@@ -510,7 +537,7 @@ substSubqueries db e env = case e of
     MaxOf a -> un MaxOf a
     _ -> pure (Right e)
   where
-    -- | 递归处理两个子表达式
+    -- \| 递归处理两个子表达式
     bin ctor a b = do
         ra <- substSubqueries db a env
         case ra of
@@ -518,7 +545,7 @@ substSubqueries db e env = case e of
             Right a' -> do
                 rb <- substSubqueries db b env
                 pure (ctor a' <$> rb)
-    -- | 递归处理一个子表达式
+    -- \| 递归处理一个子表达式
     un ctor a = do
         ra <- substSubqueries db a env
         pure (ctor <$> ra)
@@ -531,14 +558,16 @@ runSubqueryRows db sq outer = case translate (subqueryStatement sq) of
         Left err -> pure (Left err)
         Right bindings -> case bindRelOpColumns db (map fst (bindings ++ outer)) (optimize db op) of
             Left err -> pure (Left err)
-            Right bound -> materialize (show ("subquery", subqueryStatement sq, bindings, fallback))
-                (evalRelOpIn db (bindings ++ outer) bound)
+            Right bound ->
+                materialize
+                    (show ("subquery", subqueryStatement sq, bindings, fallback))
+                    (evalRelOpIn db (bindings ++ outer) bound)
   where
-    -- | 原始调用未证明依赖完整，保留整个外层行
+    -- \| 原始调用未证明依赖完整，保留整个外层行
     fallback = case sq of
         Subquery{} -> Just outer
         BoundSubquery{} -> Nothing
-    -- | 给外层物理列补回已解析的限定名
+    -- \| 给外层物理列补回已解析的限定名
     bind (column, expression) = (,) column <$> bindingReferenceValue expression outer
 
 -- | 单子求值：Scan/点查/范围查都问存储
@@ -567,7 +596,7 @@ evalRelOpIn db outer (Compute items op) = do
                 pure (table >>= \t -> traverse (computeBound t) rs)
   where
     refs = nub (concatMap (subquerySlotsIn . snd) items)
-    -- | 用这一行绑定换好的表达式算出一行
+    -- \| 用这一行绑定换好的表达式算出一行
     computeBound table r = do
         es <- boundExprs refs (r ++ outer) table
         mapM (\(label, e) -> (,) label <$> evalExpr e (r ++ outer)) (zip (map fst items) es)
@@ -603,7 +632,7 @@ evalRelOpIn db outer (Filter e op) = do
                 pure (table >>= \t -> filterM (keepBound t) rs)
   where
     refs = nub (subquerySlotsIn e)
-    -- | 用这一行绑定换好的条件判定
+    -- \| 用这一行绑定换好的条件判定
     keepBound table r = do
         e' <- boundExpr refs (r ++ outer) table
         evalCondForRow e' (r ++ outer)
@@ -631,7 +660,7 @@ evalRelOpIn db outer (SemiJoin kind left right l r query) = do
         Left err -> pure (Left err)
         Right [] -> pure (Right [])
         Right leftRows -> do
-            -- | 独立 IN 沿用子查询身份，跨算子复用结果
+            -- \| 独立 IN 沿用子查询身份，跨算子复用结果
             let key = case query of
                     Just statement -> show ("subquery", statement, [] :: Row, Nothing :: Maybe Row)
                     Nothing -> show ("derived", r, outer)
@@ -684,14 +713,14 @@ scanTable db tbl cols = do
         then lift (scanShards width tbl cols)
         else lift (maybe (scan tbl) (scanColumns tbl) cols)
   where
-    -- | 统计里的行数，没有统计算 0
+    -- \| 统计里的行数，没有统计算 0
     rows = maybe 0 metaRowCount (tableMetaOf db tbl)
 
 -- | 按输出值去重并保留首次行序
 distinctRows :: [Row] -> [Row]
 distinctRows = go HS.empty
   where
-    -- | 只输出尚未遇到的值组合
+    -- \| 只输出尚未遇到的值组合
     go _ [] = []
     go seen (row : rows)
         | HS.member key seen = go seen rows

@@ -79,7 +79,7 @@ canonicalSettingKeys :: Map.Map Text Text -> Map.Map Text Text
 canonicalSettingKeys saved =
     foldr (\(key, value) acc -> Map.insert (canonicalKey key) value acc) Map.empty (Map.toList saved)
   where
-    -- | 取一个键的规范名
+    -- \| 取一个键的规范名
     canonicalKey key = fromMaybe key (lookup key keyAliases)
 
 -- | 设置键别名：非权威写法到权威写法（多数写连字符）
@@ -171,7 +171,7 @@ staticDirCandidates given =
 resolveStaticDir :: FilePath -> IO (Maybe FilePath)
 resolveStaticDir given = go (staticDirCandidates given)
   where
-    -- | 逐个试
+    -- \| 逐个试
     go [] = pure Nothing
     go (d : ds) = do
         ok <- doesDirectoryExist d
@@ -195,11 +195,12 @@ defaultServerConfig = ServerConfig "127.0.0.1" 7777 (1024 * 1024) 1000 ""
 loadServerConfigAt :: FilePath -> IO ServerConfig
 loadServerConfigAt path = do
     values <- readSection path "server"
-    let -- | 取一个键的非空字符串值
+    let
+        -- \| 取一个键的非空字符串值
         textOf key fallback = case Map.lookup key values of
             Just value | not (T.null (T.strip value)) -> T.unpack (T.strip value)
             _ -> fallback
-        -- | 取一个键的整数值
+        -- \| 取一个键的整数值
         intOf key fallback = fromMaybe fallback (Map.lookup key values >>= readMaybe . T.unpack . T.strip)
     pure
         defaultServerConfig

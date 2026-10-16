@@ -30,7 +30,7 @@ instance MonadStorage MemoryStorage where
     -- \| 纯状态视图在求值期间不受外部修改
     withSchemaGuard _ action = action
 
-    -- | 纯状态写入不受外部结构变更影响
+    -- \| 纯状态写入不受外部结构变更影响
     withWriteSchemaGuard _ action = action
 
     -- \| 全表扫描
@@ -80,6 +80,11 @@ instance MonadStorage MemoryStorage where
                                     }
                                 db
                             )
+
+    -- \| 在同一状态转换内校验并发布领域
+    alterDomain name validate = MemoryStorage $ \db -> case validate db of
+        Left err -> Right (Left err, db)
+        Right cols -> runMemoryStorage (replaceSchema name cols []) db
 
     -- \| 原样返回当前库
     snapshot = MemoryStorage $ \db -> Right (Right db, db)

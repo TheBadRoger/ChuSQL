@@ -5,8 +5,8 @@ import ChuSQL.Core.Engine.Algebra.Expr (colsInExpr, evalExpr, hasDivision)
 import ChuSQL.Core.Engine.Algebra.JoinOrder (reorderJoins)
 import ChuSQL.Core.Engine.Algebra.Op (RelOp (..), SemiKind (..), relOpCols)
 import ChuSQL.Core.Engine.Algebra.Planner (translate)
+import ChuSQL.Core.Engine.Syntax.AST (Expr (..), FromClause (..), JoinKind (..), Statement (..), Subquery (..))
 import ChuSQL.Core.Model
-import ChuSQL.Core.Engine.Syntax.AST (Expr (..), JoinKind (..), Statement (..), FromClause (..), Subquery (..))
 import Data.List (nub)
 
 -- 查询优化：谓词下推、投影下推、常量折叠、扫描方式与连接顺序选择。
@@ -30,7 +30,7 @@ combineConj (e : es) = Just (foldl And e es)
 partitionPred :: [String] -> [Expr] -> ([Expr], [Expr])
 partitionPred have = foldr pick ([], [])
   where
-    -- | 按列归属收到左边或右边
+    -- \| 按列归属收到左边或右边
     pick e (yes, no)
         | colsInExpr e `isSubsetOf` have = (e : yes, no)
         | otherwise = (yes, e : no)
@@ -111,8 +111,13 @@ pushProject db _ (Distinct x) = Distinct (pushProject db (relOpCols db x) x)
 pushProject db need (Sort spec x) = Sort spec (pushProject db (need ++ map fst spec) x)
 pushProject db need (Limit n x) = Limit n (pushProject db need x)
 pushProject db need (SemiJoin kind left right l r query) =
-    SemiJoin kind left right (pushProject db (need ++ colsInExpr left) l)
-        (pushProject db (colsInExpr right) r) query
+    SemiJoin
+        kind
+        left
+        right
+        (pushProject db (need ++ colsInExpr left) l)
+        (pushProject db (colsInExpr right) r)
+        query
 pushProject db need (Join kind l r c)
     | needsAll need = Join kind (pushProject db need l) (pushProject db need r) c
     | otherwise =
@@ -128,15 +133,15 @@ pushProject db need leaf@(Scan a t _)
     | otherwise = Scan a t (Just (nub [column | requested <- need, let column = physicalColumn requested, column `elem` available]))
   where
     available = map (unqualify a) (relOpCols db (Scan a t Nothing))
-    -- | 把扫描限定列换成存储物理列名
+    -- \| 把扫描限定列换成存储物理列名
     physicalColumn column = unqualify (Just (deriveQualifier a t)) (unqualify a column)
 pushProject db need (Derived a x)
     | needsAll need || all (`elem` wanted) (relOpCols db x) = Derived a (pushProject db ["*"] x)
     | otherwise = Derived a (Project wanted (pushProject db wanted x))
   where
     wanted = nub (map (unqualify a) need)
-pushProject db need leaf@(Lookup {}) = pushProjectLeaf db need leaf
-pushProject db need leaf@(Range {}) = pushProjectLeaf db need leaf
+pushProject db need leaf@(Lookup{}) = pushProjectLeaf db need leaf
+pushProject db need leaf@(Range{}) = pushProjectLeaf db need leaf
 
 -- | 折一个表达式节点
 foldNode :: Expr -> Expr
@@ -186,9 +191,11 @@ worthRange db t col lo hi = case tableMetaOf db t of
 -- | 将独立 IN 或简单等值 EXISTS 变为半连接
 semiJoin :: Database -> Expr -> RelOp -> Maybe RelOp
 semiJoin db (InSub left query negated) source
-    | null (subqueryRefs query), safeKey left
+    | null (subqueryRefs query)
+    , safeKey left
     , Right right <- translate (subqueryStatement query)
-    , [column] <- relOpCols db right, column /= "*" =
+    , [column] <- relOpCols db right
+    , column /= "*" =
         Just (SemiJoin (if negated then NotIn else Matching) left (Col column) source right (Just (subqueryStatement query)))
 semiJoin db (ExistsSub query negated) source
     | [reference] <- subqueryRefs query
@@ -199,8 +206,15 @@ semiJoin db (ExistsSub query negated) source
     , Just column <- localKey columns reference a b
     , let physical = if reference `elem` relOpCols db source then reference else reverse (takeWhile (/= '.') (reverse reference))
     , physical `elem` relOpCols db source =
-        Just (SemiJoin (if negated then NonMatching else Matching) (Col physical) (Col "$semikey") source
-            (Compute (items ++ [("$semikey", Col column)]) scan) Nothing)
+        Just
+            ( SemiJoin
+                (if negated then NonMatching else Matching)
+                (Col physical)
+                (Col "$semikey")
+                source
+                (Compute (items ++ [("$semikey", Col column)]) scan)
+                Nothing
+            )
 semiJoin _ _ _ = Nothing
 
 -- | 只允许无求值错误的左键
@@ -297,7 +311,7 @@ rewriteNode db op = pushOne db op
 optimizeRelOp :: Database -> RelOp -> RelOp
 optimizeRelOp db = rewriteNode db . descend
   where
-    -- | 先递归处理子算子
+    -- \| 先递归处理子算子
     descend (Filter p x) = Filter p (optimizeRelOp db x)
     descend (Project cols x) = Project cols (optimizeRelOp db x)
     descend (Compute items x) = Compute items (optimizeRelOp db x)

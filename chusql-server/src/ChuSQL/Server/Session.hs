@@ -1,68 +1,73 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TupleSections #-}
 
-module ChuSQL.Server.Session
-    ( QueryResult (..)
-    , Session
-    , SessionError (..)
-    , engineErrorCode
-    , newSession
-    , newSessionWith
-    , sessionUser
-    , sessionIsAdmin
-    , sessionDatabase
-    , isPlainIdentifier
-    , authenticateSession
-    , authenticateSessionCoded
-    , authenticateSudoSessionCoded
-    , switchDatabase
-    , runStatement
-    , runStatementCoded
-    , runStorageCoded
-    , analyzeNormalizationCoded
-    , catalog
-    , accounts
-    , roleViews
-    , databases
-    , policyOf
-    , reloadPolicy
-    , queryResultJson
-    ) where
+module ChuSQL.Server.Session (
+    QueryResult (..),
+    Session,
+    SessionError (..),
+    engineErrorCode,
+    newSession,
+    closeSession,
+    newSessionWith,
+    sessionUser,
+    sessionIsAdmin,
+    sessionDatabase,
+    isPlainIdentifier,
+    authenticateSession,
+    authenticateSessionCoded,
+    authenticateSudoSessionCoded,
+    switchDatabase,
+    runStatement,
+    runStatementCoded,
+    runStorageCoded,
+    analyzeNormalizationCoded,
+    catalog,
+    accounts,
+    roleViews,
+    databases,
+    policyOf,
+    reloadPolicy,
+    queryResultJson,
+) where
 
-import ChuSQL.Core.Model (Database, Row, Table (..), Value (..), Column (..), typeName)
-import ChuSQL.Core.Protocol
-    ( SchemaColumn(..),
-      Account(..),
-      Request(..),
-      QueryResult(..),
-      TxnOp(..),
-      queryResultJson )
-import ChuSQL.Interface.Normalization
-import ChuSQL.Server.Normalization (normalizationBudget, normalizationReport)
-import Data.Aeson.Types (parseEither)
-import qualified Data.ByteString.Lazy as BL
-import ChuSQL.Core.Engine.Storage.IPC (TableInfo (..))
 import qualified ChuSQL.Core.Engine as Engine
 import qualified ChuSQL.Core.Engine.Error as E
+import ChuSQL.Core.Engine.Runtime.Dependencies (domainDependencies, queryTables, validateDependencies)
+import ChuSQL.Core.Engine.Storage.IPC (TableInfo (..))
 import ChuSQL.Core.Engine.Syntax.AST (Statement (..))
 import ChuSQL.Core.Engine.Syntax.Parser (parseStatement)
+import ChuSQL.Core.Model (Column (..), Database, Row, Table (..), Value (..), lastTablePart, typeName)
+import ChuSQL.Core.Protocol (
+    Account (..),
+    QueryResult (..),
+    Request (..),
+    SchemaColumn (..),
+    TxnOp (..),
+    queryResultJson,
+ )
 import ChuSQL.Interface.AccountTable (systemTableInfo)
 import ChuSQL.Interface.Auth (defaultSessionPolicy, newSessionStore)
+import ChuSQL.Interface.Normalization
 import ChuSQL.Server.Accounts
-import ChuSQL.Server.Backend (Backend (..), StatementResult (..), columnsFromStatement, scopeDdl)
+import ChuSQL.Server.Backend (Backend (..), StatementResult (..), applyTransactionMemory, columnsFromStatement, scopeDdl)
+import ChuSQL.Server.Normalization (normalizationBudget, normalizationReport)
 import ChuSQL.Server.Policy (configurePasswordPolicy)
-import ChuSQL.Server.Privileges (PrivilegeCommand (..), PrivilegeError (..), Privileges, RoleView, Grant (..), affectedAccounts, affectedObject, authorize, authorizeTables, authorizeConnect, claimObject, prepareObject, reconcileObjects, filterTables, listRoleViews, listSelfGrants, newPrivileges, privilegeCommand, runPrivilegeCommand)
-import ChuSQL.Server.Security (readSecurity, writeSecurity)
+import ChuSQL.Server.Privileges (Grant (..), PrivilegeCommand (..), PrivilegeError (..), Privileges, RoleView, affectedAccounts, affectedObject, authorize, authorizeConnect, authorizeTables, claimObject, filterTables, listRoleViews, listSelfGrants, newPrivileges, prepareObject, privilegeCommand, reconcileObjects, runPrivilegeCommand)
+import ChuSQL.Server.Security (commitSecurity, databaseSecurity, readSecurity, writeSecurity)
 import Control.Exception (IOException, try)
-import Data.Bifunctor (first)
-import Data.Char (isAlpha, isAlphaNum)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
-import Data.Maybe (isJust, fromMaybe)
-import qualified Data.IntMap.Strict as IM
-import qualified Data.IntSet as IS
-import Data.Text (Text)
-import qualified Data.Text as T
 import qualified Data.Aeson as A
 import qualified Data.Aeson.KeyMap as KM
+import Data.Aeson.Types (parseEither)
+import Data.Bifunctor (first)
+import qualified Data.ByteString.Lazy as BL
+import Data.Char (isAlpha, isAlphaNum)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import qualified Data.IntMap.Strict as IM
+import qualified Data.IntSet as IS
+import Data.List (nub)
+import Data.Maybe (fromMaybe, isJust)
+import Data.Text (Text)
+import qualified Data.Text as T
 import Data.Time.Clock (getCurrentTime)
 
 -- SQL 会话：Web、命令行与 TCP 服务器共用的账号、权限与语句执行入口。
@@ -97,6 +102,8 @@ data Transaction = Transaction
     , txSavepoints :: [(String, Database, [Statement])]
     , txStatements :: [Statement]
     , txObjects :: [(String, A.Value)]
+    , txToken :: Maybe String
+    , txSerializable :: Bool
     }
 
 -- | 开一个会话：账号与角色服务、配置策略都和 Web 端一致
@@ -116,6 +123,18 @@ newSessionWith backend name settingsFile changed = do
     identityStamp <- newIORef Nothing
     transaction <- newIORef Nothing
     pure (Session backend accountsService privileges current principal identityStamp settingsFile transaction changed)
+
+-- 关闭连接时归还存储事务、版本引用与行锁。
+closeSession :: Session -> IO ()
+closeSession session = do
+    existing <- readIORef (ssTransaction session)
+    writeIORef (ssTransaction session) Nothing
+    case existing >>= txToken of
+        Nothing -> pure ()
+        Just token -> do
+            backend <- currentBackend session
+            result <- beRollbackTransaction backend token
+            either (ioError . userError) pure result
 
 -- | 当前生效的口令策略（只有管理员能看）
 policyOf :: Session -> IO (Either Text PasswordPolicy)
@@ -195,7 +214,7 @@ storePrincipal session principal = do
         Right account -> do
             writeIORef (ssPrincipal session) (Just principal)
             writeIORef (ssIdentityStamp session) (Just (accountId account, accountRevision account))
-            writeIORef (ssTransaction session) Nothing
+            closeSession session
             writeIORef (ssCurrent session) ""
             pure (Right ())
 
@@ -216,7 +235,7 @@ switchDatabaseCoded session rawName
     | otherwise = go
   where
     name = T.toLower (T.strip rawName)
-    -- | 真的切库并记下当前库
+    -- \| 真的切库并记下当前库
     go = do
         who <- readIORef (ssPrincipal session)
         allowed <- case who of
@@ -237,17 +256,35 @@ runStatement session sql = fmap (first sessMessage) (runStatementCoded session s
 
 -- | 跑一条语句（带错误码）
 runStatementCoded :: Session -> Text -> IO (Either SessionError QueryResult)
-runStatementCoded session sql = gate $ do
-    valid <- validatePrincipal session
-    case valid of Left err -> pure (Left err); Right () -> runStatementUnlocked session sql
+runStatementCoded session sql = do
+    current <- readIORef (ssCurrent session)
+    gate current $ do
+        valid <- validatePrincipal session
+        case valid of Left err -> pure (Left err); Right () -> runStatementUnlocked session sql
   where
-    gate = case parseStatement (T.unpack sql) of
+    -- 对象及权限变更独占，数据请求按来源库排序。
+    gate current = case parseStatement (T.unpack sql) of
+        Right CommitTransaction -> databaseSecurity [(T.unpack current, not (beConcurrentTransactions (ssBackend session)))]
         Right statement | transactionDdl statement || isJust (accountCommand statement) || isJust (privilegeCommand statement) -> writeSecurity
-        _ -> readSecurity
+        Right statement -> databaseSecurity (accesses current statement)
+        Left _ -> readSecurity
+    -- 当前库写入独占，跨库查询依赖共享。
+    accesses current statement =
+        (T.unpack current, writing statement && not (beConcurrentTransactions (ssBackend session))) : [(source name, False) | name <- queryTables statement]
+      where
+        -- 无限定表使用当前工作库。
+        source name = case break (== '.') name of
+            (database, '.' : _) -> T.unpack (T.toLower (T.pack database))
+            _ -> T.unpack current
+    -- 只有数据写语句需要独占目标库。
+    writing Insert{} = True
+    writing Update{} = True
+    writing Delete{} = True
+    writing _ = False
 
 -- 在权限门内检查并执行管理员存储请求。
 runStorageCoded :: Session -> A.Value -> IO (Either SessionError A.Value)
-runStorageCoded session payload = writeSecurity $ do
+runStorageCoded session payload = gate $ do
     valid <- validatePrincipal session
     who <- readIORef (ssPrincipal session)
     case valid of
@@ -256,6 +293,11 @@ runStorageCoded session payload = writeSecurity $ do
             Nothing -> pure (Left (SessionError "unauthorized" "sign in first"))
             Just principal | not (principalIsRoot principal) -> pure (Left (SessionError "forbidden" "administrator required"))
             Just _ -> fmap (first (SessionError "storage_error" . T.pack)) (beStorage (ssBackend session) payload)
+  where
+    -- 在线整理期间允许普通数据语句进入。
+    gate = case payload of
+        A.Object object | KM.lookup "method" object == Just (A.String "compact") -> readSecurity
+        _ -> writeSecurity
 
 -- 检查登录身份的当前版本和启用状态。
 validatePrincipal :: Session -> IO (Either SessionError ())
@@ -285,7 +327,8 @@ runStatementUnlocked session sql = case parseStatement (T.unpack sql) of
                     Right () -> do
                         current <- readIORef (ssCurrent session)
                         pure (Right (emptyResult (Just current)))
-    Right BeginTransaction -> beginTransaction session
+    Right BeginTransaction -> beginTransaction session False
+    Right BeginSerializableTransaction -> beginTransaction session True
     Right CommitTransaction -> commitTransaction session
     Right RollbackTransaction -> rollbackTransaction session
     Right (Savepoint name) -> savepointTransaction session (T.pack name)
@@ -306,6 +349,7 @@ runStatementUnlocked session sql = case parseStatement (T.unpack sql) of
                         Left err -> pure (Left err)
                         Right ()
                             | isJust transaction && transactionData statement -> runInTransaction session statement
+                            | beConcurrentTransactions (ssBackend session) && transactionData statement -> runAutocommit session statement
                             | otherwise -> runObjectStatement session statement sql
     Left _ -> runPlain session sql
 
@@ -314,6 +358,7 @@ transactionDdl :: Statement -> Bool
 transactionDdl statement = case statement of
     CreateTable{} -> True
     CreateDomain{} -> True
+    AlterDomain{} -> True
     DropDomain{} -> True
     DropTable{} -> True
     CreateIndex{} -> True
@@ -339,14 +384,14 @@ transactionData statement = case statement of
     _ -> False
 
 -- | 开事务：把当前库整库做一份快照当起点
-beginTransaction :: Session -> IO (Either SessionError QueryResult)
-beginTransaction session = do
+beginTransaction :: Session -> Bool -> IO (Either SessionError QueryResult)
+beginTransaction session serializable = do
     allowed <- sessionConnectAllowed session
-    case allowed of Left err -> pure (Left err); Right () -> beginAuthorized session
+    case allowed of Left err -> pure (Left err); Right () -> beginAuthorized session serializable
 
 -- 在连接权限复核后建立事务快照。
-beginAuthorized :: Session -> IO (Either SessionError QueryResult)
-beginAuthorized session = do
+beginAuthorized :: Session -> Bool -> IO (Either SessionError QueryResult)
+beginAuthorized session serializable = do
     current <- readIORef (ssCurrent session)
     existing <- readIORef (ssTransaction session)
     case existing of
@@ -355,15 +400,20 @@ beginAuthorized session = do
             | T.null current -> pure (Left (SessionError "no_database" "no database selected"))
             | otherwise -> do
                 backend <- currentBackend session
-                snapshotResult <- beSnapshot backend
+                snapshotResult <-
+                    if beConcurrentTransactions backend
+                        then beBeginTransaction backend serializable
+                        else fmap (fmap (Nothing,)) (beSnapshot backend)
                 case snapshotResult of
                     Left err -> pure (Left (engineErrorCode err))
-                    Right db -> do
+                    Right (token, db) -> do
                         objects <- snapshotObjectIds session (map fst db)
                         case objects of
-                            Left err -> pure (Left err)
+                            Left err -> do
+                                released <- maybe (pure (Right ())) (beRollbackTransaction backend) token
+                                pure (either (Left . engineErrorCode) (const (Left err)) released)
                             Right ids -> do
-                                writeIORef (ssTransaction session) (Just (Transaction db db [] [] ids))
+                                writeIORef (ssTransaction session) (Just (Transaction db db [] [] ids token serializable))
                                 pure (Right (emptyResult (Just current)))
 
 -- | 提交：把快照差分交给存储层应用，成功才结束事务
@@ -379,25 +429,84 @@ commitTransaction session = do
             identities <- snapshotObjectIds session (map fst (txBase transaction))
             case connected >> sequence permissions >> identities of
                 Left err -> pure (Left err)
-                Right ids | ids /= txObjects transaction -> pure (Left (SessionError "serialization_failure" "transaction object identity changed"))
-                          | otherwise -> commitAuthorized session current transaction
+                Right ids
+                    | ids /= txObjects transaction -> pure (Left (SessionError "serialization_failure" "transaction object identity changed"))
+                    | otherwise -> commitAuthorized session current transaction
 
 -- 对象和权限复核后提交事务差分。
 commitAuthorized :: Session -> Text -> Transaction -> IO (Either SessionError QueryResult)
-commitAuthorized session current transaction = do
-            backend <- currentBackend session
-            liveResult <- beSnapshot backend
-            case liveResult of
-                Left err -> pure (Left (engineErrorCode err))
-                Right live -> let diffs = transactionDiffs (txBase transaction) (txStaged transaction) live in case transactionConflict diffs of
-                    Just msg -> pure (Left (SessionError "serialization_failure" (T.pack msg)))
-                    Nothing -> do
-                        applied <- beApplyTransaction backend (transactionOps diffs)
-                        case applied of
-                            Left err -> pure (Left (engineErrorCode err))
-                            Right () -> do
-                                writeIORef (ssTransaction session) Nothing
-                                pure (Right (emptyResult (Just current)))
+commitAuthorized session current transaction
+    | Just token <- txToken transaction = commitSecurity (T.unpack current) (commitMvcc session current transaction token)
+    | otherwise = commitLegacy session current transaction
+
+-- 在短提交门内校验最新合并行集并发布版本。
+commitMvcc :: Session -> Text -> Transaction -> String -> IO (Either SessionError QueryResult)
+commitMvcc session current transaction token = do
+    backend <- currentBackend session
+    preview <- bePreviewTransaction backend token
+    case preview of
+        Left err -> pure (Left (engineErrorCode err))
+        Right (checkpoint, candidate) -> do
+            let modified = changedTables (txBase transaction) (txStaged transaction)
+                names = modified ++ domainDependencies (txBase transaction) modified
+                dependencies = [(name, table) | (name, table) <- txBase transaction, name `elem` names]
+                checked = validateDependencies dependencies candidate >> mapM_ (validateFinal candidate) modified
+            case checked of
+                Left err -> pure (Left (SessionError "serialization_failure" (T.pack err)))
+                Right () -> do
+                    result <- beCommitTransaction backend token checkpoint
+                    case result of
+                        Left err -> pure (Left (engineErrorCode err))
+                        Right () -> do
+                            writeIORef (ssTransaction session) Nothing
+                            pure (Right (emptyResult (Just current)))
+  where
+    -- 复用 SQL 最终行集约束，避免存储重复规则。
+    validateFinal candidate name = maybe (Left "transaction table missing") (Engine.validateTableRows candidate) (lookup name candidate)
+
+-- 内存后端保留原差分提交与冲突行为。
+commitLegacy :: Session -> Text -> Transaction -> IO (Either SessionError QueryResult)
+commitLegacy session current transaction = do
+    backend <- currentBackend session
+    liveResult <- beSnapshot backend
+    case liveResult of
+        Left err -> pure (Left (engineErrorCode err))
+        Right live -> do
+            let base = txBase transaction
+                diffs = transactionDiffs base (txStaged transaction) live
+                modified =
+                    [ name
+                    | (name, diff) <- diffs
+                    , not (null (tdDeletes diff) && null (tdWrites diff)) || isJust (tdReplace diff)
+                    ]
+                readTables = if txSerializable transaction && not (null modified) then nub (map lastTablePart (concatMap queryTables (txStatements transaction))) else []
+                names = modified ++ readTables ++ domainDependencies base (modified ++ readTables)
+                dependencies = [(name, table) | (name, table) <- base, name `elem` names]
+                ops = transactionOps diffs
+                checked = do
+                    validateDependencies dependencies live
+                    maybe (Right ()) Left (transactionConflict diffs)
+                    mapM_ (validateRead base live) readTables
+                    candidate <- applyTransactionMemory ops live
+                    mapM_ (validateFinal candidate) modified
+            case checked of
+                Left msg -> pure (Left (SessionError "serialization_failure" (T.pack msg)))
+                Right () -> do
+                    applied <- beApplyTransaction backend ops
+                    case applied of
+                        Left err -> pure (Left (engineErrorCode err))
+                        Right () -> do
+                            writeIORef (ssTransaction session) Nothing
+                            pure (Right (emptyResult (Just current)))
+  where
+    -- 拒绝读过的表出现数据变化或幻行。
+    validateRead base live name = case (lookup name base, lookup name live) of
+        (Just before, Just after) | tableRows before == tableRows after -> Right ()
+        _ -> Left ("serializable transaction read changed: " ++ name)
+    -- 复用引擎规则检查合并后的最终行集。
+    validateFinal candidate name = case lookup name candidate of
+        Nothing -> Left ("transaction table missing: " ++ name)
+        Just table -> Engine.validateTableRows candidate table
 
 -- 检查当前数据库连接权限。
 sessionConnectAllowed :: Session -> IO (Either SessionError ())
@@ -412,9 +521,11 @@ sessionConnectAllowed session = do
 snapshotObjectIds :: Session -> [String] -> IO (Either SessionError [(String, A.Value)])
 snapshotObjectIds session names = do
     database <- readIORef (ssCurrent session)
-    if database == "system" then pure (Right []) else do
-        results <- mapM (one database) (filter (not . T.isPrefixOf "__system_" . T.pack) names)
-        pure (sequence results)
+    if database == "system"
+        then pure (Right [])
+        else do
+            results <- mapM (one database) (filter (not . T.isPrefixOf "__system_" . T.pack) names)
+            pure (sequence results)
   where
     -- 解析一个快照表的稳定对象编号。
     one database name = do
@@ -431,9 +542,14 @@ rollbackTransaction session = do
     existing <- readIORef (ssTransaction session)
     case existing of
         Nothing -> pure (Left (SessionError "query_error" "no transaction in progress"))
-        Just _ -> do
-            writeIORef (ssTransaction session) Nothing
-            pure (Right (emptyResult (Just current)))
+        Just transaction -> do
+            backend <- currentBackend session
+            result <- maybe (pure (Right ())) (beRollbackTransaction backend) (txToken transaction)
+            case result of
+                Left err -> pure (Left (engineErrorCode err))
+                Right () -> do
+                    writeIORef (ssTransaction session) Nothing
+                    pure (Right (emptyResult (Just current)))
 
 -- | 建保存点：把事务当前状态压进保存点栈
 savepointTransaction :: Session -> Text -> IO (Either SessionError QueryResult)
@@ -444,7 +560,7 @@ savepointTransaction session name = do
         Nothing -> pure (Left (SessionError "query_error" "no transaction in progress"))
         Just transaction -> do
             let stack = txSavepoints transaction ++ [(T.unpack name, txStaged transaction, txStatements transaction)]
-            writeIORef (ssTransaction session) (Just transaction {txSavepoints = stack})
+            writeIORef (ssTransaction session) (Just transaction{txSavepoints = stack})
             pure (Right (emptyResult (Just current)))
 
 -- | 回滚到保存点：事务状态退回保存点，该保存点保留
@@ -458,10 +574,13 @@ rollbackToSavepoint session name = do
             Nothing -> pure (Left (SessionError "query_error" ("no such savepoint: " <> name)))
             Just index -> do
                 let (_, staged, statements) = txSavepoints transaction !! index
-                writeIORef
-                    (ssTransaction session)
-                    (Just transaction {txStaged = staged, txStatements = statements, txSavepoints = take (index + 1) (txSavepoints transaction)})
-                pure (Right (emptyResult (Just current)))
+                let next = transaction{txStaged = staged, txStatements = statements, txSavepoints = take (index + 1) (txSavepoints transaction)}
+                stagedResult <- stageMvcc session next
+                case stagedResult of
+                    Left err -> pure (Left err)
+                    Right () -> do
+                        writeIORef (ssTransaction session) (Just next)
+                        pure (Right (emptyResult (Just current)))
 
 -- | 释放保存点：该保存点与它之后的保存点一起丢掉
 releaseSavepoint :: Session -> Text -> IO (Either SessionError QueryResult)
@@ -473,7 +592,7 @@ releaseSavepoint session name = do
         Just transaction -> case savepointIndex name (txSavepoints transaction) of
             Nothing -> pure (Left (SessionError "query_error" ("no such savepoint: " <> name)))
             Just index -> do
-                writeIORef (ssTransaction session) (Just transaction {txSavepoints = take index (txSavepoints transaction)})
+                writeIORef (ssTransaction session) (Just transaction{txSavepoints = take index (txSavepoints transaction)})
                 pure (Right (emptyResult (Just current)))
 
 -- | 最近一次同名保存点的下标
@@ -483,7 +602,7 @@ savepointIndex name entries =
         [] -> Nothing
         hits -> Just (last hits)
 
--- | 事务里跑一条数据语句：只动内存快照，不碰存储层
+-- | 执行事务数据语句并取得修改行锁
 runInTransaction :: Session -> Statement -> IO (Either SessionError QueryResult)
 runInTransaction session statement = do
     existing <- readIORef (ssTransaction session)
@@ -493,8 +612,48 @@ runInTransaction session statement = do
         Just transaction -> case scopeDdl (T.unpack current) statement >>= Engine.runStatement (txStaged transaction) of
             Left err -> pure (Left (engineErrorCode err))
             Right (staged, rows) -> do
-                writeIORef (ssTransaction session) (Just transaction {txStaged = staged, txStatements = statement : txStatements transaction})
-                pure (Right (resultOfStaged (txStaged transaction) statement rows))
+                let next = transaction{txStaged = staged, txStatements = statement : txStatements transaction}
+                locked <- stageMvcc session next
+                case locked of
+                    Left err -> pure (Left err)
+                    Right () -> do
+                        writeIORef (ssTransaction session) (Just next)
+                        pure (Right (resultOfStaged (txStaged transaction) statement rows))
+
+-- 自动提交语句同样拥有快照和原子提交边界。
+runAutocommit :: Session -> Statement -> IO (Either SessionError QueryResult)
+runAutocommit session statement = do
+    begun <- beginTransaction session False
+    case begun of
+        Left err -> pure (Left err)
+        Right _ -> do
+            executed <- runInTransaction session statement
+            case executed of
+                Left err -> do
+                    rolled <- rollbackTransaction session
+                    pure (const (Left err) =<< rolled)
+                Right rows -> do
+                    committed <- commitTransaction session
+                    case committed of
+                        Right _ -> pure (Right rows)
+                        Left err -> do
+                            rolled <- rollbackTransaction session
+                            pure (const (Left err) =<< rolled)
+
+-- 比较事务最终行集，保留原表顺序。
+changedTables :: Database -> Database -> [String]
+changedTables base staged = [name | (name, table) <- staged, fmap tableRows (lookup name base) /= Just (tableRows table)]
+
+-- 获取本事务实际修改行的锁并更新读依赖。
+stageMvcc :: Session -> Transaction -> IO (Either SessionError ())
+stageMvcc session transaction = case txToken transaction of
+    Nothing -> pure (Right ())
+    Just token -> do
+        backend <- currentBackend session
+        let modified = changedTables (txBase transaction) (txStaged transaction)
+            ops = [TxnReplace name (tableRows table) | (name, table) <- txStaged transaction, name `elem` modified]
+            dependencies = nub (map lastTablePart (concatMap queryTables (txStatements transaction)))
+        fmap (first engineErrorCode) (beStageTransaction backend token ops dependencies)
 
 -- | 事务内的结果集：空结果回落到解析出来的列名
 resultOfStaged :: Database -> Statement -> [Row] -> QueryResult
@@ -516,7 +675,7 @@ data TableDiff = TableDiff
 transactionOps :: [(String, TableDiff)] -> [TxnOp]
 transactionOps = concatMap opsOf
   where
-    -- | 一张表的请求：先删后写
+    -- \| 一张表的请求：先删后写
     opsOf (name, diff) =
         [TxnDelete name (tdDeletes diff) | not (null (tdDeletes diff))]
             ++ [TxnUpsert name (tdWrites diff) | not (null (tdWrites diff))]
@@ -533,16 +692,16 @@ transactionConflict diffs =
 transactionDiffs :: Database -> Database -> Database -> [(String, TableDiff)]
 transactionDiffs base staged live = [(name, diffFor name) | name <- names]
   where
-    -- | 事务里碰得着的表：数据语句不增删表
+    -- \| 事务里碰得着的表：数据语句不增删表
     names = nubKeys (map fst base ++ map fst staged)
 
-    -- | 一张表的差异
+    -- \| 一张表的差异
     diffFor name
         | stagedRows == baseRows = emptyDiff
         | all (isJust . rowKey) (baseRows ++ stagedRows) = keyedDiff
         -- 动过，库里还是基线：整表替换
-        | liveRows == baseRows = emptyDiff {tdReplace = Just stagedRows}
-        | otherwise = emptyDiff {tdConflict = Just ("write conflict on table " ++ name)}
+        | liveRows == baseRows = emptyDiff{tdReplace = Just stagedRows}
+        | otherwise = emptyDiff{tdConflict = Just ("write conflict on table " ++ name)}
       where
         baseRows = rowsOf name base
         stagedRows = rowsOf name staged
@@ -577,13 +736,13 @@ transactionDiffs base staged live = [(name, diffFor name) | name <- names]
                     [] -> Nothing
                 }
 
-    -- | 没有差异的空结果
+    -- \| 没有差异的空结果
     emptyDiff = TableDiff [] [] Nothing Nothing
 
-    -- | 表名去重但保持顺序
+    -- \| 表名去重但保持顺序
     nubKeys = foldr (\name acc -> if name `elem` acc then acc else name : acc) []
 
-    -- | 库里某张表的行
+    -- \| 库里某张表的行
     rowsOf name db = maybe [] tableRows (lookup name db)
 
 -- | 按整数 id 建立保留首行的查找表
@@ -759,14 +918,31 @@ currentBackend session = do
 showIdentities :: Session -> IO (Either SessionError QueryResult)
 showIdentities session = do
     admin <- maybe False principalIsCatalogManager <$> readIORef (ssPrincipal session)
-    if not admin then pure (Left (SessionError "forbidden" "catalog manager required")) else do
-        result <- beAccounts (ssBackend session) ReqAccountsList
-        pure $ case result of
-            Left err -> Left (SessionError "storage_error" (T.pack err))
-            Right identities -> Right (QueryResult ["id", "name", "can_login", "is_superuser", "enabled", "system_catalog_manager", "allow_sudo_auth", "created_at"]
-                [[VInt (fromInteger (accountId a)), VStr (T.unpack (accountUser a)), VBool (accountCanLogin a),
-                    VBool (accountIsSuperuser a), VBool (accountEnabled a), VBool (accountSystemCatalogManager a), VBool (accountAllowSudoAuth a), VStr (T.unpack (accountRegisteredAt a))] | a <- identities]
-                (length identities) False Nothing)
+    if not admin
+        then pure (Left (SessionError "forbidden" "catalog manager required"))
+        else do
+            result <- beAccounts (ssBackend session) ReqAccountsList
+            pure $ case result of
+                Left err -> Left (SessionError "storage_error" (T.pack err))
+                Right identities ->
+                    Right
+                        ( QueryResult
+                            ["id", "name", "can_login", "is_superuser", "enabled", "system_catalog_manager", "allow_sudo_auth", "created_at"]
+                            [ [ VInt (fromInteger (accountId a))
+                              , VStr (T.unpack (accountUser a))
+                              , VBool (accountCanLogin a)
+                              , VBool (accountIsSuperuser a)
+                              , VBool (accountEnabled a)
+                              , VBool (accountSystemCatalogManager a)
+                              , VBool (accountAllowSudoAuth a)
+                              , VStr (T.unpack (accountRegisteredAt a))
+                              ]
+                            | a <- identities
+                            ]
+                            (length identities)
+                            False
+                            Nothing
+                        )
 
 -- | 执行身份管理并通知受影响会话
 runAccount :: Session -> AccountCommand -> IO (Either SessionError QueryResult)
@@ -849,9 +1025,8 @@ resultOf result =
         , qrDatabase = Nothing
         }
   where
-    -- | 按列名取单元格
+    -- \| 按列名取单元格
     cellOf row name = fromMaybe VNull (lookup name row)
-
 
 -- 展示当前登录身份自己的有效权限。
 showSelfGrants :: Session -> IO (Either SessionError QueryResult)
@@ -863,10 +1038,15 @@ showSelfGrants session = do
             grants <- listSelfGrants (ssPrivileges session) principal
             pure $ case grants of
                 Left err -> Left (privilegeErrorOf err)
-                Right rows -> Right (QueryResult ["identity", "privilege", "object", "grant_option"]
-                    [[VStr (T.unpack (grantRole grant)), VStr (T.unpack (grantPrivilege grant)), VStr (T.unpack (grantObject grant)), VBool (grantable grant)] | grant <- rows]
-                    (length rows) False Nothing)
-
+                Right rows ->
+                    Right
+                        ( QueryResult
+                            ["identity", "privilege", "object", "grant_option"]
+                            [[VStr (T.unpack (grantRole grant)), VStr (T.unpack (grantPrivilege grant)), VStr (T.unpack (grantObject grant)), VBool (grantable grant)] | grant <- rows]
+                            (length rows)
+                            False
+                            Nothing
+                        )
 
 -- 在连接视图及权限稳定期间分析范式。
 analyzeNormalizationCoded :: Session -> NormalizationRequest -> IO (Either SessionError A.Value)
@@ -902,8 +1082,9 @@ normalizationView session table payload = do
             Left message -> pure (Left ("storage_error", message))
             Right identity -> case transaction of
                 Just tx -> case (lookup (T.unpack table) (txStaged tx), lookup (T.unpack table) (txObjects tx)) of
-                    (Just relation, Just oldObject) | objectIdentity oldObject == Right identity ->
-                        pure (normalizationReport identity (map normalizationColumn (tableCols relation)) "transaction_snapshot" payload)
+                    (Just relation, Just oldObject)
+                        | objectIdentity oldObject == Right identity ->
+                            pure (normalizationReport identity (map normalizationColumn (tableCols relation)) "transaction_snapshot" payload)
                     _ -> pure (Left ("conflict", "normalization snapshot object has changed"))
                 Nothing -> do
                     backend <- currentBackend session

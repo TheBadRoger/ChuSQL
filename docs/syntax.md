@@ -2,13 +2,21 @@
 
 [← 返回 README](../README.md)
 
-**本页导航：** [查询、名称与事务](#查询名称与事务) · [自定义类型 DOMAIN](#自定义类型-domain) · [账号与权限](#账号与权限)
+本页内容：
 
-客户端选项与元命令见 [commands.md](commands.md)，类型与身份字段分别见 [types.md](types.md) 和 [users-and-roles.md](users-and-roles.md)。
+- [查询、名称与事务](#查询名称与事务)
+- [自定义类型 DOMAIN](#自定义类型-domain)
+- [账号与权限](#账号与权限)
+
+本页供编写 SQL 时查阅，说明查询、事务、自定义类型和权限语法。示例使用的数据库与表须事先存在，明确展示创建步骤的示例除外。
+
+客户端选项与元命令见[命令与选项](commands.md)，类型与身份字段分别见[类型说明](types.md)和[用户与角色](users-and-roles.md)。
 
 ## 查询、名称与事务
 
 ### 表名与列名
+
+数据库、表和列的名称按以下规则解析：
 
 - 表级 DDL 可使用当前库限定名，例如选定 `sales` 后执行 `CREATE TABLE sales.orders (id INT)`；必须先选库，跨库 DDL 会被拒绝。
 - 选定数据库后语句里直接写表名即可，例如 `SELECT name FROM orders WHERE orders.id = 1`。
@@ -18,12 +26,28 @@
 
 ### SELECT 与派生表
 
+SELECT 支持以下查询来源和子句：
+
 - `SELECT` 支持 `WHERE`、`GROUP BY`、`HAVING`、`ORDER BY`、`LIMIT`、`JOIN` / `LEFT JOIN` 与聚合，以及标量 / `IN` / `EXISTS` 子查询和量词比较（`op ANY` / `op ALL`）。
 - 来源可以是派生表：`SELECT d.name FROM (SELECT name FROM users) d`。派生表必须带别名，内层不能引用外层列；输出列取裸列名（内层写 `u.id`，外层用 `d.id` 引用）。
-- 投影列可以起别名：`SELECT count(*) AS total FROM orders ORDER BY total`，别名就是结果集的列名。`ORDER BY` 的单独名称优先使用唯一的投影别名，再查来源列；重复的排序别名报歧义错误，来源列可以用限定名消除同名冲突。排序接受从 1 开始的输出列序号（例如 `ORDER BY 2 DESC`），在 `*` 展开后解析，零或越界序号报错。
+
+#### 输出别名与排序
+
+投影是查询最终返回的列或表达式。别名和排序遵循以下规则：
+
+- 输出别名：`SELECT count(*) AS total FROM orders ORDER BY total`，别名就是结果集的列名。
+- 名称排序：`ORDER BY` 的单独名称优先使用唯一的输出别名，再查来源列。重复的排序别名报歧义错误，来源列可用限定名消除同名冲突。
+- 序号排序：接受从 1 开始的输出列序号，例如 `ORDER BY 2 DESC`。序号在 `*` 展开后解析，零或越界序号报错。
 - 排序也支持表达式、函数、聚合与子查询，例如 `ORDER BY age + 1 DESC`。复合表达式中的列名只查来源，不能引用输出别名；排序表达式在 LIMIT 前求值，其他投影在 LIMIT 后求值。NULL 升序在前、降序在后，同键保留原行序。
+
+#### 分组后的过滤
+
+分组筛选与权限检查遵循以下规则：
+
 - `HAVING` 在聚合之后、DISTINCT / ORDER BY / LIMIT 之前过滤，只保留布尔真；支持未投影的聚合、子查询及外层相关列，不能引用投影别名。没有 GROUP BY 时 HAVING 形成一个整体组，空输入也有这个组；当前层未聚合的来源列必须出现在 GROUP BY 中。
 - 鉴权覆盖整棵查询树：派生表、HAVING 与排序表达式中的子查询也要求内层表的 SELECT 权限。
+
+以下示例按用户汇总订单，筛选订单数大于 1 的组，再排序并返回前 10 组：
 
 ```sql
 SELECT user_id, SUM(amount) AS total FROM orders
@@ -35,6 +59,10 @@ ORDER BY SUM(amount) + user_id DESC LIMIT 10;
 
 `SELECT DISTINCT` 按完整输出值组合去重，保留首次出现的行，然后执行排序和 LIMIT。NULL 在去重时视为相同值；等值整数与整值浮点按既有数值语义合并。默认 SELECT 或显式 `SELECT ALL` 保留重复行。
 
+内建 List、Maybe 和 Tuple 可按完整类型的结构值比较、排序、分组和去重，也可用于 JOIN、IN、ANY / ALL 与 MIN / MAX。类型之间不隐式转换，SQL NULL 与 Maybe 的 Nothing 分开处理。排序和哈希规则见 [复合值的比较、排序与分组](types.md#比较排序与分组)。
+
+例如，以下查询分别按用户编号和计算结果去重：
+
 ```sql
 SELECT DISTINCT user_id FROM orders ORDER BY 1 LIMIT 10;
 SELECT DISTINCT user_id + 1 AS next_id FROM orders ORDER BY next_id;
@@ -44,11 +72,15 @@ DISTINCT 的排序项必须出现在输出中；排序可使用输出别名、�
 
 ### 比较运算符
 
+比较和 NULL 处理规则如下：
+
 - 支持 `=`、`<>`（也可写 `!=`）、`>`、`>=`、`<`、`<=`；`<>` 与 `!=` 是同一个运算符。
 - `>`、`>=`、`<`、`<=` 在列上有索引时会改写成索引范围扫描；`>=` / `<=` 是闭区间，端点值本身也在结果里。
 - 任一操作数为 `NULL` 时比较结果是 `NULL`，`WHERE` 只保留结果为真的行。
 
 ### ANY / ALL
+
+ANY / ALL 将一个值与单列子查询的结果逐项比较：
 
 - `值 op ANY (SELECT 单列 …)` 表示子查询里至少有一行让比较成立；`值 op ALL (…)` 表示每一行都成立。
 - `ANY` 的空子查询为假、`ALL` 的空子查询为真；子查询里出现 `NULL` 时按 `AND` / `OR` 的三值规则，条件可能为 `NULL`（`WHERE` 里等同不通过）。
@@ -56,11 +88,17 @@ DISTINCT 的排序项必须出现在输出中；排序可使用输出别名、�
 
 ### IN / EXISTS 的执行优化
 
-独立 `IN` / `NOT IN` 过滤，以及单表等值相关 `EXISTS` / `NOT EXISTS` 过滤可使用哈希半连接／反连接：右侧只扫描一次，左侧行序和重复行保留，右侧重复值不会放大输出。复杂条件仍使用查询内物化及相关子查询路径；SQL 写法不变。
+半连接和反连接根据右侧是否存在匹配行来筛选左行，只返回左侧列。独立 `IN` / `NOT IN` 过滤，以及单表等值相关 `EXISTS` / `NOT EXISTS` 过滤可使用这种优化。
 
-`NOT EXISTS` 保留没有匹配的行，包括空值键；`NOT IN` 的右侧出现 NULL 时，未匹配的非空键得到 NULL，过滤不通过。右侧为空时，IN 为假、NOT IN 为真，包括左值为 NULL 的情况；右侧非空时，NULL 左值按三值逻辑得到 NULL。表达式和半连接使用相同规则。
+优化时右侧只扫描一次，左侧行序和重复行保留，右侧重复值不会放大输出。复杂条件仍使用查询内物化及相关子查询路径；SQL 写法不变。
+
+`NOT EXISTS` 保留没有匹配的行，包括空值键；`NOT IN` 的右侧出现 NULL 时，未匹配的非空键得到 NULL，过滤不通过。
+
+右侧为空时，IN 为假、NOT IN 为真，包括左值为 NULL 的情况；右侧非空时，NULL 左值按三值逻辑得到 NULL。表达式和半连接使用相同规则。
 
 ### WITH / CTE
+
+公共表表达式（CTE）用 WITH 为子查询命名，供主查询引用。定义和引用规则如下：
 
 - `WITH 名字 AS (SELECT …), 另一个 AS (SELECT …) SELECT … FROM 名字` 先定义再引用，名字可以带列清单（`WITH t(who) AS (SELECT name FROM users) …`）。
 - `WITH` 在解析期就展开成派生表，所以引用处只能当普通表用：没有别名时用 CTE 名当限定名（`WITH t AS (…) SELECT t.name FROM t`）。
@@ -70,13 +108,28 @@ DISTINCT 的排序项必须出现在输出中；排序可使用输出别名、�
 
 ### 事务与保存点
 
+开始事务前先选定数据库。事务和保存点命令如下：
+
 - `BEGIN`（或 `START TRANSACTION`）开始显式事务，`COMMIT` 提交，`ROLLBACK` 回滚。
+- `BEGIN [TRANSACTION] ISOLATION LEVEL SERIALIZABLE` 或 `START TRANSACTION ISOLATION LEVEL SERIALIZABLE` 开始带读依赖复查的事务，用于先检查再写入的业务。
 - `SAVEPOINT 名字` 在事务里记一个回滚点，`ROLLBACK TO 名字`（可写 `ROLLBACK TO SAVEPOINT 名字`）退回该点但保留它，`RELEASE 名字` 丢掉该点与它之后的回滚点。
+
+#### 事务可见性与限制
+
+事务内的可见性和命令范围如下：
+
 - 事务内只允许数据语句；DDL 与 `USE` 会被拒绝，`SHOW DATABASES` 这类不碰表数据的语句照常可用。
 - 事务里的读都看开事务那一刻的快照：别的连接在事务期间提交的改动不会出现在事务里，本会话未提交的改动别的连接也看不见。
 - 同一连接同时只能有一个事务，没有嵌套事务；回滚点只在事务内有效，事务结束就没了。开事务前要先选好数据库。
+
+#### 提交与冲突
+
+提交采用以下冲突检查和持久化规则：
+
 - 提交时按行 `id` 写回本事务改动过的行，事务没碰过的行不受影响；没有整数 `id` 的表按整表替换提交。
 - 提交前会比对基线：本事务改过的行如果已被别的连接改掉或删掉，提交报 `serialization_failure` 并保留事务，由调用方 `ROLLBACK` 或重试。
+- 合并本事务与其他连接的修改后，会在发布前复查最终行集的 CHECK、非空和唯一约束；冲突返回 `serialization_failure`，其他表的修改也不会发布。
+- SERIALIZABLE 写事务还会复查所有已执行数据语句涉及表的行集，包括子查询；读过的表发生变化即拒绝提交，因此也防止幻行。该模式按表复查，可能拒绝不同行上的合法并发修改；只读事务可完成原快照读取。回退保存点也会撤销其后的读依赖。
 - 提交是持久的：整批改动与一条提交标记一次落盘，提交后进程被强杀也会在重启时重放；提交前崩溃则整批丢弃，不会只落一半。
 
 ## 自定义类型 DOMAIN
@@ -98,6 +151,8 @@ SHOW DOMAINS;
 
 名称不分大小写，长度为 1–48 个字符，使用 ASCII 字母、数字、下划线，并遵守 SQL 标识符的首字符规则。类型按工作库隔离：另一个库不会自动获得 `sales` 中的定义。类型名不得与已有类型冲突。
 
+### 删除与嵌套定义
+
 删除前必须解除所有列引用，例如：
 
 ```sql
@@ -114,13 +169,36 @@ CREATE DOMAIN product_label AS short_text;
 CREATE TABLE labels (label product_label);
 ```
 
-`product_label` 保留对 `short_text` 的引用，最终仍按 `VARCHAR(32)` 检查。`SHOW DOMAINS` 中它的基础表示为 `domain(short_text,varchar(32))`。同样可以多层复用；被表列或其他 DOMAIN 引用的类型不能删除，需先删除引用者，再从外层到内层删除类型。不存在的基础 DOMAIN、自引用及循环定义会被拒绝。
+`product_label` 保留对 `short_text` 的引用，最终仍按 `VARCHAR(32)` 检查。`SHOW DOMAINS` 中它的基础表示为 `domain(short_text,varchar(32))`。
 
-当前不支持 DOMAIN 自身的 `CHECK`、`NOT NULL`、`DEFAULT`；这些约束仍可定义在表列上。创建和删除 DOMAIN 不能在显式事务内执行。
+同样可以多层复用；被表列或其他 DOMAIN 引用的类型不能删除，需先删除引用者，再从外层到内层删除类型。不存在的基础 DOMAIN、自引用及循环定义会被拒绝。
+
+### 默认值与检查约束
+
+DOMAIN 可声明默认值、非空和具名或匿名检查条件，也可独立修改：
+
+```sql
+CREATE DOMAIN quantity AS INT DEFAULT 1 NOT NULL
+    CONSTRAINT positive CHECK (VALUE > 0) CHECK (VALUE < 1000);
+ALTER DOMAIN quantity SET DEFAULT 2;
+ALTER DOMAIN quantity DROP DEFAULT;
+ALTER DOMAIN quantity SET NOT NULL;
+ALTER DOMAIN quantity DROP NOT NULL;
+ALTER DOMAIN quantity ADD CONSTRAINT bounded CHECK (VALUE <= 100);
+ALTER DOMAIN quantity DROP CONSTRAINT bounded;
+```
+
+`VALUE` 指当前值，不分大小写；CHECK 不允许表列、子查询或聚合，NULL 结果通过。多层领域继承全部检查和非空限制；默认值按列、最近领域、基础领域的顺序选择，仅在省略列时使用。
+
+修改前校验受影响的已有行及默认值，失败不发布；并发写入冲突返回 `serialization_failure`，可重试整条语句。领域 DEFAULT 的修改不重写旧行。
+
+创建、修改和删除 DOMAIN 都要求管理员选定工作库，不能在显式事务中执行。不支持 CASCADE、领域改名或修改基础类型。详细语义与持久化边界见 [类型说明](types.md#domain-约束与变更)。
 
 ## 账号与权限
 
 默认管理员账号为 `root`。普通账号创建后默认不拥有数据访问权限，需要管理员通过角色进行授权。
+
+### 创建与修改身份
 
 常用账号命令：
 
@@ -143,13 +221,21 @@ ALTER ROLE analyst NOSUPERUSER;
 SHOW ROLES;
 ```
 
-`SHOW GRANTS` 允许登录身份查看自己的有效对象权限，输出 `identity`、`privilege`、`object` 和 `grant_option`。结果包含直接授权、启用角色继承、PUBLIC 默认 CONNECT 和所有权隐含权限；表范围授权按现存表展开，超级用户展示全部业务对象权限。系统对象不列出，不接受 `FOR` 查询他人身份。该命令不要求选中工作库；事务中也读取当前权限目录。
+### 查询身份与权限
+
+`SHOW GRANTS` 允许登录身份查看自己的有效对象权限，输出 `identity`、`privilege`、`object` 和 `grant_option`。结果包含直接授权、启用角色继承、PUBLIC 默认 CONNECT 和所有权隐含权限；表范围授权按现存表展开，超级用户展示全部业务对象权限。
+
+系统对象不列出，不接受 `FOR` 查询他人身份。该命令不要求选中工作库；事务中也读取当前权限目录。
 
 `SHOW ROLES` 展示全部身份的编号、名称、登录能力、最高权限标志、启用状态及创建时间，不返回口令。`ALTER USER` 与 `ALTER ROLE` 的属性和口令修改语法通用；同一属性不能重复指定。身份管理仅允许最高权限身份执行。
+
+### 最高权限与身份保护
 
 `SUPERUSER` 不依赖启动参数里的管理员名称（`--user`），也不会通过角色成员关系继承。禁用登录身份会拒绝登录；禁用权限角色会停止贡献继承权限。属性修改会使受影响的既有连接失效，下一次请求返回 `unauthorized` 后关闭。最后一个启用且可以登录的最高权限身份不能删除、禁用、取消登录或取消最高权限。
 
 删除身份同时清理授权和双向成员关系；重建同名身份分配新编号。升级迁移的兼容边界见 [用户与角色](users-and-roles.md#升级兼容)。
+
+### 角色成员与对象授权
 
 常用角色和授权命令：
 
@@ -168,6 +254,8 @@ DROP ROLE analyst;
 
 表级权限包括 `SELECT`、`INSERT`、`UPDATE`、`DELETE`；数据库权限包括 `CONNECT`、`CREATE`。`ALL` 按对象类型展开。未限定的表名及 `*` 使用当前数据库，`库名.表名` 和 `库名.*` 可指定其他数据库；系统对象不能通过业务 GRANT 授权。
 
+以下示例调整数据库连接权限，并授予表或库内全部表的数据权限：
+
 ```sql
 REVOKE CONNECT ON DATABASE sales FROM PUBLIC;
 GRANT CONNECT, CREATE ON DATABASE sales TO analyst;
@@ -180,9 +268,15 @@ REVOKE SELECT ON sales.orders FROM reviewer;
 
 最高权限身份拥有完整权限。数据库默认向 PUBLIC 开放 CONNECT，不默认授予 CREATE 或数据权限。具有数据库 CREATE 的身份可建表，并成为新表所有者；表所有者可管理表、字段及索引，并授予该表权限。数据库所有者可删除自己的数据库，创建数据库与管理 DOMAIN 仍要求最高权限。
 
-`GRANT ... WITH GRANT OPTION` 允许再转授；所有者也可授予自身对象的权限。普通授予者可撤销自己的授予，所有者及最高权限身份可撤销对象上的其他授予。撤销时收回相应 grant option，并级联清理失去合法来源的下游授权；仍有独立来源的授权保留。转授权能力随启用的角色继承，循环转授不能独立维持权限。REVOKE 不移除所有者的隐含权限。
+### 转授权与撤销
+
+转授权指将自己持有的权限再授予其他身份。`GRANT ... WITH GRANT OPTION` 允许再转授；所有者也可授予自身对象的权限。普通授予者可撤销自己的授予，所有者及最高权限身份可撤销对象上的其他授予。
+
+撤销时收回相应 grant option（转授权能力），并级联清理失去合法来源的下游授权；仍有独立来源的授权保留。转授权能力随启用的角色继承，循环转授不能独立维持权限。REVOKE 不移除所有者的隐含权限。
 
 `REVOKE GRANT OPTION FOR SELECT ON users FROM alice` 只移除指定授权来源的转授权能力，保留 alice 的 SELECT 权限；失去唯一支持来源的下游授权会级联撤销，独立来源继续有效。最高权限身份或对象所有者可撤销全部匹配来源，普通授予者只能撤销自己的来源；所有权自身的权限不受 REVOKE 影响。
+
+### 系统目录管理属性
 
 系统目录访问还受目录管理属性控制，具体能力见 [用户与角色](users-and-roles.md)。
 

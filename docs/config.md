@@ -2,9 +2,15 @@
 
 [← 返回 README](../README.md)
 
-**本页导航：** [存储配置](#存储配置) · [Web 配置](#web-配置) · [Server 配置](#server-配置) · [账号与安全](#账号与安全) · [修改配置](#修改配置)
+本页内容：
 
-ChuSQL 使用统一配置文件 `settings.toml`。默认位置：
+- [存储配置](#存储配置)
+- [Web 配置](#web-配置)
+- [Server 配置](#server-配置)
+- [账号与安全](#账号与安全)
+- [修改配置](#修改配置)
+
+本页帮助你查找配置项、修改监听端口和数据路径。ChuSQL 使用统一配置文件 `settings.toml`，默认位置如下：
 
 | 平台 | 路径 |
 | --- | --- |
@@ -45,7 +51,7 @@ ChuSQL 使用统一配置文件 `settings.toml`。默认位置：
 | `password_min_length` | `12` | 普通账号最短口令长度 |
 | `password_classes` | `2` | 口令至少包含的字符类别数 |
 
-监听地址见上表，静态资源目录固定为 `static`（相对安装目录），管理员账号名不在配置里、由启动参数 `--user` 指定（默认 `root`）；后两项不能用配置项改写。
+静态资源目录固定为安装目录下的 `static`。管理员账号名由启动参数 `--user` 指定，默认为 `root`；这两项不能通过配置文件修改。
 
 ## Server 配置
 
@@ -56,7 +62,9 @@ ChuSQL 使用统一配置文件 `settings.toml`。默认位置：
 | `max_message` | `1048576` | 单条请求最大大小（字节） |
 | `max_rows` | `1000` | 单次查询最大返回行数 |
 
-本机 sudo 认证额外使用 `[server] sudo_auth_user`，默认空字符串，表示关闭。设置为一个已启用 `ALLOW_SUDO_AUTH` 的数据库身份后，必须以 Unix root 或 Windows 提升后的管理员运行 `chusql-server`。这是明确的本机身份映射，与启动参数 `--user` 和最高权限属性分别设置。配置变更后重启服务生效，Web 设置页面不提供此项。操作步骤见 [用户与角色](users-and-roles.md#本机-sudo-认证)。
+本机 sudo 认证额外使用 `[server] sudo_auth_user`，默认空字符串，表示关闭。设置为一个已启用 `ALLOW_SUDO_AUTH` 的数据库身份后，必须以 Unix root 或 Windows 提升后的管理员运行 `chusql-server`。
+
+这是明确的本机身份映射，与启动参数 `--user` 和最高权限属性分别设置。配置变更后重启服务生效，Web 设置页面不提供此项。操作步骤见 [用户与角色](users-and-roles.md#本机-sudo-认证)。
 
 > [!NOTE]
 > 修改 Server 配置后须重启 `chusql-server`。sudo 映射默认关闭，启用时还须满足身份属性和操作系统提升要求。
@@ -77,11 +85,18 @@ ChuSQL 使用统一配置文件 `settings.toml`。默认位置：
 
 配置可通过以下方式修改：
 
-1. 直接编辑 `settings.toml`；
-2. 通过 Web 设置页面修改。
+- 直接编辑 `settings.toml`。
+- 通过 Web 设置页面修改。
 
 大多数配置在相关服务下次启动时生效。
 
 安装器选择 `resources/settings.toml.linux` 或 `resources/settings.toml.windows`，填入当前用户的绝对路径后释放为 `settings.toml`。两份模板逐项提供英文注释。
 
-Linux 数据目录为 `${XDG_DATA_HOME:-$HOME/.local/share}/chusql/data`，日志目录为 `${XDG_STATE_HOME:-$HOME/.local/state}/chusql/logs`。Windows 数据和日志分别为 `%LOCALAPPDATA%\ChuSQL\data` 与 `%LOCALAPPDATA%\ChuSQL\logs`。安装参数 `--data-dir` / `-DataDir` 可覆盖数据目录，指定安装目录不会改变默认数据位置。
+默认数据和日志路径如下：
+
+| 平台 | 数据目录 | 日志目录 |
+| --- | --- | --- |
+| Linux | `${XDG_DATA_HOME:-$HOME/.local/share}/chusql/data` | `${XDG_STATE_HOME:-$HOME/.local/state}/chusql/logs` |
+| Windows | `%LOCALAPPDATA%\ChuSQL\data` | `%LOCALAPPDATA%\ChuSQL\logs` |
+
+安装参数 `--data-dir` / `-DataDir` 可覆盖数据目录。指定安装目录不会改变默认数据位置。

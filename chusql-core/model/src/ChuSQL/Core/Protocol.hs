@@ -105,6 +105,14 @@ data Request
     | ReqDropIndex String String
     | ReqDropColumn String String
     | ReqReplaceSchema String [SchemaColumn] [Row]
+    | ReqDomainSnapshot
+    | ReqDatabaseSnapshot (Maybe String)
+    | ReqMvccBegin Bool
+    | ReqMvccLock String [TxnOp] [String]
+    | ReqMvccPreview String
+    | ReqMvccCommit String String
+    | ReqMvccRollback String
+    | ReqAlterDomain String [SchemaColumn] String
     | ReqListCatalog
     | ReqApplyTransaction [TxnOp]
 
@@ -253,6 +261,14 @@ instance ToJSON Request where
             , "columns" .= cols
             , "rows" .= map rowToJSON rs
             ]
+    toJSON (ReqMvccBegin serializable) = object ["method" .= ("mvcc_begin" :: T.Text), "serializable" .= serializable]
+    toJSON (ReqMvccLock token ops dependencies) = object ["method" .= ("mvcc_lock" :: T.Text), "transaction" .= token, "ops" .= ops, "reads" .= dependencies]
+    toJSON (ReqMvccPreview token) = object ["method" .= ("mvcc_preview" :: T.Text), "transaction" .= token]
+    toJSON (ReqMvccCommit token checkpoint) = object ["method" .= ("mvcc_commit" :: T.Text), "transaction" .= token, "checkpoint" .= checkpoint, "ops" .= ([] :: [TxnOp])]
+    toJSON (ReqMvccRollback token) = object ["method" .= ("mvcc_rollback" :: T.Text), "transaction" .= token]
+    toJSON ReqDomainSnapshot = object ["method" .= ("domain_snapshot" :: T.Text)]
+    toJSON (ReqDatabaseSnapshot checkpoint) = object ["method" .= ("database_snapshot" :: T.Text), "checkpoint" .= checkpoint]
+    toJSON (ReqAlterDomain name columns checkpoint) = object ["method" .= ("alter_domain" :: T.Text), "table" .= name, "columns" .= columns, "checkpoint" .= checkpoint]
     toJSON ReqListCatalog = object ["method" .= ("list_catalog" :: T.Text)]
     toJSON (ReqApplyTransaction ops) =
         object
@@ -418,6 +434,9 @@ data Response
     | RespOk
     | RespError String
     | RespCatalog [TableInfo]
+    | RespDomainSnapshot [TableInfo] [(String, [Row])] String
+    | RespSnapshotUnchanged String
+    | RespMvccSnapshot String [TableInfo] [(String, [Row])] String
 
 -- | JSON 解回响应
 instance FromJSON Response where
@@ -432,6 +451,17 @@ instance FromJSON Response where
             "tables" -> RespTables <$> o .: "tables"
             "error" -> RespError <$> o .: "message"
             "schema" -> RespSchema <$> parseJSON (A.Object o)
+            "snapshot_unchanged" -> RespSnapshotUnchanged <$> o .: "checkpoint"
+            "mvcc_snapshot" -> do
+                schemas <- o .: "schemas"
+                tables <- o .: "rows" :: Parser [(String, [A.Value])]
+                rows <- mapM (\(name, values) -> (,) name <$> mapM rowFromJSON values) tables
+                RespMvccSnapshot <$> o .: "transaction" <*> pure schemas <*> pure rows <*> o .: "checkpoint"
+            "domain_snapshot" -> do
+                schemas <- o .: "schemas"
+                tables <- o .: "rows" :: Parser [(String, [A.Value])]
+                rows <- mapM (\(name, values) -> (,) name <$> mapM rowFromJSON values) tables
+                RespDomainSnapshot schemas rows <$> o .: "checkpoint"
             "catalog" -> do
                 xs <- o .: "schemas" :: Parser [A.Value]
                 RespCatalog <$> mapM parseJSON xs

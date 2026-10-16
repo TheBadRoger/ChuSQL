@@ -2,10 +2,12 @@
 
 module Main (main) where
 
-import ChuSQL.CLI.Normalization (runNormalizationOnce)
 import ChuSQL.CLI.Format (OutputFormat (..), formatName, parseFormat)
+import ChuSQL.CLI.Normalization (runNormalizationOnce)
 import ChuSQL.CLI.Password (readPasswordInput)
 import ChuSQL.CLI.Script (stripTerminator)
+import ChuSQL.Interface.Config (ServerConfig (..), loadServerConfigAt, loadWebConfigAt, rootUserName)
+import ChuSQL.Interface.Link (Client, closeClient, connectClient)
 import ChuSQL.Interface.Session (
     Session,
     authenticateSession,
@@ -14,8 +16,6 @@ import ChuSQL.Interface.Session (
     newSession,
     switchDatabase,
  )
-import ChuSQL.Interface.Config (ServerConfig (..), loadServerConfigAt, loadWebConfigAt, rootUserName)
-import ChuSQL.Interface.Link (Client, closeClient, connectClient)
 import ChuSQL.Interface.Sudo (SudoCredential, readSudoCredential)
 import ChuSQL.Interface.TOML (resolveConfigPath)
 import Control.Exception (finally)
@@ -106,14 +106,16 @@ main = do
     config <- loadServerConfigAt configPath
     let rootName = rootUserName base
         userName = fromMaybe (if optSudo options then scSudoUser config else rootName) (optUser options)
-    credential <- if optSudo options then do
-        when (T.null userName)
-          $ reportError "sudo_auth_user is not configured" >> exitFailure
-        local <- readSudoCredential (scPort config)
-        case local of
-            Left message -> reportError message >> exitFailure
-            Right proof -> pure (Just proof)
-        else pure Nothing
+    credential <-
+        if optSudo options
+            then do
+                when (T.null userName) $
+                    reportError "sudo_auth_user is not configured" >> exitFailure
+                local <- readSudoCredential (scPort config)
+                case local of
+                    Left message -> reportError message >> exitFailure
+                    Right proof -> pure (Just proof)
+            else pure Nothing
     password <- if optSudo options then pure "" else promptPassword userName
     connected <- connectClient (T.pack (scHost config)) (scPort config)
     case connected of

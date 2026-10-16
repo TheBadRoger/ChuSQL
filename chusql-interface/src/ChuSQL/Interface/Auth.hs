@@ -34,9 +34,9 @@ import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar)
 import Crypto.Hash (SHA256 (..))
 import qualified Crypto.KDF.PBKDF2 as PBKDF2
 import Crypto.Random (getRandomBytes)
-import qualified Data.ByteString as BS
 import Data.ByteArray (constEq)
 import Data.ByteArray.Encoding (Base (Base16), convertFromBase, convertToBase)
+import qualified Data.ByteString as BS
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)

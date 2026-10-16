@@ -8,9 +8,9 @@ module ChuSQL.Web.Secure (
     bodyLimitDynamic,
 ) where
 
-import Data.Maybe (isNothing)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
+import Data.Maybe (isNothing)
 import Data.Text (Text)
 import qualified Data.Text.Encoding as TE
 import Network.HTTP.Types (

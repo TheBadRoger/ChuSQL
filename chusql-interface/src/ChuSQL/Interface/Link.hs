@@ -17,10 +17,8 @@ module ChuSQL.Interface.Link (
     clientReloadPolicy,
 ) where
 
-import ChuSQL.Interface.Normalization (NormalizationRequest)
-import qualified Data.Aeson as A
-import ChuSQL.Interface.Sudo (SudoCredential, sudoProof, isLocalPeer)
 import ChuSQL.Core.Protocol (Account, QueryResult (..), TableInfo (..))
+import ChuSQL.Interface.Normalization (NormalizationRequest)
 import ChuSQL.Interface.Protocol (
     ClientRequest (..),
     RoleView,
@@ -29,11 +27,13 @@ import ChuSQL.Interface.Protocol (
     encodeRequest,
     protocolVersion,
  )
+import ChuSQL.Interface.Sudo (SudoCredential, isLocalPeer, sudoProof)
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Exception (IOException, try)
+import qualified Data.Aeson as A
+import qualified Data.ByteString.Char8 as BSC
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Lazy.Char8 as BLC
-import qualified Data.ByteString.Char8 as BSC
 import Data.Text (Text)
 import qualified Data.Text as T
 import Network.Socket (
@@ -75,7 +75,8 @@ connectClient host port = do
                 Right (RespHello version)
                     | version == protocolVersion -> pure (Right client)
                     | otherwise ->
-                        giveUp handle
+                        giveUp
+                            handle
                             ( "server "
                                 <> T.pack (address host port)
                                 <> " speaks protocol "
@@ -87,7 +88,7 @@ connectClient host port = do
                 Right _ -> giveUp handle "unexpected response to hello"
                 Left message -> giveUp handle message
   where
-    -- | 对不上就关连接并回错误
+    -- \| 对不上就关连接并回错误
     giveUp handle message = do
         _ <- try (hClose handle) :: IO (Either IOException ())
         pure (Left message)

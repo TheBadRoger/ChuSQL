@@ -8,7 +8,6 @@ module ChuSQL.Web.UISettings (
     writeUISettings,
 ) where
 
-import Data.Maybe (fromMaybe)
 import Control.Exception (IOException, try)
 import qualified Data.Aeson as A
 import qualified Data.Aeson.Key as K
@@ -16,6 +15,7 @@ import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.Map.Strict as Map
+import Data.Maybe (fromMaybe)
 import Data.Scientific (floatingOrInteger)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -43,18 +43,18 @@ resolveUISettingsFile = do
             ready <- firstExistingDir uiSettingsFileCandidates
             pure (fromMaybe firstCandidate ready)
   where
-    -- | 首选候选路径
+    -- \| 首选候选路径
     firstCandidate = case uiSettingsFileCandidates of
         (p : _) -> p
         [] -> "chusql.ui.settings.json"
 
-    -- | 第一个存在的候选文件
+    -- \| 第一个存在的候选文件
     firstExistingFile [] = pure Nothing
     firstExistingFile (p : ps) = do
         ok <- doesFileExist p
         if ok then pure (Just p) else firstExistingFile ps
 
-    -- | 目录已存在的第一个候选
+    -- \| 目录已存在的第一个候选
     firstExistingDir [] = pure Nothing
     firstExistingDir (p : ps) = do
         let dir = takeDirectory p
@@ -65,7 +65,7 @@ resolveUISettingsFile = do
 validateUISettings :: A.Value -> Either String (Map.Map Text A.Value)
 validateUISettings (A.Object o) = Map.fromList <$> mapM checkField (KM.toList o)
   where
-    -- | 校验一个字段
+    -- \| 校验一个字段
     checkField (rawKey, value) =
         let key = K.toText rawKey
          in case key of
@@ -85,9 +85,8 @@ validateUISettings (A.Object o) = Map.fromList <$> mapM checkField (KM.toList o)
                 "minimap" -> pair key <$> boolValue key value
                 _ -> Left ("unknown setting: " ++ T.unpack key)
 
-    -- | 把键和值配成一对
+    -- \| 把键和值配成一对
     pair key value = (key, value)
-
 validateUISettings _ = Left "settings must be a JSON object"
 
 -- | 字体链最多几项

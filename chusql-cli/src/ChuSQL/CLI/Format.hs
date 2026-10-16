@@ -1,16 +1,16 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module ChuSQL.CLI.Format
-    ( OutputFormat (..)
-    , parseFormat
-    , formatName
-    , renderResult
-    , renderTable
-    , renderRows
-    , renderCsv
-    , renderJson
-    , displayValue
-    ) where
+module ChuSQL.CLI.Format (
+    OutputFormat (..),
+    parseFormat,
+    formatName,
+    renderResult,
+    renderTable,
+    renderRows,
+    renderCsv,
+    renderJson,
+    displayValue,
+) where
 
 import ChuSQL.Core.Model (Value (..))
 import ChuSQL.Core.Protocol (QueryResult (..), queryResultJson)
@@ -55,7 +55,7 @@ renderCsv :: QueryResult -> Text
 renderCsv result = T.unlines (header : map rowLine (qrRows result))
   where
     header = T.intercalate "," (map csvField (qrColumns result))
-    -- | 拼一行 CSV
+    -- \| 拼一行 CSV
     rowLine row = T.intercalate "," (map (csvField . csvCell) row)
 
 -- | CSV 里的空值就是空字段
@@ -80,13 +80,13 @@ renderRows :: [Text] -> [[Text]] -> Text
 renderRows columns rawRows = T.unlines (border : headerLine : border : body ++ [border, summary])
   where
     widths = [columnWidth index | index <- [0 .. length columns - 1]]
-    -- | 一列的显示宽度，有上限
+    -- \| 一列的显示宽度，有上限
     columnWidth index =
         min maxColumnWidth (maximum (T.length (columns !! index) : [T.length (cellAt row index) | row <- rawRows]))
     maxColumnWidth = 64
-    -- | 取某行某列，缺的当空
+    -- \| 取某行某列，缺的当空
     cellAt row index = if index < length row then row !! index else ""
-    -- | 拼一行带竖线的表行
+    -- \| 拼一行带竖线的表行
     cellLine cells = "| " <> T.intercalate " | " (zipWith pad widths (cells ++ repeat "")) <> " |"
     headerLine = cellLine columns
     body = map cellLine rawRows

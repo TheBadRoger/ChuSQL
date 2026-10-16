@@ -1,11 +1,29 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 module ChuSQL.Server.Accounts (
-    Accounts, AccountError (..), Principal (..), PasswordPolicy (..), defaultPasswordPolicy,
-    newAccounts, accountsPolicy, setAccountsPolicy, passwordAllowed,
-    ensureRootAccount, administratorPasswordless, rootUserName, principalName, principalIsRoot, principalIsCatalogManager,
-    authenticate, authenticateSudo, currentPrincipal,
-    listAccounts, findAccount, AccountCommand (..), accountCommand, runAccountCommand,
+    Accounts,
+    AccountError (..),
+    Principal (..),
+    PasswordPolicy (..),
+    defaultPasswordPolicy,
+    newAccounts,
+    accountsPolicy,
+    setAccountsPolicy,
+    passwordAllowed,
+    ensureRootAccount,
+    administratorPasswordless,
+    rootUserName,
+    principalName,
+    principalIsRoot,
+    principalIsCatalogManager,
+    authenticate,
+    authenticateSudo,
+    currentPrincipal,
+    listAccounts,
+    findAccount,
+    AccountCommand (..),
+    accountCommand,
+    runAccountCommand,
 ) where
 
 import ChuSQL.Core.Engine.Error (accountErrorCode)
@@ -32,7 +50,7 @@ data Principal
     deriving (Eq)
 
 instance Show Principal where
-    -- | 身份的可读形式
+    -- \| 身份的可读形式
     show (Root name) = "root " ++ show name
     show (Ordinary a) = "account " ++ show (accountUser a)
 
@@ -48,9 +66,10 @@ principalIsRoot (Ordinary a) = accountIsSuperuser a && accountEnabled a && accou
 
 -- | 判断身份是否可管理系统目录
 principalIsCatalogManager :: Principal -> Bool
-principalIsCatalogManager principal = principalIsRoot principal || case principal of
-    Ordinary a -> accountSystemCatalogManager a && accountEnabled a && accountCanLogin a
-    Root _ -> True
+principalIsCatalogManager principal =
+    principalIsRoot principal || case principal of
+        Ordinary a -> accountSystemCatalogManager a && accountEnabled a && accountCanLogin a
+        Root _ -> True
 
 data Accounts = Accounts
     { acBackend :: Backend
@@ -94,12 +113,13 @@ passwordAllowed policy password
     | classes < ppClasses policy = bad "password needs more character classes"
     | otherwise = Right ()
   where
-    -- | 构造一条请求错误
+    -- \| 构造一条请求错误
     bad = Left . AccountError "bad_request"
-    -- | 命中的字符类别数
+    -- \| 命中的字符类别数
     classes =
         length
-            ( filter id
+            ( filter
+                id
                 [ T.any isAsciiLower password
                 , T.any isAsciiUpper password
                 , T.any isDigit password
@@ -114,7 +134,7 @@ validateUserName name
         Left (AccountError "bad_request" "invalid account name")
     | otherwise = Right ()
   where
-    -- | 该字符是否允许使用
+    -- \| 该字符是否允许使用
     allowed c = isAscii c && (isAlphaNum c || c `elem` ("_.-" :: String))
 
 -- | 校验新身份的名称
@@ -132,7 +152,7 @@ storageResult :: Either String [Account] -> Either AccountError ()
 storageResult (Right _) = Right ()
 storageResult (Left message) = Left (AccountError code text)
   where
-    -- | 认得的码原样用，其余存储细节不外泄
+    -- \| 认得的码原样用，其余存储细节不外泄
     code = T.pack (accountErrorCode message)
     text = if code == failureCode then failureText else T.pack message
     AccountError failureCode failureText = storageFailure
@@ -200,18 +220,18 @@ authenticate service user password = withMVar (acLock service) $ \_ -> do
   where
     name = normalize user
     ordinaryRefused = AccountError "forbidden" "this server only accepts the administrator"
-    -- | 判断是否有已设置口令的登录管理员
+    -- \| 判断是否有已设置口令的登录管理员
     unset accounts = not (any (\a -> accountIsSuperuser a && accountEnabled a && accountCanLogin a && not (T.null (accountHash a))) accounts)
-    -- | 管理员登录
+    -- \| 管理员登录
     signInRoot accounts = case filter ((== name) . accountUser) accounts of
         [a] | T.null (accountHash a) && T.null password -> issue a
         [a] | accountCanLogin a && accountEnabled a && not (T.null (accountHash a)) && verifyPassword (accountHash a) password -> issue a
         _ -> pure (Left unauthorized)
-    -- | 普通账号登录
+    -- \| 普通账号登录
     signInOrdinary accounts = case filter ((== name) . accountUser) accounts of
         [a] | accountCanLogin a && accountEnabled a && not (T.null (accountHash a)) && verifyPassword (accountHash a) password -> issue a
         _ -> pure (Left unauthorized)
-    -- | 记一次登录再发会话
+    -- \| 记一次登录再发会话
     issue a = do
         stamp <- currentStamp
         written <- beAccounts (acBackend service) (ReqAccountLogin (accountUser a) (Just stamp))
@@ -279,8 +299,8 @@ resetPassword service name password = do
 dropUser :: Accounts -> Text -> IO (Either AccountError ())
 dropUser service name =
     case validateUserName name of
-            Left err -> pure (Left err)
-            Right () -> storageResult <$> beAccounts (acBackend service) (ReqAccountDrop (normalize name))
+        Left err -> pure (Left err)
+        Right () -> storageResult <$> beAccounts (acBackend service) (ReqAccountDrop (normalize name))
 
 -- | 账号管理命令：SQL 语句与一键接口在这上面汇合
 data AccountCommand
@@ -302,7 +322,7 @@ accountCommand _ = Nothing
 runAccountCommand :: Accounts -> Principal -> AccountCommand -> IO (Either AccountError ())
 runAccountCommand service principal command = withMVar (acLock service) $ const run
   where
-    -- | 校验并执行身份管理权限
+    -- \| 校验并执行身份管理权限
     run
         | not (principalIsCatalogManager principal) = pure (Left (AccountError "forbidden" "catalog manager required"))
         | not (principalIsRoot principal) = do
@@ -311,20 +331,21 @@ runAccountCommand service principal command = withMVar (acLock service) $ const 
                 Left err -> pure (Left err)
                 Right accounts
                     | any (\a -> accountUser a == normalize (target command) && (accountIsSuperuser a || accountSystemCatalogManager a || accountAllowSudoAuth a)) accounts
-                        || privilegedChange command -> pure (Left (AccountError "forbidden" "superuser required to manage privileged identities"))
+                        || privilegedChange command ->
+                        pure (Left (AccountError "forbidden" "superuser required to manage privileged identities"))
                     | otherwise -> execute
         | otherwise = execute
-    -- | 获取身份管理的目标
+    -- \| 获取身份管理的目标
     target (CreateAccount name _) = name
     target (ResetAccountPassword name _) = name
     target (DropAccount name) = name
     target (AlterAccountAttributes name _) = name
-    -- | 判断是否修改特权属性
+    -- \| 判断是否修改特权属性
     privilegedChange (AlterAccountAttributes _ attributes) = any (\(key, _) -> key `elem` ["superuser", "system_catalog_manager", "allow_sudo_auth"]) attributes
     privilegedChange _ = False
-    -- | 执行已授权的身份命令
+    -- \| 执行已授权的身份命令
     execute = executeWith (if principalIsRoot principal then service else service{acBackend = (acBackend service){beAccounts = beAccounts (acBackend service) . ReqCatalogManage}})
-    -- | 通过受限存储请求执行管理操作
+    -- \| 通过受限存储请求执行管理操作
     executeWith managed = case command of
         CreateAccount name _ | normalize name == "public" -> pure (Left (AccountError "bad_request" "public is reserved for default privileges"))
         CreateAccount name password -> createUser managed name password
@@ -333,5 +354,14 @@ runAccountCommand service principal command = withMVar (acLock service) $ const 
         AlterAccountAttributes name attributes
             | length (nub (map fst attributes)) /= length attributes -> pure (Left (AccountError "bad_request" "duplicate identity attribute"))
             | otherwise ->
-                storageResult <$> beAccounts (acBackend managed) (ReqIdentityAlter (normalize name)
-                    (lookup "login" attributes) (lookup "superuser" attributes) (lookup "enabled" attributes) (lookup "system_catalog_manager" attributes) (lookup "allow_sudo_auth" attributes))
+                storageResult
+                    <$> beAccounts
+                        (acBackend managed)
+                        ( ReqIdentityAlter
+                            (normalize name)
+                            (lookup "login" attributes)
+                            (lookup "superuser" attributes)
+                            (lookup "enabled" attributes)
+                            (lookup "system_catalog_manager" attributes)
+                            (lookup "allow_sudo_auth" attributes)
+                        )

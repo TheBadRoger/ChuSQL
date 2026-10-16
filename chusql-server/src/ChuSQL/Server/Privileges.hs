@@ -1,31 +1,55 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module ChuSQL.Server.Privileges
-    ( Grant (..), Membership (..), PrivilegeCommand (..), PrivilegeError (..), Privileges, RoleView (..)
-    , affectedAccounts, authorize, authorizeTables, authorizeConnect, filterTables, listRoleViews, listSelfGrants
-    , newPrivileges, normalizeObject, privilegeCommand, runPrivilegeCommand, claimObject, prepareObject, reconcileObjects, affectedObject
-    ) where
+module ChuSQL.Server.Privileges (
+    Grant (..),
+    Membership (..),
+    PrivilegeCommand (..),
+    PrivilegeError (..),
+    Privileges,
+    RoleView (..),
+    affectedAccounts,
+    authorize,
+    authorizeTables,
+    authorizeConnect,
+    filterTables,
+    listRoleViews,
+    listSelfGrants,
+    newPrivileges,
+    normalizeObject,
+    privilegeCommand,
+    runPrivilegeCommand,
+    claimObject,
+    prepareObject,
+    reconcileObjects,
+    affectedObject,
+) where
 
-import Data.Maybe (maybeToList)
 import ChuSQL.Core.Engine.Syntax.AST
 import ChuSQL.Core.Protocol (Account (..))
 import ChuSQL.Interface.Protocol (Grant (..), RoleView (..))
-import ChuSQL.Server.Accounts (Principal, principalIsRoot, principalIsCatalogManager)
+import ChuSQL.Server.Accounts (Principal, principalIsCatalogManager, principalIsRoot)
 import ChuSQL.Server.Backend (Backend (..), exprTables, statementTables, systemDatabaseName)
 import ChuSQL.Server.Catalog
 import qualified ChuSQL.Server.ObjectACL as OA
 import Data.List (nub, sort)
+import Data.Maybe (maybeToList)
 import Data.Text (Text)
 import qualified Data.Text as T
 
 -- 权限服务：稳定对象授权、角色继承与受影响会话展开。
 
 data PrivilegeError = PrivilegeError Text Text deriving (Show, Eq)
-data Membership = Membership { memberRole :: Text, memberUser :: Text } deriving (Show, Eq, Ord)
-data PrivilegeCommand = CreateRoleCommand Text | DropRoleCommand Text
-    | GrantPrivilegesCommand [Text] Text Text Bool | RevokePrivilegesCommand [Text] Text Text | RevokeGrantOptionCommand [Text] Text Text
-    | GrantRoleCommand Text [Text] | RevokeRoleCommand Text [Text] deriving (Show, Eq)
-data Privileges = Privileges { pvCatalog :: Catalog, pvBackend :: Backend }
+data Membership = Membership {memberRole :: Text, memberUser :: Text} deriving (Show, Eq, Ord)
+data PrivilegeCommand
+    = CreateRoleCommand Text
+    | DropRoleCommand Text
+    | GrantPrivilegesCommand [Text] Text Text Bool
+    | RevokePrivilegesCommand [Text] Text Text
+    | RevokeGrantOptionCommand [Text] Text Text
+    | GrantRoleCommand Text [Text]
+    | RevokeRoleCommand Text [Text]
+    deriving (Show, Eq)
+data Privileges = Privileges {pvCatalog :: Catalog, pvBackend :: Backend}
 
 -- 创建权限目录服务。
 newPrivileges :: Backend -> IO Privileges
@@ -56,9 +80,10 @@ runPrivilegeCommand service principal database command = withTables service $ ca
             known <- catalog (readRoleNames directory)
             case known of
                 Left err -> pure (Left err)
-                Right names | normalizeRole role `elem` names -> pure (Left (PrivilegeError "conflict" ("role already exists: " <> role)))
-                            | normalizeRole role == "public" -> pure (Left (PrivilegeError "bad_request" "public is reserved for default privileges"))
-                            | otherwise -> catalog (insertRole directory role)
+                Right names
+                    | normalizeRole role `elem` names -> pure (Left (PrivilegeError "conflict" ("role already exists: " <> role)))
+                    | normalizeRole role == "public" -> pure (Left (PrivilegeError "bad_request" "public is reserved for default privileges"))
+                    | otherwise -> catalog (insertRole directory role)
     DropRoleCommand role
         | principalIsRoot principal -> after (catalog (dropRole directory role))
     GrantRoleCommand role members
@@ -94,12 +119,14 @@ validateMembers names pairs role members
     foldMembers edges (member : rest)
         | child `elem` closureUp edges [parent] = Left (PrivilegeError "conflict" ("role membership would create a cycle: " <> parent <> " and " <> child))
         | otherwise = foldMembers ((parent, child) : edges) rest
-      where child = normalizeUser member
+      where
+        child = normalizeUser member
 
 -- 展开角色的继承闭包。
 closureUp :: [(Text, Text)] -> [Text] -> [Text]
-closureUp edges known = let more = [parent | (parent, child) <- edges, child `elem` known, parent `notElem` known]
-                       in if null more then known else closureUp edges (nub (known ++ more))
+closureUp edges known =
+    let more = [parent | (parent, child) <- edges, child `elem` known, parent `notElem` known]
+     in if null more then known else closureUp edges (nub (known ++ more))
 
 -- 展开成员和转授权变更影响的全部身份。
 affectedAccounts :: Privileges -> PrivilegeCommand -> IO (Either PrivilegeError [Text])
@@ -173,12 +200,13 @@ listRoleViews service = withTables service $ do
     members <- catalog (readMembers (pvCatalog service))
     case (,) <$> names <*> members of
         Left err -> pure (Left err)
-        Right (identities, pairs) -> sequence
-                                       <$>
-                                         mapM
-                                           (view pairs)
-                                           (sort
-                                              (map accountUser (filter (not . accountCanLogin) identities)))
+        Right (identities, pairs) ->
+            sequence
+                <$> mapM
+                    (view pairs)
+                    ( sort
+                        (map accountUser (filter (not . accountCanLogin) identities))
+                    )
   where
     -- 组装一个角色的公开权限视图。
     view members name = do
@@ -228,13 +256,14 @@ catalog = fmap (either (Left . storageError) Right)
 storageError :: String -> PrivilegeError
 storageError message = PrivilegeError code (T.pack message)
   where
-    code | message == "no database selected" = "no_database"
-         | any (`T.isPrefixOf` T.pack message) ["permission denied:", "grant option required:", "object owner required", "administrator required", "system objects cannot be granted"] = "forbidden"
-         | any (`T.isPrefixOf` T.pack message) ["unknown role:", "unknown table", "unknown database"] = "not_found"
-         | message == "object ACL changed concurrently" = "conflict"
-         | message == "invalid privilege for object scope" = "bad_request"
-         | message == "the last enabled login superuser cannot be removed" = "bad_request"
-         | otherwise = "storage_error"
+    code
+        | message == "no database selected" = "no_database"
+        | any (`T.isPrefixOf` T.pack message) ["permission denied:", "grant option required:", "object owner required", "administrator required", "system objects cannot be granted"] = "forbidden"
+        | any (`T.isPrefixOf` T.pack message) ["unknown role:", "unknown table", "unknown database"] = "not_found"
+        | message == "object ACL changed concurrently" = "conflict"
+        | message == "invalid privilege for object scope" = "bad_request"
+        | message == "the last enabled login superuser cannot be removed" = "bad_request"
+        | otherwise = "storage_error"
 
 forbidden :: PrivilegeError
 forbidden = PrivilegeError "forbidden" "administrator required"

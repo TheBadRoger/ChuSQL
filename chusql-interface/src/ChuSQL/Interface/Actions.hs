@@ -32,13 +32,13 @@ module ChuSQL.Interface.Actions (
     revokeRoleSql,
 ) where
 
-import Control.Monad (zipWithM)
 import ChuSQL.Core.Model (Column (..), ColumnType (..), Value (..), integerType, numericType, parseColumnType, plainColumn, typeName)
 import qualified ChuSQL.Core.Model as M
-import ChuSQL.Core.Runtime
 import ChuSQL.Core.Protocol (valueFromJSON)
-import Data.Aeson.Types (parseEither)
+import ChuSQL.Core.Runtime
+import Control.Monad (zipWithM)
 import qualified Data.Aeson as A
+import Data.Aeson.Types (parseEither)
 import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
 import Data.List (intercalate)
 import Data.Scientific (floatingOrInteger)
@@ -71,7 +71,7 @@ isIdentifier t =
             (c : cs) -> (isAsciiLower c || isAsciiUpper c || c == '_') && all restChar cs
             [] -> False
   where
-    -- | 标识符里其余字符的合法集
+    -- \| 标识符里其余字符的合法集
     restChar c = isAsciiLower c || isAsciiUpper c || isDigit c || c == '_'
 
 -- | 检查一个标识符，不合法就报错（带上"是表名还是列名"）
@@ -177,7 +177,7 @@ createTableSql spec = do
     defs <- mapM columnDef cols
     pure ("CREATE TABLE " ++ T.unpack tbl ++ " (" ++ intercalate ", " defs ++ ")")
   where
-    -- | 列类型不认时报错
+    -- \| 列类型不认时报错
     columnDef (ColumnSpec name ty) = do
         col <- checkIdent "column" name
         ctype <- maybe (Left ("unknown column type: " ++ T.unpack ty)) Right (columnTypeOf ty)
@@ -258,7 +258,7 @@ updateRowSql table key assigns = do
     sets <- mapM assignment cols
     pure ("UPDATE " ++ T.unpack tbl ++ " SET " ++ intercalate ", " sets ++ " WHERE id = " ++ show key)
   where
-    -- | 校验列名并编码赋值
+    -- \| 校验列名并编码赋值
     assignment (name, value) = do
         column <- checkIdent "column" (T.pack name)
         literal <- sqlLiteral value
@@ -286,7 +286,7 @@ whereClause filters = case filters of
         terms <- mapM term filters
         pure (" WHERE " ++ intercalate " AND " terms)
   where
-    -- | 一个等值条件
+    -- \| 一个等值条件
     term (column, value) = do
         col <- checkIdent "column" column
         literal <- sqlLiteral value
@@ -306,7 +306,7 @@ accountName name
     | not (T.all allowed name) = Left ("account name may only contain ASCII letters, digits, dot, dash or underscore: " ++ T.unpack name)
     | otherwise = Right name
   where
-    -- | 账号名允许的字符集
+    -- \| 账号名允许的字符集
     allowed c = isAsciiLower c || isAsciiUpper c || isDigit c || c `elem` ("_.-" :: String)
 
 -- | 单引号字符串字面量
@@ -342,7 +342,7 @@ roleName name
     | not (T.all allowed name) = Left ("role name may only contain ASCII letters, digits, dot, dash or underscore: " ++ T.unpack name)
     | otherwise = Right name
   where
-    -- | 角色名允许的字符集
+    -- \| 角色名允许的字符集
     allowed c = isAsciiLower c || isAsciiUpper c || isDigit c || c `elem` ("_.-" :: String)
 
 -- | 授权对象：`*`，或长度不超过 128 的裸表名/`库.表`
@@ -355,7 +355,7 @@ grantObject object
     | not (T.all allowed object) = Left ("object name may only contain ASCII letters, digits, dot, dash or underscore: " ++ T.unpack object)
     | otherwise = Right object
   where
-    -- | 授权对象允许的字符集
+    -- \| 授权对象允许的字符集
     allowed c = isAsciiLower c || isAsciiUpper c || isDigit c || c `elem` ("_.-" :: String)
 
 -- | 权限清单：词要纯字母，认不认由 server 定
@@ -364,7 +364,7 @@ privilegeWords privileges
     | null privileges = Left "at least one privilege is required"
     | otherwise = mapM word privileges
   where
-    -- | 单个权限词
+    -- \| 单个权限词
     word one
         | T.null one || not (T.all (\c -> isAsciiLower c || isAsciiUpper c) one) = Left ("not a privilege keyword: " ++ T.unpack one)
         | otherwise = Right one
@@ -388,11 +388,16 @@ grantPrivilegesSql privileges object role withOption = do
     target <- grantObject object
     who <- roleName role
     pure
-        ( "GRANT " ++ T.unpack (T.intercalate ", " words') ++ " ON " ++ T.unpack target
-            ++ " TO " ++ T.unpack who ++ tailText
+        ( "GRANT "
+            ++ T.unpack (T.intercalate ", " words')
+            ++ " ON "
+            ++ T.unpack target
+            ++ " TO "
+            ++ T.unpack who
+            ++ tailText
         )
   where
-    -- | 转授权后缀
+    -- \| 转授权后缀
     tailText
         | withOption = " WITH GRANT OPTION"
         | otherwise = ""

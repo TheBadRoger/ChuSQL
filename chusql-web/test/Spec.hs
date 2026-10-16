@@ -2,13 +2,13 @@
 
 module Main (main) where
 
-import ChuSQL.Interface.Link (closeClient, connectClient)
-import ChuSQL.Interface.Auth (SessionPolicy (..), defaultSessionPolicy, lookupPayload, setPayloadPolicy)
-import ChuSQL.Interface.RateLimit (newRateLimiter)
-import ChuSQL.Interface.Session (authenticateSession, newSession, runStatement)
-import qualified ChuSQL.Interface.Actions as Actions
 import qualified ChuSQL.Core.Model as Model
 import ChuSQL.Core.Runtime
+import qualified ChuSQL.Interface.Actions as Actions
+import ChuSQL.Interface.Auth (SessionPolicy (..), defaultSessionPolicy, lookupPayload, setPayloadPolicy)
+import ChuSQL.Interface.Link (closeClient, connectClient)
+import ChuSQL.Interface.RateLimit (newRateLimiter)
+import ChuSQL.Interface.Session (authenticateSession, newSession, runStatement)
 import ChuSQL.Interface.Settings (
     applySettings,
     defaultOf,
@@ -21,8 +21,8 @@ import ChuSQL.Interface.Settings (
  )
 import ChuSQL.Web.API (
     AppEnv (..),
-    WebSession (..),
     Live (..),
+    WebSession (..),
     defaultLive,
     isIdentifier,
     newAppEnvAt,
@@ -34,8 +34,8 @@ import ChuSQL.Web.Static (contentTypeOf, safeRelative)
 import ChuSQL.Web.UISettings (validateUISettings)
 import Control.Concurrent (forkFinally, forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (IOException, bracket, throwIO, try, bracket_)
-import Control.Monad (when, unless)
+import Control.Exception (IOException, bracket, bracket_, throwIO, try)
+import Control.Monad (unless, when)
 import Data.Aeson (encode, object, (.=))
 import qualified Data.Aeson as A
 import qualified Data.Aeson.Key as K
@@ -44,8 +44,8 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import qualified Data.ByteString.Lazy as BL
 import Data.Char (isDigit)
-import Data.List (isInfixOf)
 import Data.IORef (readIORef)
+import Data.List (isInfixOf)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
@@ -79,8 +79,8 @@ import System.Directory (
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
-import System.Info (os)
 import System.IO (Handle, hGetLine)
+import System.Info (os)
 import System.Process (
     CreateProcess (std_err, std_out),
     ProcessHandle,
@@ -137,7 +137,7 @@ requestAs verb path hs payload = do
     app <- getState
     liftIO $ WT.runSession send app
   where
-    -- | 清空 cookie jar 后发出请求
+    -- \| 清空 cookie jar 后发出请求
     send = do
         WT.modifyClientCookies (const Map.empty)
         WT.srequest $
@@ -433,7 +433,7 @@ serverConfigText dataDir =
         , "data_dir = \"" ++ slashed dataDir ++ "\""
         ]
   where
-    -- | 反斜杠换成正斜杠
+    -- \| 反斜杠换成正斜杠
     slashed = map (\c -> if c == '\\' then '/' else c)
 
 -- | 逐行读 stdout 直到读出端口
@@ -472,8 +472,9 @@ locateServerExe = do
         Just path -> pure path
         Nothing -> fail "chusql-server was not found on PATH: run `stack build` first"
 
--- | 全新的数据目录还没有系统目录：先跑引导程序建表并补一个免密管理员，
--- server 才肯启动（未引导的目录会被它拒绝）。
+{- | 全新的数据目录还没有系统目录：先跑引导程序建表并补一个免密管理员，
+server 才肯启动（未引导的目录会被它拒绝）。
+-}
 seedSystemCatalog :: FilePath -> IO ()
 seedSystemCatalog config = do
     bootstrap <- locateBootstrapExe
@@ -525,8 +526,9 @@ unitSpec = describe "pure helpers" $ do
     it "escapes nested runtime string literals" $ do
         case resolveType builtinTypes (listType stringType) of
             Left err -> expectationFailure err
-            Right descriptor -> Actions.sqlLiteral (Model.VRuntime (descriptorId descriptor) (RList [RString "a'b"]))
-                `shouldBe` Right "LIST<String>('a''b')"
+            Right descriptor ->
+                Actions.sqlLiteral (Model.VRuntime (descriptorId descriptor) (RList [RString "a'b"]))
+                    `shouldBe` Right "LIST<String>('a''b')"
     it "parses the session cookie out of a Cookie header" $ do
         parseCookieHeader sessionCookieName "a=1; chusql_session=abc123; b=2" `shouldBe` Just "abc123"
         parseCookieHeader sessionCookieName "other=1" `shouldBe` Nothing
@@ -950,11 +952,20 @@ querySpec env = describe "the SQL console" $ do
             ensureAccount admin "normalization_web_reader" "Reader-Secret-1234"
             created <- testSql admin "CREATE TABLE normalization_web (id INT, course INT, name TEXT)"
             expectStatusWith "normalization table" created 200
-            let declaration = object ["declared_keys" .= ([["id", "course"]] :: [[Text]]),
-                    "dependencies" .= [object ["lhs" .= (["id"] :: [Text]), "rhs" .= (["name"] :: [Text])]],
-                    "dependencies_complete" .= True, "atomic_attributes" .= True]
-                payload = object ["api_version" .= (1 :: Int), "database" .= testDatabaseName,
-                    "table" .= ("normalization_web" :: Text), "declaration" .= declaration]
+            let declaration =
+                    object
+                        [ "declared_keys" .= ([["id", "course"]] :: [[Text]])
+                        , "dependencies" .= [object ["lhs" .= (["id"] :: [Text]), "rhs" .= (["name"] :: [Text])]]
+                        , "dependencies_complete" .= True
+                        , "atomic_attributes" .= True
+                        ]
+                payload =
+                    object
+                        [ "api_version" .= (1 :: Int)
+                        , "database" .= testDatabaseName
+                        , "table" .= ("normalization_web" :: Text)
+                        , "declaration" .= declaration
+                        ]
             unauthorized <- postAs (withDb testDatabaseName []) "/api/normalization/analyze" (encode payload)
             expectStatusWith "anonymous normalization" unauthorized 401
             reader <- ordinaryHeaders "normalization_web_reader" "Reader-Secret-1234"
@@ -969,9 +980,15 @@ querySpec env = describe "the SQL console" $ do
             check (map (asText . at "verdict") (items (at "findings" (jsonBody report))) `shouldBe` ["satisfied", "violated", "violated", "violated"])
             changed <- testSql admin "ALTER TABLE normalization_web ADD COLUMN extra INT"
             expectStatusWith "change normalization schema" changed 200
-            let stale = object ["api_version" .= (1 :: Int), "database" .= testDatabaseName,
-                    "table" .= ("normalization_web" :: Text), "declaration" .= declaration,
-                    "expected_object" .= at "object" (jsonBody report), "expected_schema_fingerprint" .= at "schema_fingerprint" (jsonBody report)]
+            let stale =
+                    object
+                        [ "api_version" .= (1 :: Int)
+                        , "database" .= testDatabaseName
+                        , "table" .= ("normalization_web" :: Text)
+                        , "declaration" .= declaration
+                        , "expected_object" .= at "object" (jsonBody report)
+                        , "expected_schema_fingerprint" .= at "schema_fingerprint" (jsonBody report)
+                        ]
             conflicted <- postAs (withDb testDatabaseName readerAgain) "/api/normalization/analyze" (encode stale)
             expectStatusWith "schema changed" conflicted 409
         it "uses a matching editing snapshot without creating a second transaction" $ do
@@ -983,8 +1000,13 @@ querySpec env = describe "the SQL console" $ do
             expectStatusWith "normalization edit begins" begun 200
             changed <- testSql admin "ALTER TABLE normalization_edit ADD COLUMN extra INT"
             expectStatusWith "live schema changes" changed 200
-            let payload = object ["api_version" .= (1 :: Int), "database" .= testDatabaseName,
-                    "table" .= ("normalization_edit" :: Text), "declaration" .= object []]
+            let payload =
+                    object
+                        [ "api_version" .= (1 :: Int)
+                        , "database" .= testDatabaseName
+                        , "table" .= ("normalization_edit" :: Text)
+                        , "declaration" .= object []
+                        ]
             snapshot <- postAs (("X-ChuSQL-Edit", "normalization-owner") : withDb testDatabaseName admin) "/api/normalization/analyze" (encode payload)
             expectStatusWith "analysis on edit connection" snapshot 200
             check (at "view" (jsonBody snapshot) `shouldBe` A.String "transaction_snapshot")
@@ -999,8 +1021,13 @@ querySpec env = describe "the SQL console" $ do
             created <- testSql admin "CREATE TABLE normalization_console (id INT)"
             expectStatusWith "console normalization table" created 200
             let owner = ("X-ChuSQL-Console", "normalization-console") : admin
-                payload = object ["api_version" .= (1 :: Int), "database" .= testDatabaseName,
-                    "table" .= ("normalization_console" :: Text), "declaration" .= object []]
+                payload =
+                    object
+                        [ "api_version" .= (1 :: Int)
+                        , "database" .= testDatabaseName
+                        , "table" .= ("normalization_console" :: Text)
+                        , "declaration" .= object []
+                        ]
             begun <- testSql owner "BEGIN"
             expectStatusWith "console begins" begun 200
             snapshot <- postAs (withDb testDatabaseName owner) "/api/normalization/analyze" (encode payload)
@@ -1013,8 +1040,11 @@ querySpec env = describe "the SQL console" $ do
         it "rejects duplicate declarations and oversized normalization bodies" $ do
             admin <- adminHeaders
             ensureDatabase admin testDatabaseName
-            duplicate <- postAs (withDb testDatabaseName admin) "/api/normalization/analyze"
-                "{\"api_version\":1,\"database\":\"test\",\"table\":\"users\",\"declaration\":{\"atomic_attributes\":true,\"atomic_attributes\":false}}"
+            duplicate <-
+                postAs
+                    (withDb testDatabaseName admin)
+                    "/api/normalization/analyze"
+                    "{\"api_version\":1,\"database\":\"test\",\"table\":\"users\",\"declaration\":{\"atomic_attributes\":true,\"atomic_attributes\":false}}"
             expectStatusWith "duplicate declaration fields" duplicate 400
             oversized <- postAs (withDb testDatabaseName admin) "/api/normalization/analyze" (BL.replicate 65537 32)
             expectStatusWith "normalization request bound" oversized 413
@@ -1050,6 +1080,19 @@ querySpec env = describe "the SQL console" $ do
             check (arrayLen envelope `shouldBe` 3)
             check (asInt (fromMaybe A.Null (nth 0 (items envelope))) `shouldBe` 1)
             check (asInt (fromMaybe A.Null (nth 1 (firstRow result))) `shouldBe` 3)
+            compared <- testSql hs "SELECT LIST<Int>(2) < LIST<Int>(10), MAYBE<Int>() = MAYBE<Int>(), LIST<Int>() = NULL"
+            expectStatusWith "compound comparison values" compared 200
+            check (firstRow compared `shouldBe` [A.Bool True, A.Bool True, A.Null])
+            created <- testSql hs "CREATE TABLE http_compound_caps (id INT, xs [Int])"
+            expectStatusWith "compound table" created 200
+            inserted <- testSql hs "INSERT INTO http_compound_caps (id,xs) VALUES (1, LIST<Int>(10)), (2, LIST<Int>(2)), (3, LIST<Int>(2))"
+            expectStatusWith "compound rows" inserted 200
+            ordered <- testSql hs "SELECT id FROM http_compound_caps ORDER BY xs"
+            expectStatusWith "compound ordering" ordered 200
+            check (at "rows" (jsonBody ordered) `shouldBe` A.toJSON ([[2], [3], [1]] :: [[Int]]))
+            grouped <- testSql hs "SELECT COUNT(*) FROM http_compound_caps GROUP BY xs ORDER BY xs"
+            expectStatusWith "compound grouping" grouped 200
+            check (at "rows" (jsonBody grouped) `shouldBe` A.toJSON ([[2], [1]] :: [[Int]]))
         it "runs DDL and DML and returns positional rows" $ do
             hs <- adminHeaders
             ensureDatabase hs testDatabaseName
@@ -1089,8 +1132,15 @@ querySpec env = describe "the SQL console" $ do
 
 -- | 发出编辑事务控制请求。
 editRequest :: [Header] -> BS.ByteString -> Text -> [A.Value] -> TestSession WT.SResponse
-editRequest hs path owner changes = postAs hs path (encode (object
-    ["id" .= owner, "database" .= testDatabaseName, "changes" .= changes]))
+editRequest hs path owner changes =
+    postAs
+        hs
+        path
+        ( encode
+            ( object
+                ["id" .= owner, "database" .= testDatabaseName, "changes" .= changes]
+            )
+        )
 
 -- | 在测试库执行一条 SQL。
 testSql :: [Header] -> Text -> TestSession WT.SResponse
@@ -1098,8 +1148,12 @@ testSql hs sql = postAs (withDb testDatabaseName hs) "/api/query" (encode (objec
 
 -- | 生成整数行插入编辑。
 editInsert :: Text -> Int -> A.Value
-editInsert table key = object ["op" .= ("insert" :: Text), "table" .= table,
-    "values" .= object ["id" .= key, "value" .= key]]
+editInsert table key =
+    object
+        [ "op" .= ("insert" :: Text)
+        , "table" .= table
+        , "values" .= object ["id" .= key, "value" .= key]
+        ]
 
 -- | 验证编辑原子性、隔离与失效清理。
 editSpec :: AppEnv -> Spec
@@ -1160,8 +1214,13 @@ editSpec env = describe "web editing transactions" $ withApp (webApp env) $ do
         expectStatusWith "concurrent update" updated 200
         snapshot <- getAs (("X-ChuSQL-Edit", "conflicts") : withDb testDatabaseName hs) "/api/tables/edit_conflicts/rows"
         check (firstRow snapshot `shouldBe` [A.Number 1, A.Number 10])
-        let change = object ["op" .= ("update" :: Text), "table" .= ("edit_conflicts" :: Text),
-                "pk" .= (1 :: Int), "set" .= object ["value" .= (30 :: Int)]]
+        let change =
+                object
+                    [ "op" .= ("update" :: Text)
+                    , "table" .= ("edit_conflicts" :: Text)
+                    , "pk" .= (1 :: Int)
+                    , "set" .= object ["value" .= (30 :: Int)]
+                    ]
         failed <- editRequest hs "/api/edit/commit" "conflicts" [change]
         expectStatusWith "serialization conflict" failed 409
         check (at "reloadRequired" (jsonBody failed) `shouldBe` A.Bool True)
@@ -1180,8 +1239,15 @@ editSpec env = describe "web editing transactions" $ withApp (webApp env) $ do
         expectStatusWith "repeated begin" repeated 200
         otherPage <- editRequest hs "/api/edit/begin" "intruder" []
         expectStatusWith "another page" otherPage 409
-        otherDatabase <- postAs hs "/api/edit/commit" (encode (object
-            ["id" .= ("owner" :: Text), "database" .= ("system" :: Text), "changes" .= ([] :: [A.Value])]))
+        otherDatabase <-
+            postAs
+                hs
+                "/api/edit/commit"
+                ( encode
+                    ( object
+                        ["id" .= ("owner" :: Text), "database" .= ("system" :: Text), "changes" .= ([] :: [A.Value])]
+                    )
+                )
         expectStatusWith "another database" otherDatabase 409
         forged <- getAs (("X-ChuSQL-Edit", "intruder") : withDb testDatabaseName hs) "/api/tables"
         expectStatusWith "another page snapshot" forged 409
@@ -1250,8 +1316,15 @@ editSpec env = describe "web editing transactions" $ withApp (webApp env) $ do
         expectStatusWith "console begin" begun 200
         rejected <- testSql intruder "ROLLBACK"
         expectStatusWith "other console rollback" rejected 409
-        rest <- postAs (withDb testDatabaseName hs) "/api/tables" (encode (object
-            ["name" .= ("edit_rest_intruder" :: Text), "columns" .= [column "id" "int"]]))
+        rest <-
+            postAs
+                (withDb testDatabaseName hs)
+                "/api/tables"
+                ( encode
+                    ( object
+                        ["name" .= ("edit_rest_intruder" :: Text), "columns" .= [column "id" "int"]]
+                    )
+                )
         expectStatusWith "REST write inside console transaction" rest 409
         closed <- postAs hs "/api/query/rollback" (encode (object ["console" .= ("page:console-a" :: Text)]))
         expectStatusWith "close owning console" closed 204
@@ -1265,10 +1338,12 @@ editSpec env = describe "web editing transactions" $ withApp (webApp env) $ do
         let token = fromMaybe "" (lookup "Cookie" hs >>= parseCookieHeader sessionCookieName . TE.decodeUtf8)
         stored <- liftIO (lookupPayload (aeSessions env) token)
         app <- getState
-        res <- liftIO $ bracket_
-                          (setPayloadPolicy (aeSessions env) (SessionPolicy (- 1) 86400))
-                          (setPayloadPolicy (aeSessions env) defaultSessionPolicy)
-                          (editFromApp app hs "expires" [])
+        res <-
+            liftIO $
+                bracket_
+                    (setPayloadPolicy (aeSessions env) (SessionPolicy (-1) 86400))
+                    (setPayloadPolicy (aeSessions env) defaultSessionPolicy)
+                    (editFromApp app hs "expires" [])
         expectStatusWith "expired commit" res 401
         case stored of
             Nothing -> check (expectationFailure "missing live web session")
@@ -1295,10 +1370,13 @@ editSpec env = describe "web editing transactions" $ withApp (webApp env) $ do
 editFromApp :: Wai.Application -> [Header] -> Text -> [A.Value] -> IO WT.SResponse
 editFromApp app hs owner changes = WT.runSession send app
   where
-    -- | 构造带 Cookie 的原子提交请求。
-    send = WT.srequest (WT.SRequest
-        (WT.setPath WT.defaultRequest {Wai.requestMethod = methodPost, Wai.requestHeaders = jsonHeaders hs} "/api/edit/commit")
-        (encode (object ["id" .= owner, "database" .= testDatabaseName, "changes" .= changes])))
+    -- \| 构造带 Cookie 的原子提交请求。
+    send =
+        WT.srequest
+            ( WT.SRequest
+                (WT.setPath WT.defaultRequest{Wai.requestMethod = methodPost, Wai.requestHeaders = jsonHeaders hs} "/api/edit/commit")
+                (encode (object ["id" .= owner, "database" .= testDatabaseName, "changes" .= changes]))
+            )
 
 -- | IDE 设置用例
 uiSettingsSpec :: AppEnv -> Spec

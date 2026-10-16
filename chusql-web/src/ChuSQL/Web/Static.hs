@@ -11,7 +11,7 @@ import Data.Char (isAsciiLower, isAsciiUpper, isDigit, toLower)
 import Data.Text (Text)
 import qualified Data.Text as T
 import System.Directory (doesFileExist)
-import System.FilePath ((</>), takeExtension)
+import System.FilePath (takeExtension, (</>))
 
 -- 静态文件交付：文件名白名单加扩展名白名单，不做目录列举。
 
@@ -33,7 +33,7 @@ safeRelative t
     | map toLower (takeExtension (T.unpack t)) `notElem` allowedExtensions = Nothing
     | otherwise = Just (T.unpack t)
   where
-    -- | 文件名里是否出现不允许的字符
+    -- \| 文件名里是否出现不允许的字符
     badChar c = not (isAsciiLower c || isAsciiUpper c || isDigit c || c `elem` ("._-" :: String))
 
 -- | 读一个静态文件；不存在（或是目录）给 Nothing

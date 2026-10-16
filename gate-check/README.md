@@ -1,6 +1,8 @@
-# gate-check — 项目门禁
+# 项目门禁
 
-独立门禁目录：脚本与说明都在这一个目录，入口是 `run-gate.ps1`，三条车道并行；车道日志与临时目录写到仓库根的 `logs/`。
+本页面向开发者，说明如何运行测试门禁和定位失败步骤。在仓库根目录使用 PowerShell 运行 `gate-check/run-gate.ps1`。
+
+门禁先构建存储动态库，再并行运行 Rust、Haskell 和注释检查三个任务组（脚本中称为车道）。日志与临时目录写入仓库根的 `logs/`。
 
 ## 快速开始
 
@@ -8,7 +10,6 @@
 pwsh -NoProfile -File gate-check/run-gate.ps1              # 全量
 pwsh -NoProfile -File gate-check/run-gate.ps1 -Clean       # 先清各项目自己的构建工件
 pwsh -NoProfile -File gate-check/run-gate.ps1 -Full        # 连依赖副本一起清（最慢，怀疑旧产物复用时才用）
-pwsh -NoProfile -File gate-check/run-gate.ps1 -NoLint      # 跳过 cargo clippy
 pwsh -NoProfile -File gate-check/run-gate.ps1 -Only stack  # 只跑 Haskell 车道：cargo|stack|comments
 ```
 
@@ -32,12 +33,18 @@ Server 步骤先刷新该工程里的 model、engine 与 interface 本地依赖�
 - 日志在仓库根的 `logs/<车道>.log`（stderr 在 `.err.log`），终端实时转发同一份内容；文件不进版本库。
 - `comment-check.ps1` 有问题数时退出 1；`comment-purity.ps1` 只报告差异，恒退出 0。
 
-## 相对旧脚本的提速点
+## 清理与局部检查
 
-1. 默认不再 `stack clean --full`：改为零清理；`-Clean` 只清各项目自己的工件，`-Full` 才回到旧行为。
-2. 车道并行：Rust 测试 + clippy、五个 Haskell 套件、注释检查同时跑。
-3. 输出流式：旧脚本 `| Out-String` 要等整步跑完才吐字，这里逐行实时转发。
-4. 单车道开关 `-Only`，改一个模块时不用全量。
+按需要选择运行范围和清理程度：
+
+| 选项 | 行为 |
+| --- | --- |
+| 不带清理选项 | 复用构建工件，不主动清理 |
+| `-Clean` | 清理各项目自己的构建工件 |
+| `-Full` | 连依赖副本一起清理，怀疑复用旧产物时使用 |
+| `-Only cargo\|stack\|comments` | 运行指定任务组，不能代替要求执行的全量门禁 |
+
+脚本也提供 `-NoLint` 跳过 Clippy；使用该选项的结果不包含 Clippy 验收，不得以此绕过项目要求的检查。输出逐行实时转发，无需等整步结束。
 
 ## 约定
 

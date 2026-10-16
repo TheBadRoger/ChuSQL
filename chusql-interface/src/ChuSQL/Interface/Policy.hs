@@ -33,10 +33,12 @@ passwordKeys = ["password-min-length", "password-classes"]
 
 -- | 策略值：缺项或空值回落到内置默认
 policyFromValues :: PasswordPolicy -> Map.Map Text Text -> PasswordPolicy
-policyFromValues before values = PasswordPolicy
-    (number "password-min-length" (ppMinLength before)) (number "password-classes" (ppClasses before))
+policyFromValues before values =
+    PasswordPolicy
+        (number "password-min-length" (ppMinLength before))
+        (number "password-classes" (ppClasses before))
   where
-    -- | 取一个键的数值，缺项或空值回落到给定默认
+    -- \| 取一个键的数值，缺项或空值回落到给定默认
     number key fallback = case Map.lookup key values of
         Nothing -> fallback
         Just value -> fromMaybe fallback (readMaybe (T.unpack (if T.null value then defaultOf key else value)))

@@ -2,9 +2,17 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 module ChuSQL.Interface.Sudo (
-    SudoCredential, createSudoCredential, removeSudoCredential,
-    readSudoCredential, sudoProof, verifySudoProof, sudoChallenge, sudoPrivileged,
-    newSudoCredential, isLocalPeer, validSudoChallenge,
+    SudoCredential,
+    createSudoCredential,
+    removeSudoCredential,
+    readSudoCredential,
+    sudoProof,
+    verifySudoProof,
+    sudoChallenge,
+    sudoPrivileged,
+    newSudoCredential,
+    isLocalPeer,
+    validSudoChallenge,
 ) where
 
 import Crypto.Hash (SHA256)
@@ -21,7 +29,7 @@ import Data.Time.Clock (UTCTime, diffUTCTime)
 import Foreign.C.String (CString)
 import Foreign.C.Types (CInt (..))
 import Foreign.Marshal.Alloc (allocaBytes)
-import Network.Socket (SockAddr (..), hostAddressToTuple, hostAddress6ToTuple)
+import Network.Socket (SockAddr (..), hostAddress6ToTuple, hostAddressToTuple)
 
 -- 用系统保护凭据与一次性挑战验证本机提升身份。
 
@@ -33,10 +41,13 @@ instance Show SudoCredential where
 
 -- 检查当前进程的操作系统提升身份。
 foreign import ccall unsafe "chusql_sudo_privileged" nativePrivileged :: IO CInt
+
 -- 创建操作系统保护的本机凭据。
 foreign import ccall safe "chusql_sudo_create" nativeCreate :: CInt -> CString -> IO CInt
+
 -- 读取操作系统保护的本机凭据。
 foreign import ccall safe "chusql_sudo_read" nativeRead :: CInt -> CString -> IO CInt
+
 -- 清理本次服务启动的凭据。
 foreign import ccall safe "chusql_sudo_remove" nativeRemove :: CInt -> IO CInt
 
@@ -53,7 +64,8 @@ createSudoCredential :: Int -> IO SudoCredential
 createSudoCredential port = do
     credential@(SudoCredential secret) <- newSudoCredential
     status <- BS.useAsCString secret (nativeCreate (fromIntegral port))
-    if status == 0 then pure credential
+    if status == 0
+        then pure credential
         else ioError (userError (T.unpack (nativeError "create" status)))
 
 -- 生成独立服务实例的随机凭据。
@@ -72,8 +84,10 @@ isLocalPeer _ = False
 -- 校验挑战有效期及其账号绑定证明。
 validSudoChallenge :: SudoCredential -> UTCTime -> Maybe (Text, UTCTime) -> Text -> Text -> Bool
 validSudoChallenge credential now challenge user proof = case challenge of
-    Just (nonce, issued) -> diffUTCTime now issued >= 0 && diffUTCTime now issued <= 60
-        && verifySudoProof credential nonce user proof
+    Just (nonce, issued) ->
+        diffUTCTime now issued >= 0
+            && diffUTCTime now issued <= 60
+            && verifySudoProof credential nonce user proof
     Nothing -> False
 
 -- 删除本次服务实例的受保护凭据。
@@ -86,10 +100,14 @@ removeSudoCredential port = do
 readSudoCredential :: Int -> IO (Either Text SudoCredential)
 readSudoCredential port = allocaBytes 64 $ \buffer -> do
     status <- nativeRead (fromIntegral port) buffer
-    if status /= 0 then pure (Left (nativeError "read" status)) else do
-        secret <- BS.packCStringLen (buffer, 64)
-        pure $ if BS.all (isHexDigit . toEnum . fromIntegral) secret
-            then Right (SudoCredential secret) else Left "invalid sudo credential"
+    if status /= 0
+        then pure (Left (nativeError "read" status))
+        else do
+            secret <- BS.packCStringLen (buffer, 64)
+            pure $
+                if BS.all (isHexDigit . toEnum . fromIntegral) secret
+                    then Right (SudoCredential secret)
+                    else Left "invalid sudo credential"
 
 -- 计算绑定挑战与目标账号的认证证明。
 sudoProof :: SudoCredential -> Text -> Text -> Text
@@ -99,10 +117,15 @@ sudoProof (SudoCredential secret) challenge user = TE.decodeUtf8 (convertToBase 
 
 -- 按固定长度常量时间比对认证证明。
 verifySudoProof :: SudoCredential -> Text -> Text -> Text -> Bool
-verifySudoProof credential challenge user proof = T.length proof == 64
-    && BA.constEq (TE.encodeUtf8 (sudoProof credential challenge user)) (TE.encodeUtf8 proof)
+verifySudoProof credential challenge user proof =
+    T.length proof == 64
+        && BA.constEq (TE.encodeUtf8 (sudoProof credential challenge user)) (TE.encodeUtf8 proof)
 
 -- 将原生错误转换为明确诊断。
 nativeError :: Text -> CInt -> Text
-nativeError operation status = "sudo credential " <> operation <> " failed (OS error "
-    <> T.pack (show status) <> "); requires root or an elevated administrator; stale credential directories must be removed after stopping the server"
+nativeError operation status =
+    "sudo credential "
+        <> operation
+        <> " failed (OS error "
+        <> T.pack (show status)
+        <> "); requires root or an elevated administrator; stale credential directories must be removed after stopping the server"
