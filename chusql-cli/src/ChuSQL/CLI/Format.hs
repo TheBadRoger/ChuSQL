@@ -108,6 +108,7 @@ displayValue VNull = "NULL"
 displayValue (VInt n) = T.pack (show n)
 displayValue (VFloat d) = T.pack (show d)
 displayValue (VStr s) = T.pack s
+displayValue (VEnum _ _ label) = T.pack label
 displayValue (VBool True) = "true"
 displayValue (VBool False) = "false"
 displayValue (VRuntime _ value) = T.pack (renderRuntimeValue value)

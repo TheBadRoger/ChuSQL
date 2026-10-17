@@ -2,15 +2,16 @@
 
 [← 返回 README](../README.md)
 
-本页内容：
-
-- [查询、名称与事务](#查询名称与事务)
-- [自定义类型 DOMAIN](#自定义类型-domain)
-- [账号与权限](#账号与权限)
-
 本页供编写 SQL 时查阅，说明查询、事务、自定义类型和权限语法。示例使用的数据库与表须事先存在，明确展示创建步骤的示例除外。
 
 客户端选项与元命令见[命令与选项](commands.md)，类型与身份字段分别见[类型说明](types.md)和[用户与角色](users-and-roles.md)。
+
+本页内容：
+
+- [查询、名称与事务](#查询名称与事务)
+- [命名枚举 ENUM](#命名枚举-enum)
+- [自定义类型 DOMAIN](#自定义类型-domain)
+- [账号与权限](#账号与权限)
 
 ## 查询、名称与事务
 
@@ -126,11 +127,46 @@ ANY / ALL 将一个值与单列子查询的结果逐项比较：
 
 提交采用以下冲突检查和持久化规则：
 
-- 提交时按行 `id` 写回本事务改动过的行，事务没碰过的行不受影响；没有整数 `id` 的表按整表替换提交。
-- 提交前会比对基线：本事务改过的行如果已被别的连接改掉或删掉，提交报 `serialization_failure` 并保留事务，由调用方 `ROLLBACK` 或重试。
+- 存储层以稳定的内部行编号跟踪版本，将本事务修改与其他连接已提交的修改合并；内部编号不要求表中声明整数 `id` 列。业务 `id` 可用于匹配修改前后的行，没有业务键时按快照行及剩余行顺序匹配。
+- 提交前会比对基线：本事务改过的行如果已被别的连接改掉或删掉，提交报 `serialization_failure`。调用方先执行 `ROLLBACK`，再从 `BEGIN` 重做读取、检查和写入，不能只重发 `COMMIT`。
 - 合并本事务与其他连接的修改后，会在发布前复查最终行集的 CHECK、非空和唯一约束；冲突返回 `serialization_failure`，其他表的修改也不会发布。
 - SERIALIZABLE 写事务还会复查所有已执行数据语句涉及表的行集，包括子查询；读过的表发生变化即拒绝提交，因此也防止幻行。该模式按表复查，可能拒绝不同行上的合法并发修改；只读事务可完成原快照读取。回退保存点也会撤销其后的读依赖。
-- 提交是持久的：整批改动与一条提交标记一次落盘，提交后进程被强杀也会在重启时重放；提交前崩溃则整批丢弃，不会只落一半。
+- 修改冲突行或相同唯一键时等待持锁事务结束；死锁返回 `deadlock_detected`，总等待超过 5 秒返回 `lock_timeout`。这两种错误会中止存储事务，客户端仍须执行 `ROLLBACK` 清理会话后重新开始。回滚保存点不释放已取得的锁。
+- 成功提交前写入整批 WAL 和提交标记。重启恢复只重放已提交事务；提交前崩溃的修改不会发布。断线可能使客户端无法确认提交结果，应先按稳定业务键查询，避免重复执行已经提交的操作。
+
+## 命名枚举 ENUM
+
+管理员在当前工作库声明可复用的枚举类型，再将名称用于列声明：
+
+```sql
+CREATE TYPE blog_role AS ENUM ('MEMBER', 'AUTHOR', 'MASTER', 'BANNED');
+CREATE TABLE members (
+    id INT PRIMARY KEY,
+    role blog_role NOT NULL DEFAULT 'MEMBER'
+);
+INSERT INTO members (id) VALUES (1);
+UPDATE members SET role = 'AUTHOR' WHERE id = 1;
+SELECT id, role FROM members WHERE role = 'AUTHOR';
+```
+
+标签必须是单引号字符串，集合不能为空，标签不能重复；每个标签最多 63 个 UTF-8 字节，不能含 NUL。大小写和空白精确匹配，中文及转义单引号均保留。未声明的值会使 INSERT、UPDATE、列默认值或类型转换失败。NULL 由列的可空约束决定，不需要声明为枚举标签。
+
+枚举比较、排序及 MIN / MAX 使用声明顺序。例如上述定义中 `MEMBER < AUTHOR < MASTER < BANNED`，与字典顺序无关。客户端收到字符串标签；内部保存枚举身份和标签集合，不把值当作普通文本。
+
+不同命名枚举之间、枚举列与普通文本列之间不能隐式赋值或比较；字符串字面量会按目标枚举校验。
+
+支持 UNIQUE、PRIMARY KEY、索引、GROUP BY 和 DISTINCT；行大小仍受存储限制。命名类型与 DOMAIN 共用当前库的名称空间和依赖保护，可用 `SHOW DOMAINS` 查看名称与枚举定义。
+
+已有文本列可用 `ALTER TABLE members ALTER COLUMN role TYPE blog_role` 转换，发布前校验所有现存值。删除前先解除列和其他类型的引用：
+
+```sql
+DROP TABLE members;
+DROP TYPE blog_role;
+```
+
+类型名称按 DOMAIN 的命名规则处理，定义随数据库持久化。本次只支持命名 ENUM，不支持列内 `ENUM (...)`、`ALTER TYPE ... ADD VALUE` / 重命名标签或通用显式 CAST。枚举之间不能直接转换；需要调整标签时先将列转为 TEXT，再转为另一个枚举，或迁移到新列。
+
+按照 [PostgreSQL ENUM 的声明、排序与类型安全规则](https://www.postgresql.org/docs/current/datatype-enum.html)处理上述行为；存储布局、系统目录及未列出的扩展语法不承诺兼容。引导程序保留原生 BOOL / BOOLEAN，不预装 BoolText、YesNo 或 OnOff 等项目自定枚举。
 
 ## 自定义类型 DOMAIN
 

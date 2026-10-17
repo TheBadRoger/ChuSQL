@@ -145,6 +145,7 @@ inferExpr _ _ _ OuterColumnSlot{} = Left "execution column cannot be used in sem
 inferExpr _ _ _ LitNull = Right InferNull
 inferExpr _ _ _ (LitInt _) = Right (InferType CInt)
 inferExpr _ _ _ (LitFloat _) = Right (InferType CFloat)
+inferExpr _ _ _ (EnumLiteral ty label) = coerceValue ty (VStr label) >> Right (InferType ty)
 inferExpr _ _ _ (LitStr _) = Right (InferType CStr)
 inferExpr _ _ _ (LitBool _) = Right (InferType CBool)
 inferExpr _ _ _ (LitDate _) = Right (InferType CDate)
@@ -347,7 +348,8 @@ checkBool db place env e = do
 checkTyped :: Database -> String -> Scope -> Table -> (String, Expr) -> Either String ()
 checkTyped db place env t (c, e) = do
     want <- maybe (Left (missingColumn place c (tableCols t))) Right (colType t c)
-    got <- inferExpr db place env e
+    converted <- contextualEnum (columnType want) e
+    got <- inferExpr db place env converted
     case got of
         InferNull -> Right ()
         InferType x
@@ -651,6 +653,8 @@ checkColumnDefs schemaColumns cols = do
 checkTypeParameters :: ColumnType -> Either String ()
 checkTypeParameters (CDomain _ base) = checkTypeParameters base
 checkTypeParameters (CRuntime tid) = void (describeType builtinTypes tid)
+checkTypeParameters (CEnum _ labels)
+    | not (validEnumLabels labels) = Left "ENUM requires distinct labels of at most 63 UTF-8 bytes without NUL"
 checkTypeParameters CNull = Left "NULL is only valid as an inferred query output"
 checkTypeParameters (CDecimal p s)
     | p <= 0 || p > 308 || s < 0 || s > p = Left "invalid decimal precision or scale"
@@ -668,6 +672,7 @@ checkAutoIncrement c
 checkDefault :: Column -> Value -> Either String ()
 checkDefault c v
     | VNull <- v = Right ()
+    | Just _ <- enumDefinition (columnType c) = void (coerceValue (columnType c) v)
     | valueFits (columnType c) v = void (coerceValue (columnType c) v)
     | otherwise = Left ("DEFAULT: value does not fit column type " ++ typeLabel (columnType c))
 
@@ -784,12 +789,12 @@ resolveExpr db env outer f e = case e of
     Mul a b -> binary Mul a b
     Div a b -> binary Div a b
     Neg a -> Neg <$> resolveExpr db env outer f a
-    Gt a b -> binary Gt a b
-    Lt a b -> binary Lt a b
-    Eq a b -> binary Eq a b
-    GtE a b -> binary GtE a b
-    LtE a b -> binary LtE a b
-    NotEq a b -> binary NotEq a b
+    Gt a b -> enumBinary Gt a b
+    Lt a b -> enumBinary Lt a b
+    Eq a b -> enumBinary Eq a b
+    GtE a b -> enumBinary GtE a b
+    LtE a b -> enumBinary LtE a b
+    NotEq a b -> enumBinary NotEq a b
     And a b -> binary And a b
     Or a b -> binary Or a b
     IsNull a -> IsNull <$> resolveExpr db env outer f a
@@ -801,14 +806,48 @@ resolveExpr db env outer f e = case e of
     MinOf a -> MinOf <$> resolveExpr db env outer f a
     MaxOf a -> MaxOf <$> resolveExpr db env outer f a
     ScalarSub sq -> ScalarSub <$> resolveSubquery db (env : outer) sq
-    InSub a sq negated -> InSub <$> resolveExpr db env outer f a <*> resolveSubquery db (env : outer) sq <*> pure negated
-    InList a es negated -> InList <$> resolveExpr db env outer f a <*> mapM (resolveExpr db env outer f) es <*> pure negated
+    InSub a sq negated -> enumSub (\left query -> InSub left query negated) a sq
+    InList a es negated -> do
+        values <- mapM (resolveExpr db env outer f) (a : es)
+        let expected = [ty | Right (InferType ty) <- map infer values, Just _ <- [enumDefinition ty]]
+        converted <- case expected of
+            ty : _ -> mapM (contextualEnum ty) values
+            [] -> Right values
+        case converted of
+            value : rest -> Right (InList value rest negated)
+            [] -> Left "invalid IN list"
     ExistsSub sq negated -> ExistsSub <$> resolveSubquery db (env : outer) sq <*> pure negated
-    QuantCmp op a sq q -> QuantCmp op <$> resolveExpr db env outer f a <*> resolveSubquery db (env : outer) sq <*> pure q
+    QuantCmp op a sq q -> enumSub (\left query -> QuantCmp op left query q) a sq
     _ -> Right e
   where
     -- \| 递归处理两个子表达式
     binary ctor a b = ctor <$> resolveExpr db env outer f a <*> resolveExpr db env outer f b
+    -- 推导已解析表达式的类型。
+    infer = inferExpr db "enum context" (Scope env outer)
+    -- 将比较中的字符串常量绑定到枚举身份。
+    enumBinary ctor a b = do
+        left <- resolveExpr db env outer f a
+        right <- resolveExpr db env outer f b
+        let lt = infer left
+            rt = infer right
+        left' <- case rt of Right (InferType ty) -> contextualEnum ty left; _ -> Right left
+        right' <- case lt of Right (InferType ty) -> contextualEnum ty right; _ -> Right right
+        Right (ctor left' right')
+    -- 按子查询输出绑定枚举常量。
+    enumSub ctor expression query = do
+        left <- resolveExpr db env outer f expression
+        bound <- resolveSubquery db (env : outer) query
+        output <- inferSubqueryOutput db (Scope env outer) bound
+        value <- case output of [(_, InferType ty)] -> contextualEnum ty left; _ -> Right left
+        Right (ctor value bound)
+
+-- 把有枚举上下文的字符串常量类型化。
+contextualEnum :: ColumnType -> Expr -> Either String Expr
+contextualEnum ty (LitStr label)
+    | Just (name, labels) <- enumDefinition ty = do
+        _ <- coerceValue (CEnum name labels) (VStr label)
+        Right (EnumLiteral (CEnum name labels) label)
+contextualEnum _ expression = Right expression
 
 -- | 校验具体构造器和参数逻辑类型
 inferConstruction :: Database -> String -> Scope -> TypeExpr -> [Expr] -> Either String TypeId

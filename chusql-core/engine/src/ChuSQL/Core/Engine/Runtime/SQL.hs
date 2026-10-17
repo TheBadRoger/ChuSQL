@@ -75,6 +75,7 @@ runtimeValue (VFloat n) = Right (RDouble n)
 runtimeValue (VBool b) = Right (RBool b)
 runtimeValue (VStr text) = Right (RString text)
 runtimeValue (VRuntime tid value) = validateValue builtinTypes tid value >> Right value
+runtimeValue VEnum{} = Left "enum values require an explicit cast for runtime functions"
 runtimeValue VNull = Left "untyped SQL NULL has no runtime scalar value"
 
 -- | 转换运行时标量结果

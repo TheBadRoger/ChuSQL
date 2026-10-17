@@ -108,6 +108,9 @@ sqlLiteral (VFloat d)
     | isNaN d || isInfinite d = Left "SQL floating literal must be finite"
     | otherwise = Right (show d)
 sqlLiteral (VStr s) = Right ("'" ++ escapeStringLiteral s ++ "'")
+sqlLiteral value@(VEnum name labels label) = do
+    _ <- M.coerceValue (CEnum name labels) value
+    sqlLiteral (VStr label)
 sqlLiteral (VBool True) = Right "TRUE"
 sqlLiteral (VBool False) = Right "FALSE"
 sqlLiteral (VRuntime tid value) = do

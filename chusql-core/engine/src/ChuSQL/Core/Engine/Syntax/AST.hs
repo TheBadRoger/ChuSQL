@@ -137,6 +137,7 @@ data Expr
     | BoundFunction FunctionId TypeId [Expr]
     | Construct TypeExpr [Expr]
     | BoundConstruct TypeId [Expr]
+    | EnumLiteral ColumnType String
     | RuntimeLiteral TypeId RuntimeValue
     | LitNull
     | LitInt Int

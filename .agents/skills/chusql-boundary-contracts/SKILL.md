@@ -58,6 +58,7 @@ description: 修改 ChuSQL Rust/Haskell FFI、客户端与 Server 协议、跨�
 - Interface TCP 是一行 UTF-8 JSON，Hello 校验 protocolVersion=1；同一 Client 的 MVar 串行化请求 / 响应。Server 每连接建 Session 并限制行长度，客户端锁不是全局数据库锁。
 - SchemaColumn 字段、method / status 标签、缺省字段、错误码及 QueryResult columns / rows 的位置关系是消费者契约，不用自动派生构造器名替代稳定标签。
 - 复合值标签为 __chusql_runtime_v1，由 Core.Runtime 编解码；Rust 行仍是通用 JSON。封装变化检查 CLI / Web / 存储重载，Web 数值受 JavaScript 安全整数限制。
+- ENUM 的 __chusql_enum_v1 是存储 / FFI 值编码，保存类型名、标签集合和值；公开查询结果通过 queryResultJson 输出标签字符串。不能直接复用存储编码给客户端，CLI / Web 编辑须复用类型校验及转义。
 - 原始存储透传仍经过 Server 会话鉴权；新入口核对 TCP 分派、会话策略与 Web 消费者，不绕过对象权限或业务错误。
 
 ## 实现取舍与边界

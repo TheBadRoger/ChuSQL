@@ -6,7 +6,7 @@ module ChuSQL.Core.Engine.Syntax.Parser (parseStatement, parseExpression) where
 import ChuSQL.Core.Engine.Builtin (Builtin (..), builtinName, builtinNames, builtinNode, compareNode)
 import ChuSQL.Core.Engine.Runtime.Types
 import ChuSQL.Core.Engine.Syntax.AST
-import ChuSQL.Core.Model (Column (..), ColumnType (..), Value (..), plainColumn)
+import ChuSQL.Core.Model (Column (..), ColumnType (..), Value (..), plainColumn, validEnumLabels)
 import Control.Monad (void)
 import Control.Monad.Combinators.Expr (Operator (..), makeExprParser)
 import Data.Char (isAlpha, isAlphaNum, isHexDigit, isSpace, toLower, toUpper)
@@ -619,6 +619,15 @@ revokeStatement = do
         , if optionOnly then fail "GRANT OPTION FOR requires object privileges" else RevokeRole <$> userName <*> (keyword "from" *> sepBy1 userName (symbol ","))
         ]
 
+-- | 读取命名枚举并复用类型目录
+createEnumStatement :: Parser Statement
+createEnumStatement = do
+    name <- keyword "create" *> keyword "type" *> identifier
+    labels <- keyword "as" *> keyword "enum" *> between (symbol "(") (symbol ")") (sepBy1 stringLit (symbol ","))
+    if validEnumLabels labels
+        then pure (CreateDomain name (DomainDefinition (plainColumn (CEnum (map toLower name) labels)) []))
+        else fail "ENUM needs distinct labels of at most 63 UTF-8 bytes without NUL"
+
 -- | 读取领域及其独立约束
 createDomainStatement :: Parser Statement
 createDomainStatement = do
@@ -992,9 +1001,11 @@ parseStatement input =
             <|> (UseDatabase <$> (keyword "use" *> identifier))
             <|> try (ShowDatabases <$ (keyword "show" *> keyword "databases"))
             <|> try (ShowDomains <$ (keyword "show" *> keyword "domains"))
+            <|> try createEnumStatement
             <|> try createDomainStatement
             <|> try alterDomainStatement
             <|> try (DropDomain <$> (keyword "drop" *> keyword "domain" *> identifier))
+            <|> try (DropDomain <$> (keyword "drop" *> keyword "type" *> identifier))
             <|> insertStatement
             <|> deleteStatement
             <|> updateStatement

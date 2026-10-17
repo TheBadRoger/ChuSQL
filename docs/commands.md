@@ -2,6 +2,12 @@
 
 [← 返回 README](../README.md)
 
+本页面向命令行和 Web 使用者，说明启动参数、交互命令及编辑事务的行为。CLI 指命令行客户端。
+
+类型见 [类型与函数](types.md)，身份与授权见 [用户与角色](users-and-roles.md)。
+
+查询、事务、类型、用户与授权语法见 [SQL 语法](syntax.md)。
+
 本页内容：
 
 - [组件命令](#组件命令)
@@ -9,12 +15,6 @@
 - [chusql-web](#chusql-web)
 - [chusql-server](#chusql-server)
 - [范式分析](#范式分析)
-
-本页面向命令行和 Web 使用者，说明启动参数、交互命令及编辑事务的行为。CLI 指命令行客户端。
-
-类型见 [类型与函数](types.md)，身份与授权见 [用户与角色](users-and-roles.md)。
-
-查询、事务、类型、用户与授权语法见 [SQL 语法](syntax.md)。
 
 ## 组件命令
 

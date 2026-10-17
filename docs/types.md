@@ -2,17 +2,26 @@
 
 [← 返回 README](../README.md)
 
+本页帮助你选择列类型、理解类型限制、枚举和 DOMAIN 约束。
+
+ChuSQL 支持基础类型、运行时复合类型以及按数据库保存的 ENUM 和 DOMAIN。DOMAIN 为基础类型命名，便于多个表列复用同一定义。
+
 本页内容：
 
+- [命名枚举 ENUM](#命名枚举-enum)
 - [自定义类型 DOMAIN](#自定义类型-domain)
 - [预定义类型的含义](#预定义类型的含义)
 - [系统类型目录字段](#系统类型目录字段)
 - [运行时类型与函数](#运行时类型与函数)
 - [DOMAIN 约束与变更](#domain-约束与变更)
 
-本页帮助你选择列类型、理解类型限制和 DOMAIN 约束。
+## 命名枚举 ENUM
 
-ChuSQL 支持基础类型、运行时复合类型和按数据库保存的 DOMAIN。DOMAIN 为基础类型命名，便于多个表列复用同一定义。
+`CREATE TYPE blog_role AS ENUM ('MEMBER', 'AUTHOR', 'MASTER')` 声明一组允许的文本标签。列使用 `blog_role` 后，默认值、插入、更新和已有列转换都必须满足标签集合；NULL 另外受列的可空约束控制。
+
+标签区分大小写，每个标签最多 63 个 UTF-8 字节，集合不能为空或包含重复项。值以字符串返回，比较与排序按声明顺序，支持分组、唯一约束和索引。不同命名枚举不能直接比较或赋值，枚举列与普通文本列也不能隐式混用。ENUM 和 DOMAIN 共用库内类型名称空间，已有引用会阻止删除；使用方法见[命名枚举语法](syntax.md#命名枚举-enum)。
+
+原生 BOOL / BOOLEAN 使用 TRUE、FALSE 和 SQL NULL，引导程序不额外安装布尔枚举。枚举内部保存类型身份、标签集合和值，因此较大的集合会增加单行开销，仍须满足[页内行大小限制](#行大小与索引键限制)。
 
 ## 自定义类型 DOMAIN
 
@@ -106,7 +115,7 @@ SELECT not(TRUE), length('你好');
 
 ### 比较、排序与分组
 
-类型能力说明一种类型支持哪些运算。相等比较、排序和哈希分别记为 Eq、Ord 和 Hash；哈希用于 JOIN、GROUP BY 和 DISTINCT 的值分组。内建 Int、Double、Bool、String 提供这些能力，List、Maybe 和 Tuple 根据全部参数类型递归获得能力，DOMAIN 沿用基础类型的能力。
+类型能力说明一种类型支持哪些运算。相等比较、排序和哈希分别记为 Eq、Ord 和 Hash；哈希用于 JOIN、GROUP BY 和 DISTINCT 的值分组。内建 Int、Double、Bool、String 提供这些能力，List、Maybe 和 Tuple 根据全部参数类型递归获得能力，DOMAIN 沿用基础类型的能力；ENUM 按自身身份与声明顺序实现比较和排序，哈希保留类型身份。
 
 同一完整类型的复合值可以使用比较运算、IN、ANY / ALL、JOIN、ORDER BY、GROUP BY、DISTINCT 和 MIN / MAX。不同类型身份之间不隐式转换，例如 `[Int]` 与 `[Double]` 不能比较，空列表也遵守这一规则。SUM / AVG 仍只接受数值标量。
 

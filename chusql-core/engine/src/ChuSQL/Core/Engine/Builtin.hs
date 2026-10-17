@@ -277,6 +277,7 @@ comparableValue _ (VInt _) (VInt _) = True
 comparableValue _ (VFloat _) (VFloat _) = True
 comparableValue _ (VStr _) (VStr _) = True
 comparableValue _ (VBool _) (VBool _) = True
+comparableValue _ (VEnum left xs _) (VEnum right ys _) = left == right && xs == ys
 comparableValue capability (VRuntime left x) (VRuntime right y) =
     left == right
         && hasTypeCapability capability (CRuntime left)

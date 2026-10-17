@@ -1808,6 +1808,7 @@ valueJson VNull = A.Null
 valueJson (VInt n) = A.Number (fromIntegral n)
 valueJson (VFloat d) = A.Number (fromFloatDigits d)
 valueJson (VStr s) = A.String (T.pack s)
+valueJson (VEnum _ _ label) = A.String (T.pack label)
 valueJson (VBool b) = A.Bool b
 valueJson value@VRuntime{} = valueToJSON value
 

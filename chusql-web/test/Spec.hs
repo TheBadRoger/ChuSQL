@@ -523,6 +523,13 @@ unitSpec = describe "pure helpers" $ do
             Right descriptor ->
                 Actions.insertRowSql "t" [("xs", Model.VRuntime (descriptorId descriptor) (RList [RString "wrong"]))]
                     `shouldSatisfy` either (const True) (const False)
+    it "validates and quotes enum labels for web edits" $ do
+        let labels = ["reader", "a'b"]
+            column = Model.plainColumn (Model.CEnum "role" labels)
+        Actions.coerceValue column (A.String "a'b") `shouldBe` Right (Model.VEnum "role" labels "a'b")
+        Actions.sqlLiteral (Model.VEnum "role" labels "a'b") `shouldBe` Right "'a''b'"
+        Actions.coerceValue column (A.String "unknown") `shouldSatisfy` either (const True) (const False)
+        Actions.sqlLiteral (Model.VEnum "role" labels "unknown") `shouldSatisfy` either (const True) (const False)
     it "escapes nested runtime string literals" $ do
         case resolveType builtinTypes (listType stringType) of
             Left err -> expectationFailure err
@@ -1070,6 +1077,18 @@ querySpec env = describe "the SQL console" $ do
             check (at "columns" (jsonBody grants) `shouldBe` A.toJSON (["identity", "privilege", "object", "grant_option"] :: [Text]))
             denied <- testSql reader "GRANT SELECT ON http_distinct_probe TO admin"
             expectStatusWith "no delegation" denied 403
+        it "returns enum labels in declaration order through HTTP and TCP" $ do
+            hs <- adminHeaders
+            ensureDatabase hs testDatabaseName
+            created <- testSql hs "CREATE TYPE http_state AS ENUM ('z', 'a', 'b')"
+            expectStatusWith "enum type" created 200
+            table <- testSql hs "CREATE TABLE http_enums (id INT, state http_state)"
+            expectStatusWith "enum table" table 200
+            inserted <- testSql hs "INSERT INTO http_enums (id, state) VALUES (1, 'a'), (2, 'z'), (3, 'b')"
+            expectStatusWith "enum rows" inserted 200
+            result <- testSql hs "SELECT state FROM http_enums WHERE state > 'z' ORDER BY state"
+            expectStatusWith "enum ordering" result 200
+            check (at "rows" (jsonBody result) `shouldBe` A.toJSON ([["a"], ["b"]] :: [[Text]]))
         it "returns typed compound values through HTTP and TCP" $ do
             hs <- adminHeaders
             ensureDatabase hs testDatabaseName

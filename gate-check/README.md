@@ -6,6 +6,8 @@
 
 ## 快速开始
 
+先安装 PowerShell 7、Cargo、Stack 及项目指定的 GHC，确保这些命令可从终端调用。从仓库根目录按检查范围选择命令；Haskell 构建应串行执行，不要同时启动另一组 Stack 构建：
+
 ```powershell
 pwsh -NoProfile -File gate-check/run-gate.ps1              # 全量
 pwsh -NoProfile -File gate-check/run-gate.ps1 -Clean       # 先清各项目自己的构建工件
@@ -24,7 +26,7 @@ pwsh -NoProfile -File gate-check/run-gate.ps1 -Only stack  # 只跑 Haskell 车�
 
 `build` 车道先跑完，再并行启动其余三条；这样动态库刷新与 Haskell 测试不会互相抢文件。
 
-Server 步骤先刷新该工程里的 model、engine 与 interface 本地依赖；Web 步骤先刷新 model、engine、interface 与 server，再运行对应模块测试，避免复用旧的注册库。刷新失败会使对应步骤失败，不继续测试。
+Server、CLI 和 Bootstrap 步骤先刷新各自工程里的 model、engine 与 interface 本地依赖；Web 步骤还刷新 server，再运行对应模块测试，避免复用旧的注册库。刷新失败会使对应步骤失败，不继续测试。
 
 ## 退出码与日志
 

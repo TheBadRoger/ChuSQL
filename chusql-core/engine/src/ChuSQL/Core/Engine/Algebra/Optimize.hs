@@ -151,6 +151,7 @@ foldNode e
         Right (VInt n) -> LitInt n
         Right (VFloat d) -> LitFloat d
         Right (VStr s) -> LitStr s
+        Right (VEnum name labels label) -> EnumLiteral (CEnum name labels) label
         Right (VBool b) -> LitBool b
         Right (VRuntime tid value) -> RuntimeLiteral tid value
         Left _ -> e
@@ -224,6 +225,7 @@ safeKey LitNull = True
 safeKey LitInt{} = True
 safeKey LitFloat{} = True
 safeKey LitStr{} = True
+safeKey EnumLiteral{} = True
 safeKey LitBool{} = True
 safeKey _ = False
 
@@ -243,6 +245,8 @@ localKey columns reference a b
 rewriteNode :: Database -> RelOp -> RelOp
 rewriteNode db (Filter expression source)
     | Just joined <- semiJoin db expression source = joined
+rewriteNode db (Filter (Eq (Col k) literal@EnumLiteral{}) (Scan mAlias t Nothing))
+    | Right value <- evalExpr literal [], worthLookup db t (unqualify mAlias k) = Lookup mAlias t (unqualify mAlias k) value
 rewriteNode db (Filter (Eq (Col k) (LitInt v)) (Scan mAlias t Nothing))
     | worthLookup db t (unqualify mAlias k) = Lookup mAlias t (unqualify mAlias k) (VInt v)
 rewriteNode db (Filter (Eq (Col k) (LitStr v)) (Scan mAlias t Nothing))

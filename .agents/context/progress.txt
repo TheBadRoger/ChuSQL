@@ -1,5 +1,5 @@
 # ChuSQL 已完成事项
-更新：2026-10-16
+更新：2026-10-17
 
 本文件是当前完成状态及最新验收的唯一来源，等价于 project-plan.txt；不保留历史批次、提交记录或修改流水。
 设计见 design-decisions.txt，未解决限制见 known-issues.txt，后续计划见 side-branch-plan.txt。
@@ -19,6 +19,12 @@
 - 建立固定类型 / 函数编号、TypeId / TypeExpr / Kind、逻辑与物理类型、版本化复合值编码；支持 Int / Double / Bool / String / List / Maybe / Tuple、length / not，接入 SQL、存储、CLI 和 Web。
 - 内建类型描述提供 Eq / Ord / Hash 能力，List / Maybe / Tuple 根据参数递归派生，DOMAIN 沿用基础能力。复合值支持结构比较、排序、JOIN、IN / ANY / ALL、分组、去重及 MIN / MAX；完整身份不隐式转换，保留 SQL NULL / Nothing、稳定排序及正负零的相等哈希一致性。索引与唯一键边界见 known-issues.txt。
 - 实现 CREATE / ALTER / DROP / SHOW DOMAIN、库内嵌套定义、列引用、依赖与循环校验及持久化；支持领域 DEFAULT / NOT NULL / 多条具名或匿名 CHECK、约束继承、默认值优先级与旧数据校验，查询输出保留 DOMAIN 身份。
+
+### 命名枚举 ENUM
+
+- 支持 CREATE TYPE ... AS ENUM、列引用和 DROP TYPE，复用库内类型目录、对象身份守卫和依赖删除保护。标签按大小写与空白精确匹配，非空集合、重复标签、63 个 UTF-8 字节及 NUL 边界统一校验；默认值、插入、更新及现存文本列转换均按类型校验。
+- 核心行为参照 PostgreSQL：比较、排序、MIN / MAX 按声明顺序，不同命名枚举及枚举列 / 文本列禁止隐式混用，字符串字面量按上下文绑定为枚举；NULL 保留独立语义。验证 IN / ANY、分组、去重、唯一键和原生 Bool 运算。
+- 版本 1 的 __chusql_enum_v1 保存类型名、标签集合与值；索引复用声明序号的保序整数键，实际 FFI 验证点查、范围查与重启。客户端结果仍为字符串标签，CLI / Web 的显示与编辑沿用文字输入并校验标签。引导保留 18 个原生类型与别名，不新增 BoolText、YesNo 或 OnOff。
 
 ### 查询与写入绑定
 
@@ -74,9 +80,14 @@
 
 ### 门禁结果
 
-- 全量门禁通过：Rust 221 / Engine 619 / Server 177 / Web 80 / CLI 20 / Bootstrap 9，均零失败；release 动态库重建、Clippy、注释检查及 git diff --check 通过。
+- 全量门禁通过：Rust 222 / Engine 628 / Server 177 / Web 82 / CLI 21 / Bootstrap 9，均零失败；release 动态库重建、Clippy、注释检查及 git diff --check 通过。
 
   受影响 Haskell 源码与测试 HLint 无建议；Fourmolu 格式及幂等检查通过。
+
+### ENUM 验收
+
+- 全量日志为 logs/enum-final-gate.log；实际 ChuBlog 固定驱动通过命名声明、默认值、声明顺序比较、不同枚举类型拒绝、标签输入与依赖保护，并保持博客业务、强杀恢复及备份恢复通过，日志为 logs/enum-driver.log。未修改 ChuBlog 实现，未重建 Docker 镜像。
+- 受影响源码 Fourmolu 检查通过，核心与客户端 HLint 无建议，驱动 Clippy 通过。CLI 门禁先刷新共享 model / engine / interface，避免旧缓存遗漏新增值构造器；未跳过检查。
 
 ### 存储回归
 
