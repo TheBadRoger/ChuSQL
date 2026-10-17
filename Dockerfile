@@ -13,7 +13,7 @@ COPY chusql-core/storage/src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo --config 'source.crates-io.replace-with="build-mirror"' \
     --config "source.build-mirror.registry=\"${CARGO_REGISTRY}\"" \
-    build --release --locked --jobs 1
+    build --release --locked --lib --jobs 1
 
 FROM ${BASE_REGISTRY}/library/haskell:9.10.3-slim-bookworm@sha256:4f1f62fec9cea4cbb03e885c9ad45642609cadd3897b1e64a7f61d0862b575b1 AS haskell
 ARG DEBIAN_MIRROR
@@ -34,7 +34,7 @@ COPY chusql-web ./chusql-web
 COPY chusql-cli ./chusql-cli
 RUN --mount=type=cache,target=/root/.stack \
     stack --stack-yaml chusql-cli/stack.yaml --system-ghc --no-install-ghc \
-    build --fast --jobs 1 --ghc-options=-j1 --copy-bins --local-bin-path /out/bin \
+    build --fast --no-test --no-bench --jobs 1 --ghc-options=-j1 --copy-bins --local-bin-path /out/bin \
     chusql-server:exe:chusql-server chusql-bootstrap:exe:csql-bootstrap \
     chusql-web:exe:chusql-web chusql-cli:exe:csql
 
