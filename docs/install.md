@@ -2,11 +2,11 @@
 
 [← 返回 README](../README.md)
 
-本页帮助你安装、更新和卸载 ChuSQL。发行包包含编译后的程序，使用发行包时无需安装 Haskell 编译器 GHC 或 Rust 工具链。
+本页帮助你安装、更新和卸载 ChuSQL。发行包包含编译后的程序，发行包可直接安装运行。
 
 项目仓库：[GitHub](https://github.com/TheBadRoger/ChuSQL) · [ChuRepo](https://repo.chunana.cn/ChuNa7a/ChuSQL)。两处均可获取源码，按网络情况选择。
 
-使用容器部署时，按 [Docker 部署](docker.md) 创建口令文件并启动 Compose，无需在宿主机安装 GHC 或 Rust。
+使用容器部署时，按 [Docker 部署](docker.md) 创建口令文件并启动 Compose。
 
 本页内容：
 
@@ -61,7 +61,7 @@ irm https://repo.chunana.cn/ChuNa7a/ChuSQL/raw/branch/main/scripts/install.ps1 -
 
 每个平台的首组命令优先从 GitHub 下载脚本，失败后尝试 ChuRepo。安装和更新时，版本查询或发行包下载失败也会尝试 ChuRepo；已选定的版本保持不变，校验失败直接报错。
 
-两站均无对应发行包时，使用包内安装或源码安装。显式指定其他仓库或归档 URL 时，不会回退到官方仓库。
+两站均无对应发行包时，使用包内安装或源码安装。显式指定其他仓库或归档 URL 时，安装器使用指定来源。
 
 ## 安装方式
 
@@ -75,9 +75,9 @@ ChuSQL 支持三种安装方式：
 
 安装时可以选择 Web 管理端、命令行客户端，或同时安装两者。数据库服务及核心组件会按需安装。
 
-安装过程中必须为管理员账号设置口令。口令不会以明文写入配置文件。
+安装过程中必须为管理员账号设置口令。口令经哈希后保存在系统数据库中。
 
-完成系统目录初始化后，安装程序默认会启动 `chusql-server`；如不希望自动启动，可使用 `--no-start`（Windows 为 `-NoStart`）。
+完成系统目录初始化后，安装程序默认会启动 `chusql-server`；需要稍后启动时，使用 `--no-start`（Windows 为 `-NoStart`）。
 
 ### Linux 用户服务
 
@@ -102,7 +102,7 @@ journalctl --user -u chusql-server.service
 
 发行包入口：[GitHub Releases](https://github.com/TheBadRoger/ChuSQL/releases) · [ChuRepo Releases](https://repo.chunana.cn/ChuNa7a/ChuSQL/releases)。两站的发行包需分别发布；若所选站点没有对应版本或平台的包，请切换站点或从源码安装。
 
-下载并解压对应平台的发行包后，在包根目录执行；包内安装不需要连接发行站点：
+下载并解压对应平台的发行包后，在包根目录执行；包内安装使用本地文件：
 
 ```sh
 ./install.sh --component web
@@ -128,7 +128,7 @@ Windows：
 | `--list-versions` | `-ListVersions` | 列出可安装版本 |
 | `--from-source` | — | 从源码构建并安装 |
 
-自动化安装可通过 `CHUSQL_ADMIN_PASSWORD` 提供管理员口令，两个平台的安装器均支持。由部署环境注入该变量，避免将口令直接写入命令或脚本；安装器通过标准输入把它交给引导程序。
+自动化安装可通过 `CHUSQL_ADMIN_PASSWORD` 提供管理员口令，两个平台的安装器均支持。由部署环境注入该变量；安装器通过标准输入把它交给引导程序。
 
 ## 从源码安装
 
@@ -143,7 +143,7 @@ git clone https://github.com/TheBadRoger/ChuSQL.git
 git clone https://repo.chunana.cn/ChuNa7a/ChuSQL.git
 ```
 
-Linux 进入仓库后使用本地源码构建，避免再次连接 GitHub 克隆：
+Linux 进入仓库后使用本地源码构建：
 
 ```sh
 cd ChuSQL
@@ -179,7 +179,7 @@ csql-web
 
 浏览器打开 <http://127.0.0.1:7778>。首次 SQL 验证见 [README 的启动步骤](../README.md#启动并验证)。
 
-只有使用 `--no-start` 或服务未运行时才需要启动数据库。Linux 用户服务使用 `systemctl --user start chusql-server.service`；未注册服务的环境运行 `chusql-server`。已有服务运行时不要再启动一个使用相同数据目录的进程。
+只有使用 `--no-start` 或服务未运行时才需要启动数据库。Linux 用户服务使用 `systemctl --user start chusql-server.service`；未注册服务的环境运行 `chusql-server`。同一数据目录由单个服务进程使用。
 
 ## 更新
 
@@ -193,7 +193,7 @@ csql-web
 
 Linux 更新会先停止该安装目录中的 Web 和数据库进程，保留已有 `settings.toml`、数据库和管理员口令，再引导检查系统目录。
 
-修改数据位置须编辑配置并自行迁移数据；更新时不能用不同的 `--data-dir` 覆盖现有配置。安装默认重启数据库服务，Web 管理端需重新运行 `csql-web`。
+修改数据位置须编辑配置并自行迁移数据；更新时的 `--data-dir` 须与现有配置一致。安装默认重启数据库服务，Web 管理端需重新运行 `csql-web`。
 
 Linux 安装目录中保留 `uninstall.sh`。卸载时指定安装目录，数据目录默认读取现有配置。
 
@@ -220,4 +220,4 @@ Linux 卸载时会停止服务、取消开机启动并移除服务文件。用�
 ## 发布校验
 
 > [!IMPORTANT]
-> SHA256 校验只检测产物损坏，不证明发布来源。发布签名、可信根和轮换验证尚未实现。
+> SHA256 用于检测产物损坏。发布来源验证仍待实现签名、可信根和轮换机制。

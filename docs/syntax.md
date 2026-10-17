@@ -30,7 +30,7 @@
 SELECT 支持以下查询来源和子句：
 
 - `SELECT` 支持 `WHERE`、`GROUP BY`、`HAVING`、`ORDER BY`、`LIMIT`、`JOIN` / `LEFT JOIN` 与聚合，以及标量 / `IN` / `EXISTS` 子查询和量词比较（`op ANY` / `op ALL`）。
-- 来源可以是派生表：`SELECT d.name FROM (SELECT name FROM users) d`。派生表必须带别名，内层不能引用外层列；输出列取裸列名（内层写 `u.id`，外层用 `d.id` 引用）。
+- 来源可以是派生表：`SELECT d.name FROM (SELECT name FROM users) d`。派生表必须带别名，内层仅引用内层可见列；输出列取裸列名（内层写 `u.id`，外层用 `d.id` 引用）。
 
 #### 输出别名与排序
 
@@ -104,7 +104,7 @@ ANY / ALL 将一个值与单列子查询的结果逐项比较：
 - `WITH 名字 AS (SELECT …), 另一个 AS (SELECT …) SELECT … FROM 名字` 先定义再引用，名字可以带列清单（`WITH t(who) AS (SELECT name FROM users) …`）。
 - `WITH` 在解析期就展开成派生表，所以引用处只能当普通表用：没有别名时用 CTE 名当限定名（`WITH t AS (…) SELECT t.name FROM t`）。
 - 名字不分大小写；只能引用前面已经定义的 CTE，向前引用会当成普通表名去查（有同名表就用表，没有就报 `unknown table`）。
-- 不支持递归 CTE，主语句与每个 CTE 都只能是 `SELECT`。重复引用时，相同执行子树在一次查询中物化复用；不同投影或优化后的子树仍分别执行，尚无 `MATERIALIZED` / `NOT MATERIALIZED` 语法。
+- CTE 的主语句和定义体均使用 `SELECT`；递归 CTE 仍待实现。重复引用时，相同执行子树在一次查询中物化复用；不同投影或优化后的子树仍分别执行，尚无 `MATERIALIZED` / `NOT MATERIALIZED` 语法。
 - 鉴权同样覆盖 CTE 里的表：`WITH d AS (SELECT name FROM orders) …` 要求对 `orders` 有权限。
 
 ### 事务与保存点
@@ -232,7 +232,7 @@ ALTER DOMAIN quantity DROP CONSTRAINT bounded;
 
 ## 账号与权限
 
-默认管理员账号为 `root`。普通账号创建后默认不拥有数据访问权限，需要管理员通过角色进行授权。
+默认管理员为 `root`，普通账号通过直接授权或角色继承取得数据权限。
 
 ### 创建与修改身份
 
@@ -244,7 +244,7 @@ ALTER USER alice IDENTIFIED BY 'new-password';
 DROP USER alice;
 ```
 
-用户和角色共用名称空间。`CREATE USER` 默认可以登录，`CREATE ROLE` 默认不能登录；两者默认启用，且不具有最高权限。管理员可以修改身份属性：
+用户和角色共用名称空间。`CREATE USER` 默认可以登录，`CREATE ROLE` 默认使用 NOLOGIN；两者默认使用 ENABLED、NOSUPERUSER。管理员可以修改身份属性：
 
 ```sql
 ALTER ROLE analyst LOGIN;
@@ -263,7 +263,7 @@ SHOW ROLES;
 
 系统对象不列出，不接受 `FOR` 查询他人身份。该命令不要求选中工作库；事务中也读取当前权限目录。
 
-`SHOW ROLES` 展示全部身份的编号、名称、登录能力、最高权限标志、启用状态及创建时间，不返回口令。`ALTER USER` 与 `ALTER ROLE` 的属性和口令修改语法通用；同一属性不能重复指定。身份管理仅允许最高权限身份执行。
+`SHOW ROLES` 展示全部身份的编号、名称、登录能力、最高权限标志、启用状态及创建时间，口令保持隐藏。`ALTER USER` 与 `ALTER ROLE` 的属性和口令修改语法通用；每项属性在一条语句中指定一次。身份管理仅允许最高权限身份执行。
 
 ### 最高权限与身份保护
 
@@ -308,9 +308,9 @@ REVOKE SELECT ON sales.orders FROM reviewer;
 
 转授权指将自己持有的权限再授予其他身份。`GRANT ... WITH GRANT OPTION` 允许再转授；所有者也可授予自身对象的权限。普通授予者可撤销自己的授予，所有者及最高权限身份可撤销对象上的其他授予。
 
-撤销时收回相应 grant option（转授权能力），并级联清理失去合法来源的下游授权；仍有独立来源的授权保留。转授权能力随启用的角色继承，循环转授不能独立维持权限。REVOKE 不移除所有者的隐含权限。
+撤销时收回相应 grant option（转授权能力），并级联清理失去合法来源的下游授权；仍有独立来源的授权保留。转授权能力随启用的角色继承，循环转授不能独立维持权限。REVOKE 后所有者保留隐含权限。
 
-`REVOKE GRANT OPTION FOR SELECT ON users FROM alice` 只移除指定授权来源的转授权能力，保留 alice 的 SELECT 权限；失去唯一支持来源的下游授权会级联撤销，独立来源继续有效。最高权限身份或对象所有者可撤销全部匹配来源，普通授予者只能撤销自己的来源；所有权自身的权限不受 REVOKE 影响。
+`REVOKE GRANT OPTION FOR SELECT ON users FROM alice` 只移除指定授权来源的转授权能力，保留 alice 的 SELECT 权限；失去唯一支持来源的下游授权会级联撤销，独立来源继续有效。最高权限身份或对象所有者可撤销全部匹配来源，普通授予者只能撤销自己的来源；REVOKE 后所有权权限保留。
 
 ### 系统目录管理属性
 

@@ -68,8 +68,8 @@ Rust panic、Haskell IO 失败与业务错误按边界转成明确失败；当�
 
 ## 验证入口
 
-- ABI / ownership 变更验证 `chusql-core/storage/tests/ffi_test.rs` 的成功、错误、长度、编码和释放路径；必要时用可用 Miri，不为普通消息变更强制安装工具。
-- 存储协议变化测试相关 Rust 模块并重建实际 cdylib，再串行验证受影响 Haskell 模块；rlib 或 mock 不能证明实际 FFI 可用。
+- ABI / ownership 变更验证 `chusql-core/storage/tests/ffi_test.rs` 的成功、错误、长度、编码和释放路径；必要时用可用 Miri，工具安装按实际验证需要决定。
+- 存储协议变化测试相关 Rust 模块并重建实际 cdylib，再串行验证受影响 Haskell 模块；真实 FFI 可用性须通过实际动态库验证。
 - TCP 改动验证 Hello、错误响应和真实消费者，复用 `chusql-server/test/Spec.hs`、`chusql-web/test/Spec.hs`、`chusql-cli/test/Spec.hs` 中相关行为。
 - 入口见 `gate-check/run-step.ps1`，测试范围按风险决定，不自动运行所有者全量门禁。
 

@@ -27,7 +27,7 @@
 | `[btree] order` | `4` | B+ 树阶数 |
 | `[buffer] pool_size` | `1024` | 缓冲池页数 |
 | `[storage] data_dir` | 平台默认数据目录 | 数据文件保存位置 |
-| `[storage] log_files` | 安装时填写平台日志目录 | 诊断日志目录，不是 WAL |
+| `[storage] log_files` | 安装时填写平台日志目录 | 诊断日志目录；WAL 位于数据库目录 |
 | `[log] level` | `info` | 日志级别 |
 
 正常运行时数据目录由 `chusql-server` 访问，离线初始化与修复由 `csql-bootstrap` 访问。安装器填写绝对路径，日志目录由启动器与安装脚本使用。
@@ -53,11 +53,11 @@
 | `password_min_length` | `12` | 普通账号最短口令长度 |
 | `password_classes` | `2` | 口令至少包含的字符类别数 |
 
-静态资源目录固定为安装目录下的 `static`。管理员账号名由启动参数 `--user` 指定，默认为 `root`；这两项不能通过配置文件修改。
+静态资源目录固定为安装目录下的 `static`。管理员账号名由启动参数 `--user` 指定，默认为 `root`；这两项分别由安装目录和启动参数决定。
 
 ## Server 配置
 
-以下配置项位于 `[server]` 节，例如 `port = 7777`。同名的 Web 端口配置互不影响。
+以下配置项位于 `[server]` 节，例如 `port = 7777`。Web 端口在独立的 `[web]` 节配置。
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -68,14 +68,14 @@
 
 本机 sudo 认证额外使用 `[server] sudo_auth_user`，默认空字符串，表示关闭。设置为一个已启用 `ALLOW_SUDO_AUTH` 的数据库身份后，必须以 Unix root 或 Windows 提升后的管理员运行 `chusql-server`。
 
-这是明确的本机身份映射，与启动参数 `--user` 和最高权限属性分别设置。配置变更后重启服务生效，Web 设置页面不提供此项。操作步骤见 [用户与角色](users-and-roles.md#本机-sudo-认证)。
+这是明确的本机身份映射，与启动参数 `--user` 和最高权限属性分别设置。配置变更后重启服务生效，此项通过配置文件管理。操作步骤见 [用户与角色](users-and-roles.md#本机-sudo-认证)。
 
 > [!NOTE]
 > 修改 Server 配置后须重启 `chusql-server`。sudo 映射默认关闭，启用时还须满足身份属性和操作系统提升要求。
 
 ## 账号与安全
 
-账号口令不保存在配置文件中，而保存在系统数据库中。管理员口令在安装或系统引导时设置，之后可通过 SQL 或 Web 管理界面修改。
+账号口令保存在系统数据库中。管理员口令在安装或系统引导时设置，之后可通过 SQL 或 Web 管理界面修改。
 
 系统目录未完成初始化时，`chusql-server` 将拒绝启动并提示运行 `csql-bootstrap`。
 
@@ -94,7 +94,7 @@
 
 修改后重启对应服务，并检查监听地址、端口和登录结果。Docker 的启动配置只读挂载，需修改宿主文件后重新创建服务，见 [Docker 配置](docker.md#配置端口目录与资源)。
 
-修改 `data_dir` 不会搬迁数据。先停止全部使用该目录的进程，再完整复制数据目录并更新配置；保留原目录备份，启动后检查业务数据。已有数据的 `page.size` 和 `btree.order` 应保持不变，不能通过修改配置转换磁盘格式。
+迁移数据目录时，先停止相关进程，再完整复制数据目录并更新 `data_dir`；保留原目录备份，启动后检查业务数据。已有数据的 `page.size` 和 `btree.order` 须保持原值；磁盘格式转换需专门的迁移流程。
 
 安装器选择 `resources/settings.toml.linux` 或 `resources/settings.toml.windows`，填入当前用户的绝对路径后释放为 `settings.toml`。两份模板逐项提供英文注释。
 
@@ -105,4 +105,4 @@
 | Linux | `${XDG_DATA_HOME:-$HOME/.local/share}/chusql/data` | `${XDG_STATE_HOME:-$HOME/.local/state}/chusql/logs` |
 | Windows | `%LOCALAPPDATA%\ChuSQL\data` | `%LOCALAPPDATA%\ChuSQL\logs` |
 
-安装参数 `--data-dir` / `-DataDir` 可覆盖数据目录。指定安装目录不会改变默认数据位置。
+安装参数 `--data-dir` / `-DataDir` 可覆盖数据目录。安装目录与数据目录分别设置。
