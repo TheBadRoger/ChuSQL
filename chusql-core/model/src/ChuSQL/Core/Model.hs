@@ -30,6 +30,8 @@ module ChuSQL.Core.Model (
     typeLabel,
     typeName,
     parseColumnType,
+    validEnumLabels,
+    enumDefinition,
     domainTableName,
     isDomainTable,
     typeClassOf,
@@ -47,11 +49,16 @@ module ChuSQL.Core.Model (
 ) where
 
 import ChuSQL.Core.Runtime
+import qualified Data.Aeson as A
 import qualified Data.ByteString.Lazy.Char8 as BS
 import Data.Char (isDigit, isSpace, toLower)
 import Data.Hashable (Hashable (..))
-import Data.List (isPrefixOf, isSuffixOf, stripPrefix)
+import Data.List (elemIndex, isPrefixOf, isSuffixOf, nub, stripPrefix)
 import Data.Maybe (fromMaybe, mapMaybe)
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
+import qualified Data.Text.Lazy as TL
+import qualified Data.Text.Lazy.Encoding as TLE
 import Data.Word (Word64)
 
 -- 数据模型：列类型、列约束、值、行、表、数据库，外加查表小工具。
@@ -62,6 +69,7 @@ data ColumnType
     | CBigInt
     | CSmallInt
     | CStr
+    | CEnum String [String]
     | CVarchar Int
     | CChar Int
     | CBool
@@ -116,6 +124,7 @@ typeLabel CInt = "TInt"
 typeLabel CBigInt = "TBigInt"
 typeLabel CSmallInt = "TSmallInt"
 typeLabel CStr = "TStr"
+typeLabel (CEnum name _) = name
 typeLabel (CVarchar n) = "TVarchar " ++ show n
 typeLabel (CChar n) = "TChar " ++ show n
 typeLabel CBool = "TBool"
@@ -135,6 +144,7 @@ typeName CInt = "int"
 typeName CBigInt = "bigint"
 typeName CSmallInt = "smallint"
 typeName CStr = "str"
+typeName (CEnum name labels) = "enum(" ++ TL.unpack (TLE.decodeUtf8 (A.encode (name, labels))) ++ ")"
 typeName (CVarchar n) = "varchar(" ++ show n ++ ")"
 typeName (CChar n) = "char(" ++ show n ++ ")"
 typeName CBool = "bool"
@@ -159,6 +169,10 @@ isDomainTable name = "__system_domain_" `isPrefixOf` map toLower name
 -- | 解析类型名，可带长度/精度参数；不认识的给 Nothing
 parseColumnType :: String -> Maybe ColumnType
 parseColumnType raw
+    | Just inner <- stripPrefix "enum(" raw
+    , Just body <- stripSuffixMaybe ")" inner = do
+        (name, labels) <- either (const Nothing) Just (A.eitherDecodeStrict (TE.encodeUtf8 (T.pack body)))
+        if not (null name) && validEnumLabels labels then Just (CEnum name labels) else Nothing
     | Just inner <- stripPrefix "runtime(" raw
     , Just body <- stripSuffixMaybe ")" inner =
         either (const Nothing) (Just . CRuntime) (decodeType builtinTypes (BS.pack body))
@@ -202,6 +216,19 @@ parseColumnType raw
         Nothing -> []
         Just inner -> map (filter (not . isSpace)) (splitOn ',' inner)
 
+-- | 验证枚举标签非空集合且没有重复
+validEnumLabels :: [String] -> Bool
+validEnumLabels labels = not (null labels) && length labels == length (nub labels) && all validLabel labels
+  where
+    -- 检查标签的 UTF-8 长度和文本边界。
+    validLabel label = '\0' `notElem` label && BS.length (BS.fromStrict (TE.encodeUtf8 (T.pack label))) <= 63
+
+-- 取得领域包装后的枚举身份与标签。
+enumDefinition :: ColumnType -> Maybe (String, [String])
+enumDefinition (CDomain _ base) = enumDefinition base
+enumDefinition (CEnum name labels) = Just (name, labels)
+enumDefinition _ = Nothing
+
 -- | 去掉结尾
 stripSuffixMaybe :: String -> String -> Maybe String
 stripSuffixMaybe suffix s
@@ -243,6 +270,7 @@ data TypeClass
     | BooleanClass
     | NullClass
     | RuntimeClass
+    | EnumClass
     deriving (Show, Eq)
 
 -- | 整型大类判断
@@ -254,6 +282,7 @@ typeClassOf CFloat = NumericClass
 typeClassOf CDouble = NumericClass
 typeClassOf CDecimal{} = NumericClass
 typeClassOf CStr = TextClass
+typeClassOf CEnum{} = EnumClass
 typeClassOf CVarchar{} = TextClass
 typeClassOf CChar{} = TextClass
 typeClassOf CBlob = TextClass
@@ -271,6 +300,7 @@ assignable target (CDomain _ base) = assignable target base
 assignable target source
     | source == CNull = True
     | target == source = True
+    | typeClassOf target == EnumClass || typeClassOf source == EnumClass = False
     | CRuntime tid <- target = Just (typeExpression tid) == scalarTypeExpression source
     | typeClassOf target == RuntimeClass || typeClassOf source == RuntimeClass = False
     | typeClassOf target == typeClassOf source = True
@@ -291,6 +321,7 @@ comparableTypes (CDomain _ base) other = comparableTypes base other
 comparableTypes other (CDomain _ base) = comparableTypes other base
 comparableTypes a b
     | a == CNull || b == CNull = True
+    | typeClassOf a == EnumClass || typeClassOf b == EnumClass = a == b
     | typeClassOf a == RuntimeClass || typeClassOf b == RuntimeClass = a == b && hasTypeCapability EqCapability a
     | otherwise = a == CNull || b == CNull || sameClass || crossTemporal
   where
@@ -332,6 +363,7 @@ valueFits CDouble (VFloat _) = True
 valueFits CDecimal{} (VInt _) = True
 valueFits CDecimal{} (VFloat _) = True
 valueFits CStr (VStr _) = True
+valueFits (CEnum name labels) (VEnum other supplied label) = name == other && labels == supplied && label `elem` labels
 valueFits CVarchar{} (VStr _) = True
 valueFits CChar{} (VStr _) = True
 valueFits CBool (VBool _) = True
@@ -350,6 +382,10 @@ coerceValue t v = case t of
     CFloat -> toFloat t v
     CDouble -> toFloat t v
     CDecimal p s -> toDecimal p s v
+    CEnum name labels -> case v of
+        VStr label | label `elem` labels -> Right (VEnum name labels label)
+        VEnum{} | valueFits t v -> Right v
+        _ -> Left ("invalid ENUM value for " ++ name ++ ": " ++ show v ++ "; expected one of " ++ show labels)
     CStr -> toText t v
     CVarchar n -> toSized n v
     CChar n -> toSized n v
@@ -406,6 +442,7 @@ toDecimal p s v
 -- | 字符串收进文本列
 toText :: ColumnType -> Value -> Either String Value
 toText _ (VStr s) = Right (VStr s)
+toText _ (VEnum _ _ label) = Right (VStr label)
 toText t _ = Left ("cannot put this value into " ++ typeLabel t)
 
 -- | 按列长度限制收字符串
@@ -463,6 +500,7 @@ data Value
     | VFloat Double
     | VStr String
     | VBool Bool
+    | VEnum String [String] String
     | VRuntime TypeId RuntimeValue
     deriving (Show, Eq)
 
@@ -492,6 +530,7 @@ compareValue a b = case (canonicalValue a, canonicalValue b) of
     (VFloat x, VFloat y) -> compare x y
     (VStr x, VStr y) -> compare x y
     (VBool x, VBool y) -> compare x y
+    (VEnum nx xs x, VEnum ny ys y) -> compare (nx, xs, elemIndex x xs) (ny, ys, elemIndex y ys)
     (VRuntime tx x, VRuntime ty y) -> compare (tx, x) (ty, y)
     (x, y) -> compare (valueRank x) (valueRank y)
 
@@ -503,6 +542,7 @@ valueRank (VFloat _) = 1
 valueRank (VStr _) = 2
 valueRank (VBool _) = 3
 valueRank VRuntime{} = 4
+valueRank VEnum{} = 5
 
 -- | 相等语义：比较关键字相同即相等，与 hashValue 配套
 valuesEqual :: Value -> Value -> Bool
@@ -516,6 +556,7 @@ hashValue v = case canonicalValue v of
     VFloat d -> hashWithSalt 1 d
     VStr t -> hashWithSalt 2 t
     VBool b -> hashWithSalt 3 b
+    VEnum name labels label -> hashWithSalt 5 (name, labels, label)
     VRuntime tid value -> hashWithSalt 4 (BS.unpack (encodeType tid), value)
 
 -- | 解析现有标量列的逻辑类型

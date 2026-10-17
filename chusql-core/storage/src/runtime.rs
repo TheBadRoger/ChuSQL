@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::catalog::Catalog;
 use crate::config::{self, Config, Loaded};
-use crate::heap::{DUPLICATE_ID, HeapTable, check_index_key, key_of, row_key, scalar_int};
+use crate::heap::{
+    DUPLICATE_ID, HeapTable, check_index_key, enum_rank, key_of, row_key, scalar_int,
+};
 use crate::log;
 use crate::protocol::{
     Account, ColumnStatWire, IDENTITIES_TABLE, IndexWire, Request, Response, Row, SchemaColumn,
@@ -17,6 +19,23 @@ use crate::{log_debug, log_error, log_info, log_warn};
 
 // 进程内存储运行时：Haskell 侧经 ffi.rs 调进来。
 // request_line 的语义等同原来的「一行 JSON 请求 → 一行 JSON 响应」套接字协议。
+
+/// 仅解析类型包装，不把枚举标签当成类型引用
+fn type_uses_domain(mut ty: &str, name: &str) -> bool {
+    while let Some(body) = ty
+        .strip_prefix("domain(")
+        .and_then(|body| body.strip_suffix(')'))
+    {
+        let Some((domain, base)) = body.split_once(',') else {
+            return false;
+        };
+        if domain == name {
+            return true;
+        }
+        ty = base;
+    }
+    false
+}
 
 struct Server {
     cfg: Config,
@@ -738,17 +757,17 @@ impl Server {
                 }
             }
             WalOp::DropTable { table } => {
-                if let Some(name) = table.strip_prefix("__system_domain_") {
-                    let prefix = format!("domain({name},");
-                    if catalog.all_tables().iter().any(|(_, schema)| {
+                if let Some(name) = table.strip_prefix("__system_domain_")
+                    && catalog.all_tables().iter().any(|(_, schema)| {
                         schema.columns.iter().any(|c| {
-                            !schema.dropped_columns.contains(&c.name) && c.ty.contains(&prefix)
+                            !schema.dropped_columns.contains(&c.name)
+                                && type_uses_domain(&c.ty, name)
                         })
-                    }) {
-                        return Err(std::io::Error::other(format!(
-                            "domain is still used by a column: {name}"
-                        )));
-                    }
+                    })
+                {
+                    return Err(std::io::Error::other(format!(
+                        "domain is still used by a column: {name}"
+                    )));
                 }
             }
             _ => {}
@@ -2731,13 +2750,15 @@ impl Server {
                 if !indexed {
                     return Response::NoIndex;
                 }
-                let found = match scalar_int(&key) {
+                let found = match scalar_int(&key).or_else(|| enum_rank(&key)) {
                     Some(k) => self.with_table(&table, |t| t.get_all_by_column_key(&column, k)),
                     None => match key.as_str() {
                         Some(s) => self.with_table(&table, |t| t.get_all_by_string_key(&column, s)),
                         None => {
                             return Response::Error {
-                                message: "lookup_by_index: key must be a number or a string".into(),
+                                message:
+                                    "lookup_by_index: key must be a number, string or valid enum"
+                                        .into(),
                             };
                         }
                     },

@@ -532,3 +532,29 @@ fn compact_pages_keeps_index_positions_valid() {
         );
     }
 }
+
+/// 枚举索引按声明顺序点查范围查并可重开
+#[test]
+fn enum_indexes_follow_declaration_order_and_reopen() -> std::io::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let data = directory.path().join("enum.db");
+    let indexes = vec![("state".into(), directory.path().join("enum.state.idx"))];
+    let value = |label: &str| json!({"__chusql_enum_v1":["state", ["z", "a", "b"], label]});
+    {
+        let mut heap = HeapTable::open_with_indexes(&data, &indexes, DEFAULT_PAGE_SIZE, 4, 2)?;
+        for (id, label) in [(1, "b"), (2, "z"), (3, "a")] {
+            heap.insert_row(&row(&[("id", json!(id)), ("state", value(label))]))?;
+        }
+        heap.flush()?;
+    }
+    let mut heap = HeapTable::open_with_indexes(&data, &indexes, DEFAULT_PAGE_SIZE, 4, 2)?;
+    assert_eq!(heap.get_all_by_column_key("state", 0)?[0]["id"], json!(2));
+    let lower = value("z");
+    let upper = value("b");
+    let found = heap
+        .scan_range("state", Some((&lower, false)), Some((&upper, false)))?
+        .unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0]["id"], json!(3));
+    Ok(())
+}

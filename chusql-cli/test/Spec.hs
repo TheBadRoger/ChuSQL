@@ -34,6 +34,8 @@ main = hspec spec
 spec :: Spec
 spec = do
     normalizationSpec
+    it "renders enum labels without exposing storage encoding" $ do
+        displayValue (VEnum "role" ["reader", "作者"] "作者") `shouldBe` "作者"
     it "renders typed compound values without losing their wire identity" $ do
         case resolveType builtinTypes (listType intType) of
             Left err -> expectationFailure err

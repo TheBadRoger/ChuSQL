@@ -59,6 +59,7 @@ valueLiteral :: Value -> Expr
 valueLiteral (VInt n) = LitInt n
 valueLiteral (VFloat d) = LitFloat d
 valueLiteral (VStr s) = LitStr s
+valueLiteral (VEnum name labels label) = EnumLiteral (CEnum name labels) label
 valueLiteral (VBool b) = LitBool b
 valueLiteral (VRuntime tid value) = RuntimeLiteral tid value
 valueLiteral VNull = LitNull

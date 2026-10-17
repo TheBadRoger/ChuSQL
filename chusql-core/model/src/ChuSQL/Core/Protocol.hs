@@ -15,7 +15,7 @@ module ChuSQL.Core.Protocol (
     queryResultJson,
 ) where
 
-import ChuSQL.Core.Model (Histogram (..), Row, TableIdentity (..), Value (..))
+import ChuSQL.Core.Model (ColumnType (..), Histogram (..), Row, TableIdentity (..), Value (..), coerceValue, validEnumLabels)
 import ChuSQL.Core.Runtime (builtinTypes, runtimeFromJSON, runtimeToJSON)
 import Data.Aeson (FromJSON (..), ToJSON (..), object, withObject, (.!=), (.:), (.:?), (.=))
 import qualified Data.Aeson as A
@@ -474,6 +474,7 @@ valueToJSON (VInt n) = A.Number (fromIntegral n)
 valueToJSON (VFloat d) = A.Number (fromFloatDigits d)
 valueToJSON (VStr s) = A.String (T.pack s)
 valueToJSON (VBool b) = A.Bool b
+valueToJSON (VEnum name labels label) = object ["__chusql_enum_v1" .= (name, labels, label)]
 valueToJSON (VRuntime tid value) = object ["__chusql_runtime_v1" .= runtimeToJSON tid value]
 
 -- | JSON 解回值
@@ -486,6 +487,12 @@ valueFromJSON (A.Number n) =
 valueFromJSON (A.String s) = pure (VStr (T.unpack s))
 valueFromJSON (A.Bool b) = pure (VBool b)
 valueFromJSON (A.Object fields)
+    | KM.size fields == 1
+    , Just payload <- KM.lookup "__chusql_enum_v1" fields = do
+        (name, labels, label) <- A.parseJSON payload
+        if not (null name) && validEnumLabels labels
+            then either fail pure (coerceValue (CEnum name labels) (VStr label))
+            else fail "invalid enum value encoding"
     | KM.size fields == 1
     , Just payload <- KM.lookup "__chusql_runtime_v1" fields =
         either fail (pure . uncurry VRuntime) (runtimeFromJSON builtinTypes payload)
@@ -527,12 +534,17 @@ instance FromJSON QueryResult where
             <*> o .:? "truncated" .!= False
             <*> o .:? "database"
 
--- | 结果还原成 JSON（JSON 输出与 TCP 结果集共用）
+-- 输出枚举标签并保留其他结果值。
+resultValue :: Value -> A.Value
+resultValue (VEnum _ _ label) = A.String (T.pack label)
+resultValue value = valueToJSON value
+
+-- | 结果还原成 JSON，与 TCP 结果集共用。
 queryResultJson :: QueryResult -> A.Value
 queryResultJson result =
     object
         [ "columns" .= qrColumns result
-        , "rows" .= map (map valueToJSON) (qrRows result)
+        , "rows" .= map (map resultValue) (qrRows result)
         , "rowCount" .= qrRowCount result
         , "truncated" .= qrTruncated result
         , "database" .= qrDatabase result

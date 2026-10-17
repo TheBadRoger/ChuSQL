@@ -23,7 +23,8 @@ import ChuSQL.Core.Model
 
 -- | 保存运行时或兼容列类型
 data QueryType
-    = RuntimeType TypeId
+    = EnumType String [String]
+    | RuntimeType TypeId
     | CompatibilityType ColumnType
     | DomainType String QueryType
     | NullType
@@ -56,6 +57,7 @@ bindQuery catalog statement = do
     -- \| 保留阶段外类型的兼容表示
     bindingType CNull = Right NullType
     bindingType (CDomain name base) = DomainType name <$> bindingType base
+    bindingType (CEnum name labels) = Right (EnumType name labels)
     bindingType CDate = Right (CompatibilityType CDate)
     bindingType CTimestamp = Right (CompatibilityType CTimestamp)
     bindingType CBlob = Right (CompatibilityType CBlob)

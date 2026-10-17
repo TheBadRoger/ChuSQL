@@ -26,6 +26,7 @@ description: 修改 ChuSQL SQL 类型、值表示、赋值转换、类型推导�
 
 - 构造器编号固定：Int=1、Double=2、Bool=3、String=4、List=5、Maybe=6、Tuple=7。使用 resolveType 检查参数 / kind，不把显示名当身份，不再维护第二份注册表。
 - CRuntime / VRuntime 身份必须匹配；递归检查列表元素、Maybe 内容与元组字段数，Double 必须有限。保留逻辑类型与物理表示的区别。
+- CEnum / VEnum 保留库内类型名、完整标签集合与当前标签；EnumType 不占用固定运行时构造器编号。声明顺序决定比较与排序，类型名和标签集合决定兼容性，不能退化为普通文本或混同不同枚举。
 - SQL VNull 与 RMaybe Nothing 不同；CNull 是查询推导类型，不能声明为存储列。保留三值逻辑与函数 NULL 传播。
 
 ### 转换与数值语义
@@ -36,11 +37,13 @@ description: 修改 ChuSQL SQL 类型、值表示、赋值转换、类型推导�
 ### 领域与兼容表示
 
 - DOMAIN 使用 domainTableName 与目录定义解析基础类型、依赖及循环；不能拿解析器占位基础类型直接执行。系统内建类型目录也不是通过增加行即可扩展的插件注册表。
+- 命名 ENUM 沿用领域目录及依赖守卫；EnumLiteral 在字符串常量的比较、IN / ANY 上下文绑定，枚举列与普通文本列不能自动转换。标签参数由 validEnumLabels 统一校验：非空集合、无重复、每项至多 63 个 UTF-8 字节且无 NUL。引导仅保留原生 Bool，不预装 BoolText / YesNo / OnOff。
 - Date / Timestamp / Blob 在 QueryType 保留 CompatibilityType；ColumnType 与 RelOp 仍有真实消费者，不能作为无用兼容层删除。
 
 ### 编码与错误传播
 
 - 类型 / 值编码版本为 1；身份、类型名、封装或值结构变化可能影响 catalog、WAL、FFI、TCP 和 Web，组合相关 Skills 核对消费者。
+- 枚举使用版本 1 的 __chusql_enum_v1 编码，存储保留类型名、标签集合和值，TCP / Web / CLI 结果输出字符串标签。Rust heap::enum_rank 统一为枚举索引计算声明序号；更新编码同时验证索引与实际动态库。
 - Rust 当前保存通用 JSON，只做局部校验，包括隐藏列、DOMAIN 依赖和 DECIMAL 规范化。它没有 Haskell validateValue 的完整等价检查，不要依赖原始存储请求完成所有 SQL 类型校验。
 - 错误沿 Either String 返回；`chusql-core/engine/src/ChuSQL/Core/Engine/Error.hs` 用消息规则映射类别 / 协议码。修改错误文字须检查分类，不用默认值或 NULL 掩盖错误。
 

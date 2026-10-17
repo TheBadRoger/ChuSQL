@@ -111,8 +111,34 @@ fn value_key(v: &serde_json::Value) -> Option<Vec<u8>> {
         serde_json::Value::Number(_) => scalar_int(v).map(|k| key_of(k).to_vec()),
         serde_json::Value::String(s) => Some(s.as_bytes().to_vec()),
         serde_json::Value::Bool(b) => Some(vec![u8::from(*b)]),
+        serde_json::Value::Object(_) => enum_rank(v).map(|rank| key_of(rank).to_vec()),
         _ => None,
     }
+}
+
+/// 从有效枚举值取得声明序号
+pub(crate) fn enum_rank(value: &serde_json::Value) -> Option<i64> {
+    let fields = value.as_object()?;
+    if fields.len() != 1 {
+        return None;
+    }
+    let payload = fields.get("__chusql_enum_v1")?.as_array()?;
+    if payload.len() != 3 || payload[0].as_str()?.is_empty() {
+        return None;
+    }
+    let mut seen = HashSet::new();
+    let labels = payload[1].as_array()?;
+    for value in labels {
+        let label = value.as_str()?;
+        if label.len() > 63 || label.contains('\0') || !seen.insert(label) {
+            return None;
+        }
+    }
+    let label = payload[2].as_str()?;
+    let rank = labels
+        .iter()
+        .position(|value| value.as_str() == Some(label))?;
+    i64::try_from(rank).ok()
 }
 
 /// 取行里某一列的索引键；NULL 与缺列不入索引

@@ -2,6 +2,12 @@
 
 [← 返回 README](../README.md)
 
+本页帮助你安装、更新和卸载 ChuSQL。发行包包含编译后的程序，使用发行包时无需安装 Haskell 编译器 GHC 或 Rust 工具链。
+
+项目仓库：[GitHub](https://github.com/TheBadRoger/ChuSQL) · [ChuRepo](https://repo.chunana.cn/ChuNa7a/ChuSQL)。两处均可获取源码，按网络情况选择。
+
+使用容器部署时，按 [Docker 部署](docker.md) 创建口令文件并启动 Compose，无需在宿主机安装 GHC 或 Rust。
+
 本页内容：
 
 - [在线安装](#在线安装)
@@ -13,12 +19,6 @@
 - [更新](#更新)
 - [卸载](#卸载)
 - [发布校验](#发布校验)
-
-本页帮助你安装、更新和卸载 ChuSQL。发行包包含编译后的程序，使用发行包时无需安装 Haskell 编译器 GHC 或 Rust 工具链。
-
-项目仓库：[GitHub](https://github.com/TheBadRoger/ChuSQL) · [ChuRepo](https://repo.chunana.cn/ChuNa7a/ChuSQL)。两处均可获取源码，按网络情况选择。
-
-使用容器部署时，按 [Docker 部署](docker.md) 创建口令文件并启动 Compose，无需在宿主机安装 GHC 或 Rust。
 
 ## 在线安装
 
@@ -128,7 +128,7 @@ Windows：
 | `--list-versions` | `-ListVersions` | 列出可安装版本 |
 | `--from-source` | — | 从源码构建并安装 |
 
-自动化安装时建议通过环境变量提供管理员口令，避免口令出现在 shell 历史中。
+自动化安装可通过 `CHUSQL_ADMIN_PASSWORD` 提供管理员口令，两个平台的安装器均支持。由部署环境注入该变量，避免将口令直接写入命令或脚本；安装器通过标准输入把它交给引导程序。
 
 ## 从源码安装
 
@@ -165,15 +165,21 @@ sh scripts/install.sh --component web --from-source --source-dir .
 - `settings.toml`：全局配置文件；
 - 数据目录与日志目录。
 
-常用命令：
+安装器默认已启动数据库。选择 `cli` 或 `both` 时，运行以下命令，并使用安装时设置的管理员口令登录：
 
 ```sh
-chusql-server
 csql
+```
+
+选择 `web` 或 `both` 时，另行启动 Web 管理端：
+
+```sh
 csql-web
 ```
 
-管理员使用安装时设置的口令登录。
+浏览器打开 <http://127.0.0.1:7778>。首次 SQL 验证见 [README 的启动步骤](../README.md#启动并验证)。
+
+只有使用 `--no-start` 或服务未运行时才需要启动数据库。Linux 用户服务使用 `systemctl --user start chusql-server.service`；未注册服务的环境运行 `chusql-server`。已有服务运行时不要再启动一个使用相同数据目录的进程。
 
 ## 更新
 
@@ -192,6 +198,8 @@ Linux 更新会先停止该安装目录中的 Web 和数据库进程，保留已
 Linux 安装目录中保留 `uninstall.sh`。卸载时指定安装目录，数据目录默认读取现有配置。
 
 ## 卸载
+
+在安装目录执行卸载脚本。以下命令会删除数据；需要保留时先加上文末所列的保留选项。
 
 Linux / macOS：
 

@@ -23,11 +23,13 @@ import ChuSQL.Core.Engine.Storage.Memory (MemoryStorage (runMemoryStorage))
 import ChuSQL.Core.Engine.Syntax.AST
 import ChuSQL.Core.Engine.Syntax.Parser
 import ChuSQL.Core.Model
+import qualified ChuSQL.Core.Protocol as Wire
 import Control.Concurrent (forkFinally, forkIO, killThread, threadDelay)
 import Control.Concurrent.Chan (newChan, readChan, writeChan)
 import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Exception (ErrorCall, IOException, bracket_, finally, try)
 import Control.Monad (replicateM_, void, when, (>=>))
+import Data.Aeson.Types (parseEither)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import Data.Either (fromRight)
@@ -357,6 +359,77 @@ main = hspec $ do
             parseStatement "ALTER ROLE worker" `shouldSatisfy` isLeft
             parseStatement "ALTER USER worker ACTIVE" `shouldSatisfy` isLeft
             prepare [] (AlterIdentity "worker" [("login", True), ("login", False)]) `shouldSatisfy` isLeft
+    describe "ChuSQL.Core.Engine (ENUM)" $ do
+        it "parses named enum declarations and rejects invalid labels" $ do
+            parseStatement "CREATE TYPE role AS ENUM ('reader', 'AUTHOR', '管理员')"
+                `shouldBe` Right (CreateDomain "role" (DomainDefinition (plainColumn (CEnum "role" ["reader", "AUTHOR", "管理员"])) []))
+            parseStatement "DROP TYPE role" `shouldBe` Right (DropDomain "role")
+            mapM_
+                (\sql -> parseStatement sql `shouldSatisfy` isLeft)
+                ["CREATE TYPE role AS ENUM ()", "CREATE TYPE role AS ENUM ('a', 'a')", "CREATE TYPE role AS ENUM (1)", "CREATE TYPE role AS ENUM ('" ++ replicate 64 'x' ++ "')"]
+            parseStatement ("CREATE TYPE role AS ENUM ('" ++ replicate 63 'x' ++ "')") `shouldSatisfy` either (const False) (const True)
+            validEnumLabels [replicate 21 '界'] `shouldBe` True
+            validEnumLabels [replicate 22 '界'] `shouldBe` False
+            validEnumLabels ["a\0b"] `shouldBe` False
+        it "round trips nominal enum schemas and encoded values" $ do
+            let labels = ["", "AUTHOR", "管理员", "a,b)", "quote'", "domain(other,str)"]
+                ty = CDomain "role" (CEnum "role" labels)
+                value = VEnum "role" labels "管理员"
+            parseColumnType (typeName ty) `shouldBe` Just ty
+            parseColumnType "enum([])" `shouldBe` Nothing
+            parseColumnType "enum([\"role\",[\"a\",\"a\"]])" `shouldBe` Nothing
+            parseEither Wire.valueFromJSON (Wire.valueToJSON value) `shouldBe` Right value
+            parseEither Wire.valueFromJSON (Wire.valueToJSON (VEnum "role" labels "unknown")) `shouldSatisfy` isLeft
+        it "enforces labels on inserts updates and defaults" $ do
+            let labels = ["reader", "author", "admin"]
+                setup = ["CREATE TYPE role AS ENUM ('reader', 'author', 'admin')", "CREATE TABLE members (id INT, role role DEFAULT 'reader')", "INSERT INTO members (id) VALUES (1)", "INSERT INTO members (id, role) VALUES (2, 'admin'), (3, NULL)"]
+            case domainSql [] setup of
+                Left err -> expectationFailure err
+                Right (db, _) -> do
+                    fmap snd (domainSql db ["SELECT role FROM members ORDER BY id"])
+                        `shouldBe` Right [[("role", VEnum "role" labels "reader")], [("role", VEnum "role" labels "admin")], [("role", VNull)]]
+                    mapM_
+                        (\sql -> domainSql db [sql] `shouldSatisfy` isLeft)
+                        ["INSERT INTO members (id, role) VALUES (4, 'Reader')", "INSERT INTO members (id, role) VALUES (4, 1)", "UPDATE members SET role = 'unknown' WHERE id = 1", "CREATE TABLE invalid (role role DEFAULT 'unknown')", "DROP TYPE role"]
+                    fmap snd (domainSql db ["UPDATE members SET role = 'author' WHERE id = 1", "SELECT role FROM members WHERE id = 1"])
+                        `shouldBe` Right [[("role", VEnum "role" labels "author")]]
+                    domainSql db ["DROP TABLE members", "DROP TYPE role"] `shouldSatisfy` either (const False) (const True)
+        it "validates existing text rows before conversion" $ do
+            let setup = ["CREATE TYPE state AS ENUM ('a', 'b')", "CREATE TABLE items (id INT, value TEXT)", "INSERT INTO items (id, value) VALUES (1, 'a'), (2, 'unknown')"]
+            case domainSql [] setup of
+                Left err -> expectationFailure err
+                Right (db, _) -> do
+                    domainSql db ["ALTER TABLE items ALTER COLUMN value TYPE state"] `shouldSatisfy` isLeft
+                    domainSql db ["CREATE TYPE state AS ENUM ('c')"] `shouldSatisfy` isLeft
+                    fmap snd (domainSql db ["DELETE FROM items WHERE id = 2", "ALTER TABLE items ALTER COLUMN value TYPE state", "SELECT value FROM items"])
+                        `shouldBe` Right [[("value", VEnum "state" ["a", "b"] "a")]]
+        it "orders compares and aggregates by declaration order" $ do
+            let labels = ["z", "a", "b"]
+                setup = ["CREATE TYPE status AS ENUM ('z', 'a', 'b')", "CREATE TABLE items (id INT, state status UNIQUE)", "INSERT INTO items (id, state) VALUES (1, 'z'), (2, 'a'), (3, 'b'), (4, NULL), (5, NULL)"]
+                value = VEnum "status" labels
+            fmap snd (domainSql [] (setup ++ ["SELECT state FROM items WHERE state > 'z' ORDER BY state"]))
+                `shouldBe` Right [[("state", value "a")], [("state", value "b")]]
+            fmap snd (domainSql [] (setup ++ ["SELECT MIN(state), MAX(state) FROM items"]))
+                `shouldBe` Right [[("MIN(state)", value "z"), ("MAX(state)", value "b")]]
+            domainSql [] (setup ++ ["INSERT INTO items (id, state) VALUES (6, 'a')"]) `shouldSatisfy` isLeft
+            fmap snd (domainSql [] (setup ++ ["SELECT state, COUNT(*) FROM items WHERE state = 'z' GROUP BY state"]))
+                `shouldBe` Right [[("state", value "z"), ("COUNT(*)", VInt 1)]]
+        it "rejects different enum identities and implicit text column comparisons" $ do
+            let setup = ["CREATE TYPE first AS ENUM ('a', 'b')", "CREATE TYPE second AS ENUM ('a', 'b')", "CREATE TABLE items (a first, b second, text_value TEXT)"]
+            mapM_
+                (\query -> domainSql [] (setup ++ [query]) `shouldSatisfy` isLeft)
+                ["SELECT * FROM items WHERE a = b", "SELECT * FROM items WHERE a = text_value", "UPDATE items SET a = b", "UPDATE items SET a = text_value", "SELECT * FROM items WHERE a = 'unknown'"]
+        it "keeps enum identity through IN and quantified subqueries" $ do
+            let setup = ["CREATE TYPE state AS ENUM ('z', 'a', 'b')", "CREATE TABLE items (id INT, value state)", "INSERT INTO items (id, value) VALUES (1, 'z'), (2, 'a'), (3, 'b')"]
+                expected = Right [[("id", VInt 2)], [("id", VInt 3)]]
+            mapM_
+                (\query -> fmap snd (domainSql [] (setup ++ [query])) `shouldBe` expected)
+                ["SELECT id FROM items WHERE value IN ('a', 'b') ORDER BY id", "SELECT id FROM items WHERE value IN (SELECT value FROM items WHERE id > 1) ORDER BY id", "SELECT id FROM items WHERE value > ANY (SELECT value FROM items WHERE id = 1) ORDER BY id"]
+            fmap snd (domainSql [] (setup ++ ["SELECT id FROM items WHERE 'a' IN (SELECT value FROM items) ORDER BY id LIMIT 1"])) `shouldBe` Right [[("id", VInt 1)]]
+        it "preserves native boolean expressions" $ do
+            fmap snd (domainSql [] ["CREATE TABLE flags (active BOOL)", "INSERT INTO flags (active) VALUES (TRUE), (FALSE)", "SELECT not(active) AS inactive FROM flags WHERE active"])
+                `shouldBe` Right [[("inactive", VBool False)]]
+
     describe "ChuSQL.Core.Engine (DOMAIN)" $ do
         it "parses domain commands and named columns" $ do
             parseStatement "CREATE DOMAIN amount AS DECIMAL(12,2)" `shouldBe` Right (CreateDomain "amount" (DomainDefinition (plainColumn (CDecimal 12 2)) []))
@@ -3282,6 +3355,32 @@ main = hspec $ do
                 result <- ipcDomainSql "CREATE TABLE items (qty quantity DEFAULT NULL)"
                 result `shouldSatisfy` either (isInfixOf "bound query schema changed") (const False)
                 runIPCStorage (scan "items") >>= (`shouldSatisfy` isLeft)
+
+        it "persists enum labels defaults and indexes across actual FFI restart" $ do
+            let labels = ["READER", "作者", "q'uote", "a,b)", "domain(unrelated,str)"]
+            withTestSession $ \srv -> do
+                withServerEnv srv $ do
+                    mapM_
+                        (\sql -> ipcDomainSql sql `shouldReturn` Right [])
+                        [ "CREATE TYPE role AS ENUM ('READER', '作者', 'q''uote', 'a,b)', 'domain(unrelated,str)')"
+                        , "CREATE TABLE enum_members (id INT, role role DEFAULT 'READER' UNIQUE)"
+                        , "INSERT INTO enum_members (id) VALUES (1)"
+                        , "INSERT INTO enum_members (id, role) VALUES (2, '作者'), (3, 'q''uote'), (4, 'a,b)')"
+                        , "CREATE INDEX ON enum_members (role)"
+                        , "CREATE DOMAIN unrelated AS TEXT"
+                        , "DROP DOMAIN unrelated"
+                        ]
+                closeConnection
+                openSessionIn (dataDir srv)
+                withServerEnv srv $ do
+                    ipcDomainSql "SELECT role FROM enum_members WHERE role = '作者'" `shouldReturn` Right [[("role", VEnum "role" labels "作者")]]
+                    ipcDomainSql "SELECT role FROM enum_members ORDER BY id" `shouldReturn` Right [[("role", VEnum "role" labels value)] | value <- ["READER", "作者", "q'uote", "a,b)"]]
+                    ipcDomainSql "UPDATE enum_members SET role = 'reader' WHERE id = 1" >>= (`shouldSatisfy` isLeft)
+                    ipcDomainSql "INSERT INTO enum_members (id, role) VALUES (5, '作者')" >>= (`shouldSatisfy` isLeft)
+                    ipcDomainSql "DROP TYPE role" >>= (`shouldSatisfy` isLeft)
+                    ipcDomainSql "DELETE FROM enum_members WHERE id = 1" `shouldReturn` Right []
+                    ipcDomainSql "INSERT INTO enum_members (id) VALUES (5)" `shouldReturn` Right []
+                    ipcDomainSql "SELECT role FROM enum_members WHERE id = 5" `shouldReturn` Right [[("role", VEnum "role" labels "READER")]]
 
         it "persists nested domains and named columns across restart" $ do
             withTestSession $ \srv -> do

@@ -1,5 +1,7 @@
 # 用 Docker 部署 ChuSQL
 
+[← 返回 README](../README.md)
+
 本页帮助你在 Linux 容器中启动数据库和可选的 Web 管理端，并保留数据、备份及升级。需要 Docker Engine 或启用 Linux 容器的 Docker Desktop，以及 Docker Compose v2 或更新版本。
 
 以下命令在 Linux 或 WSL 的 Bash 中执行。WSL 或小内存机器应先按[受限构建说明](#在-wsl-或内存受限的机器上构建)生成镜像，再启动服务。
@@ -43,6 +45,8 @@
 首次初始化的管理员默认为 `root`。修改口令文件不会重设已有账号口令；修改方法见[账号与权限命令](users-and-roles.md)。重启时仍需保留可读的口令文件。
 
 Dockerfile 默认从腾讯云内网 Debian 镜像源 `http://mirrors.tencentyun.com` 安装系统依赖，继续使用 Debian 的软件包签名校验。其他网络环境可用构建参数覆盖，例如 `docker compose build --build-arg DEBIAN_MIRROR=http://deb.debian.org server`；切换该参数不改变运行配置。
+
+镜像构建只编译存储库和 server、bootstrap、Web、CLI 四个程序，不编译或执行测试。部署前的运行验收需单独执行，见[验证部署镜像](#验证部署镜像)。
 
 Rust 依赖默认通过 rsproxy 下载，保留 `Cargo.lock` 的版本与校验和检查。其他镜像可通过 `--build-arg CARGO_REGISTRY=sparse+https://镜像地址/index/` 指定；该地址须提供 Cargo sparse 索引及其下载配置。
 
@@ -145,6 +149,8 @@ docker compose --profile web up -d --wait
 
 ## 验证部署镜像
 
+源码测试通过不代表已有镜像包含相同修改。每次构建候选镜像后都应单独验收，并记录镜像 ID；旧镜像的验收结果不能用于新源码。
+
 构建完成后，在仓库根目录运行以下命令，需要 Python 3。验收使用随机命名的独立容器和数据卷，不连接已有部署；每个数据库容器限制为 1 核、512 MiB，结束后删除本次创建的容器和卷。
 
 ```sh
@@ -201,4 +207,4 @@ docker compose --profile web up -d --wait --no-build
 docker compose --profile web logs --tail=100
 ```
 
-命名卷保留数据，启动引导会保留已有口令。当前源码会为页文件增加 `.pages`、`.page-wal` 和可能残留的 `.pages.pending`；备份和恢复须复制整个数据目录，不能只选择 `.db`、`.idx` 或 `wal.log`。不要用旧版本程序直接打开已经升级的数据目录；回退需要原镜像和升级前备份。
+命名卷保留数据，启动引导会保留已有口令。数据目录包含版本目录 `mvcc.json`、物理文件代次及页侧文件 `.pages`、`.page-wal`，也可能残留 `.pages.pending`；备份和恢复须复制整个数据目录，不能只选择 `.db`、`.idx` 或 `wal.log`。不要用旧版本程序直接打开已经升级的数据目录；回退需要原镜像和升级前备份。
