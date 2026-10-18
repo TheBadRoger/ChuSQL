@@ -283,3 +283,11 @@
 - ChuRepo（Gitea）作为 GitHub 之外的发布与下载渠道：发行版保存平台发行包和校验值，通用软件包以 `chusql` 包名按版本保存同名文件。软件包路径版本不带 `v`，git 标签带 `v`；两者由发布脚本对应。
 - 构建与测试只在 GitHub Actions 运行，ChuRepo 关闭 Actions 并注明验证来源。自建服务器性能不足，双份流水线会带来等待和结果不一致；发行包仍是同一批 GitHub Actions 产物，校验值可复核。
 - 发布脚本 `scripts/publish-gitea.sh` 保持幂等：已有发行版和资产跳过，软件包文件已存在时先删除再上传，保证重新发布的文件与本地校验一致。
+
+## 系统级安装与 Debian 软件包
+
+- Linux 安装分两层：普通用户安装仍走 XDG 目录，root 或 `--system` 走系统目录。root 默认写系统目录，避免把安装物放进 `/root` 下的用户目录；`--prefix` 只用于打包与测试，跳过服务账户和 systemd，保持非 root 可验证。
+- deb 用 `dpkg-deb` 手工装配，不引入 debhelper：项目没有 Debian 打包链路，脚本与现有 sh/Windows 发布脚本保持同一形态。`Depends` 按 `ldd` 实测取 `libc6 (>= 2.34)`、`libgmp10`、`libgcc-s1` 与 `adduser`。
+- 配置查找先看 `/etc/chusql/settings.toml`，再回落 XDG：系统级服务、客户端与 Web 共用一份文件，普通用户安装完全不受影响。
+- 首次安装口令由 postinst 生成随机值写入 `/etc/chusql/admin-password`（0600）并交给 `csql-bootstrap` 初始化；口令不进入配置文件、日志或 conffiles，purge 时删除。
+- deb 同时作为发行版资产与 Gitea Debian registry 包发布（distribution `stable`、component `main`）；通用软件包保持原样，两类包的版本号都不带 `v`。

@@ -34,6 +34,9 @@ jobs:
       - name: installer release fallback tests
         run: python3 scripts/test-release-fallback.py
 
+      - name: deb packaging tests
+        run: python3 scripts/test-deb-package.py
+
       # ---------- Rust 存储 ----------
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable

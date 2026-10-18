@@ -120,10 +120,16 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/package.ps1 -OutDir dist -Platform '${{ matrix.platform }}' -Version '${{ inputs.tag || github.ref_name }}' -NoBuild
+      - name: build deb (Linux)
+        if: matrix.platform == 'linux-x86_64'
+        shell: bash
+        run: |
+          sh scripts/package-deb.sh --package "$PWD/dist/chusql-linux-x86_64.tar.gz" --version '${{ inputs.tag || github.ref_name }}' --out-dir "$PWD/dist"
+
       - name: checksum
         shell: pwsh
         run: |
-          Get-ChildItem dist -File | Where-Object { $_.Name -match '\.(zip|tar\.gz)$' } | ForEach-Object {
+          Get-ChildItem dist -File | Where-Object { $_.Name -match '\.(zip|tar\.gz|deb)$' } | ForEach-Object {
             $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
             "$hash  $($_.Name)" | Set-Content -NoNewline "$($_.FullName).sha256"
             Write-Host "$($_.Name)  $hash"
@@ -136,6 +142,7 @@ jobs:
           path: |
             dist/*.zip
             dist/*.tar.gz
+            dist/*.deb
             dist/*.sha256
           if-no-files-found: error
 

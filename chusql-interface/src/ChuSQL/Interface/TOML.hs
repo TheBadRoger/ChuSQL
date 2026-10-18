@@ -166,11 +166,15 @@ appendSection section entries lines' =
         ++ ("[" <> section <> "]")
         : [assignmentLine key value | (key, value) <- entries]
 
--- | 全局配置文件的固定路径，跟随系统惯例
+-- | 全局配置路径：系统级优先 /etc/chusql
 defaultConfigFile :: IO FilePath
 defaultConfigFile = do
-    dir <- getXdgDirectory XdgConfig "ChuSQL"
-    pure (dir </> "settings.toml")
+    systemWide <- doesFileExist "/etc/chusql/settings.toml"
+    if systemWide
+        then pure "/etc/chusql/settings.toml"
+        else do
+            dir <- getXdgDirectory XdgConfig "ChuSQL"
+            pure (dir </> "settings.toml")
 
 -- | 定位配置文件：命令行 --config 优先，否则用固定路径
 resolveConfigPath :: Maybe FilePath -> IO FilePath

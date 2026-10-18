@@ -58,6 +58,34 @@ def wait_server(port):
     raise RuntimeError("server did not become ready")
 
 
+# 验证系统级布局的暂存安装与卸载。
+def test_system_layout(repo, archive, root, env):
+    stage = root / "sys-stage"
+    env = dict(env, CHUSQL_ADMIN_PASSWORD="Lifecycle-test-123!")
+    run(["sh", str(repo / "scripts/install.sh"), "--url", archive, "--system",
+         "--prefix", str(stage), "--component", "both", "--no-service", "--no-start"], env)
+    binary = stage / "usr/lib/chusql/bin/chusql-server"
+    assert binary.is_file(), "system layout: missing the server binary"
+    for name in ("csql", "csql-web", "chusql-server"):
+        link = stage / "usr/bin" / name
+        assert link.is_symlink(), f"system layout: {name} is not a link"
+        assert link.resolve().is_file(), f"system layout: {name} points nowhere"
+    settings = (stage / "etc/chusql/settings.toml").read_text()
+    assert "@DATA_DIR@" not in settings and "@LOG_DIR@" not in settings
+    assert f'data_dir = "{stage}/var/lib/chusql"' in settings, settings
+    assert (stage / "var/lib/chusql/system/catalog.json").is_file()
+    assert not (stage / "etc/systemd/system/chusql-server.service").exists(), "prefix staging must skip systemd"
+    profile = root / "home/.profile"
+    assert not profile.exists() or "# ChuSQL" not in profile.read_text(), "system layout must not edit .profile"
+    print("PASS staged system install lays out /usr, /etc, /var and links", flush=True)
+    run(["sh", str(repo / "scripts/uninstall.sh"), "--system", "--prefix", str(stage), "--yes"], env)
+    assert not (stage / "usr/lib/chusql").exists()
+    assert not (stage / "var/lib/chusql").exists()
+    assert not (stage / "etc/chusql/settings.toml").exists()
+    assert not (stage / "usr/bin/csql").exists()
+    print("PASS staged system uninstall removes the layout", flush=True)
+
+
 # 用真实用户 systemd 验证注册、更新启动和卸载。
 def test_systemd(repo, archive, root, env):
     systemctl = shutil.which("systemctl")
@@ -206,6 +234,7 @@ def main():
                 server.terminate()
                 server.wait(timeout=10)
         test_online(repo, archive, root, env)
+        test_system_layout(repo, archive, root, env)
         if len(sys.argv) == 3:
             with tempfile.TemporaryDirectory(prefix="chusql-systemd-") as service_temporary:
                 test_systemd(repo, archive, Path(service_temporary), env)

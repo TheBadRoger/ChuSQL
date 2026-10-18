@@ -1,11 +1,13 @@
 #!/bin/sh
 set -eu
 
-# ChuSQL 卸载脚本（Linux/macOS）：停服务、删程序与配置、
-# 从 .profile 摘掉 PATH 段。数据目录默认一起删。
+# ChuSQL 卸载脚本：停服务，删程序、数据与配置。
+# 系统级安装用 --system，--prefix 指向暂存根。
 
 install_dir=''
 data_dir=''
+system_mode='no'
+prefix=''
 keep_data='no'
 keep_config='no'
 assume_yes='no'
@@ -16,6 +18,10 @@ Uninstall ChuSQL (Linux/macOS).
 
 Usage: uninstall.sh [options]
 
+  --system            remove a system-wide install (/usr/lib/chusql, /etc/chusql,
+                      /var/lib/chusql, /var/log/chusql, the systemd unit and the
+                      "chusql" service account)
+  --prefix DIR        with --system: the staging root used by the installer
   --install-dir DIR   program directory (default: $HOME/.local/share/chusql)
   --data-dir DIR      data directory (default: settings.toml, then XDG data directory)
   --keep-data         keep the data directory, remove programs only
@@ -78,6 +84,8 @@ ask_yes_no() {
 while [ $# -gt 0 ]; do
     case "$1" in
         -h | --help) usage; exit 0 ;;
+        --system) system_mode='yes'; shift ;;
+        --prefix) prefix="${2:-}"; shift 2 ;;
         --install-dir) install_dir="${2:-}"; shift 2 ;;
         --data-dir) data_dir="${2:-}"; shift 2 ;;
         --keep-data) keep_data='yes'; shift ;;
@@ -87,15 +95,40 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-install_dir=${install_dir:-$HOME/.local/share/chusql}
-config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ChuSQL"
+while [ "${prefix%/}" != "$prefix" ]; do prefix="${prefix%/}"; done
+[ -n "$prefix" ] || prefix='/'
+case "$prefix" in
+    /*) ;;
+    *) prefix="$PWD/$prefix" ;;
+esac
+if [ "$system_mode" = 'no' ] && [ "$(id -u)" = '0' ] && [ -d "$prefix/usr/lib/chusql" ]; then
+    system_mode='yes'
+fi
+if [ "$system_mode" = 'yes' ]; then
+    if [ "$(id -u)" != '0' ] && [ "$prefix" = '/' ]; then
+        fail 'removing a system-wide install needs root; pass --prefix DIR to remove a staged layout'
+    fi
+    service_user="${CHUSQL_SERVICE_USER:-chusql}"
+    install_dir=${install_dir:-$prefix/usr/lib/chusql}
+    config_dir="$prefix/etc/chusql"
+    log_dir="$prefix/var/log/chusql"
+    service_file="$prefix/etc/systemd/system/chusql-server.service"
+else
+    install_dir=${install_dir:-$HOME/.local/share/chusql}
+    config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ChuSQL"
+    service_file="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/chusql-server.service"
+fi
 config_file="$config_dir/settings.toml"
 if [ -z "$data_dir" ] && [ -f "$config_file" ]; then
     data_dir=$(awk '/^[[:space:]]*\[storage\]/ { storage=1; next } /^[[:space:]]*\[/ { storage=0 } storage && /^[[:space:]]*data_dir[[:space:]]*=[[:space:]]*"[^"\\]*"[[:space:]]*(#.*)?$/ { sub(/^[^=]*=[[:space:]]*"/, ""); sub(/"[[:space:]]*(#.*)?$/, ""); print; exit }' "$config_file")
     [ -n "$data_dir" ] || fail 'settings.toml needs an explicit double-quoted storage.data_dir without escapes; pass --data-dir'
     case "$data_dir" in /*) ;; *) data_dir="$install_dir/$data_dir" ;; esac
 fi
-data_dir=${data_dir:-${XDG_DATA_HOME:-$HOME/.local/share}/chusql/data}
+if [ "$system_mode" = 'yes' ]; then
+    data_dir=${data_dir:-$prefix/var/lib/chusql}
+else
+    data_dir=${data_dir:-${XDG_DATA_HOME:-$HOME/.local/share}/chusql/data}
+fi
 if [ "$(uname -s)" = Linux ]; then
     install_dir=$(realpath -m -- "$install_dir")
     data_dir=$(realpath -m -- "$data_dir")
@@ -127,8 +160,16 @@ if [ "$assume_yes" = 'no' ]; then
 fi
 
 step 'Stopping the service'
-service_file="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/chusql-server.service"
-if [ "$(uname -s)" = 'Linux' ] && [ -f "$service_file" ]; then
+if [ "$system_mode" = 'yes' ]; then
+    if [ "$prefix" = '/' ] && [ -f "$service_file" ]; then
+        command -v systemctl >/dev/null 2>&1 || fail 'systemctl is required to remove the service'
+        systemctl disable --now chusql-server.service || fail 'cannot stop and disable chusql-server.service'
+        rm -f "$service_file"
+        systemctl daemon-reload || fail 'cannot reload systemd units'
+    elif [ -f "$service_file" ]; then
+        rm -f "$service_file"
+    fi
+elif [ "$(uname -s)" = 'Linux' ] && [ -f "$service_file" ]; then
     command -v systemctl >/dev/null 2>&1 || fail 'systemctl is required to remove the service'
     systemctl --user disable --now chusql-server.service || fail 'cannot stop and disable chusql-server.service'
     rm -f "$service_file"
@@ -151,6 +192,12 @@ else
     note "removed $install_dir"
 fi
 if [ "$keep_data" = 'no' ] && [ -d "$data_dir" ]; then rm -rf "$data_dir"; fi
+if [ "$system_mode" = 'yes' ]; then
+    for command_link in csql csql-web chusql-server; do
+        rm -f "$prefix/usr/bin/$command_link"
+    done
+    if [ -d "$log_dir" ]; then rm -rf "$log_dir"; fi
+fi
 
 step 'Removing settings.toml'
 if [ "$keep_config" = 'yes' ]; then
@@ -159,6 +206,17 @@ else
     rm -f "$config_file"
     rmdir "$config_dir" 2>/dev/null || true
     note "removed config: $config_file"
+fi
+
+if [ "$system_mode" = 'yes' ]; then
+    if [ "$prefix" = '/' ] && [ "$keep_data" = 'no' ]; then
+        if getent passwd "$service_user" >/dev/null 2>&1; then
+            deluser --system --quiet "$service_user" 2>/dev/null || true
+            delgroup --quiet "$service_user" 2>/dev/null || true
+        fi
+    fi
+    step 'Done'
+    exit 0
 fi
 
 step 'Removing the PATH entry'

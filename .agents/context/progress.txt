@@ -166,3 +166,10 @@
 - ChuRepo 关闭 Actions，构建与测试以 GitHub Actions 结果为准，发行说明注明该来源；本地 `scripts/publish-gitea.sh` 负责发行版、资产与软件包的幂等发布。
 - `docs/install.md` 新增“通过软件包源下载”，安装方式表增加对应一行；发布说明统一放在 `docs/releases/`，`v26.10.1` 由 git 历史还原。
 
+### 系统级安装与 deb 打包
+
+- Linux 安装新增系统级布局：root 默认采用（也可显式 `--system`），程序在 `/usr/lib/chusql`，配置 `/etc/chusql/settings.toml`，数据与日志在 `/var/lib/chusql`、`/var/log/chusql`，创建 `chusql` 服务账户与系统级 `chusql-server.service`，命令入口链接到 `/usr/bin`；非 root 用 `--system --prefix DIR` 把同一布局放进临时根，跳过账户与 systemd。卸载脚本对称支持 `--system` 与 `--prefix`。
+- 默认配置查找改为优先 `/etc/chusql/settings.toml`，不存在时回落原 XDG 路径；`chusql-server`、`chusql-web`、`csql-bootstrap` 的用法文本同时说明系统级位置。
+- 新增 `scripts/package-deb.sh`，用 `dpkg-deb` 从发行包或目录装配 `.deb`：控制字段与 `Depends` 按实测动态库填写，`/etc/chusql/settings.toml` 为 conffile，postinst 建账户与目录并在首次安装生成随机管理员口令（`/etc/chusql/admin-password`，0600），prerm 停服务，postrm purge 清理数据、日志、配置与账户。
+- 本机实测 `dpkg -i` 后服务 active、`csql` 用 `/etc/chusql/admin-password` 登录并建库建表查询通过，`apt purge` 后目录与账户全部清除。`release.yml` 的 Linux 作业新增 deb 构建、校验与 artifact，`linux.yml` 测试阶段新增 `scripts/test-deb-package.py`；`scripts/publish-gitea.sh` 增加 deb 发布到 Gitea Debian registry（`stable`/`main`，409 先删后传）。
+- `scripts/test-linux-lifecycle.py` 新增系统级暂存安装与卸载用例；文档新增 `docs/install.md` 的 apt 软件源、系统级安装与卸载说明，以及 `docs/config.md` 的系统级路径与权限。web 测试 83 例 2 失败均为缺少 Node.js 的环境用例；server 184 例、bootstrap 9 例、cli 测试与 HLint 通过。

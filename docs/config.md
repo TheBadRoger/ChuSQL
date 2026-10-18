@@ -8,6 +8,9 @@
 | --- | --- |
 | Windows | `%APPDATA%\ChuSQL\settings.toml` |
 | Linux / macOS | `$XDG_CONFIG_HOME/ChuSQL/settings.toml`；未设置时为 `~/.config/ChuSQL/settings.toml` |
+| Linux 系统级安装 | `/etc/chusql/settings.toml` |
+
+系统级安装（deb 软件包或安装器 `--system`）的配置固定为 `/etc/chusql/settings.toml`；该文件存在时，程序和客户端优先读取它，不再回落到 XDG 路径。
 
 `chusql-server`、`chusql-web` 和 `csql` 均可通过 `--config <path>` 临时指定其他配置文件。配置优先级为：**命令行参数 > 配置文件 > 内置默认值**。
 
@@ -105,6 +108,9 @@
 | 平台 | 数据目录 | 日志目录 |
 | --- | --- | --- |
 | Linux | `${XDG_DATA_HOME:-$HOME/.local/share}/chusql/data` | `${XDG_STATE_HOME:-$HOME/.local/state}/chusql/logs` |
+| Linux 系统级安装 | `/var/lib/chusql` | `/var/log/chusql` |
 | Windows | `%LOCALAPPDATA%\ChuSQL\data` | `%LOCALAPPDATA%\ChuSQL\logs` |
+
+系统级安装的配置文件属主为 `root:chusql`、权限 `0660`，数据与日志目录属主为 `chusql:chusql`、权限 `0750`。
 
 安装参数 `--data-dir` / `-DataDir` 可覆盖数据目录。安装目录与数据目录分别设置。

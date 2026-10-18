@@ -12,6 +12,7 @@
 
 - [在线安装](#在线安装)
 - [通过软件包源下载](#通过软件包源下载)
+- [apt 软件源](#apt-软件源)
 - [安装方式](#安装方式)
 - [包内安装](#包内安装)
 - [常用安装选项](#常用安装选项)
@@ -92,6 +93,29 @@ Expand-Archive chusql-windows-x86_64.zip
 
 `VERSION` 和 `$version` 是不带 `v` 前缀的版本号，例如 `26.10.2`。`--compressed` 保证服务器压缩传输时仍还原出原文件。校验值文件与包放在同一目录，先校验再解压。解压后按[包内安装](#包内安装)运行安装器。
 
+## apt 软件源
+
+ChuRepo 同时提供 Debian 软件包仓库，适用于 Debian、Ubuntu 及其衍生发行版。安装包把程序放到 `/usr/lib/chusql`，配置为 `/etc/chusql/settings.toml`，数据和日志分别在 `/var/lib/chusql`、`/var/log/chusql`，并注册系统级 `chusql-server.service`。
+
+```sh
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo curl -fsSL https://repo.chunana.cn/api/packages/ChuNa7a/debian/repository.key \
+  -o /etc/apt/keyrings/gitea-chuna7a.asc
+echo 'deb [signed-by=/etc/apt/keyrings/gitea-chuna7a.asc] https://repo.chunana.cn/api/packages/ChuNa7a/debian stable main' \
+  | sudo tee /etc/apt/sources.list.d/chusql.list
+sudo apt update
+sudo apt install chusql
+```
+
+首次安装会创建 `chusql` 服务账户，并生成管理员 `root` 的随机口令，保存在 `/etc/chusql/admin-password`（权限 `0600`）。用该口令登录，随后执行 `ALTER USER root PASSWORD '...'` 修改口令，再删除该文件：
+
+```sh
+sudo cat /etc/chusql/admin-password
+csql -u root
+```
+
+升级用 `sudo apt install --only-upgrade chusql`。卸载用 `sudo apt remove chusql`，保留数据与配置；`sudo apt purge chusql` 还会删除 `/var/lib/chusql`、`/var/log/chusql`、`/etc/chusql` 和服务账户。
+
 ## 安装方式
 
 ChuSQL 支持四种安装方式：
@@ -128,6 +152,18 @@ systemctl --user stop chusql-server.service
 journalctl --user -u chusql-server.service
 ```
 
+### Linux 系统级安装
+
+在 Linux 上以 root 运行安装脚本时，默认采用系统级安装：程序安装到 `/usr/lib/chusql`，配置写入 `/etc/chusql/settings.toml`，数据与日志分别在 `/var/lib/chusql`、`/var/log/chusql`。安装器创建 `chusql` 服务账户，注册系统级 `chusql-server.service`，并在 `/usr/bin` 下提供 `csql`、`csql-web` 和 `chusql-server`。
+
+```sh
+sudo ./install.sh --system --component both
+```
+
+选择 `cli` 或 `both` 时，安装器把管理员口令提示为 `csql-bootstrap` 的交互输入；系统级安装不修改 shell 的 `PATH`，也不使用 `loginctl enable-linger`。
+
+打包或测试时可加 `--prefix DIR`，把同一布局写入 `DIR` 并跳过服务账户与 systemd。该模式不要求 root，也不会改动系统目录。
+
 ## 包内安装
 
 发行包入口：[GitHub Releases](https://github.com/TheBadRoger/ChuSQL/releases) · [ChuRepo Releases](https://repo.chunana.cn/ChuNa7a/ChuSQL/releases) · [ChuRepo 软件包](https://repo.chunana.cn/ChuNa7a/-/packages/generic/chusql)。各站点的发行包需分别发布；若所选站点没有对应版本或平台的包，请切换站点、改用软件包源或从源码安装。
@@ -154,6 +190,8 @@ Windows：
 | `--user NAME` | `-RootUser` | 指定管理员账号名 |
 | `--no-start` | `-NoStart` | 安装后不自动启动服务 |
 | `--no-service` | — | 跳过 Linux 服务注册和开机启动 |
+| `--system` | — | 系统级安装（Linux，root 默认启用） |
+| `--prefix DIR` | — | 把系统级布局写入 DIR，跳过服务账户与 systemd |
 | `--version TAG` | `-Version` | 指定发行版本 |
 | `--list-versions` | `-ListVersions` | 列出可安装版本 |
 | `--from-source` | — | 从源码构建并安装 |
@@ -210,7 +248,9 @@ csql-web
 
 浏览器打开 <http://127.0.0.1:7778>。首次 SQL 验证见 [README 的启动步骤](../README.md#启动并验证)。
 
-只有使用 `--no-start` 或服务未运行时才需要启动数据库。Linux 用户服务使用 `systemctl --user start chusql-server.service`；未注册服务的环境运行 `chusql-server`。同一数据目录由单个服务进程使用。
+只有使用 `--no-start` 或服务未运行时才需要启动数据库。Linux 用户服务使用 `systemctl --user start chusql-server.service`；系统级安装使用 `sudo systemctl start chusql-server.service`；未注册服务的环境运行 `chusql-server`。同一数据目录由单个服务进程使用。
+
+系统级安装不在用户目录下留配置；配置文件为 `/etc/chusql/settings.toml`，管理员口令在首次安装时写入 `/etc/chusql/admin-password`。
 
 ## 更新
 
@@ -247,6 +287,8 @@ Windows：
 如需保留数据，可使用 `--keep-data`（Windows 为 `-KeepData`）；如需保留配置，可使用 `--keep-config`（Windows 为 `-KeepConfig`）。
 
 Linux 卸载时会停止服务、取消开机启动并移除服务文件。用户的 linger 设置保留，其他用户服务仍可使用它。
+
+系统级安装的卸载命令为 `sudo ./uninstall.sh --system`；加 `--keep-data` 或 `--keep-config` 可保留数据与配置。通过 deb 安装时使用 `sudo apt remove chusql` 或 `sudo apt purge chusql`，见 [apt 软件源](#apt-软件源)。
 
 ## 发布校验
 

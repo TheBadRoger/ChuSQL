@@ -86,6 +86,7 @@ usage = do
     putStrLn "usage: chusql-server [options]"
     putStrLn ""
     putStrLn "config: settings.toml sits at a fixed place and holds every knob;"
+    putStrLn "        system-wide install: /etc/chusql/settings.toml"
     putStrLn "        Windows: %APPDATA%\\ChuSQL\\settings.toml"
     putStrLn "        other:   $XDG_CONFIG_HOME/ChuSQL/settings.toml (or ~/.config/ChuSQL/settings.toml)"
     putStrLn "        [storage] data_dir/log_files; [server] listen_host/port/max_message/max_rows;"

@@ -1,11 +1,13 @@
 #!/bin/sh
-# 把发行包发布到 ChuRepo：创建发行版、上传资产与通用软件包。
+# 把发行包发布到 ChuRepo：创建发行版、上传资产、通用软件包与 Debian 软件包。
 # 用法：GITEA_TOKEN=... sh scripts/publish-gitea.sh v26.10.2 <发行包目录>
 set -eu
 
 REPO_API=${GITEA_REPO_API:-https://repo.chunana.cn/api/v1/repos/ChuNa7a/ChuSQL}
 PKG_API=${GITEA_PKG_API:-https://repo.chunana.cn/api/packages/ChuNa7a/generic/chusql}
 PKG_API_DELETE=${GITEA_PKG_DELETE_API:-$PKG_API}
+DEB_API=${GITEA_DEB_API:-https://repo.chunana.cn/api/packages/ChuNa7a/debian}
+DEB_POOL=${GITEA_DEB_POOL:-$DEB_API/pool/stable/main}
 NOTES_DIR=${GITEA_NOTES_DIR:-docs/releases}
 
 version=${1:?用法: publish-gitea.sh <vX.Y.Z> <发行包目录>}
@@ -13,6 +15,14 @@ dir=${2:?用法: publish-gitea.sh <vX.Y.Z> <发行包目录>}
 [ -n "${GITEA_TOKEN:-}" ] || { echo 'publish-gitea: 需要 GITEA_TOKEN' >&2; exit 1; }
 
 files='chusql-linux-x86_64.tar.gz chusql-linux-x86_64.tar.gz.sha256 chusql-windows-x86_64.zip chusql-windows-x86_64.zip.sha256'
+deb_name=''
+for candidate in "$dir"/chusql_*.deb; do
+	[ -f "$candidate" ] || continue
+	deb_name=$(basename "$candidate")
+done
+if [ -n "$deb_name" ]; then
+	files="$files $deb_name $deb_name.sha256"
+fi
 
 echo 'publish-gitea: 校验发行包'
 for f in $files; do
@@ -20,6 +30,9 @@ for f in $files; do
 done
 (cd "$dir" && sha256sum -c chusql-linux-x86_64.tar.gz.sha256 >/dev/null &&
 	sha256sum -c chusql-windows-x86_64.zip.sha256 >/dev/null)
+if [ -n "$deb_name" ]; then
+	(cd "$dir" && sha256sum -c "$deb_name.sha256" >/dev/null)
+fi
 
 # 调用 Gitea API
 api() {
@@ -91,6 +104,31 @@ for f in $files; do
 	[ "$code" = 201 ] || exit 1
 done
 
+if [ -n "$deb_name" ]; then
+	echo "publish-gitea: 上传 Debian 软件包 $deb_name"
+	deb_version=$(printf '%s' "$deb_name" | sed -e 's/^chusql_//' -e 's/_.*$//')
+	code=$(curl -sS -m 900 -o /dev/null -w '%{http_code}' -X PUT \
+		-H "Authorization: token $GITEA_TOKEN" \
+		-H 'Content-Type: application/vnd.debian.binary-package' \
+		--upload-file "$dir/$deb_name" "$DEB_POOL/upload")
+	echo "publish-gitea: Debian 软件包 $deb_version -> $code"
+	if [ "$code" = 409 ]; then
+		echo "publish-gitea: Debian 软件包已存在，替换"
+		curl -sS -m 60 -o /dev/null -w '' -X DELETE \
+			-H "Authorization: token $GITEA_TOKEN" \
+			"$DEB_POOL/chusql/$deb_version/amd64"
+		code=$(curl -sS -m 900 -o /dev/null -w '%{http_code}' -X PUT \
+			-H "Authorization: token $GITEA_TOKEN" \
+			-H 'Content-Type: application/vnd.debian.binary-package' \
+			--upload-file "$dir/$deb_name" "$DEB_POOL/upload")
+		echo "publish-gitea: Debian 软件包 $deb_version -> $code"
+	fi
+	[ "$code" = 201 ] || exit 1
+fi
+
 echo "publish-gitea: 完成"
 echo "  发行版: https://repo.chunana.cn/ChuNa7a/ChuSQL/releases/tag/$version"
 echo "  软件包: https://repo.chunana.cn/ChuNa7a/-/packages/generic/chusql/$pkg_version"
+if [ -n "$deb_name" ]; then
+	echo "  apt 源: deb [signed-by=/etc/apt/keyrings/gitea-chuna7a.asc] https://repo.chunana.cn/api/packages/ChuNa7a/debian stable main"
+fi

@@ -38,6 +38,12 @@ usage: ./install.sh [--component web|cli|both] [options]
                           read from stdin (one per line)
   --install-dir DIR       where to install   (default: $HOME/.local/share/chusql)
   --data-dir DIR          where to keep data (default: XDG data directory)
+  --system                install system-wide: /usr/lib/chusql, /etc/chusql,
+                          /var/lib/chusql, /var/log/chusql, a "chusql" service
+                          account and a systemd unit; the default when running
+                          as root on Linux
+  --prefix DIR            with --system: put the same layout under DIR and skip
+                          the service account and systemd (packaging and tests)
   --user NAME             administrator name (default: root)
   --keep-package          do not delete the downloaded/extracted package
   --password VALUE        password of the administrator account (required when
@@ -88,6 +94,8 @@ from_source='no'
 source_dir=''
 list_versions='no'
 interactive_flag='no'
+system_mode='no'
+prefix=''
 want_web='no'
 want_cli='no'
 
@@ -107,6 +115,8 @@ while [ $# -gt 0 ]; do
         --version) version="${2:-}"; shift 2 ;;
         --list-versions) list_versions='yes'; shift ;;
         --interactive) interactive_flag='yes'; shift ;;
+        --system) system_mode='yes'; shift ;;
+        --prefix) prefix="${2:-}"; shift 2 ;;
         --from-source) from_source='yes'; shift ;;
         --source-dir) source_dir="${2:-}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
@@ -178,8 +188,30 @@ case "$self" in
     *) script_dir=$(CDPATH= cd -- "$(dirname -- "$self")" 2>/dev/null && pwd) || script_dir='' ;;
 esac
 
-[ -n "$install_dir" ] || install_dir="$HOME/.local/share/chusql"
-config_file="${XDG_CONFIG_HOME:-$HOME/.config}/ChuSQL/settings.toml"
+# 系统级安装：root 在 Linux 上默认走系统目录；--prefix 把同一布局放进别的根
+if [ "$system_mode" = 'no' ] && [ "$list_versions" = 'no' ] && [ "$(id -u)" = '0' ] && [ "$(uname -s)" = 'Linux' ]; then
+    system_mode='yes'
+fi
+while [ "${prefix%/}" != "$prefix" ]; do prefix="${prefix%/}"; done
+[ -n "$prefix" ] || prefix='/'
+case "$prefix" in
+    /*) ;;
+    *) prefix="$PWD/$prefix" ;;
+esac
+if [ "$system_mode" = 'yes' ]; then
+    if [ "$(id -u)" != '0' ] && [ "$prefix" = '/' ]; then
+        fail 'a system-wide install needs root; pass --prefix DIR to stage the layout elsewhere'
+    fi
+    service_user="${CHUSQL_SERVICE_USER:-chusql}"
+    [ -n "$install_dir" ] || install_dir="$prefix/usr/lib/chusql"
+    config_file="$prefix/etc/chusql/settings.toml"
+    [ -n "$data_dir" ] || data_dir="$prefix/var/lib/chusql"
+    log_dir="$prefix/var/log/chusql"
+    service_file="$prefix/etc/systemd/system/chusql-server.service"
+else
+    [ -n "$install_dir" ] || install_dir="$HOME/.local/share/chusql"
+    config_file="${XDG_CONFIG_HOME:-$HOME/.config}/ChuSQL/settings.toml"
+fi
 if [ "$list_versions" = 'no' ] && [ -f "$config_file" ]; then
     requested_data_dir=$data_dir
     data_dir=$(awk '/^[[:space:]]*\[storage\]/ { storage=1; next } /^[[:space:]]*\[/ { storage=0 } storage && /^[[:space:]]*data_dir[[:space:]]*=[[:space:]]*"[^"\\]*"[[:space:]]*(#.*)?$/ { sub(/^[^=]*=[[:space:]]*"/, ""); sub(/"[[:space:]]*(#.*)?$/, ""); print; exit }' "$config_file")
@@ -192,8 +224,10 @@ if [ "$list_versions" = 'no' ] && [ -f "$config_file" ]; then
             fail 'existing settings.toml: edit its data_dir instead of passing a different --data-dir'
     fi
 fi
-[ -n "$data_dir" ] || data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/chusql/data"
-log_dir="${XDG_STATE_HOME:-$HOME/.local/state}/chusql/logs"
+if [ "$system_mode" = 'no' ]; then
+    [ -n "$data_dir" ] || data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/chusql/data"
+    log_dir="${XDG_STATE_HOME:-$HOME/.local/state}/chusql/logs"
+fi
 
 # ---- 交互：先确定答案从哪来 ----
 # 管道安装（curl ... | sh -s --）时 stdin 是脚本本身，所以优先开 /dev/tty；
@@ -719,12 +753,24 @@ echo "  root user  $root_user (password asked above, kept out of settings.toml)"
 
 # ---- 释放文件 ----
 # 包是合在一起的（web 和 cli 都在），这里按这次的选择逐个释放：没选的组件不落地
-service_file="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/chusql-server.service"
 use_service='no'
-if [ "$(uname -s)" = 'Linux' ] && [ "$no_service" = 'no' ]; then
+ctl='systemctl'
+if [ "$system_mode" = 'yes' ]; then
+    if [ "$no_service" = 'no' ] && [ "$prefix" = '/' ]; then
+        command -v systemctl >/dev/null 2>&1 || fail 'systemd is required; use --no-service to opt out'
+        use_service='yes'
+        if [ -f "$service_file" ]; then
+            systemctl stop chusql-server.service 2>/dev/null || true
+        fi
+    elif [ "$prefix" != '/' ]; then
+        note '--prefix: systemd registration skipped; register the unit yourself'
+    fi
+elif [ "$(uname -s)" = 'Linux' ] && [ "$no_service" = 'no' ]; then
+    service_file="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/chusql-server.service"
+    ctl='systemctl --user'
     command -v systemctl >/dev/null 2>&1 || fail 'systemd is required; use --no-service to opt out'
     command -v loginctl >/dev/null 2>&1 || fail 'loginctl is required for boot autostart'
-    systemctl --user show-environment >/dev/null || fail 'cannot connect to user systemd; run in a login session or use --no-service'
+    $ctl show-environment >/dev/null || fail 'cannot connect to user systemd; run in a login session or use --no-service'
     os_user=$(id -un)
     linger=$(loginctl show-user "$os_user" -p Linger --value) || fail 'cannot query boot autostart for this OS user'
     if [ "$linger" != 'yes' ]; then
@@ -732,7 +778,7 @@ if [ "$(uname -s)" = 'Linux' ] && [ "$no_service" = 'no' ]; then
     fi
     use_service='yes'
     if [ -f "$service_file" ]; then
-        systemctl --user stop chusql-server.service || fail 'cannot stop the existing service'
+        $ctl stop chusql-server.service || fail 'cannot stop the existing service'
     fi
 fi
 # 停止安装目录中的进程，避免更新运行中的文件。
@@ -752,6 +798,15 @@ stop_installed() {
         done
     done
 }
+if [ "$system_mode" = 'yes' ]; then
+    step 'Preparing the system layout'
+    if [ "$prefix" = '/' ] && ! getent group "$service_user" >/dev/null 2>&1; then
+        command -v adduser >/dev/null 2>&1 || fail 'adduser is required to create the service account'
+        adduser --system --group --no-create-home --home "$data_dir" --shell /usr/sbin/nologin "$service_user" >/dev/null ||
+            fail "cannot create the service account $service_user"
+    fi
+    mkdir -p "$prefix/usr/bin" "$prefix/etc/chusql"
+fi
 step 'Installing files'
 mkdir -p "$install_dir/bin" "$log_dir" "$data_dir"
 install_dir=$(CDPATH= cd -- "$install_dir" && pwd -P)
@@ -786,8 +841,7 @@ fi
 
 # ---- 写全局配置 ----
 step 'Writing settings.toml'
-config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ChuSQL"
-config_file="$config_dir/settings.toml"
+config_dir=$(dirname -- "$config_file")
 mkdir -p "$config_dir"
 config_dir=$(CDPATH= cd -- "$config_dir" && pwd)
 config_file="$config_dir/settings.toml"
@@ -815,6 +869,13 @@ bootstrap="$install_dir/bin/csql-bootstrap"
 [ -n "$admin_password" ] || fail 'the administrator password is required'
 ( cd "$install_dir" && printf '%s\n' "$admin_password" | "$bootstrap" --config "$config_file" --user "$root_user" --password-stdin ) ||
     fail 'the bootstrap program failed; identities or preinstalled types are not ready'
+if [ "$system_mode" = 'yes' ] && [ "$prefix" = '/' ]; then
+    chown -R "$service_user:$service_user" "$data_dir" "$log_dir"
+    chmod 0750 "$data_dir" "$log_dir"
+    chown root:"$service_user" "$config_dir" "$config_file"
+    chmod 0750 "$config_dir"
+    chmod 0660 "$config_file"
+fi
 
 # ---- 命令入口 ----
 step 'Creating commands'
@@ -833,7 +894,20 @@ EOF
     chmod +x "$install_dir/csql"
 fi
 
+if [ "$system_mode" = 'yes' ]; then
+    if [ "$want_cli" = 'yes' ]; then ln -sf "$install_dir/bin/csql" "$prefix/usr/bin/csql"; else rm -f "$prefix/usr/bin/csql"; fi
+    if [ "$want_web" = 'yes' ]; then ln -sf "$install_dir/csql-web.sh" "$prefix/usr/bin/csql-web"; else rm -f "$prefix/usr/bin/csql-web"; fi
+    ln -sf "$install_dir/bin/chusql-server" "$prefix/usr/bin/chusql-server"
+fi
+
 # ---- 环境变量 ----
+if [ "$system_mode" = 'yes' ]; then
+    step 'Linking commands'
+    system_commands='chusql-server'
+    if [ "$want_cli" = 'yes' ]; then system_commands="csql $system_commands"; fi
+    if [ "$want_web" = 'yes' ]; then system_commands="csql-web $system_commands"; fi
+    note "commands: $system_commands (in $prefix/usr/bin)"
+else
 step 'Updating PATH'
 profile="$HOME/.profile"
 marker='# ChuSQL'
@@ -848,6 +922,7 @@ fi
     echo "export PATH"
 } >> "$profile"
 echo "added $install_dir to PATH in $profile (login again or: . \"$profile\")"
+fi
 
 # ---- 删掉安装包 ----
 if [ "$keep_package" = 'no' ]; then
@@ -884,13 +959,22 @@ if [ "$use_service" = 'yes' ]; then
     unit_quote() {
         printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g'
     }
+    if [ "$system_mode" = 'yes' ]; then
+        service_identity="User=$service_user
+Group=$service_user
+"
+        unit_target='multi-user.target'
+    else
+        service_identity=''
+        unit_target='default.target'
+    fi
     cat > "$service_file" <<EOF
 [Unit]
 Description=ChuSQL database server
 
 [Service]
 Type=simple
-WorkingDirectory=$(printf '%s' "$install_dir" | sed 's/%/%%/g')
+${service_identity}WorkingDirectory=$(printf '%s' "$install_dir" | sed 's/%/%%/g')
 ExecStart=:"$(unit_quote "$server_bin")" --config "$(unit_quote "$config_file")" --user "$(unit_quote "$root_user")"
 Restart=on-failure
 RestartSec=5
@@ -898,16 +982,16 @@ StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=default.target
+WantedBy=$unit_target
 EOF
-    systemctl --user daemon-reload || fail 'cannot reload systemd units'
-    systemctl --user enable chusql-server.service || fail 'cannot enable boot autostart'
+    $ctl daemon-reload || fail 'cannot reload systemd units'
+    $ctl enable chusql-server.service || fail 'cannot enable boot autostart'
     if [ "$no_start" = 'yes' ]; then
         note '--no-start: boot autostart enabled; the server was not started'
     else
-        systemctl --user restart chusql-server.service || fail 'cannot start chusql-server.service'
+        $ctl restart chusql-server.service || fail 'cannot start chusql-server.service'
         sleep 1
-        systemctl --user is-active --quiet chusql-server.service || fail 'the server stopped; run journalctl --user -u chusql-server.service'
+        $ctl is-active --quiet chusql-server.service || fail 'the server stopped; run journalctl -u chusql-server.service'
         note 'server running under systemd'
     fi
 elif [ "$no_start" = 'yes' ]; then
@@ -935,7 +1019,11 @@ if [ "$want_cli" = 'yes' ]; then
 fi
 echo "  start with   $start_with"
 echo "  tcp server   $server_bin (listens on [server] listen_host/port, defaults 127.0.0.1:7777)"
-if [ "$use_service" = 'yes' ]; then
+if [ "$use_service" = 'yes' ] && [ "$system_mode" = 'yes' ]; then
+    echo "  service      chusql-server.service (system-wide, boot autostart enabled)"
+    echo "  manage       systemctl status|start|stop|restart chusql-server.service"
+    echo "  logs         journalctl -u chusql-server.service"
+elif [ "$use_service" = 'yes' ]; then
     echo '  service      chusql-server.service (boot autostart enabled)'
     echo '  manage       systemctl --user status|start|stop|restart chusql-server.service'
     echo '  logs         journalctl --user -u chusql-server.service'
