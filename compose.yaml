@@ -5,6 +5,8 @@ services:
     image: ${CHUSQL_IMAGE:-chusql:local}
     build:
       context: .
+      args:
+        CHUSQL_VERSION: ${CHUSQL_VERSION:-26.10.2}
     init: true
     restart: unless-stopped
     stop_grace_period: 30s

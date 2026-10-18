@@ -100,15 +100,21 @@ def conflict(port, password):
     try:
         for client in (first, second):
             client.sql("BEGIN")
-            client.sql("UPDATE counters SET value = value + 1 WHERE id = 1")
-        first.sql("COMMIT")
+        first.sql("UPDATE counters SET value = value + 1 WHERE id = 1")
         try:
-            second.sql("COMMIT")
+            second.sql("UPDATE counters SET value = value + 1 WHERE id = 1")
         except QueryError as error:
-            assert error.reply["code"] == "serialization_failure", error.reply
+            assert error.reply["code"] == "lock_timeout", error.reply
             second.sql("ROLLBACK")
         else:
-            raise AssertionError("conflicting update unexpectedly committed")
+            first.sql("COMMIT")
+            try:
+                second.sql("COMMIT")
+            except QueryError as error:
+                assert error.reply["code"] == "serialization_failure", error.reply
+                second.sql("ROLLBACK")
+            else:
+                raise AssertionError("conflicting update unexpectedly committed")
         assert first.sql("SELECT value FROM counters WHERE id = 1")["rows"] == [[1]]
         first.sql("UPDATE counters SET value = 0 WHERE id = 1")
     finally:
@@ -126,16 +132,19 @@ def workload(port, password, seconds, stop, acknowledged, lock, worker):
         while not stop.is_set() and time.monotonic() < deadline:
             sequence += 1
             identity = worker * 1_000_000 + sequence
-            client.sql("BEGIN")
-            client.sql(f"INSERT INTO events (id, actor) VALUES ({identity}, {worker})")
-            client.sql("UPDATE counters SET value = value + 1 WHERE id = 1")
             try:
+                client.sql("BEGIN")
+                client.sql(f"INSERT INTO events (id, actor) VALUES ({identity}, {worker})")
+                client.sql("UPDATE counters SET value = value + 1 WHERE id = 1")
                 client.sql("COMMIT")
             except QueryError as error:
-                if error.reply["code"] != "serialization_failure":
+                if error.reply["code"] not in ("serialization_failure", "lock_timeout"):
                     raise
                 conflicts += 1
-                client.sql("ROLLBACK")
+                try:
+                    client.sql("ROLLBACK")
+                except QueryError:
+                    pass
                 continue
             with lock:
                 acknowledged.add(identity)

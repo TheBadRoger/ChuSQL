@@ -136,7 +136,7 @@
 - 验证文章查阅口令完整 PHC、撤销版本及管理审计持久化，文章索引重建不覆盖隐藏 / 删除 / 精华等权威状态；仅获文章索引表权限的数据库账号不能读口令哈希或改管理状态，关闭连接后的查询明确失败。HTTP / SSH / 文件访问授权仍由博客实现。
 - 标量索引键默认支持 128 字节，实际上限按页容量及分支数计算；真实驱动验证 113 字节文章键，Rust 回归覆盖 128 字节键跨页 / 重启、旧 64 字节头无写打开及首次长键升级、密集旧配置边界与超限写前拒绝。无正文或长行存储改动。
 - examples/blog/test-business.py 以真实本机服务和 ChuBlog 固定 Rust 驱动完成 seed、重启 verify 及停机备份副本 verify，账户哈希、授权版本、评论、互动计数及审计均保留；临时业务目录和副本自动清理。日志为 logs/blog-business-driver.log。
-- Dockerfile 的 Debian 源改为 http://mirrors.tencentyun.com，按用户要求未验证或重建镜像；既有 Docker 验收结果只适用于上节固定镜像。接入方式及应用边界见 docs/blog-database.md。
+- Dockerfile 的 Debian 源改为 http://mirrors.tencentyun.com，按用户要求未验证或重建镜像；既有 Docker 验收结果只适用于上节固定镜像。博客业务接入文档已按用户要求删除。
 
 ### 行版本、并发与在线迁移
 
@@ -173,3 +173,19 @@
 - 新增 `scripts/package-deb.sh`，用 `dpkg-deb` 从发行包或目录装配 `.deb`：控制字段与 `Depends` 按实测动态库填写，`/etc/chusql/settings.toml` 为 conffile，postinst 建账户与目录并在首次安装生成随机管理员口令（`/etc/chusql/admin-password`，0600），prerm 停服务，postrm purge 清理数据、日志、配置与账户。
 - 本机实测 `dpkg -i` 后服务 active、`csql` 用 `/etc/chusql/admin-password` 登录并建库建表查询通过，`apt purge` 后目录与账户全部清除。`release.yml` 的 Linux 作业新增 deb 构建、校验与 artifact，`linux.yml` 测试阶段新增 `scripts/test-deb-package.py`；`scripts/publish-gitea.sh` 增加 deb 发布到 Gitea Debian registry（`stable`/`main`，409 先删后传）。
 - `scripts/test-linux-lifecycle.py` 新增系统级暂存安装与卸载用例；文档新增 `docs/install.md` 的 apt 软件源、系统级安装与卸载说明，以及 `docs/config.md` 的系统级路径与权限。web 测试 83 例 2 失败均为缺少 Node.js 的环境用例；server 184 例、bootstrap 9 例、cli 测试与 HLint 通过。
+
+### Docker 镜像改用 deb 与安装文档整理
+
+- 容器镜像由源码多阶段构建改为 `debian:bookworm-slim` 单阶段：从 ChuRepo Debian registry 用 `apt-get install chusql` 安装，构建参数 `BASE_REGISTRY`（默认 `docker.m.daocloud.io`）、`DEBIAN_MIRROR`（默认 `http://mirrors.aliyun.com`）、`CHUSQL_APT_BASE`、`CHUSQL_VERSION` 控制来源与版本；预建 uid/gid 10001 的 `chusql` 用户，安装后清空数据目录与口令文件，命名卷仍是首次启动时初始化。
+- deb 增加 `/usr/bin/{csql,csql-bootstrap,csql-web,chusql-server,chusql-web}` 入口，容器 entrypoint 直接调用这些命令；`scripts/test-deb-package.py` 同步断言。
+- 镜像实测构建成功，`Config.User` 为 10001:10001，服务 healthy，`csql` 查询与 Web 健康检查通过；`docker/test-runtime.py` 的冲突事务、15 秒负载、SIGKILL 恢复、ENOSPC、幂等引导、冷备份恢复全部通过，镜像约 51 MiB。
+- 运行验收把行锁等待超时与序列化失败都视为可重试冲突：引擎等待 5 秒后中止事务，这是既有的 MVCC 语义，本地非镜像构建同样复现。
+- `docs/docker.md` 按 deb 镜像重写；README 快速开始新增 Debian/Ubuntu 的 apt 安装并去掉博客接入段落与导航行；`docs/install.md` 安装方式改为五种并列出 apt 软件源；按用户要求删除 `docs/blog-database.md`，上下文中的引用一并更正。
+- 校验：Documentation 2 例、Installer scripts 12 例通过，注释门禁 118 文件、2210 条函数注释、问题 0，shell 与 Python 语法检查通过；测试镜像与构建缓存已清理。
+
+### 文档整理与发布说明简化
+
+- README、`docs/install.md`、`docs/docker.md` 重写：快速开始只保留一种最快安装方式，删掉测试与验证结果叙述，约束改为正面描述。
+- 发布说明归入 `docs/releases/`，去掉与发布页标题重复的一级标题；`v26.10.1` 从 tag 历史还原。
+- 重写 `docs/config.md`、`bootstrap.md`、`commands.md`、`users-and-roles.md`、`types.md`、`syntax.md`、`performance.md`、`architecture.md`，保留既有锚点与事实表格。
+- 链接与锚点检查覆盖 13 个 Markdown 文件 0 问题；Documentation 门禁 2 例通过。

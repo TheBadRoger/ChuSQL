@@ -58,7 +58,7 @@ def main():
         assert (tree / "usr/lib/chusql/bin/chusql-server").is_file()
         assert (tree / "usr/lib/chusql/csql-web.sh").is_file()
         assert os.access(tree / "usr/lib/chusql/bin/chusql-server", os.X_OK)
-        for name in ("csql", "csql-web", "chusql-server"):
+        for name in ("csql", "csql-bootstrap", "csql-web", "chusql-server", "chusql-web"):
             link = tree / "usr/bin" / name
             assert link.is_symlink(), f"missing /usr/bin/{name} link"
             assert link.resolve(strict=False).is_file(), f"broken /usr/bin/{name} link"

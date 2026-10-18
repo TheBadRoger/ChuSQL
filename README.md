@@ -9,60 +9,32 @@
   <br>
 </p>
 
-ChuSQL 是一个用 Haskell 和 Rust 编写的数据库，提供命令行客户端和 Web 管理界面。本页帮助你安装并启动客户端；SQL 写法和内部设计见文末的文档导航。
+ChuSQL 是一个用 Haskell 和 Rust 编写的数据库，提供命令行客户端和 Web 管理界面。本页帮助你完成安装、启动并执行第一条查询；SQL 语法和内部设计见文末的文档导航。
 
-你可以用 SQL 查询和修改数据、通过事务提交或回滚修改，以及管理用户与角色。数据库还支持命名枚举（ENUM）和自定义类型（DOMAIN），并通过预写日志（WAL）在崩溃后恢复已提交的数据。
+你可以用 SQL 查询和修改数据，通过事务提交或回滚修改，并管理用户与角色。数据库支持命名枚举（ENUM）和自定义类型（DOMAIN），并通过预写日志（WAL）在崩溃后恢复已提交的数据。
 
-项目仓库：[GitHub](https://github.com/TheBadRoger/ChuSQL) · [ChuRepo](https://repo.chunana.cn/ChuNa7a/ChuSQL)。两处均可获取源码，按网络情况选择。
+项目仓库：[GitHub](https://github.com/TheBadRoger/ChuSQL) · [ChuRepo](https://repo.chunana.cn/ChuNa7a/ChuSQL)。
 
 ## 快速开始
 
-按操作系统选择安装命令，再启动命令行客户端或 Web 界面。
-
-### 安装
-
-选择要安装的组件：`web` 安装 Web 管理端，`cli` 安装命令行客户端，`both` 同时安装。以下示例使用 `both`，便于完成后面的 SQL 验证。安装时需设置管理员口令；Linux 默认注册 systemd 用户服务，其他环境见[安装前提](docs/install.md#安装方式)。
-
-Linux / macOS，下载脚本并安装：
+在 Linux 或 macOS 的终端运行安装脚本：
 
 ```sh
-(curl -fsSL --connect-timeout 10 \
-  https://raw.githubusercontent.com/TheBadRoger/ChuSQL/main/scripts/install.sh -o install.sh ||
- curl -fsSL --connect-timeout 10 \
-  https://repo.chunana.cn/ChuNa7a/ChuSQL/raw/branch/main/scripts/install.sh -o install.sh) &&
+curl -fsSL https://raw.githubusercontent.com/TheBadRoger/ChuSQL/main/scripts/install.sh -o install.sh &&
 sh install.sh --component both
 ```
 
-Windows：在 PowerShell 中下载并执行安装脚本。
-
-```powershell
-try {
-    irm https://raw.githubusercontent.com/TheBadRoger/ChuSQL/main/scripts/install.ps1 -OutFile "$env:TEMP\install.ps1" -TimeoutSec 60 -ErrorAction Stop
-} catch {
-    irm https://repo.chunana.cn/ChuNa7a/ChuSQL/raw/branch/main/scripts/install.ps1 -OutFile "$env:TEMP\install.ps1" -TimeoutSec 60 -ErrorAction Stop
-}
-& "$env:TEMP\install.ps1" -Component both
-```
-
-首组命令优先从 GitHub 下载脚本，失败后尝试 ChuRepo。安装脚本在查询版本或下载发行包失败时，也会尝试 ChuRepo，并保持已选定的版本。校验失败时直接报错。
-
-两站均无对应发行包时，使用包内安装或源码安装。显式指定其他仓库或归档 URL 时，安装器使用指定来源。详细步骤见[安装与卸载](docs/install.md)。
-
-### Docker 部署
-
-已提供 Dockerfile 和 Compose 配置，可启动数据库并按需启用 Web。首次运行先创建管理员口令文件，再构建和启动；步骤与资源限制见 [Docker 部署](docs/docker.md)。
-
-博客接入的数据模型、事务、迁移与验收步骤见[博客业务数据库接入](docs/blog-database.md)。
+脚本安装数据库、命令行客户端和 Web 管理端，中途提示设置管理员口令。Windows、apt 软件源、离线安装包和容器部署见[安装与卸载](docs/install.md)。
 
 ### 启动并验证
 
-安装器默认已启动数据库服务。已安装 CLI 时，运行以下命令并用安装时设置的管理员口令登录：
+安装完成后，运行客户端并用管理员口令登录：
 
 ```sh
 csql
 ```
 
-登录后依次执行以下 SQL，创建独立的示例库并验证写入和查询。`chusql_demo` 必须是尚未使用的数据库名：
+登录后执行以下 SQL，创建示例库并验证读写：
 
 ```sql
 CREATE DATABASE chusql_demo;
@@ -72,15 +44,15 @@ INSERT INTO notes (id, title) VALUES (1, 'Hello ChuSQL');
 SELECT id, title FROM notes ORDER BY id;
 ```
 
-查询应返回一行，`id` 为 `1`、`title` 为 `Hello ChuSQL`。示例数据会保留；确认无需保留后可执行 `DROP DATABASE chusql_demo;`。数据库连接失败时先检查服务状态，见[安装完成后](docs/install.md#安装完成后)。
+查询返回一行，`id` 为 `1`，`title` 为 `Hello ChuSQL`。示例库可以保留，也可以用 `DROP DATABASE chusql_demo;` 删除。
 
-已安装 Web 组件时，运行以下命令启动 Web 界面：
+安装 Web 管理端时，另开终端启动：
 
 ```sh
 csql-web
 ```
 
-启动后，在浏览器中打开 <http://127.0.0.1:7778>。监听地址和端口的修改方法见[配置选项](docs/config.md)。
+浏览器打开 <http://127.0.0.1:7778>。监听地址和端口的修改方法见[配置选项](docs/config.md)。
 
 ## 文档导航
 
@@ -88,7 +60,6 @@ csql-web
 
 | 任务 | 文档 |
 | --- | --- |
-| 接入博客业务数据 | [博客业务数据库接入](docs/blog-database.md) |
 | 用容器部署和备份 | [Docker 部署](docs/docker.md) |
 | 安装、更新或卸载 | [安装与卸载](docs/install.md) |
 | 修改端口、路径等设置 | [配置选项](docs/config.md) |

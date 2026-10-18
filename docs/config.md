@@ -2,25 +2,17 @@
 
 [← 返回 README](../README.md)
 
-本页帮助你查找配置项、修改监听端口和数据路径。ChuSQL 使用统一配置文件 `settings.toml`，默认位置如下：
+本页帮助你查找配置项，并修改监听端口、数据路径和访问限制。ChuSQL 使用统一配置文件 `settings.toml`，默认位置如下：
 
 | 平台 | 路径 |
 | --- | --- |
 | Windows | `%APPDATA%\ChuSQL\settings.toml` |
-| Linux / macOS | `$XDG_CONFIG_HOME/ChuSQL/settings.toml`；未设置时为 `~/.config/ChuSQL/settings.toml` |
+| Linux / macOS | `$XDG_CONFIG_HOME/ChuSQL/settings.toml`，默认 `~/.config/ChuSQL/settings.toml` |
 | Linux 系统级安装 | `/etc/chusql/settings.toml` |
 
-系统级安装（deb 软件包或安装器 `--system`）的配置固定为 `/etc/chusql/settings.toml`；该文件存在时，程序和客户端优先读取它，不再回落到 XDG 路径。
+系统级安装（deb 软件包或安装器 `--system`）使用 `/etc/chusql/settings.toml`；该文件存在时，程序和客户端优先读取它，其余情况读取 XDG 路径。
 
-`chusql-server`、`chusql-web` 和 `csql` 均可通过 `--config <path>` 临时指定其他配置文件。配置优先级为：**命令行参数 > 配置文件 > 内置默认值**。
-
-本页内容：
-
-- [存储配置](#存储配置)
-- [Web 配置](#web-配置)
-- [Server 配置](#server-配置)
-- [账号与安全](#账号与安全)
-- [修改配置](#修改配置)
+`chusql-server`、`chusql-web` 和 `csql` 都可以用 `--config <path>` 临时指定其他配置文件。配置优先级为：**命令行参数 > 配置文件 > 内置默认值**。
 
 ## 存储配置
 
@@ -33,7 +25,7 @@
 | `[storage] log_files` | 安装时填写平台日志目录 | 诊断日志目录；WAL 位于数据库目录 |
 | `[log] level` | `info` | 日志级别 |
 
-正常运行时数据目录由 `chusql-server` 访问，离线初始化与修复由 `csql-bootstrap` 访问。安装器填写绝对路径，日志目录由启动器与安装脚本使用。
+正常运行时数据目录由 `chusql-server` 访问，离线初始化与修复由 `csql-bootstrap` 访问。安装器写入绝对路径，启动器和安装脚本共用日志目录。
 
 ## Web 配置
 
@@ -43,7 +35,7 @@
 | --- | --- | --- |
 | `port` | `7778` | Web 服务端口 |
 | `listen_host` | `127.0.0.1` | Web 服务监听地址 |
-| `cookie_secure` | `false` | HTTPS 部署时应启用 |
+| `cookie_secure` | `false` | HTTPS 部署时设为 `true` |
 | `body_limit` | `65536` | 请求体大小上限（字节） |
 | `session_idle` | `28800` | 会话空闲超时（秒） |
 | `session_max` | `86400` | 会话最大存活时间（秒） |
@@ -56,7 +48,7 @@
 | `password_min_length` | `12` | 普通账号最短口令长度 |
 | `password_classes` | `2` | 口令至少包含的字符类别数 |
 
-静态资源目录固定为安装目录下的 `static`。管理员账号名由启动参数 `--user` 指定，默认为 `root`；这两项分别由安装目录和启动参数决定。
+静态资源目录是安装目录下的 `static`，管理员账号名由启动参数 `--user` 指定，默认为 `root`。
 
 ## Server 配置
 
@@ -69,39 +61,21 @@
 | `max_message` | `1048576` | 单条请求最大大小（字节） |
 | `max_rows` | `1000` | 单次查询最大返回行数 |
 
-本机 sudo 认证额外使用 `[server] sudo_auth_user`，默认空字符串，表示关闭。设置为一个已启用 `ALLOW_SUDO_AUTH` 的数据库身份后，必须以 Unix root 或 Windows 提升后的管理员运行 `chusql-server`。
-
-这是明确的本机身份映射，与启动参数 `--user` 和最高权限属性分别设置。配置变更后重启服务生效，此项通过配置文件管理。操作步骤见 [用户与角色](users-and-roles.md#本机-sudo-认证)。
-
-> [!NOTE]
-> 修改 Server 配置后须重启 `chusql-server`。sudo 映射默认关闭，启用时还须满足身份属性和操作系统提升要求。
+本机 sudo 认证使用 `[server] sudo_auth_user`，默认空字符串，表示关闭。把它设置为一个已启用 `ALLOW_SUDO_AUTH` 的数据库身份后，`chusql-server` 需要以 Unix root 或 Windows 提升后的管理员运行。这项映射独立于启动参数 `--user` 和最高权限属性，修改配置后重启服务生效。操作步骤见 [用户与角色](users-and-roles.md#本机-sudo-认证)。
 
 ## 账号与安全
 
-账号口令保存在系统数据库中。管理员口令在安装或系统引导时设置，之后可通过 SQL 或 Web 管理界面修改。
+账号口令保存在系统数据库中。管理员口令在安装或系统引导时设置，之后通过 SQL 或 Web 管理界面修改。系统目录未初始化时，`chusql-server` 拒绝启动并提示运行 `csql-bootstrap`。
 
-系统目录未完成初始化时，`chusql-server` 将拒绝启动并提示运行 `csql-bootstrap`。
-
-对外部署时建议：
-
-- 数据库服务仅监听受控网络接口；
-- Web 服务通过 HTTPS 或反向代理提供；
-- HTTPS 环境启用 `cookie_secure`。
+对外部署时建议让数据库服务只监听受控网络接口，Web 服务通过 HTTPS 或反向代理提供，HTTPS 环境把 `cookie_secure` 设为 `true`。
 
 ## 修改配置
 
-配置可通过以下方式修改：
+配置文件可以直接编辑，也可以通过 Web 设置页面修改。修改后重启对应服务，并检查监听地址、端口和登录结果。Docker 的启动配置只读挂载，修改宿主文件后重新创建服务，见 [Docker 配置](docker.md#配置端口目录与资源)。
 
-- 直接编辑 `settings.toml`。
-- 通过 Web 设置页面修改。
+迁移数据目录时，先停止相关进程，再完整复制数据目录并更新 `data_dir`，保留原目录备份，启动后检查业务数据。已有数据的 `page.size` 和 `btree.order` 保持原值，磁盘格式转换使用专门的迁移流程。
 
-修改后重启对应服务，并检查监听地址、端口和登录结果。Docker 的启动配置只读挂载，需修改宿主文件后重新创建服务，见 [Docker 配置](docker.md#配置端口目录与资源)。
-
-迁移数据目录时，先停止相关进程，再完整复制数据目录并更新 `data_dir`；保留原目录备份，启动后检查业务数据。已有数据的 `page.size` 和 `btree.order` 须保持原值；磁盘格式转换需专门的迁移流程。
-
-安装器选择 `resources/settings.toml.linux` 或 `resources/settings.toml.windows`，填入当前用户的绝对路径后释放为 `settings.toml`。两份模板逐项提供英文注释。
-
-安装时加 `--low-performance-adapted`（Windows 为 `-LowPerformanceAdapted`），安装器会把 `resources/settings.low-performance.toml` 中的参数值覆盖进新写的 `settings.toml`；已有配置文件不会被改写。
+安装器从 `resources/settings.toml.linux` 或 `resources/settings.toml.windows` 模板填入当前用户的绝对路径，写为 `settings.toml`；模板逐项提供英文注释。安装时加 `--low-performance-adapted`（Windows 为 `-LowPerformanceAdapted`），安装器会把 `resources/settings.low-performance.toml` 中的参数值覆盖进新写的 `settings.toml`，已有配置文件保持不变。
 
 默认数据和日志路径如下：
 
@@ -111,6 +85,4 @@
 | Linux 系统级安装 | `/var/lib/chusql` | `/var/log/chusql` |
 | Windows | `%LOCALAPPDATA%\ChuSQL\data` | `%LOCALAPPDATA%\ChuSQL\logs` |
 
-系统级安装的配置文件属主为 `root:chusql`、权限 `0660`，数据与日志目录属主为 `chusql:chusql`、权限 `0750`。
-
-安装参数 `--data-dir` / `-DataDir` 可覆盖数据目录。安装目录与数据目录分别设置。
+系统级安装的配置文件属主为 `root:chusql`、权限 `0660`，数据与日志目录属主为 `chusql:chusql`、权限 `0750`。安装参数 `--data-dir` / `-DataDir` 可以覆盖数据目录，安装目录与数据目录分别设置。
