@@ -7,14 +7,14 @@ import ChuSQL.Core.Engine.Algebra.Expr (evalCondForRow, evalExpr, hasSubquery, q
 import ChuSQL.Core.Engine.Algebra.Op
 import ChuSQL.Core.Engine.Algebra.Optimize (optimize)
 import ChuSQL.Core.Engine.Algebra.Planner (translate)
-import ChuSQL.Core.Engine.Algebra.Sort (sortBoundRows, sortRows)
+import ChuSQL.Core.Engine.Algebra.Sort (sortBoundRows, sortRows, sortRowsTopK)
 import ChuSQL.Core.Engine.Builtin (aggregateArg, builtinOfExpr, inValues, invokeBuiltin, unsupportedAggregate)
 import ChuSQL.Core.Engine.Runtime.Relation (bindRelOpColumns, orderRow)
 import ChuSQL.Core.Engine.Storage (IndexResult (..), MonadStorage (..))
 import ChuSQL.Core.Engine.Storage.Memory (runMemoryStorage)
 import ChuSQL.Core.Engine.Syntax.AST (Expr (..), JoinKind (..), Subquery (..))
 import ChuSQL.Core.Model
-import Control.Monad (filterM)
+import Control.Monad (filterM, foldM)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.State.Strict (StateT, evalStateT, gets, modify')
 import Data.Bifunctor (first)
@@ -194,7 +194,8 @@ unmatched LeftJoin l cols = [l ++ [(c, VNull) | c <- cols]]
 hashJoin :: JoinKind -> EquiKeys -> [String] -> [Row] -> [Row] -> [Row]
 hashJoin kind ks ncols lrows rrows = concatMap probe lrows
   where
-    buckets = HM.fromListWith (flip (++)) [(v, [r]) | r <- rrows, Just v <- [joinKeyOf (ekRight ks) r]]
+    -- 先头插再逐桶反转，避免重复键尾插的平方开销并保持右行顺序。
+    buckets = HM.map reverse (HM.fromListWith (++) [(v, [r]) | r <- rrows, Just v <- [joinKeyOf (ekRight ks) r]])
     -- \| 拿左行的键去桶里找
     probe l =
         let miss = case kind of
@@ -409,30 +410,24 @@ boundExpr refs env table = do
         [x] -> Right x
         _ -> Left "subquery binding is missing"
 
--- | 单子过滤：条件本身是单子求值的
-filterRowsM :: (Monad m) => (Row -> m (Either String Bool)) -> [Row] -> m (Either String [Row])
-filterRowsM p = go []
+-- | 无子查询的投影直接计算每个值
+computeRow :: Row -> [(String, Expr)] -> Row -> Either String Row
+computeRow outer items row = mapM compute items
   where
-    -- \| 逐行留下通过条件的
-    go acc [] = pure (Right (reverse acc))
-    go acc (r : rs) = do
-        keep <- p r
-        case keep of
-            Left e -> pure (Left e)
-            Right True -> go (r : acc) rs
-            Right False -> go acc rs
+    env = row ++ outer
+    -- \| 按声明顺序求值并保留输出名
+    compute (label, expression) = (label,) <$> evalExpr expression env
 
--- | 按投影顺序逐项求值（可以带子查询）
-computeM :: (MonadStorage m) => Database -> Row -> [(String, Expr)] -> Row -> Execution m (Either String Row)
-computeM db outer items row = go items []
+-- | 校验全部输入，仅保留 LIMIT 所需的过滤或投影行
+rowsLimited :: Int -> (Row -> Either String (Maybe Row)) -> [Row] -> Either String [Row]
+rowsLimited limit transform rows = reverse . snd <$> foldM step (max 0 limit, []) rows
   where
-    -- \| 逐项求值并攒成一行
-    go [] acc = pure (Right (reverse acc))
-    go ((label, e) : rest) acc = do
-        v <- evalExprIn db e (row ++ outer)
-        case v of
-            Left err -> pure (Left err)
-            Right val -> go rest ((label, val) : acc)
+    -- \| 截断后继续检查错误，避免隐藏后续求值失败
+    step (remaining, kept) row = do
+        result <- transform row
+        Right $ case result of
+            Just computed | remaining > 0 -> (remaining - 1, computed : kept)
+            _ -> (remaining, kept)
 
 -- | 表达式求值（先把子查询求成字面量）
 evalExprM :: (MonadStorage m) => Database -> Expr -> Row -> m (Either String Value)
@@ -589,9 +584,7 @@ evalRelOpIn db outer (Compute items op) = do
     case rows of
         Left e -> pure (Left e)
         Right rs
-            | not (any (hasSubquery . snd) items) -> do
-                computed <- mapM (computeM db outer items) rs
-                pure (sequence computed)
+            | not (any (hasSubquery . snd) items) -> pure (mapM (computeRow outer items) rs)
             | otherwise -> do
                 table <- bindingsTableM db outer (map snd items) rs
                 pure (table >>= \t -> traverse (computeBound t) rs)
@@ -627,7 +620,7 @@ evalRelOpIn db outer (Filter e op) = do
     case rows of
         Left err -> pure (Left err)
         Right rs
-            | not (hasSubquery e) -> filterRowsM (\r -> evalCondIn db e (r ++ outer)) rs
+            | not (hasSubquery e) -> pure (filterM (evalCondForRow e . (++ outer)) rs)
             | otherwise -> do
                 table <- bindingsTableM db outer [e] rs
                 pure (table >>= \t -> filterM (keepBound t) rs)
@@ -649,6 +642,22 @@ evalRelOpIn db outer (Sort spec op) = do
 evalRelOpIn db outer (BoundSort spec op) = do
     rows <- evalRelOpIn db outer op
     pure (rows >>= sortBoundRows spec outer)
+evalRelOpIn db outer (Limit n (Compute items op))
+    | not (any (hasSubquery . snd) items) = do
+        rows <- evalRelOpIn db outer op
+        pure (rows >>= rowsLimited n (fmap Just . computeRow outer items))
+evalRelOpIn db outer (Limit n (Filter expression op))
+    | not (hasSubquery expression) = do
+        rows <- evalRelOpIn db outer op
+        pure (rows >>= rowsLimited n keep)
+  where
+    -- \| 逐行过滤，不构建截断范围外的匹配清单
+    keep row = do
+        matched <- evalCondForRow expression (row ++ outer)
+        Right (if matched then Just row else Nothing)
+evalRelOpIn db outer (Limit n (Sort spec op)) = do
+    rows <- evalRelOpIn db outer op
+    pure (fmap (sortRowsTopK spec n) rows)
 evalRelOpIn db outer (Limit n op) = do
     rows <- evalRelOpIn db outer op
     pure (fmap (take n) rows)

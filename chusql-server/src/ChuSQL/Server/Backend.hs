@@ -66,8 +66,9 @@ data StatementResult = StatementResult
 data Backend = Backend
     { beConcurrentTransactions :: Bool
     , beBeginTransaction :: Bool -> IO (Either String (Maybe String, Database))
+    , beReadTransaction :: String -> [(String, Maybe [String])] -> IO (Either String Database)
     , beStageTransaction :: String -> [TxnOp] -> [String] -> IO (Either String ())
-    , bePreviewTransaction :: String -> IO (Either String (String, Database))
+    , bePreviewTransaction :: String -> [String] -> IO (Either String (String, Database))
     , beCommitTransaction :: String -> String -> IO (Either String ())
     , beRollbackTransaction :: String -> IO (Either String ())
     , beStatement :: String -> IO (Either String StatementResult)
@@ -104,14 +105,20 @@ ipcBackend = do
             Backend
                 { beConcurrentTransactions = True
                 , beBeginTransaction = \serializable -> do
-                    response <- sendRequest (ReqInDatabase current (ReqMvccBegin serializable))
+                    response <- sendRequest (ReqInDatabase current (ReqMvccBeginLazy serializable))
                     pure $ case response of
                         RespMvccSnapshot token infos rows _ -> (,) (Just token) <$> snapshotDatabase infos rows
                         RespError err -> Left err
                         _ -> Left "unexpected MVCC begin response"
+                , beReadTransaction = \token names -> do
+                    response <- sendRequest (ReqInDatabase current (ReqMvccRead token names))
+                    pure $ case response of
+                        RespDomainSnapshot infos rows _ -> snapshotDatabase infos rows
+                        RespError err -> Left err
+                        _ -> Left "unexpected MVCC read response"
                 , beStageTransaction = \token ops dependencies -> transactionRequest current (ReqMvccLock token ops dependencies)
-                , bePreviewTransaction = \token -> do
-                    response <- sendRequest (ReqInDatabase current (ReqMvccPreview token))
+                , bePreviewTransaction = \token names -> do
+                    response <- sendRequest (ReqInDatabase current (ReqMvccPreview token names))
                     pure $ case response of
                         RespDomainSnapshot infos rows checkpoint -> (,) checkpoint <$> snapshotDatabase infos rows
                         RespError err -> Left err
@@ -207,8 +214,9 @@ memoryBackendWith trusted name ref =
     Backend
         { beConcurrentTransactions = False
         , beBeginTransaction = \_ -> fmap (fmap (Nothing,)) (beSnapshot (memoryBackend name ref))
+        , beReadTransaction = \_ _ -> pure (Left "MVCC unavailable for memory backend")
         , beStageTransaction = \_ _ _ -> pure (Left "MVCC unavailable for memory backend")
-        , bePreviewTransaction = \_ -> pure (Left "MVCC unavailable for memory backend")
+        , bePreviewTransaction = \_ _ -> pure (Left "MVCC unavailable for memory backend")
         , beCommitTransaction = \_ _ -> pure (Left "MVCC unavailable for memory backend")
         , beRollbackTransaction = \_ -> pure (Left "MVCC unavailable for memory backend")
         , beStatement = \sql -> case parseStatement sql >>= scopeDdl (if trusted then systemDatabaseName else name) of

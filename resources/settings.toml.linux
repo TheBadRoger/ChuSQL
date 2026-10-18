@@ -39,6 +39,21 @@ max_rows = 1000
 # Requires ALLOW_SUDO_AUTH on the identity and an elevated server process.
 sudo_auth_user = ""
 
+# Maximum Haskell execution threads, bounded by detected processors (1 to 256).
+# Parallel page scans retain their existing per-scan ceiling of 8 workers.
+worker_threads = 8
+# Simultaneously executing SQL requests; 0 disables this limit.
+# COMMIT, ROLLBACK and savepoint controls bypass this queue to release locks.
+max_concurrent_queries = 0
+# Accepted TCP connections, including connections that have not logged in; 0 is unlimited.
+max_connections = 0
+# Seconds waiting for a complete request frame; 0 disables this timeout.
+connection_idle = 0
+# Transaction inactivity and total lifetime in seconds; 0 disables each timeout.
+# Checked between requests; running statements are allowed to finish.
+transaction_idle = 0
+transaction_max = 0
+
 [log]
 # Diagnostic verbosity: off, error, warn, info or debug.
 level = "info"

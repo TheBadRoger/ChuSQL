@@ -206,6 +206,14 @@ pub enum Request {
     MvccBegin {
         #[serde(default)]
         serializable: bool,
+        #[serde(default)]
+        tables: Option<Vec<String>>,
+    },
+    MvccRead {
+        transaction: String,
+        tables: Vec<String>,
+        #[serde(default)]
+        columns: HashMap<String, Vec<String>>,
     },
     MvccLock {
         transaction: String,
@@ -215,6 +223,8 @@ pub enum Request {
     },
     MvccPreview {
         transaction: String,
+        #[serde(default)]
+        tables: Option<Vec<String>>,
     },
     MvccCommit {
         transaction: String,
@@ -339,6 +349,7 @@ impl Request {
             | Self::DomainSnapshot
             | Self::MvccPreview { .. }
             | Self::MvccBegin { .. }
+            | Self::MvccRead { .. }
             | Self::MvccLock { .. }
             | Self::MvccCommit { .. }
             | Self::MvccRollback { .. }

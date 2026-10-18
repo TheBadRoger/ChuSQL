@@ -135,8 +135,6 @@ orElse Nothing y = y
 -- | 入口：开够能力数，分片扫描才真并行
 main :: IO ()
 main = do
-    caps <- getNumProcessors
-    setNumCapabilities (max 1 (min 8 caps))
     hSetBuffering stdout LineBuffering
     args <- getArgs
     case parseArgs args of
@@ -157,6 +155,8 @@ run opts = do
     legacy <- legacyPasswordKey configPath
     let rootName = rootUserName cfg
     config <- applyServerOptions <$> loadServerConfigAt configPath <*> pure opts
+    caps <- getNumProcessors
+    setNumCapabilities (max 1 (min (scWorkerThreads config) caps))
     opened <- localStorageLink (Just configPath)
     case opened of
         Left err -> do

@@ -58,6 +58,7 @@ function Assert-Stage([string]$stage) {
         'static\index.html',
         'csql-web.ps1',
         'resources\settings.toml.windows',
+        'resources\settings.low-performance.toml',
         'install.ps1',
         'install.sh',
         'uninstall.ps1',
@@ -235,6 +236,7 @@ try {
         ForEach-Object { Copy-Item $_.FullName (Join-Path $stage 'bin') }
 
     Copy-Item (Join-Path $repoRoot 'resources\settings.toml.windows') (Join-Path $stage 'resources')
+    Copy-Item (Join-Path $repoRoot 'resources\settings.low-performance.toml') (Join-Path $stage 'resources')
     Copy-Item (Join-Path $repoRoot 'scripts\install.ps1'), (Join-Path $repoRoot 'scripts\install.sh') $stage
     Copy-Item (Join-Path $repoRoot 'scripts\uninstall.ps1'), (Join-Path $repoRoot 'scripts\uninstall.sh') $stage
     New-Item -ItemType Directory -Force -Path (Join-Path $stage 'static') | Out-Null

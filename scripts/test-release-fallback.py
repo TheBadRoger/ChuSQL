@@ -2,6 +2,8 @@
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import shlex
+import tomllib
 from pathlib import Path
 import re
 import shutil
@@ -68,6 +70,61 @@ ext=tar.gz
     # 执行真实安装脚本中的发行函数。
     def shell(self, command):
         return subprocess.run(["sh", "-c", self.setup + command], capture_output=True, text=True, timeout=15)
+
+    # 预设只更新资源键，保留路径和其它设置且可重复合并。
+    def test_low_performance_profile_merge(self):
+        resources = Path(__file__).resolve().parent.parent / "resources"
+        profile = resources / "settings.low-performance.toml"
+        expected = tomllib.loads(profile.read_text())
+        samples = ["[storage]\ndata_dir = '/srv/keep data'\n[server]\nport = 9999\nmax_connections = 77 # keep comment\n",
+                   (resources / "settings.toml.linux").read_text(),
+                   (resources / "settings.toml.windows").read_text()]
+        for source in samples:
+            target = self.root / "settings.toml"
+            target.write_text(source)
+            command = f"apply_performance_profile {shlex.quote(str(profile))} {shlex.quote(str(target))}"
+            result = self.shell(command)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            parsed = tomllib.loads(result.stdout)
+            original = tomllib.loads(source)
+            for section, values in expected.items():
+                for key, value in values.items():
+                    self.assertEqual(parsed[section][key], value)
+            for section, values in original.items():
+                for key, value in values.items():
+                    if key not in expected.get(section, {}):
+                        self.assertEqual(parsed[section][key], value)
+            target.write_text(result.stdout)
+            self.assertEqual(tomllib.loads(self.shell(command).stdout), parsed)
+
+    # PowerShell 共用同一预设，并接受精确的双连字符选项。
+    def test_powershell_profile_and_option(self):
+        pwsh = shutil.which("pwsh")
+        if not pwsh:
+            self.skipTest("pwsh is unavailable")
+        repo = Path(__file__).resolve().parent.parent
+        source = (repo / "scripts/install.ps1").read_text()
+        merge = re.search(r"^function Merge-PerformanceProfile.*?^\}", source, re.M | re.S).group()
+        script = self.root / "merge.ps1"
+        config = self.root / "config.toml"
+        config.write_text("[server]\nport = 9001\nworker_threads = 12 # custom\n[storage]\ndata_dir = '/srv/keep'\n")
+        script.write_text("param([string]$Config,[string]$Profile)\n$ErrorActionPreference = 'Stop'\n" + merge + "\nMerge-PerformanceProfile (Get-Content -Raw $Config) (Get-Content -Raw $Profile)\n")
+        profile = repo / "resources/settings.low-performance.toml"
+        result = subprocess.run([pwsh, "-NoProfile", "-File", str(script), "-Config", str(config), "-Profile", str(profile)], capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        parsed = tomllib.loads(result.stdout)
+        self.assertEqual(parsed["server"]["worker_threads"], 2)
+        self.assertEqual(parsed["server"]["port"], 9001)
+        self.assertEqual(parsed["storage"]["data_dir"], "/srv/keep")
+        for section, values in tomllib.loads(profile.read_text()).items():
+            for key, value in values.items():
+                self.assertEqual(parsed[section][key], value)
+        parameters = source[:source.index("$ErrorActionPreference")]
+        script.write_text(parameters + "\nWrite-Output ([bool]$LowPerformanceAdapted)\n")
+        for flag in ["--low-performance-adapted", "-LowPerformanceAdapted"]:
+            result = subprocess.run([pwsh, "-NoProfile", "-File", str(script), flag], capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "True")
 
     # 验证紧凑 API、附件回退、同站校验与认证隔离。
     def test_api_and_asset_fallback(self):

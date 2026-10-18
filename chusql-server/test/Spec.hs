@@ -61,8 +61,9 @@ import ChuSQL.Server.TCP (
     startServer,
  )
 import Control.Concurrent (forkFinally, forkIO, killThread, threadDelay)
-import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, takeMVar)
-import Control.Exception (IOException, bracket, evaluate, finally, try)
+import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, readMVar, takeMVar)
+import Control.Concurrent.QSem (signalQSem, waitQSem)
+import Control.Exception (IOException, bracket, bracket_, evaluate, finally, try)
 import Control.Monad (forM_, replicateM_, void, when, (>=>))
 import Data.Aeson (decode)
 import qualified Data.Aeson as A
@@ -72,7 +73,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import qualified Data.ByteString.Lazy as BL
 import Data.Either (lefts)
-import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (sort)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
@@ -645,9 +646,75 @@ tcpSpec = do
             scPort config `shouldBe` scPort defaultServerConfig
             scMaxRows config `shouldBe` scMaxRows defaultServerConfig
 
+        it "reads resource limits and rejects malformed or out-of-range values" $ do
+            path <- tcpConfigPath "server-resources"
+            BS.writeFile path "[server]\nworker_threads=2\nmax_concurrent_queries=2\nmax_connections=32\nconnection_idle=300\ntransaction_idle=60\ntransaction_max=300\n"
+            config <- loadServerConfigAt path
+            (scWorkerThreads config, scMaxConcurrentQueries config, scMaxConnections config) `shouldBe` (2, 2, 32)
+            (scConnectionIdle config, scTransactionIdle config, scTransactionMax config) `shouldBe` (300, 60, 300)
+            forM_ ["worker_threads=0", "worker_threads=257", "max_connections=-1", "transaction_idle=oops", "transaction_max=31536001"] $ \invalid -> do
+                BS.writeFile path (BSC.pack ("[server]\n" ++ invalid ++ "\n"))
+                loadServerConfigAt path `shouldThrow` anyIOException
+
 -- | 真连 TCP 服务器的用例
 tcpServerSpec :: Spec
 tcpServerSpec = do
+    describe "configurable resource limits" $ do
+        it "closes excess connections and releases their capacity after disconnect" $
+            withTcpServer defaultServerConfig{scMaxConnections = 1} $ \env server -> do
+                withConnection server $ \first -> do
+                    reply <- tcpTalk first "{\"method\":\"hello\",\"protocol\":1}"
+                    asText (at "status" reply) `shouldBe` "hello"
+                    withConnection server tcpClosed
+                -- \| 等待断线的会话完成清理
+                let released = do
+                        count <- readMVar (srvConnectionCount env)
+                        if count == 0 then pure () else threadDelay 1000 >> released
+                timeout 1000000 released `shouldReturn` Just ()
+                withConnection server $ \next -> do
+                    reply <- tcpTalk next "{\"method\":\"hello\",\"protocol\":1}"
+                    asText (at "status" reply) `shouldBe` "hello"
+        it "queues queries while allowing COMMIT to release a transaction" $
+            withTcpServer defaultServerConfig{scMaxConcurrentQueries = 1} $ \env server ->
+                withConnection server $ \writer -> withConnection server $ \reader -> do
+                    _ <- tcpLogin writer testRootName testRootPassword
+                    _ <- tcpLogin reader testRootName testRootPassword
+                    _ <- tcpQuery writer "USE test"
+                    _ <- tcpQuery reader "USE test"
+                    _ <- tcpQuery writer "BEGIN"
+                    slots <- maybe (fail "missing query limiter") pure (srvQuerySlots env)
+                    bracket_ (waitQSem slots) (signalQSem slots) $ do
+                        BSC.hPutStr reader "{\"method\":\"query\",\"sql\":\"SELECT 1\"}\n"
+                        hFlush reader
+                        queued <- timeout 100000 (BSC.hGetLine reader)
+                        queued `shouldBe` Nothing
+                        committed <- tcpQuery writer "COMMIT"
+                        asText (at "status" committed) `shouldBe` "result"
+                    line <- timeout 1000000 (BSC.hGetLine reader)
+                    fmap (at "status" . fromMaybe A.Null . decode . BL.fromStrict) line `shouldBe` Just (A.String "result")
+        it "closes idle connections with an explicit timeout response" $
+            withTcpServer defaultServerConfig{scConnectionIdle = 1} $ \_ server ->
+                withConnection server $ \client -> do
+                    line <- timeout 3000000 (BSC.hGetLine client)
+                    fmap (at "code" . fromMaybe A.Null . decode . BL.fromStrict) line `shouldBe` Just (A.String "connection_timeout")
+                    tcpClosed client
+        forM_ [("transaction inactivity", \config -> config{scTransactionIdle = 1}), ("transaction lifetime", \config -> config{scTransactionMax = 1})] $ \(label, limit) ->
+            it ("rolls back and closes a connection after " ++ label) $
+                withTcpServer (limit defaultServerConfig) $ \_ server -> do
+                    withConnection server $ \writer -> do
+                        _ <- tcpLogin writer testRootName testRootPassword
+                        _ <- tcpQuery writer "USE test"
+                        _ <- tcpQuery writer "BEGIN"
+                        _ <- tcpQuery writer "INSERT INTO users (id, name, age) VALUES (999, 'expired', 99)"
+                        line <- timeout 3000000 (BSC.hGetLine writer)
+                        fmap (at "code" . fromMaybe A.Null . decode . BL.fromStrict) line `shouldBe` Just (A.String "transaction_expired")
+                        tcpClosed writer
+                    withConnection server $ \reader -> do
+                        _ <- tcpLogin reader testRootName testRootPassword
+                        _ <- tcpQuery reader "USE test"
+                        rows <- tcpQuery reader "SELECT id FROM users WHERE id = 999"
+                        at "rows" rows `shouldBe` A.toJSON ([] :: [A.Value])
+
     describe "TCP server: handshake and login" $ do
         it "binds a real port when asked for port 0" $
             withTcpServer defaultServerConfig $ \_ handle ->
@@ -2298,6 +2365,52 @@ ipcConcurrencySpec = describe "server backend on the real storage" $ do
         _ <- mustSql second "commit"
         rows <- rowsOf (beStatement alpha "SELECT value FROM items ORDER BY id")
         intColumn "value" rows `shouldBe` [11, 22]
+
+    it "loads snapshot columns on demand and upgrades them across savepoints" $ withIpcStorage $ do
+        base <- ipcBackend
+        mustRun (beStatement base "CREATE DATABASE alpha")
+        let alpha = beWithDatabase base "alpha"
+        mustRun (beStatement alpha "CREATE TABLE items (id INT, name TEXT, age INT)")
+        mustRun (beStatement alpha "INSERT INTO items (id, name, age) VALUES (1, 'old', 21), (2, 'second', 22)")
+        readRequests <- newIORef []
+        -- \| 切库后继续记录事务实际读取列
+        let tracked backend =
+                backend
+                    { beReadTransaction = \token names -> do
+                        modifyIORef' readRequests (++ [names])
+                        beReadTransaction backend token names
+                    , beWithDatabase = tracked . beWithDatabase backend
+                    }
+        settings <- tempSettingsPath "lazy-snapshot-columns"
+        removeIfExists settings
+        session <- newSession (tracked alpha) (T.pack testDatabaseName) settings
+        _ <- mustSql session "USE alpha"
+        _ <- mustSql session "BEGIN"
+        readIORef readRequests `shouldReturn` []
+        _ <- mustSql session "SAVEPOINT before_read"
+        mustRun (beStatement alpha "UPDATE items SET name = 'new' WHERE id = 1")
+        first <- mustSql session "SELECT name FROM items"
+        qrRows first `shouldBe` [[VStr "old"], [VStr "second"]]
+        readIORef readRequests `shouldReturn` [[("items", Just ["name"])]]
+        second <- mustSql session "SELECT name FROM items"
+        qrRows second `shouldBe` qrRows first
+        readIORef readRequests `shouldReturn` [[("items", Just ["name"])]]
+        _ <- mustSql session "ROLLBACK TO before_read"
+        expanded <- mustSql session "SELECT name, age FROM items"
+        qrRows expanded `shouldBe` [[VStr "old", VInt 21], [VStr "second", VInt 22]]
+        readIORef readRequests `shouldReturn` [[("items", Just ["name"])], [("items", Nothing)]]
+        _ <- mustSql session "UPDATE items SET age = 99 WHERE id = 2"
+        _ <- mustSql session "ROLLBACK TO before_read"
+        restored <- mustSql session "SELECT name, age FROM items"
+        qrRows restored `shouldBe` [[VStr "old", VInt 21], [VStr "second", VInt 22]]
+        _ <- mustSql session "ROLLBACK"
+        fresh <- mustSql session "SELECT name FROM items"
+        qrRows fresh `shouldBe` [[VStr "new"], [VStr "second"]]
+        mustRun (beStatement alpha "ALTER TABLE items RENAME COLUMN name TO title")
+        stale <- runStatementCoded session "SELECT name FROM items"
+        stale `shouldSatisfy` isLeftResult
+        renamed <- mustSql session "SELECT title FROM items"
+        qrRows renamed `shouldBe` [[VStr "new"], [VStr "second"]]
 
     it "refuses the second COMMIT on the real storage" $ withIpcStorage $ do
         base <- ipcBackend

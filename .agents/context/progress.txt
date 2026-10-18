@@ -1,16 +1,19 @@
 # ChuSQL 已完成事项
-更新：2026-10-17
+更新：2026-10-18
 
 本文件是当前完成状态及最新验收的唯一来源，等价于 project-plan.txt；不保留历史批次、提交记录或修改流水。
 设计见 design-decisions.txt，未解决限制见 known-issues.txt，后续计划见 side-branch-plan.txt。
 
-近期第一阶段“数据库可靠性与部署验收”、第二阶段“博客业务持久化与驱动联调”及第三阶段“存储并发与恢复扩展”已完成数据库侧本地验收。第三阶段包括持久化行版本、行与唯一键锁、死锁与锁等待取消、同库并行数据准备、在线文件代次迁移，以及页 LSN / 全页镜像恢复。整库物化、串行最终提交和切换窗口的成本见 known-issues.txt。ChuBlog 实际业务接入、生产文件迁移、长期运行及真实断电仍保留配套边界。
+近期第一阶段“数据库可靠性与部署验收”、第二阶段“博客业务持久化与驱动联调”及第三阶段“存储并发与恢复扩展”已完成数据库侧本地验收。第三阶段包括持久化行版本、行与唯一键锁、死锁与锁等待取消、同库并行数据准备、在线文件代次迁移，以及页 LSN / 全页镜像恢复。表行物化、串行最终提交和切换窗口的成本见 known-issues.txt。ChuBlog 实际业务接入、生产文件迁移、长期运行及真实断电仍保留配套边界。
 
 ## SQL 与查询执行
 
 - 实现 CRUD、表列约束、索引、INNER / LEFT JOIN、聚合、GROUP BY、HAVING、ORDER BY、LIMIT、投影别名、DISTINCT / ALL；排序支持输出序号、表达式、函数、聚合及子查询。
 - 实现标量及相关子查询、派生表、非递归 CTE、IN / EXISTS、比较与 ANY / ALL；保持 NULL 三值逻辑、重复列、稳定排序、空输入聚合及空集成员比较语义；HAVING 覆盖整体组与未投影聚合，新子句参与依赖守卫和表权限检查。
 - 实现谓词 / 投影下推、常量折叠、点查 / 范围成本选择、贪心内连接重排、16 桶直方图及保序并行扫描；子查询按定义和外层值在查询内物化、跨子句复用，相同 CTE / 派生执行子树共享结果；独立 IN / NOT IN 和简单等值相关 EXISTS / NOT EXISTS 使用哈希半连接 / 反连接。
+
+- 哈希连接按线性累积构建重复键桶并保持行序；无子查询的投影和过滤直接求值，LIMIT 下按原计划检查错误并限制保留的输出行。
+- 会话复用最近一条查询的绑定计划，以结构身份和列定义失效，不缓存行数据或权限；同次 CONNECT 与表权限检查共享目录，事务对象编号通过一次 catalog 读取复查。
 
 ## 类型与绑定
 
@@ -46,6 +49,9 @@
 - 实现按连接隔离工作库、持久化行版本快照、行级写写冲突检查、保存点和合并提交；权限及对象身份在事务提交时复查。COMMIT 在发布前复用引擎规则校验合并最终行集，拒绝不同整数主键形成的 UNIQUE 冲突，失败不发布其他表修改。
 - 支持 BEGIN [TRANSACTION] ISOLATION LEVEL SERIALIZABLE 及 START TRANSACTION ISOLATION LEVEL SERIALIZABLE，写事务提交按表复查全部读依赖的 schema 和数据，包含子查询和幻行；保存点回退恢复读依赖，只读快照可完成，默认 BEGIN 保留不同行合并行为。
 
+- BEGIN 仅传输一致结构并固定版本引用，按语句涉及的表和扫描列延迟加载原始快照；扩列或写入时补齐完整行和保存点。提交预检仅传输修改表及类型依赖，保留最终约束校验。
+- 普通版本发布只扫描受影响表，未改表共享历史；mvcc.json 格式 2 与带校验和的 mvcc.delta 保存快照与变化行链，并定期归并。读取兼容旧格式 1；保留 WAL、页、版本和检查点发布顺序，数据提交不重复刷无关表。
+
 ### 提交前校验
 
 - 普通 WAL 提交组在落盘前复用堆行与索引键编码检查行大小及有效索引键长度，覆盖单行 / 批量插入、整表替换、事务、结构替换及整理；超限输入不改变数据、索引、catalog、WAL 或检查点，不触发 recovery_required。
@@ -80,9 +86,16 @@
 
 ### 门禁结果
 
-- 全量门禁通过：Rust 222 / Engine 628 / Server 177 / Web 82 / CLI 21 / Bootstrap 9，均零失败；release 动态库重建、Clippy、注释检查及 git diff --check 通过。
+- 全量门禁通过：Rust 227 / Engine 631 / Server 178 / Web 82 / CLI 21 / Bootstrap 9，均零失败；release 动态库重建、Clippy、注释检查及 git diff --check 通过。
 
   受影响 Haskell 源码与测试 HLint 无建议；Fourmolu 格式及幂等检查通过。
+
+### 查询执行资源验收
+
+- 全量日志为 logs/query-efficiency-final-gate.log；受影响 Haskell HLint 无建议，Fourmolu、Clippy、注释及 git diff --check 通过。
+- 回归覆盖列投影、旧快照延迟读取、列补齐后的保存点回退、重复查询读取复用、结构变化后计划失效，以及 LIMIT 包裹投影或过滤时的错误传播与行序。
+- 存储回归覆盖变化表发布、未改表保留、旧格式读取、增量重开、完整帧损坏拒绝、撕裂尾部清理、归并中断重复打开，以及增量写入失败后的封闭与重复重启恢复。
+- 按要求未运行基准测试，未量化性能收益，未部署生产实例或重建容器。
 
 ### ENUM 验收
 
@@ -95,7 +108,7 @@
 - 重复 id 回归验证单行 / 批内 / 跨操作冲突均不改变持久文件，事务早先的跨表修改不发布；合法删除再插入可提交并重启点查。验证整值浮点等键、NULL / 缺失 id 及旧重复 id 的删除顺序；真实 TCP 验证重复 id SQL 插入报错后仍可查询和合法写入。
 - 扩列回归验证单行、批量、整表替换、结构替换及事务在 schema 版本耗尽前拒绝，失败后持久文件不变，原表可读、合法写入及重启正常；同一行多列与未定型 NULL 的版本行为保持一致。
 - 非法字段名回归覆盖六种写入路径，空名、路径字符、点号、空白、非 ASCII 字符和 NUL 均在写入前拒绝且文件不变；合法文本及嵌套对象可重启读取，旧式字段名的已提交日志仍可重放并继续合法写入。
-- 验收入口：gate-check/run-gate.ps1；最新日志：logs/mvcc-stage-gate-final.log，真实 TCP 日志：logs/id-preflight-tcp.log。当前工作区改动未提交。
+- 验收入口：gate-check/run-gate.ps1；最新日志：logs/query-efficiency-final-gate.log，真实 TCP 日志：logs/id-preflight-tcp.log。当前工作区改动未提交。
 
 ### DOMAIN 回归
 
@@ -138,3 +151,10 @@
 - 版本与锁专项验证不同行合并、等待后旧版本拒绝、死锁中止、锁超时、等待取消、旧版本引用回收、SERIALIZABLE 幻行拒绝和重启读取。在线整理回归验证文件缩小、隐藏字节回收、旧快照结束前旧文件保留及重启索引点查。
 - 实际 ChuBlog Rust 驱动业务验收后连续提交关联明细与计数，收到十次回执后强杀一次性服务；重启保留全部十次已确认提交，明细 / 计数一致，停机备份副本再次通过。日志为 logs/mvcc-driver-final.log；不据此承诺真实断电或任意介质损坏恢复。
 - 本阶段源码动态库、全量门禁、补充 Rust 回归、实际驱动业务 / 并发 / 强杀恢复、HLint、Fourmolu 与差异空白检查通过；日志为 logs/mvcc-stage-gate-final.log、logs/mvcc-lifecycle.log、logs/mvcc-hlint.log。未重建 Docker 镜像，ChuBlog 实现未修改。
+
+### 安装配置与查询优化
+
+- 安装器不再从 storage 目录读取示例配置：删除 `chusql-core/storage/chusql-core-storage.toml.example`，默认配置来自 `resources/settings.toml.linux|windows`，安装时按平台把 `@DATA_DIR@`、`@LOG_DIR@` 换成实际路径后写入新配置；已经存在的 `settings.toml` 不改写。选择低性能适配时，安装器把 `resources/settings.low-performance.toml` 的整数参数覆盖进新写的配置，覆盖前备份为 `settings.toml.before-low-performance`；重复合并保持相同结果。
+- 验证覆盖 Linux 与 PowerShell 两条安装路径、模板与内置默认值一致、低性能参数合并与幂等，具体为 `scripts/test-release-fallback.py` 相关用例、`chusql-web` 平台模板测试与 `cargo test` 配置测试；命令行选项在 `docs/install.md`，配置说明在 `docs/config.md`。
+- 索引 / Top-K / 并行扫描 / 子查询物化 / 批量写入的启用条件由代码按查询形状、统计信息和运行时容量自动决定，不新增配置开关；可配置项只保留资源预算（线程数、连接池等）。Top-K 以分块排序加有界归并实现，稳定顺序与全排序前缀一致，`LIMIT` 远小于输入行数时不再全量排序；结果缓存仍不跨查询保留。
+- engine 全量测试 632 例通过，HLint 与注释检查无提示。

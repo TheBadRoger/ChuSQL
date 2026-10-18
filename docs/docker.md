@@ -110,7 +110,7 @@ docker compose run --rm -T --no-deps --user 0:0 --entrypoint chown server \
 
 随后启动服务，使用原口令检查原数据及新增写入。只在迁移所有者时使用 root，正常服务继续以 UID/GID 10001 运行。
 
-每个运行中的服务默认限制为 1 核、512 MiB、128 个进程或线程，不使用额外交换空间。大数据量、整库快照事务或大型查询可能需要在 `compose.yaml` 中提高 `mem_limit` 和 `memswap_limit`；达到内存限制可能使容器被终止，重启后由 WAL 恢复。
+每个运行中的服务默认限制为 1 核、512 MiB、128 个进程或线程，不使用额外交换空间。大数据量、长事务或大型查询可能需要在 `compose.yaml` 中提高 `mem_limit` 和 `memswap_limit`；达到内存限制可能使容器被终止，重启后由 WAL 恢复。
 
 ### 在 WSL 或内存受限的机器上构建
 
@@ -207,4 +207,4 @@ docker compose --profile web up -d --wait --no-build
 docker compose --profile web logs --tail=100
 ```
 
-命名卷保留数据，启动引导会保留已有口令。数据目录包含版本目录 `mvcc.json`、物理文件代次及页侧文件 `.pages`、`.page-wal`，也可能残留 `.pages.pending`；备份和恢复须复制整个数据目录，包括 `.db`、`.idx`、`wal.log` 及全部侧文件。版本回退使用原镜像和升级前备份。
+命名卷保留数据，启动引导会保留已有口令。数据目录包含版本快照 `mvcc.json`、版本增量 `mvcc.delta`、物理文件代次及页侧文件 `.pages`、`.page-wal`，也可能残留 `.pages.pending`；备份和恢复须复制整个数据目录，包括 `.db`、`.idx`、`wal.log` 及全部侧文件。版本回退使用原镜像和升级前备份。

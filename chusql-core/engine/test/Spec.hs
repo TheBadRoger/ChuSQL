@@ -10,7 +10,7 @@ import ChuSQL.Core.Engine.Algebra.Expr (colsInExpr, evalExpr)
 import ChuSQL.Core.Engine.Algebra.Op (RelOp (..), renderPlan)
 import ChuSQL.Core.Engine.Algebra.Optimize (optimize, pushProject)
 import ChuSQL.Core.Engine.Algebra.Planner (translate)
-import ChuSQL.Core.Engine.Algebra.Sort (sortRows)
+import ChuSQL.Core.Engine.Algebra.Sort (sortRows, sortRowsTopK)
 import ChuSQL.Core.Engine.Builtin
 import ChuSQL.Core.Engine.Error
 import ChuSQL.Core.Engine.Parallel (poolRun, workerPool)
@@ -1824,11 +1824,42 @@ main = hspec $ do
             rowsOf (runStatement testDB q)
                 `shouldBe` Right []
 
+        it "keeps errors when LIMIT wraps a projection" $ do
+            let projection = Compute [("value", Div (LitInt 1) (Sub (Col "age") (LitInt 17)))] (Scan Nothing "users" Nothing)
+            evalRelOp testDB (Limit 1 projection) `shouldBe` Left "division by zero"
+            evalRelOp testDB (Limit 0 projection) `shouldBe` Left "division by zero"
+            evalRelOp testDB (Limit 1 (Compute [("name", Col "name")] (Scan Nothing "users" Nothing)))
+                `shouldBe` Right [[("name", VStr "Alice")]]
+
+        it "keeps filter errors beyond LIMIT without changing matching row order" $ do
+            -- \| 解析并执行过滤截断查询
+            let query text = parseStatement text >>= rowsOf . runStatement testDB
+            query "SELECT name FROM users WHERE 100 / (age - 17) > 0 LIMIT 1" `shouldBe` Left "division by zero"
+            query "SELECT name FROM users WHERE 100 / (age - 17) > 0 LIMIT 0" `shouldBe` Left "division by zero"
+            query "SELECT name FROM users WHERE age > 20 LIMIT 1" `shouldBe` Right [[("name", VStr "Alice")]]
+
         it "rejects negative LIMIT" $ do
             parseStatement "SELECT * FROM users LIMIT -1"
                 `shouldSatisfy` isLeft
 
     describe "ChuSQL.Core.Engine (JOIN)" $ do
+        it "preserves duplicate key order, numeric equality and NULL padding in hash joins" $ do
+            let leftRows = [[("id", key)] | key <- [VInt 1, VInt 2, VNull, VInt 3, VInt 1]]
+                rightRows =
+                    [ [("user_id", key), ("id", VInt position)]
+                    | (position, key) <- zip [1 ..] [VInt 1, VInt 2, VFloat 1, VNull, VInt 2, VInt 1]
+                    ]
+                db = [("users", users{tableRows = leftRows, tableCols = [("id", TInt)]}), ("orders", orders{tableRows = rightRows, tableCols = [("user_id", TInt), ("id", TInt)]})]
+                -- \| 派生右表直接覆盖哈希连接路径
+                plan kind = Join kind (Scan (Just "u") "users" Nothing) (Derived (Just "o") (Scan Nothing "orders" Nothing)) (Eq (Col "u.id") (Col "o.user_id"))
+                -- \| 构造预期输出行
+                output key other position = [("u.id", key), ("o.user_id", other), ("o.id", position)]
+                ones = [output (VInt 1) other (VInt position) | (other, position) <- [(VInt 1, 1), (VFloat 1, 3), (VInt 1, 6)]]
+                twos = [output (VInt 2) (VInt 2) (VInt position) | position <- [2, 5]]
+            evalRelOp db (plan InnerJoin) `shouldBe` Right (ones ++ twos ++ ones)
+            evalRelOp db (plan LeftJoin)
+                `shouldBe` Right (ones ++ twos ++ [output VNull VNull VNull, output (VInt 3) VNull VNull] ++ ones)
+
         it "executes a two-table JOIN with aliases" $ do
             rowsOf (parseStatement "SELECT u.name, o.product FROM users u JOIN orders o ON u.id = o.user_id" >>= runStatement testDB)
                 `shouldBe` Right
@@ -3914,6 +3945,17 @@ main = hspec $ do
             vals rows3 "SELECT v FROM m ORDER BY v, id" `shouldBe` Right [[VInt 1], [VInt 2], [VInt 2]]
             vals rows3 "SELECT v FROM m ORDER BY v DESC, id" `shouldBe` Right [[VInt 2], [VInt 2], [VInt 1]]
             vals rows3 "SELECT MIN(v), MAX(v) FROM m" `shouldBe` Right [[VInt 1, VInt 2]]
+
+        it "keeps the first k rows of the same stable order when limiting a sort" $ do
+            let rows = [[("id", VInt n), ("v", VInt (n `mod` 4))] | n <- [1 .. 33]]
+                spec = [("v", Asc), ("id", Desc)]
+                flat = [("v", Asc)]
+                values = map (map snd)
+            values (sortRowsTopK spec 5 rows) `shouldBe` take 5 (values (sortRows spec rows))
+            values (sortRowsTopK flat 7 rows) `shouldBe` take 7 (values (sortRows flat rows))
+            values (sortRowsTopK spec 33 rows) `shouldBe` values (sortRows spec rows)
+            values (sortRowsTopK spec 0 rows) `shouldBe` []
+            vals rows3 "SELECT id FROM m ORDER BY v LIMIT 2" `shouldBe` Right [[VInt 2], [VInt 1]]
 
         it "sorts the catalog names that are unknown into one code" $ do
             errorCode "unknown database: d" `shouldBe` "not_found"

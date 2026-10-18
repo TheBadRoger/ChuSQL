@@ -1,0 +1,17 @@
+# Low performance installation overrides for a small server.
+# The installer merges these values into settings.toml; all remain editable.
+
+[buffer]
+pool_size = 256
+
+[server]
+worker_threads = 2
+max_concurrent_queries = 2
+max_connections = 32
+connection_idle = 300
+transaction_idle = 60
+transaction_max = 300
+
+[web]
+session_idle = 1800
+session_max = 7200

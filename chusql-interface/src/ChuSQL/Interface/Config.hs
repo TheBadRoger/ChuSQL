@@ -13,6 +13,7 @@ module ChuSQL.Interface.Config (
     ServerConfig (..),
     defaultServerConfig,
     loadServerConfigAt,
+    validateServerConfig,
 ) where
 
 import ChuSQL.Interface.TOML (readSection)
@@ -184,12 +185,36 @@ data ServerConfig = ServerConfig
     , scMaxMessage :: Int
     , scMaxRows :: Int
     , scSudoUser :: Text
+    , scWorkerThreads :: Int
+    , scMaxConcurrentQueries :: Int
+    , scMaxConnections :: Int
+    , scConnectionIdle :: Int
+    , scTransactionIdle :: Int
+    , scTransactionMax :: Int
     }
     deriving (Eq, Show)
 
 -- | 默认本机 7777，行 1 MiB，最多 1000 行
 defaultServerConfig :: ServerConfig
-defaultServerConfig = ServerConfig "127.0.0.1" 7777 (1024 * 1024) 1000 ""
+defaultServerConfig = ServerConfig "127.0.0.1" 7777 (1024 * 1024) 1000 "" 8 0 0 0 0 0
+
+-- | 校验资源配置，零只在允许关闭限制时有效
+validateServerConfig :: ServerConfig -> Either String ()
+validateServerConfig config =
+    mapM_
+        check
+        [ ("worker_threads", scWorkerThreads config, 1, 256)
+        , ("max_concurrent_queries", scMaxConcurrentQueries config, 0, 1000000)
+        , ("max_connections", scMaxConnections config, 0, 1000000)
+        , ("connection_idle", scConnectionIdle config, 0, 31536000)
+        , ("transaction_idle", scTransactionIdle config, 0, 31536000)
+        , ("transaction_max", scTransactionMax config, 0, 31536000)
+        ]
+  where
+    -- \| 拒绝越界配置，避免误关资源上限
+    check (key, value, low, high)
+        | value >= low && value <= high = Right ()
+        | otherwise = Left ("server." ++ key ++ " must be between " ++ show low ++ " and " ++ show high)
 
 -- | 读 [server] 段键，缺的用默认
 loadServerConfigAt :: FilePath -> IO ServerConfig
@@ -202,11 +227,31 @@ loadServerConfigAt path = do
             _ -> fallback
         -- \| 取一个键的整数值
         intOf key fallback = fromMaybe fallback (Map.lookup key values >>= readMaybe . T.unpack . T.strip)
-    pure
-        defaultServerConfig
-            { scHost = textOf "listen_host" (scHost defaultServerConfig)
-            , scPort = intOf "port" (scPort defaultServerConfig)
-            , scMaxMessage = intOf "max_message" (scMaxMessage defaultServerConfig)
-            , scMaxRows = intOf "max_rows" (scMaxRows defaultServerConfig)
-            , scSudoUser = T.toLower (T.pack (textOf "sudo_auth_user" ""))
-            }
+        -- \| 已填写的资源数值必须是有效整数
+        resourceInt key fallback = case Map.lookup key values of
+            Nothing -> Right fallback
+            Just value -> maybe (Left ("server." ++ T.unpack key ++ " needs an integer")) Right (readMaybe (T.unpack (T.strip value)))
+        config = do
+            workers <- resourceInt "worker_threads" (scWorkerThreads defaultServerConfig)
+            concurrent <- resourceInt "max_concurrent_queries" 0
+            connections <- resourceInt "max_connections" 0
+            idle <- resourceInt "connection_idle" 0
+            transactionIdle <- resourceInt "transaction_idle" 0
+            transactionMax <- resourceInt "transaction_max" 0
+            let result =
+                    defaultServerConfig
+                        { scHost = textOf "listen_host" (scHost defaultServerConfig)
+                        , scPort = intOf "port" (scPort defaultServerConfig)
+                        , scMaxMessage = intOf "max_message" (scMaxMessage defaultServerConfig)
+                        , scMaxRows = intOf "max_rows" (scMaxRows defaultServerConfig)
+                        , scSudoUser = T.toLower (T.pack (textOf "sudo_auth_user" ""))
+                        , scWorkerThreads = workers
+                        , scMaxConcurrentQueries = concurrent
+                        , scMaxConnections = connections
+                        , scConnectionIdle = idle
+                        , scTransactionIdle = transactionIdle
+                        , scTransactionMax = transactionMax
+                        }
+            validateServerConfig result
+            Right result
+    either (ioError . userError) pure config

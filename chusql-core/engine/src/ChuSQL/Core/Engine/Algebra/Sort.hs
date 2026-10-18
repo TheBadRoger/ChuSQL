@@ -1,4 +1,4 @@
-module ChuSQL.Core.Engine.Algebra.Sort (sortRows, sortBoundRows, compareValue) where
+module ChuSQL.Core.Engine.Algebra.Sort (sortRows, sortRowsTopK, sortBoundRows, compareValue) where
 
 import ChuSQL.Core.Engine.Algebra.Expr (evalExpr)
 import ChuSQL.Core.Engine.Syntax.AST
@@ -38,6 +38,43 @@ sortRows spec rows = map snd (sortBy cmp (map decorate rows))
     decorate row = (sortKey spec row, row)
     -- \| 比较两个带键的行
     cmp (k1, _) (k2, _) = compareKeys (map snd spec) k1 k2
+
+-- | 只取前 k 行：分块排序后稳定归并，与全排序前缀一致
+sortRowsTopK :: [(String, SortDir)] -> Int -> [Row] -> [Row]
+sortRowsTopK _ k _ | k <= 0 = []
+sortRowsTopK spec k rows
+    | null spec = take k rows
+    | otherwise = map snd (reduce (map sortChunk (chunksOf k rows)))
+  where
+    -- \| 一块内稳定排序并预存排序键
+    sortChunk chunk = sortBy cmp (map decorate chunk)
+    -- \| 行与它的排序键
+    decorate row = (sortKey spec row, row)
+    -- \| 按当前规格比较两行
+    cmp (left, _) (right, _) = compareKeys directions left right
+    directions = map snd spec
+    -- \| 逐层两两归并直到只剩一块
+    reduce [] = []
+    reduce [only] = only
+    reduce layer = reduce (pairwise layer)
+    pairwise (a : b : rest) = mergeTwo a b : pairwise rest
+    pairwise rest = rest
+    -- \| 稳定归并两块，只保留前 k 行
+    mergeTwo = go k
+    go 0 _ _ = []
+    go n [] ys = take n ys
+    go n xs [] = take n xs
+    go n (a : as) (b : bs)
+        | cmp a b == GT = b : go (n - 1) (a : as) bs
+        | otherwise = a : go (n - 1) as (b : bs)
+
+-- | 按 k 切块
+chunksOf :: Int -> [a] -> [[a]]
+chunksOf n = go
+  where
+    go [] = []
+    go ys = case splitAt n ys of
+        (chunk, rest) -> chunk : go rest
 
 -- | 用绑定槽位取键并稳定排序
 sortBoundRows :: [(Expr, SortDir)] -> Row -> [Row] -> Either String [Row]

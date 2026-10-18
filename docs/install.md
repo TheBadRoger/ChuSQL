@@ -11,6 +11,7 @@
 本页内容：
 
 - [在线安装](#在线安装)
+- [通过软件包源下载](#通过软件包源下载)
 - [安装方式](#安装方式)
 - [包内安装](#包内安装)
 - [常用安装选项](#常用安装选项)
@@ -61,15 +62,44 @@ irm https://repo.chunana.cn/ChuNa7a/ChuSQL/raw/branch/main/scripts/install.ps1 -
 
 每个平台的首组命令优先从 GitHub 下载脚本，失败后尝试 ChuRepo。安装和更新时，版本查询或发行包下载失败也会尝试 ChuRepo；已选定的版本保持不变，校验失败直接报错。
 
-两站均无对应发行包时，使用包内安装或源码安装。显式指定其他仓库或归档 URL 时，安装器使用指定来源。
+各来源均无对应发行包时，使用包内安装或源码安装。显式指定其他仓库或归档 URL 时，安装器使用指定来源。
+
+## 通过软件包源下载
+
+ChuRepo 提供通用软件包仓库，长期保存每个发行版本的 Linux 和 Windows 发行包。包内文件与 GitHub 发行包相同，构建和测试由 GitHub Actions 完成，ChuRepo 不重复运行流水线。软件包索引见 [ChuRepo 软件包](https://repo.chunana.cn/ChuNa7a/-/packages/generic/chusql)。
+
+Linux：
+
+```sh
+VERSION=26.10.2
+BASE="https://repo.chunana.cn/api/packages/ChuNa7a/generic/chusql/$VERSION"
+curl -fL --compressed -O "$BASE/chusql-linux-x86_64.tar.gz"
+curl -fL --compressed -O "$BASE/chusql-linux-x86_64.tar.gz.sha256"
+sha256sum -c chusql-linux-x86_64.tar.gz.sha256
+tar -xzf chusql-linux-x86_64.tar.gz
+```
+
+Windows：
+
+```powershell
+$version = "26.10.2"
+$base = "https://repo.chunana.cn/api/packages/ChuNa7a/generic/chusql/$version"
+Invoke-WebRequest "$base/chusql-windows-x86_64.zip" -OutFile chusql-windows-x86_64.zip
+Invoke-WebRequest "$base/chusql-windows-x86_64.zip.sha256" -OutFile chusql-windows-x86_64.zip.sha256
+(Get-FileHash chusql-windows-x86_64.zip -Algorithm SHA256).Hash
+Expand-Archive chusql-windows-x86_64.zip
+```
+
+`VERSION` 和 `$version` 是不带 `v` 前缀的版本号，例如 `26.10.2`。`--compressed` 保证服务器压缩传输时仍还原出原文件。校验值文件与包放在同一目录，先校验再解压。解压后按[包内安装](#包内安装)运行安装器。
 
 ## 安装方式
 
-ChuSQL 支持三种安装方式：
+ChuSQL 支持四种安装方式：
 
 | 方式 | 适用场景 |
 | --- | --- |
 | 在线安装 | 有网络，希望安装发行版本 |
+| 软件包源下载 | 需要固定版本或脚本化下载，或从 ChuRepo 获取 |
 | 包内安装 | 已下载发行包，或处于离线环境 |
 | 源码安装 | 当前平台没有发行包，或需要自行修改源码 |
 
@@ -100,7 +130,7 @@ journalctl --user -u chusql-server.service
 
 ## 包内安装
 
-发行包入口：[GitHub Releases](https://github.com/TheBadRoger/ChuSQL/releases) · [ChuRepo Releases](https://repo.chunana.cn/ChuNa7a/ChuSQL/releases)。两站的发行包需分别发布；若所选站点没有对应版本或平台的包，请切换站点或从源码安装。
+发行包入口：[GitHub Releases](https://github.com/TheBadRoger/ChuSQL/releases) · [ChuRepo Releases](https://repo.chunana.cn/ChuNa7a/ChuSQL/releases) · [ChuRepo 软件包](https://repo.chunana.cn/ChuNa7a/-/packages/generic/chusql)。各站点的发行包需分别发布；若所选站点没有对应版本或平台的包，请切换站点、改用软件包源或从源码安装。
 
 下载并解压对应平台的发行包后，在包根目录执行；包内安装使用本地文件：
 
@@ -127,6 +157,7 @@ Windows：
 | `--version TAG` | `-Version` | 指定发行版本 |
 | `--list-versions` | `-ListVersions` | 列出可安装版本 |
 | `--from-source` | — | 从源码构建并安装 |
+| `--low-performance-adapted` | `-LowPerformanceAdapted` | 低性能机器沿用较小并发参数，见[配置](config.md#修改配置) |
 
 自动化安装可通过 `CHUSQL_ADMIN_PASSWORD` 提供管理员口令，两个平台的安装器均支持。由部署环境注入该变量；安装器通过标准输入把它交给引导程序。
 

@@ -108,8 +108,10 @@ data Request
     | ReqDomainSnapshot
     | ReqDatabaseSnapshot (Maybe String)
     | ReqMvccBegin Bool
+    | ReqMvccBeginLazy Bool
+    | ReqMvccRead String [(String, Maybe [String])]
     | ReqMvccLock String [TxnOp] [String]
-    | ReqMvccPreview String
+    | ReqMvccPreview String [String]
     | ReqMvccCommit String String
     | ReqMvccRollback String
     | ReqAlterDomain String [SchemaColumn] String
@@ -262,8 +264,10 @@ instance ToJSON Request where
             , "rows" .= map rowToJSON rs
             ]
     toJSON (ReqMvccBegin serializable) = object ["method" .= ("mvcc_begin" :: T.Text), "serializable" .= serializable]
+    toJSON (ReqMvccBeginLazy serializable) = object ["method" .= ("mvcc_begin" :: T.Text), "serializable" .= serializable, "tables" .= ([] :: [String])]
+    toJSON (ReqMvccRead token tables) = object ["method" .= ("mvcc_read" :: T.Text), "transaction" .= token, "tables" .= map fst tables, "columns" .= object [K.fromText (T.pack name) .= columns | (name, Just columns) <- tables]]
     toJSON (ReqMvccLock token ops dependencies) = object ["method" .= ("mvcc_lock" :: T.Text), "transaction" .= token, "ops" .= ops, "reads" .= dependencies]
-    toJSON (ReqMvccPreview token) = object ["method" .= ("mvcc_preview" :: T.Text), "transaction" .= token]
+    toJSON (ReqMvccPreview token tables) = object ["method" .= ("mvcc_preview" :: T.Text), "transaction" .= token, "tables" .= tables]
     toJSON (ReqMvccCommit token checkpoint) = object ["method" .= ("mvcc_commit" :: T.Text), "transaction" .= token, "checkpoint" .= checkpoint, "ops" .= ([] :: [TxnOp])]
     toJSON (ReqMvccRollback token) = object ["method" .= ("mvcc_rollback" :: T.Text), "transaction" .= token]
     toJSON ReqDomainSnapshot = object ["method" .= ("domain_snapshot" :: T.Text)]

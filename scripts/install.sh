@@ -43,6 +43,9 @@ usage: ./install.sh [--component web|cli|both] [options]
   --password VALUE        password of the administrator account (required when
                           there is no terminal to ask on; shows up in the shell
                           history, so CHUSQL_ADMIN_PASSWORD is safer)
+  --low-performance-adapted
+                          apply editable low performance resource limits
+                          (default: high performance settings on a fresh install)
   --no-start              do not start the server after installing
   --no-service            skip Linux systemd registration and boot autostart
 
@@ -74,6 +77,7 @@ install_dir=''
 data_dir=''
 root_user='root'
 keep_package='no'
+low_performance_adapted='no'
 password_arg=''
 no_start='no'
 no_service='no'
@@ -94,6 +98,7 @@ while [ $# -gt 0 ]; do
         --data-dir) data_dir="${2:-}"; shift 2 ;;
         --user) root_user="${2:-}"; shift 2 ;;
         --keep-package) keep_package='yes'; shift ;;
+        --low-performance-adapted) low_performance_adapted='yes'; shift ;;
         --password) password_arg="${2:-}"; shift 2 ;;
         --no-start) no_start='yes'; shift ;;
         --no-service) no_service='yes'; shift ;;
@@ -115,6 +120,44 @@ fail() { echo "!! $1" >&2; exit 1; }
 step() { echo; echo "==> $1"; }
 # 打印缩进提示行。
 note() { echo "  $1"; }
+
+# 合并预设中的数值键，保留路径、端口与其它用户设置。
+apply_performance_profile() {
+    awk '
+    function missing(section, i, pair) {
+        for (i=1; i<=count; i++) {
+            split(order[i], pair, SUBSEP)
+            if (pair[1] == section && !seen[order[i]]) {
+                print pair[2] " = " values[order[i]]
+                seen[order[i]]=1
+            }
+        }
+    }
+    FNR == NR {
+        if ($0 ~ /^[[:space:]]*\[/) { section=$0; sub(/^[[:space:]]*\[/,"",section); sub(/\].*$/,"",section); if (!known[section]++) sections[++total]=section }
+        else if ($0 ~ /^[[:space:]]*[a-z_]+[[:space:]]*=[[:space:]]*[0-9]+[[:space:]]*$/) {
+            key=$0; sub(/[[:space:]]*=.*$/,"",key); sub(/^[[:space:]]*/,"",key)
+            value=$0; sub(/^.*=[[:space:]]*/,"",value); sub(/[[:space:]]*$/,"",value)
+            id=section SUBSEP key; order[++count]=id; values[id]=value
+        }
+        else if ($0 !~ /^[[:space:]]*(#.*)?$/) { invalid=1; exit 1 }
+        next
+    }
+    /^[[:space:]]*\[/ {
+        missing(current); current=$0; sub(/^[[:space:]]*\[/,"",current); sub(/\].*$/,"",current); present[current]=1
+    }
+    {
+        key=$0; sub(/[[:space:]]*=.*$/,"",key); sub(/^[[:space:]]*/,"",key)
+        id=current SUBSEP key
+        if (id in values) { comment=$0; if (comment ~ /#/) sub(/^[^#]*/,"",comment); else comment=""; print key " = " values[id] (comment == "" ? "" : " " comment); seen[id]=1 }
+        else print
+    }
+    END {
+        if (invalid || count == 0) exit 1
+        missing(current)
+        for (i=1; i<=total; i++) if (!present[sections[i]]) { print "\n[" sections[i] "]"; missing(sections[i]) }
+    }' "$1" "$2"
+}
 
 # --list-versions 只问仓库有什么版本，不需要 --component
 if [ "$list_versions" = 'no' ]; then
@@ -563,7 +606,7 @@ if [ "$from_source" = 'yes' ]; then
     pack="$tmp/stage"
     mkdir -p "$pack/bin" "$pack/resources"
     cp "$storage_lib" "$pack/bin/"
-    cp "$src/resources/settings.toml.linux" "$pack/resources/"
+    cp "$src/resources/settings.toml.linux" "$src/resources/settings.low-performance.toml" "$pack/resources/"
     cp "$src/scripts/install.sh" "$src/scripts/uninstall.sh" "$pack/"
     for comp in $wanted; do
         if [ "$comp" = 'web' ]; then
@@ -663,6 +706,9 @@ if [ "$want_cli" = 'yes' ]; then
     [ -f "$pack/bin/csql" ] || fail 'package is incomplete: bin/csql not found'
 fi
 [ -f "$pack/resources/settings.toml.linux" ] || fail 'package is incomplete: resources/settings.toml.linux not found'
+if [ "$low_performance_adapted" = 'yes' ]; then
+    [ -f "$pack/resources/settings.low-performance.toml" ] || fail 'package is incomplete: resources/settings.low-performance.toml not found'
+fi
 
 echo 'ChuSQL installer'
 echo "  version    $version"
@@ -749,6 +795,16 @@ if [ ! -f "$config_file" ]; then
     sed -e "s|@DATA_DIR@|$(printf '%s' "$data_dir" | sed 's/[\&|]/\\&/g')|g" \
         -e "s|@LOG_DIR@|$(printf '%s' "$log_dir" | sed 's/[\&|]/\\&/g')|g" \
         "$pack/resources/settings.toml.linux" > "$config_file"
+fi
+if [ "$low_performance_adapted" = 'yes' ]; then
+    [ -f "$config_file.before-low-performance" ] || cp -p "$config_file" "$config_file.before-low-performance"
+    profile_output=$(mktemp "$config_file.XXXXXX")
+    if apply_performance_profile "$pack/resources/settings.low-performance.toml" "$config_file" > "$profile_output"; then
+        mv "$profile_output" "$config_file"
+    else
+        fail 'cannot apply low performance profile; original settings.toml was preserved'
+    fi
+    note 'low performance settings applied; every resource limit can be edited in settings.toml'
 fi
 echo "  config file  $config_file"
 

@@ -94,6 +94,7 @@ check_stage() {
     [ -f "$stage/static/index.html" ] || Fail 'static/index.html is missing from the package'
     [ -f "$stage/csql-web.sh" ] || Fail 'csql-web.sh is missing from the package'
     [ -f "$stage/resources/settings.toml.linux" ] || Fail 'resources/settings.toml.linux is missing from the package'
+    [ -f "$stage/resources/settings.low-performance.toml" ] || Fail 'resources/settings.low-performance.toml is missing from the package'
     [ -f "$stage/install.sh" ] || Fail 'install.sh is missing from the package'
     [ -f "$stage/install.ps1" ] || Fail 'install.ps1 is missing from the package'
     [ -f "$stage/uninstall.sh" ] || Fail 'uninstall.sh is missing from the package'
@@ -226,7 +227,7 @@ for lib in "$repo_root"/chusql-core/storage/target/release/*.so "$repo_root"/chu
     cp "$lib" "$stage/bin/"
 done
 
-cp "$repo_root/resources/settings.toml.linux" "$stage/resources/"
+cp "$repo_root/resources/settings.toml.linux" "$repo_root/resources/settings.low-performance.toml" "$stage/resources/"
 cp "$repo_root/scripts/install.sh" "$repo_root/scripts/install.ps1" "$repo_root/scripts/uninstall.sh" "$repo_root/scripts/uninstall.ps1" "$stage/"
 mkdir -p "$stage/static"
 cp -R "$repo_root"/chusql-web/static/. "$stage/static/"

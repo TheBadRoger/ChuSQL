@@ -18,7 +18,7 @@ module ChuSQL.Server.TCP (
 
 import qualified ChuSQL.Core.Engine.Error as E
 import ChuSQL.Core.Protocol (Account (..), Request (ReqIdentityInitialize))
-import ChuSQL.Interface.Config (ServerConfig (..), defaultServerConfig, loadServerConfigAt)
+import ChuSQL.Interface.Config (ServerConfig (..), defaultServerConfig, loadServerConfigAt, validateServerConfig)
 import ChuSQL.Interface.Policy (PasswordPolicy (..))
 import ChuSQL.Interface.Protocol (ClientRequest (..), ServerResponse (..), decodeRequest, encodeResponse, protocolVersion)
 import ChuSQL.Interface.RateLimit (RateLimiter, rateLimitBlock, rateLimitClear, rateLimitRecord)
@@ -26,16 +26,19 @@ import ChuSQL.Interface.Sudo (SudoCredential, createSudoCredential, isLocalPeer,
 import ChuSQL.Server.Backend (Backend (..))
 import ChuSQL.Server.Privileges (newPrivileges, reconcileObjects)
 import ChuSQL.Server.Security (writeSecurity)
-import ChuSQL.Server.Session (QueryResult (..), Session, SessionError (..), accounts, analyzeNormalizationCoded, authenticateSessionCoded, authenticateSudoSessionCoded, catalog, closeSession, databases, isPlainIdentifier, newSessionWith, policyOf, reloadPolicy, roleViews, runStatementCoded, runStorageCoded, sessionIsAdmin, sessionUser)
-import Control.Concurrent (forkIO)
-import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar)
-import Control.Exception (IOException, bracket, finally, onException, try)
+import ChuSQL.Server.Session (QueryResult (..), Session, SessionError (..), accounts, analyzeNormalizationCoded, authenticateSessionCoded, authenticateSudoSessionCoded, catalog, closeSession, databases, isPlainIdentifier, newSessionWith, policyOf, reloadPolicy, roleViews, runStatementAdmitted, runStorageCoded, sessionIsAdmin, sessionUser, transactionTimeout)
+import Control.Concurrent (forkFinally, forkIO)
+import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar, readMVar)
+import Control.Concurrent.QSem (QSem, newQSem, signalQSem, waitQSem)
+import Control.Exception (IOException, bracket, bracket_, finally, mask, onException, try)
 import Control.Monad (filterM, void, when)
 import qualified Data.ByteString.Char8 as BSC
 import qualified Data.ByteString.Lazy.Char8 as BLC
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.List (minimumBy)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isNothing)
+import Data.Ord (comparing)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Time.Clock (UTCTime, getCurrentTime)
@@ -63,6 +66,7 @@ import Network.Socket (
  )
 import System.IO (BufferMode (LineBuffering), Handle, IOMode (ReadWriteMode), hClose, hFlush, hPutStrLn, hSetBuffering, hSetNewlineMode, noNewlineTranslation, stderr)
 import System.IO.Error (eofErrorType, isEOFError, mkIOError)
+import System.Timeout (timeout)
 
 -- TCP 服务器：监听端口，一连接一会话，按一行一 JSON 收发协议消息。
 
@@ -123,11 +127,14 @@ data ServerEnv = ServerEnv
     , srvLimiter :: RateLimiter
     , srvLive :: LiveConnections
     , srvSudo :: MVar (Maybe (Int, Text, SudoCredential))
+    , srvQuerySlots :: Maybe QSem
+    , srvConnectionCount :: MVar Int
     }
 
 -- | 组装服务器环境：每个连接再各开一个会话
 newServerEnv :: Backend -> Text -> FilePath -> ServerConfig -> RateLimiter -> IO ServerEnv
 newServerEnv backend rootName settingsFile config limiter = do
+    either (ioError . userError) pure (validateServerConfig config)
     migrated <- beAccounts backend (ReqIdentityInitialize rootName)
     case migrated of
         Left err -> ioError (userError ("identity migration failed: " ++ err ++ "; stop all processes and try csql-bootstrap repair --config <settings.toml>; use recover if data restoration is required"))
@@ -141,7 +148,9 @@ newServerEnv backend rootName settingsFile config limiter = do
         Left err -> ioError (userError ("object privilege recovery failed: " ++ show err))
         Right () -> pure ()
     sudo <- newMVar Nothing
-    pure (ServerEnv backend rootName settingsFile config limiter live sudo)
+    slots <- if scMaxConcurrentQueries config == 0 then pure Nothing else Just <$> newQSem (scMaxConcurrentQueries config)
+    connectionCount <- newMVar 0
+    pure (ServerEnv backend rootName settingsFile config limiter live sudo slots connectionCount)
 
 data ServerHandle = ServerHandle
     { shPort :: Int
@@ -242,8 +251,27 @@ acceptLoop env sock stopped = loop
                         stopping <- readMVar stopped
                         if stopping then pure () else hPutStrLn stderr ("accept failed: " ++ show err)
                     Right (conn, _) -> do
-                        void (forkIO (reportConnection env conn))
+                        mask $ \restore -> do
+                            admitted <- modifyMVar (srvConnectionCount env) $ \count ->
+                                if scMaxConnections (srvConfig env) > 0 && count >= scMaxConnections (srvConfig env)
+                                    then pure (count, False)
+                                    else pure (count + 1, True)
+                            if admitted
+                                then
+                                    void (forkFinally (restore (reportConnection env conn)) (const (releaseConnection env)))
+                                        `onException` (releaseConnection env `finally` close conn)
+                                else close conn
                         loop
+
+-- | 连接结束或创建线程失败后归还名额
+releaseConnection :: ServerEnv -> IO ()
+releaseConnection env = modifyMVar_ (srvConnectionCount env) (pure . subtract 1)
+
+-- | 排队取得查询名额，取消和异常时归还
+withQuerySlot :: ServerEnv -> IO a -> IO a
+withQuerySlot env action = case srvQuerySlots env of
+    Nothing -> action
+    Just slots -> bracket_ (waitQSem slots) (signalQSem slots) action
 
 -- | 连接线程：异常写到 stderr
 reportConnection :: ServerEnv -> Socket -> IO ()
@@ -271,10 +299,11 @@ serveConnection env conn = do
   where
     -- \| 逐行读请求并应答
     loop h session entry pending = do
-        frame <- readRequestLine h (scMaxMessage (srvConfig env)) pending
+        frame <- readConnectionFrame env session h pending
         case frame of
-            Nothing -> send h (RespError "too_large" "request line too large")
-            Just (cleaned, remaining) -> case decodeRequest cleaned of
+            Left (code, message) -> send h (RespError code message)
+            Right Nothing -> send h (RespError "too_large" "request line too large")
+            Right (Just (cleaned, remaining)) -> case decodeRequest cleaned of
                 Left message -> send h (RespError "bad_request" message) >> loop h session entry remaining
                 Right request -> do
                     expired <- readIORef (leDropped entry)
@@ -289,6 +318,27 @@ serveConnection env conn = do
         BLC.hPutStr h (encodeResponse response)
         BLC.hPutStr h "\n"
         hFlush h
+
+-- | 在读取下一帧时执行连接和事务的空闲上限
+readConnectionFrame :: ServerEnv -> Session -> Handle -> BSC.ByteString -> IO (Either (Text, Text) (Maybe (BSC.ByteString, BSC.ByteString)))
+readConnectionFrame env session handle pending = do
+    transaction <- transactionTimeout session (scTransactionIdle config) (scTransactionMax config)
+    let limits =
+            [(micros, ("transaction_expired", "transaction expired; connection closed and transaction rolled back")) | Just micros <- [transaction]]
+                ++ [(secondsToMicroseconds (scConnectionIdle config), ("connection_timeout", "connection idle timeout")) | scConnectionIdle config > 0]
+        action = readRequestLine handle (scMaxMessage config) pending
+    case limits of
+        [] -> Right <$> action
+        _ -> do
+            let (micros, failure) = minimumBy (comparing fst) limits
+            result <- timeout micros action
+            pure (maybe (Left failure) Right result)
+  where
+    config = srvConfig env
+
+-- | 秒数转换保持在计时器整数范围内
+secondsToMicroseconds :: Int -> Int
+secondsToMicroseconds seconds = fromInteger (min (toInteger (maxBound :: Int)) (toInteger seconds * 1000000))
 
 -- | 限长读取一行并保留后续帧
 readRequestLine :: Handle -> Int -> BSC.ByteString -> IO (Maybe (BSC.ByteString, BSC.ByteString))
@@ -341,7 +391,7 @@ dispatch env session entry request = case request of
         response <- sudoLogin env session entry user proof
         pure (response, True)
     ReqNormalization payload -> do
-        result <- analyzeNormalizationCoded session payload
+        result <- withQuerySlot env (analyzeNormalizationCoded session payload)
         pure (either (\err -> RespError (sessCode err) (sessMessage err)) RespNormalization result, True)
     ReqQuery sql -> do
         who <- sessionUser session
@@ -350,13 +400,13 @@ dispatch env session entry request = case request of
             Just _
                 | T.null (T.strip sql) -> pure (RespError "bad_request" "sql must not be empty")
                 | otherwise -> do
-                    result <- runStatementCoded session sql
+                    result <- runStatementAdmitted (withQuerySlot env) session sql
                     pure $ case result of
                         Left err -> RespError (sessCode err) (sessMessage err)
                         Right queryResult -> RespResult (trimResult (scMaxRows (srvConfig env)) queryResult)
         pure (response, True)
     ReqStorage payload -> do
-        result <- runStorageCoded session payload
+        result <- withQuerySlot env (runStorageCoded session payload)
         let response = case result of
                 Left err -> RespError (sessCode err) (sessMessage err)
                 Right value -> RespStorage value

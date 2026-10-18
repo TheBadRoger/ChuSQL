@@ -175,9 +175,7 @@ authorizeTables :: Privileges -> Principal -> Text -> [(Text, Text)] -> IO (Eith
 authorizeTables service principal database needed
     | principalIsRoot principal = pure (Right ())
     | T.null database && (not . all (T.isPrefixOf "database:" . fst)) needed = pure (Left (PrivilegeError "no_database" "no database selected"))
-    | otherwise = withTables service $ do
-        connected <- if T.null database then pure (Right ()) else catalog (OA.objectConnect (pvBackend service) (pvCatalog service) principal database)
-        case connected of Left err -> pure (Left err); Right () -> catalog (OA.objectAuthorize (pvBackend service) (pvCatalog service) principal database needed)
+    | otherwise = withTables service (catalog (OA.objectAuthorizeConnected (pvBackend service) (pvCatalog service) principal database needed))
 
 -- 仅返回拥有 SELECT 权限的表名。
 filterTables :: Privileges -> Principal -> Text -> [Text] -> IO (Either PrivilegeError [Text])

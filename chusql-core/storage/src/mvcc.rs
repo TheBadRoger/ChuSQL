@@ -1,8 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs::File;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,7 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 type TableRows = Vec<(String, Vec<Row>)>;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Version {
     begin: u64,
     end: Option<u64>,
@@ -38,7 +38,117 @@ struct Durable {
     format: u32,
     csn: u64,
     next_row: u64,
-    tables: BTreeMap<u64, History>,
+    tables: BTreeMap<u64, Arc<History>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TableDelta {
+    schema: TableSchemaWire,
+    changed: u64,
+    live: bool,
+    rows: BTreeMap<u64, Vec<Version>>,
+    removed: Vec<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Delta {
+    format: u32,
+    csn: u64,
+    next_row: u64,
+    oldest: u64,
+    tables: BTreeMap<u64, TableDelta>,
+    removed: Vec<u64>,
+}
+
+/// 检测增量记录的完整内容损坏
+fn checksum(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325, |value, byte| {
+        (value ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+/// 按同一回收边界删除过期版本及退役表
+fn prune_durable(durable: &mut Durable, oldest: u64) {
+    for history in durable.tables.values_mut() {
+        if history
+            .rows
+            .values()
+            .any(|chain| chain.iter().any(|v| v.end.is_some_and(|end| end <= oldest)))
+        {
+            Arc::make_mut(history).rows.retain(|_, chain| {
+                chain.retain(|v| v.end.is_none_or(|end| end > oldest));
+                !chain.is_empty()
+            });
+        }
+    }
+    durable
+        .tables
+        .retain(|_, history| history.live || !history.rows.is_empty());
+}
+
+/// 重放已同步增量，丢弃末尾未完整写入的记录
+fn replay_deltas(path: &Path, durable: &mut Durable) -> io::Result<()> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let base = durable.csn;
+    let mut complete = 0;
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        if line.last() != Some(&b'\n') {
+            break;
+        }
+        let body = line
+            .get(17..line.len() - 1)
+            .ok_or_else(|| io::Error::other("invalid MVCC delta frame"))?;
+        let expected = std::str::from_utf8(&line[..16])
+            .ok()
+            .and_then(|text| u64::from_str_radix(text, 16).ok());
+        if line[16] != b' ' || expected != Some(checksum(body)) {
+            return Err(io::Error::other("invalid MVCC delta checksum"));
+        }
+        let delta: Delta = serde_json::from_slice(body).map_err(io::Error::other)?;
+        if delta.format != 1 || delta.oldest > delta.csn {
+            return Err(io::Error::other("invalid MVCC delta version"));
+        }
+        if delta.csn > base {
+            if delta.csn < durable.csn || delta.next_row < durable.next_row {
+                return Err(io::Error::other("MVCC delta moved backwards"));
+            }
+            for id in delta.removed {
+                durable.tables.remove(&id);
+            }
+            for (id, update) in delta.tables {
+                let history = durable.tables.entry(id).or_insert_with(|| {
+                    Arc::new(History {
+                        schema: update.schema.clone(),
+                        changed: update.changed,
+                        live: update.live,
+                        rows: BTreeMap::new(),
+                    })
+                });
+                let history = Arc::make_mut(history);
+                history.schema = update.schema;
+                history.changed = update.changed;
+                history.live = update.live;
+                for id in update.removed {
+                    history.rows.remove(&id);
+                }
+                history.rows.extend(update.rows);
+            }
+            durable.csn = delta.csn;
+            durable.next_row = delta.next_row;
+            prune_durable(durable, delta.oldest);
+        }
+        complete += line.len();
+    }
+    if complete != bytes.len() {
+        let file = OpenOptions::new().write(true).open(path)?;
+        file.set_len(complete as u64)?;
+        file.sync_all()?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -107,6 +217,17 @@ fn unique_key(row: &Row, column: &str) -> Option<Vec<u8>> {
     }
 }
 
+/// 按原行序建立业务键候选，重复键保留首次匹配顺序
+fn key_positions<'a>(rows: impl Iterator<Item = &'a Row>) -> HashMap<Vec<u8>, VecDeque<usize>> {
+    let mut positions: HashMap<Vec<u8>, VecDeque<usize>> = HashMap::new();
+    for (position, row) in rows.enumerate() {
+        if let Some(key) = unique_key(row, "id") {
+            positions.entry(key).or_default().push_back(position);
+        }
+    }
+    positions
+}
+
 struct Change {
     table: u64,
     wanted: Vec<(Option<u64>, Row)>,
@@ -158,17 +279,19 @@ fn plans(state: &State, token: &str, ops: &[StorageOp]) -> io::Result<Vec<Change
         .into_iter()
         .map(|(table, rows)| {
             let old = visible(&state.durable.tables[&table], tx.snapshot);
+            let mut positions = key_positions(old.iter().map(|(_, version)| &version.row));
             let mut used = HashSet::new();
             let mut wanted = Vec::new();
             for row in rows {
-                let identity = unique_key(&row, "id");
-                let prior = old.iter().find(|(id, v)| {
-                    !used.contains(id)
-                        && (v.row == row
-                            || identity
-                                .as_ref()
-                                .is_some_and(|key| unique_key(&v.row, "id").as_ref() == Some(key)))
-                });
+                let prior = match unique_key(&row, "id") {
+                    Some(key) => positions
+                        .get_mut(&key)
+                        .and_then(VecDeque::pop_front)
+                        .and_then(|position| old.get(position)),
+                    None => old
+                        .iter()
+                        .find(|(id, version)| !used.contains(id) && version.row == row),
+                };
                 if let Some((id, _)) = prior {
                     used.insert(*id);
                     wanted.push((Some(*id), row));
@@ -282,6 +405,7 @@ fn prune(state: &mut State) {
         .min()
         .unwrap_or(state.durable.csn);
     for history in state.durable.tables.values_mut() {
+        let history = Arc::make_mut(history);
         history.rows.retain(|_, chain| {
             chain.retain(|version| version.end.is_none_or(|end| end > oldest));
             !chain.is_empty()
@@ -391,7 +515,7 @@ impl Mvcc {
     /// 打开版本目录，未提交事务不会跨进程存活
     pub(crate) fn open(directory: &Path) -> io::Result<Self> {
         let path = directory.join("mvcc.json");
-        let durable = match std::fs::read(&path) {
+        let mut durable = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice::<Durable>(&bytes).map_err(io::Error::other)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => Durable {
                 format: 1,
@@ -401,7 +525,16 @@ impl Mvcc {
             },
             Err(error) => return Err(error),
         };
-        if durable.format != 1
+        if !path.exists()
+            && path
+                .with_extension("delta")
+                .metadata()
+                .is_ok_and(|meta| meta.len() > 0)
+        {
+            return Err(io::Error::other("MVCC delta has no base snapshot"));
+        }
+        replay_deltas(&path.with_extension("delta"), &mut durable)?;
+        if !matches!(durable.format, 1 | 2)
             || durable.tables.values().any(|table| {
                 table.rows.iter().any(|(id, chain)| {
                     *id > durable.next_row
@@ -436,7 +569,7 @@ impl Mvcc {
     }
 
     /// 数据同步后原子发布版本目录并同步目录项
-    fn persist(&self, durable: &Durable) -> io::Result<()> {
+    fn persist_snapshot(&self, durable: &Durable) -> io::Result<()> {
         let temporary = self.path.with_extension("pending");
         let mut file = File::create(&temporary)?;
         serde_json::to_writer(&mut file, durable).map_err(io::Error::other)?;
@@ -444,6 +577,91 @@ impl Mvcc {
         file.sync_all()?;
         drop(file);
         std::fs::rename(&temporary, &self.path)?;
+        #[cfg(unix)]
+        File::open(
+            self.path
+                .parent()
+                .ok_or_else(|| io::Error::other("MVCC parent missing"))?,
+        )?
+        .sync_all()?;
+        Ok(())
+    }
+
+    /// 追加变更行链并同步，达到快照大小后原子归并
+    fn persist(&self, previous: &Durable, durable: &Durable, oldest: u64) -> io::Result<()> {
+        let path = self.path.with_extension("delta");
+        let log_size = std::fs::metadata(&path)
+            .map(|meta| meta.len())
+            .or_else(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    Ok(0)
+                } else {
+                    Err(error)
+                }
+            })?;
+        let base_size = std::fs::metadata(&self.path)
+            .map(|meta| meta.len())
+            .or_else(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    Ok(0)
+                } else {
+                    Err(error)
+                }
+            })?;
+        if previous.format != 2 || base_size == 0 || log_size > base_size.max(1024 * 1024) {
+            self.persist_snapshot(durable)?;
+            let file = File::create(path)?;
+            file.sync_all()?;
+            return Ok(());
+        }
+        let mut tables = BTreeMap::new();
+        for (id, history) in &durable.tables {
+            let prior = previous.tables.get(id);
+            if prior.is_some_and(|old| Arc::ptr_eq(old, history)) {
+                continue;
+            }
+            let rows = history
+                .rows
+                .iter()
+                .filter(|(id, chain)| prior.and_then(|old| old.rows.get(id)) != Some(chain))
+                .map(|(id, chain)| (*id, chain.clone()))
+                .collect();
+            let removed = prior
+                .into_iter()
+                .flat_map(|old| old.rows.keys())
+                .filter(|id| !history.rows.contains_key(id))
+                .copied()
+                .collect();
+            tables.insert(
+                *id,
+                TableDelta {
+                    schema: history.schema.clone(),
+                    changed: history.changed,
+                    live: history.live,
+                    rows,
+                    removed,
+                },
+            );
+        }
+        let delta = Delta {
+            format: 1,
+            csn: durable.csn,
+            next_row: durable.next_row,
+            oldest,
+            tables,
+            removed: previous
+                .tables
+                .keys()
+                .filter(|id| !durable.tables.contains_key(id))
+                .copied()
+                .collect(),
+        };
+        let body = serde_json::to_vec(&delta).map_err(io::Error::other)?;
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        write!(file, "{:016x} ", checksum(&body))?;
+        file.write_all(&body)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
         #[cfg(unix)]
         File::open(
             self.path
@@ -470,6 +688,17 @@ impl Mvcc {
         csn: u64,
         tables: Vec<(TableSchemaWire, Vec<Row>)>,
     ) -> io::Result<()> {
+        let schemas = tables.iter().map(|(schema, _)| schema.clone()).collect();
+        self.publish_changed(csn, schemas, tables)
+    }
+
+    /// 只重建受影响表，保留其余表的共享版本链
+    pub(crate) fn publish_changed(
+        &self,
+        csn: u64,
+        schemas: Vec<TableSchemaWire>,
+        tables: Vec<(TableSchemaWire, Vec<Row>)>,
+    ) -> io::Result<()> {
         let mut state = self
             .state
             .lock()
@@ -478,33 +707,35 @@ impl Mvcc {
             return Err(io::Error::other("MVCC commit sequence moved backwards"));
         }
         let mut next = state.durable.clone();
-        let current_ids: HashSet<_> = tables.iter().map(|(schema, _)| schema.object_id).collect();
+        let current_ids: HashSet<_> = schemas.iter().map(|schema| schema.object_id).collect();
         for (schema, rows) in tables {
-            let history = next
-                .tables
-                .entry(schema.object_id)
-                .or_insert_with(|| History {
+            let history = next.tables.entry(schema.object_id).or_insert_with(|| {
+                Arc::new(History {
                     schema: schema.clone(),
                     changed: csn,
                     live: true,
                     rows: BTreeMap::new(),
-                });
+                })
+            });
+            let history = Arc::make_mut(history);
             let old: Vec<_> = visible(history, next.csn)
                 .into_iter()
                 .map(|(id, v)| (id, v.clone()))
                 .collect();
+            let mut positions = key_positions(old.iter().map(|(_, version)| &version.row));
             let mut used = HashSet::new();
             let mut changed = history.schema.columns != schema.columns
                 || history.schema.schema_version != schema.schema_version;
             for (position, row) in rows.into_iter().enumerate() {
-                let identity = unique_key(&row, "id");
-                let prior = old.iter().find(|(id, v)| {
-                    !used.contains(id)
-                        && (v.row == row
-                            || identity
-                                .as_ref()
-                                .is_some_and(|key| unique_key(&v.row, "id").as_ref() == Some(key)))
-                });
+                let prior = match unique_key(&row, "id") {
+                    Some(key) => positions
+                        .get_mut(&key)
+                        .and_then(VecDeque::pop_front)
+                        .and_then(|position| old.get(position)),
+                    None => old
+                        .iter()
+                        .find(|(id, version)| !used.contains(id) && version.row == row),
+                };
                 let order = position as u64;
                 if let Some((id, previous)) = prior {
                     used.insert(*id);
@@ -576,7 +807,8 @@ impl Mvcc {
             }
         }
         for (id, history) in &mut next.tables {
-            if !current_ids.contains(id) {
+            if !current_ids.contains(id) && history.live {
+                let history = Arc::make_mut(history);
                 history.live = false;
                 for chain in history.rows.values_mut() {
                     if let Some(last) = chain.last_mut().filter(|v| v.end.is_none()) {
@@ -587,6 +819,7 @@ impl Mvcc {
             }
         }
         next.csn = csn;
+        next.format = 2;
         let oldest = state
             .transactions
             .values()
@@ -595,6 +828,14 @@ impl Mvcc {
             .min()
             .unwrap_or(csn);
         for history in next.tables.values_mut() {
+            if !history
+                .rows
+                .values()
+                .any(|chain| chain.iter().any(|v| v.end.is_some_and(|end| end <= oldest)))
+            {
+                continue;
+            }
+            let history = Arc::make_mut(history);
             history.rows.retain(|_, chain| {
                 chain.retain(|v| v.end.is_none_or(|end| end > oldest));
                 !chain.is_empty()
@@ -602,7 +843,7 @@ impl Mvcc {
         }
         next.tables
             .retain(|id, history| current_ids.contains(id) || !history.rows.is_empty());
-        self.persist(&next)?;
+        self.persist(&state.durable, &next, oldest)?;
         state.durable = next;
         self.changed.notify_all();
         Ok(())
@@ -613,6 +854,16 @@ impl Mvcc {
         &self,
         schemas: Vec<TableSchemaWire>,
         serializable: bool,
+    ) -> io::Result<(String, TableRows, u64)> {
+        self.begin_selected(schemas, serializable, None)
+    }
+
+    /// 固定快照并只物化指定表，空列表只返回结构
+    pub(crate) fn begin_selected(
+        &self,
+        schemas: Vec<TableSchemaWire>,
+        serializable: bool,
+        selected: Option<&[String]>,
     ) -> io::Result<(String, TableRows, u64)> {
         let mut state = self
             .state
@@ -633,10 +884,14 @@ impl Mvcc {
                 .ok_or_else(|| io::Error::other("MVCC schema is not synchronized"))?;
             rows.push((
                 schema.table.clone(),
-                visible(history, snapshot)
-                    .into_iter()
-                    .map(|(_, v)| v.row.clone())
-                    .collect(),
+                if selected.is_none_or(|names| names.contains(&schema.table)) {
+                    visible(history, snapshot)
+                        .into_iter()
+                        .map(|(_, v)| v.row.clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                },
             ));
         }
         state.transactions.insert(
@@ -653,6 +908,55 @@ impl Mvcc {
             },
         );
         Ok((token, rows, snapshot))
+    }
+
+    /// 从事务原始快照按需读取表，不能读取后来的提交
+    pub(crate) fn read(
+        &self,
+        token: &str,
+        names: &[String],
+        columns: &HashMap<String, Vec<String>>,
+    ) -> io::Result<(Vec<TableSchemaWire>, TableRows)> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("MVCC lock poisoned"))?;
+        validate(&state, token, false)?;
+        let tx = &state.transactions[token];
+        let mut schemas = Vec::new();
+        let mut tables = Vec::new();
+        for name in names {
+            let schema = tx
+                .schemas
+                .iter()
+                .find(|schema| schema.table == *name)
+                .ok_or_else(|| io::Error::other("unknown transaction read table"))?;
+            let history = state
+                .durable
+                .tables
+                .get(&schema.object_id)
+                .ok_or_else(|| io::Error::other("transaction history missing"))?;
+            tables.push((
+                name.clone(),
+                visible(history, tx.snapshot)
+                    .into_iter()
+                    .map(|(_, version)| match columns.get(name) {
+                        None => version.row.clone(),
+                        Some(selected) => selected
+                            .iter()
+                            .filter_map(|column| {
+                                version
+                                    .row
+                                    .get(column)
+                                    .map(|value| (column.clone(), value.clone()))
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            ));
+            schemas.push(schema.clone());
+        }
+        Ok((schemas, tables))
     }
 
     /// 获取增量行锁并检测跨请求等待环
@@ -853,6 +1157,20 @@ impl Mvcc {
     }
 
     /// 提交前复查版本、锁覆盖和串行化读取
+    pub(crate) fn commit_ops(&self, token: &str) -> io::Result<Vec<StorageOp>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("MVCC lock poisoned"))?;
+        let tx = state
+            .transactions
+            .get(token)
+            .ok_or_else(|| io::Error::other("transaction no longer exists"))?;
+        validate(&state, token, !tx.plan.is_empty())?;
+        merged_ops(&state, token)
+    }
+
+    /// 提交前复查版本、锁覆盖和串行化读取
     pub(crate) fn validate_commit(&self, token: &str, ops: &[StorageOp]) -> io::Result<()> {
         let state = self
             .state
@@ -952,6 +1270,132 @@ mod tests {
             table: "items".into(),
             rows,
         }]
+    }
+
+    /// 延迟加载仍读取原始快照且投影不改变行数
+    #[test]
+    fn lazy_reads_keep_snapshot_and_project_columns() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mvcc = Mvcc::open(directory.path())?;
+        mvcc.publish(1, vec![(schema(), rows("a", "b"))])?;
+        let (token, initial, _) = mvcc.begin_selected(vec![schema()], false, Some(&[]))?;
+        assert!(initial[0].1.is_empty());
+        mvcc.publish(2, vec![(schema(), rows("aa", "bb"))])?;
+        let columns = HashMap::from([("items".to_owned(), vec!["name".to_owned()])]);
+        let (_, projected) = mvcc.read(&token, &["items".into()], &columns)?;
+        assert_eq!(
+            projected[0].1,
+            vec![
+                HashMap::from([("name".into(), json!("a"))]),
+                HashMap::from([("name".into(), json!("b"))])
+            ]
+        );
+        let (_, complete) = mvcc.read(&token, &["items".into()], &HashMap::new())?;
+        assert_eq!(complete[0].1, rows("a", "b"));
+        let (_, empty) = mvcc.read(
+            &token,
+            &["items".into()],
+            &HashMap::from([("items".into(), Vec::new())]),
+        )?;
+        assert_eq!(empty[0].1.len(), 2);
+        assert!(empty[0].1.iter().all(HashMap::is_empty));
+        assert!(
+            mvcc.read(&token, &["missing".into()], &HashMap::new())
+                .is_err()
+        );
+        mvcc.finish(&token)?;
+        assert!(
+            mvcc.read(&token, &["items".into()], &HashMap::new())
+                .is_err()
+        );
+        Ok(())
+    }
+
+    /// 部分表发布与增量重开保留未修改表及旧版本
+    #[test]
+    fn changed_table_deltas_preserve_other_tables_and_reopen() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mvcc = Mvcc::open(directory.path())?;
+        let mut other = schema();
+        other.table = "other".into();
+        other.object_id = 2;
+        let schemas = vec![schema(), other.clone()];
+        mvcc.publish(1, vec![(schema(), rows("a", "b")), (other, rows("x", "y"))])?;
+        let (token, _, _) = mvcc.begin_selected(schemas.clone(), false, Some(&[]))?;
+        mvcc.publish_changed(2, schemas.clone(), vec![(schema(), rows("aa", "b"))])?;
+        let base: Durable =
+            serde_json::from_slice(&std::fs::read(directory.path().join("mvcc.json"))?)
+                .map_err(io::Error::other)?;
+        assert_eq!(base.csn, 1);
+        assert!(directory.path().join("mvcc.delta").metadata()?.len() > 0);
+        let (_, old) = mvcc.read(&token, &["items".into()], &HashMap::new())?;
+        assert_eq!(old[0].1, rows("a", "b"));
+        mvcc.finish(&token)?;
+        drop(mvcc);
+        let reopened = Mvcc::open(directory.path())?;
+        let (_, latest, csn) = reopened.begin(schemas, false)?;
+        assert_eq!(csn, 2);
+        assert_eq!(latest[0].1, rows("aa", "b"));
+        assert_eq!(latest[1].1, rows("x", "y"));
+        // 同一已提交组重放不再改变可见行。
+        reopened.publish_changed(2, vec![schema()], vec![(schema(), rows("aa", "b"))])?;
+        drop(reopened);
+        assert_eq!(Mvcc::open(directory.path())?.csn()?, 2);
+        Ok(())
+    }
+
+    /// 完整记录损坏拒绝打开，撕裂尾部可恢复并继续追加
+    #[test]
+    fn delta_corruption_and_torn_tail_are_distinguished() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mvcc = Mvcc::open(directory.path())?;
+        mvcc.publish(1, vec![(schema(), rows("a", "b"))])?;
+        mvcc.publish(2, vec![(schema(), rows("aa", "b"))])?;
+        drop(mvcc);
+        let path = directory.path().join("mvcc.delta");
+        let valid = std::fs::read(&path)?;
+        OpenOptions::new()
+            .append(true)
+            .open(&path)?
+            .write_all(b"partial frame")?;
+        let reopened = Mvcc::open(directory.path())?;
+        assert_eq!(reopened.csn()?, 2);
+        assert_eq!(std::fs::read(&path)?, valid);
+        reopened.publish(3, vec![(schema(), rows("aaa", "b"))])?;
+        drop(reopened);
+        assert_eq!(Mvcc::open(directory.path())?.csn()?, 3);
+        let mut corrupt = std::fs::read(&path)?;
+        corrupt[0] = if corrupt[0] == b'0' { b'1' } else { b'0' };
+        std::fs::write(&path, corrupt)?;
+        assert!(Mvcc::open(directory.path()).is_err());
+        std::fs::write(&path, valid)?;
+        std::fs::remove_file(directory.path().join("mvcc.json"))?;
+        assert!(Mvcc::open(directory.path()).is_err());
+        Ok(())
+    }
+
+    /// 旧快照升级与日志归并中断均可重复打开
+    #[test]
+    fn legacy_snapshot_and_compacted_delta_remain_readable() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mvcc = Mvcc::open(directory.path())?;
+        mvcc.publish(1, vec![(schema(), rows("a", "b"))])?;
+        mvcc.publish(2, vec![(schema(), rows("aa", "b"))])?;
+        let mut durable = mvcc.state.lock().unwrap().durable.clone();
+        mvcc.persist_snapshot(&durable)?;
+        // 快照已发布而旧增量尚未截断。
+        drop(mvcc);
+        assert_eq!(Mvcc::open(directory.path())?.csn()?, 2);
+        durable.format = 1;
+        std::fs::write(
+            directory.path().join("mvcc.json"),
+            serde_json::to_vec(&durable).unwrap(),
+        )?;
+        let migrated = Mvcc::open(directory.path())?;
+        migrated.publish(3, vec![(schema(), rows("aaa", "b"))])?;
+        drop(migrated);
+        assert_eq!(Mvcc::open(directory.path())?.csn()?, 3);
+        Ok(())
     }
 
     /// 发布后旧快照保留且不同行修改可合并

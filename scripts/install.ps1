@@ -10,7 +10,8 @@ param(
     [switch]$ListVersions,
     [switch]$Interactive,
     [switch]$KeepPackage,
-    [switch]$NoStart
+    [switch]$NoStart,
+    [Alias('low-performance-adapted', '-low-performance-adapted')][switch]$LowPerformanceAdapted
 )
 
 $ErrorActionPreference = 'Stop'
@@ -88,6 +89,56 @@ function Get-Releases {
             if ($releases.Count -gt 0) { return $releases }
         } catch { Note "release API unavailable: $url" }
     }
+}
+
+# 合并预设数值键，保留其它用户配置与注释。
+function Merge-PerformanceProfile([string]$Content, [string]$Profile) {
+    $settings = [ordered]@{}
+    $section = ''
+    foreach ($line in ($Profile -split "`r?`n")) {
+        if ($line -match '^\s*\[([^\]]+)\]\s*$') {
+            $section = $Matches[1]
+            $settings[$section] = [ordered]@{}
+        } elseif ($line -match '^\s*([a-z_]+)\s*=\s*([0-9]+)\s*$') {
+            if (-not $settings.Contains($section)) { throw 'profile key has no section' }
+            $settings[$section][$Matches[1]] = $Matches[2]
+        } elseif ($line -notmatch '^\s*(#.*)?$') { throw 'invalid performance profile' }
+    }
+    if ($settings.Count -eq 0) { throw 'empty performance profile' }
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new()
+    $present = [System.Collections.Generic.HashSet[string]]::new()
+    # 补齐已出现分节中尚未填写的资源键。
+    $missing = {
+        param([string]$Name)
+        if ($settings.Contains($Name)) {
+            foreach ($key in $settings[$Name].Keys) {
+                if ($seen.Add("$Name.$key")) { $lines.Add("$key = $($settings[$Name][$key])") }
+            }
+        }
+    }
+    $section = ''
+    foreach ($line in ($Content -split "`r?`n")) {
+        if ($line -match '^\s*\[([^\]]+)\]\s*(#.*)?$') {
+            & $missing $section
+            $section = $Matches[1]
+            [void]$present.Add($section)
+        }
+        if ($line -match '^\s*([a-z_]+)\s*=' -and $settings.Contains($section) -and $settings[$section].Contains($Matches[1])) {
+            $key = $Matches[1]
+            $comment = if ($line.Contains('#')) { ' ' + $line.Substring($line.IndexOf('#')) } else { '' }
+            $lines.Add("$key = $($settings[$section][$key])$comment")
+            [void]$seen.Add("$section.$key")
+        } else { $lines.Add($line) }
+    }
+    & $missing $section
+    foreach ($name in $settings.Keys) {
+        if (-not $present.Contains($name)) {
+            $lines.Add("`n[$name]")
+            & $missing $name
+        }
+    }
+    return $lines -join "`n"
 }
 
 # ---- 列版本 ----
@@ -312,6 +363,8 @@ if ($wantCli) {
 }
 $template = Join-Path $pack 'resources\settings.toml.windows'
 if (-not (Test-Path $template)) { Fail 'package is incomplete: resources\settings.toml.windows not found' }
+$performanceProfile = Join-Path $pack 'resources\settings.low-performance.toml'
+if ($LowPerformanceAdapted -and -not (Test-Path $performanceProfile)) { Fail 'package is incomplete: resources\settings.low-performance.toml not found' }
 
 Say "ChuSQL installer"
 Say ("  version    {0}" -f $Version)
@@ -349,10 +402,23 @@ if ($wantWeb) {
 Step 'Writing settings.toml'
 $configDir = if ($env:APPDATA) { Join-Path $env:APPDATA 'ChuSQL' } else { Join-Path $InstallDir 'config' }
 $configFile = Join-Path $configDir 'settings.toml'
-$toml = Get-Content -Path $template -Raw -Encoding UTF8
-$toml = $toml.Replace('@DATA_DIR@', ($DataDir -replace '\\', '/')).Replace('@LOG_DIR@', ($LogDir -replace '\\', '/'))
 New-Item -ItemType Directory -Force -Path $configDir | Out-Null
-Set-Content -Path $configFile -Value $toml -Encoding UTF8
+if (Test-Path $configFile) {
+    $toml = Get-Content -Path $configFile -Raw -Encoding UTF8
+} else {
+    $toml = Get-Content -Path $template -Raw -Encoding UTF8
+    $toml = $toml.Replace('@DATA_DIR@', ($DataDir -replace '\\', '/')).Replace('@LOG_DIR@', ($LogDir -replace '\\', '/'))
+    Set-Content -Path $configFile -Value $toml -Encoding UTF8
+}
+if ($LowPerformanceAdapted) {
+    $backup = "$configFile.before-low-performance"
+    if (-not (Test-Path $backup)) { Copy-Item -LiteralPath $configFile -Destination $backup }
+    $toml = Merge-PerformanceProfile $toml (Get-Content -Path $performanceProfile -Raw -Encoding UTF8)
+    $profileOutput = "$configFile.$([Guid]::NewGuid().ToString('N')).tmp"
+    Set-Content -LiteralPath $profileOutput -Value $toml -Encoding UTF8
+    Move-Item -LiteralPath $profileOutput -Destination $configFile -Force
+    Note 'low performance settings applied; every resource limit can be edited in settings.toml'
+}
 Say ("  config file  {0}" -f $configFile)
 
 # ---- 引导系统目录 ----

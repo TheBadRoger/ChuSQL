@@ -3,6 +3,7 @@
 
 module ChuSQL.Server.ObjectACL (
     objectAuthorize,
+    objectAuthorizeConnected,
     objectGrant,
     objectRevoke,
     objectRevokeGrantOption,
@@ -322,9 +323,27 @@ privileges target names =
 objectAuthorize :: Backend -> Catalog -> Principal -> Text -> [(Text, Text)] -> IO (Either String ())
 objectAuthorize backend catalog principal database needed = do
     loaded <- load backend catalog
+    case loaded of
+        Left err -> pure (Left err)
+        Right value -> authorizeLoaded backend principal database needed value
+
+-- 同次鉴权共享权限目录，先检查连接再检查表。
+objectAuthorizeConnected :: Backend -> Catalog -> Principal -> Text -> [(Text, Text)] -> IO (Either String ())
+objectAuthorizeConnected backend catalog principal database needed = do
+    loaded <- load backend catalog
+    case loaded of
+        Left err -> pure (Left err)
+        Right value -> do
+            connected <- if T.null database then pure (Right ()) else authorizeLoaded backend principal "" [("database:" <> database, "connect")] value
+            case connected of
+                Left err -> pure (Left err)
+                Right () -> authorizeLoaded backend principal database needed value
+
+-- 用同一权限快照复核身份及对象权限。
+authorizeLoaded :: Backend -> Principal -> Text -> [(Text, Text)] -> (Context, Maybe Text, ACL) -> IO (Either String ())
+authorizeLoaded backend principal database needed (env, _, acl) = do
     objects <- mapM (resolve backend database . fst) needed
     pure $ do
-        (env, _, acl) <- loaded
         found <- sequence objects
         identity <- roleId env (principalName principal)
         if active env identity then Right () else Left "permission denied: disabled identity"

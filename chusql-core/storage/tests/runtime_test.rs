@@ -763,6 +763,43 @@ fn checkpoint_failure_requires_recovery_and_preserves_committed_rows()
     Ok(())
 }
 
+/// 版本增量失败保留已提交日志并可重复恢复
+#[test]
+fn mvcc_delta_failure_requires_recovery_and_replays_commit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (server, data) = start_server();
+    let mut c = connect()?;
+    request_ok(
+        &mut c,
+        serde_json::json!({"method":"create_table","table":"items","columns":[{"name":"id","ty":"int"}]}),
+    )?;
+    let path = data.path().join("databases/main/mvcc.delta");
+    let previous = std::fs::read(&path)?;
+    std::fs::remove_file(&path)?;
+    std::fs::create_dir(&path)?;
+    let failed = send(
+        &mut c,
+        r#"{"method":"insert","table":"items","row":{"id":1}}"#,
+    );
+    assert!(failed.contains("error"), "{failed}");
+    assert!(send(&mut c, r#"{"method":"scan","table":"items"}"#).contains("recovery required"));
+    assert!(data.path().join("databases/main/wal.log").metadata()?.len() > 0);
+    drop(c);
+    drop(server);
+    std::fs::remove_dir(&path)?;
+    std::fs::write(&path, previous)?;
+    for _ in 0..2 {
+        let restarted = restart_at(data.path())?;
+        let mut c = connect()?;
+        let rows: serde_json::Value =
+            serde_json::from_str(&send(&mut c, r#"{"method":"scan","table":"items"}"#))?;
+        assert_eq!(rows["rows"], serde_json::json!([{"id":1}]));
+        drop(c);
+        drop(restarted);
+    }
+    Ok(())
+}
+
 /// 应用失败封闭读写并重放完整提交组
 #[test]
 fn committed_apply_failures_require_recovery() -> Result<(), Box<dyn std::error::Error>> {

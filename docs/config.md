@@ -98,6 +98,8 @@
 
 安装器选择 `resources/settings.toml.linux` 或 `resources/settings.toml.windows`，填入当前用户的绝对路径后释放为 `settings.toml`。两份模板逐项提供英文注释。
 
+安装时加 `--low-performance-adapted`（Windows 为 `-LowPerformanceAdapted`），安装器会把 `resources/settings.low-performance.toml` 中的参数值覆盖进新写的 `settings.toml`；已有配置文件不会被改写。
+
 默认数据和日志路径如下：
 
 | 平台 | 数据目录 | 日志目录 |

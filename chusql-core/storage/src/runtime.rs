@@ -1097,8 +1097,19 @@ impl Server {
         for op in ops.iter() {
             self.flush_op_tables(op)?;
         }
-        self.flush_all_tables()?;
-        self.publish_mvcc(commit_lsn)?;
+        // 普通数据操作已逐表同步，目录和账号操作保留完整刷盘。
+        if !ops.iter().all(|op| {
+            matches!(
+                op,
+                WalOp::Insert { .. }
+                    | WalOp::InsertBatch { .. }
+                    | WalOp::DeleteKeys { .. }
+                    | WalOp::ReplaceAll { .. }
+            )
+        }) {
+            self.flush_all_tables()?;
+        }
+        self.publish_changed_mvcc(commit_lsn, &ops)?;
         wal.write_checkpoint(commit_lsn)?;
         wal.truncate_before(commit_lsn)?;
         self.recovery_required.store(false, Ordering::Release);
@@ -1130,6 +1141,26 @@ impl Server {
     /// 数据落盘后发布持久化行版本
     fn publish_mvcc(&self, csn: u64) -> std::io::Result<()> {
         self.mvcc.publish(csn, self.version_tables()?)
+    }
+
+    /// 普通提交只扫描受影响表，账号组保留完整目录同步
+    fn publish_changed_mvcc(&self, csn: u64, ops: &[WalOp]) -> std::io::Result<()> {
+        if ops.iter().any(|op| matches!(op, WalOp::Accounts { .. })) {
+            return self.publish_mvcc(csn);
+        }
+        let schemas = self.catalog_schemas();
+        let tables = schemas
+            .iter()
+            .filter(|schema| {
+                ops.iter()
+                    .any(|op| op.table() == Some(schema.table.as_str()))
+            })
+            .map(|schema| {
+                self.with_existing_table(&schema.table, |heap| heap.scan())
+                    .map(|rows| (schema.clone(), rows))
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
+        self.mvcc.publish_changed(csn, schemas, tables)
     }
 
     /// 把打开的表都 fsync 一遍
@@ -2843,8 +2874,19 @@ impl Server {
                 Response::Catalog { schemas }
             }
 
-            Request::MvccPreview { transaction } => {
-                let schemas = self.catalog_schemas();
+            Request::MvccPreview {
+                transaction,
+                tables,
+            } => {
+                let schemas = self
+                    .catalog_schemas()
+                    .into_iter()
+                    .filter(|schema| {
+                        tables
+                            .as_ref()
+                            .is_none_or(|names| names.contains(&schema.table))
+                    })
+                    .collect::<Vec<_>>();
                 let result =
                     self.mvcc
                         .preview(&transaction, schemas.clone())
@@ -2862,19 +2904,41 @@ impl Server {
                     },
                 }
             }
-            Request::MvccBegin { serializable } => {
+            Request::MvccRead {
+                transaction,
+                tables,
+                columns,
+            } => match self.mvcc.read(&transaction, &tables, &columns) {
+                Ok((schemas, rows)) => Response::DomainSnapshot {
+                    schemas,
+                    rows,
+                    checkpoint: String::new(),
+                },
+                Err(error) => Response::Error {
+                    message: error.to_string(),
+                },
+            },
+            Request::MvccBegin {
+                serializable,
+                tables,
+            } => {
                 let result = self.ensure_mvcc().and_then(|()| {
                     let schemas = self.catalog_schemas();
-                    self.mvcc.begin(schemas.clone(), serializable).and_then(
-                        |(transaction, rows, _)| {
-                            Ok(Response::MvccSnapshot {
-                                transaction,
-                                schemas,
-                                rows,
-                                checkpoint: self.domain_checkpoint()?,
-                            })
-                        },
-                    )
+                    match tables.as_deref() {
+                        None => self.mvcc.begin(schemas.clone(), serializable),
+                        selected => {
+                            self.mvcc
+                                .begin_selected(schemas.clone(), serializable, selected)
+                        }
+                    }
+                    .and_then(|(transaction, rows, _)| {
+                        Ok(Response::MvccSnapshot {
+                            transaction,
+                            schemas,
+                            rows,
+                            checkpoint: self.domain_checkpoint()?,
+                        })
+                    })
                 });
                 match result {
                     Ok(response) => response,
@@ -2894,7 +2958,7 @@ impl Server {
                             "serialization_failure: commit point changed",
                         ));
                     }
-                    let (_, ops) = self.mvcc.preview(&transaction, self.catalog_schemas())?;
+                    let ops = self.mvcc.commit_ops(&transaction)?;
                     self.mvcc.validate_commit(&transaction, &ops)?;
                     if !ops.is_empty() {
                         self.apply_transaction(&ops)?;
@@ -4239,6 +4303,7 @@ fn concurrent_read(req: &Request) -> bool {
     matches!(
         req,
         Request::DomainSnapshot
+            | Request::MvccRead { .. }
             | Request::DatabaseSnapshot { .. }
             | Request::Scan { .. }
             | Request::ValidateWrite { .. }

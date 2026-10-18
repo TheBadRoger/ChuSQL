@@ -2,12 +2,14 @@ module ChuSQL.Core.Engine.Runtime.Query (
     BoundQuery,
     QueryType (..),
     queryTypes,
+    queryReads,
     bindQuery,
     executeQueryM,
 ) where
 
 import ChuSQL.Core.Engine.Algebra.Eval (evalRelOpM)
-import ChuSQL.Core.Engine.Algebra.Op (RelOp)
+import ChuSQL.Core.Engine.Algebra.Expr (hasSubquery)
+import ChuSQL.Core.Engine.Algebra.Op (RelOp (..))
 import ChuSQL.Core.Engine.Algebra.Optimize (optimize)
 import ChuSQL.Core.Engine.Algebra.Planner (translate)
 import ChuSQL.Core.Engine.Runtime.Dependencies (domainDependencies, queryTables, validateDependencies)
@@ -18,6 +20,7 @@ import ChuSQL.Core.Engine.Semantic (prepare, querySchema)
 import ChuSQL.Core.Engine.Storage (MonadStorage (schema, withSchemaGuard))
 import ChuSQL.Core.Engine.Syntax.AST (Statement)
 import ChuSQL.Core.Model
+import Data.List (nub)
 
 -- SQL 查询绑定边界：保存解析后的类型、函数身份及输出 schema。
 
@@ -36,6 +39,36 @@ data BoundQuery = BoundQuery Database [String] [(String, Column)] [(String, Quer
 -- | 查询绑定计划的输出类型身份
 queryTypes :: BoundQuery -> [(String, QueryType)]
 queryTypes (BoundQuery _ _ _ types _) = types
+
+-- | 从扫描布局提取读取列，复杂子查询保守读取完整行
+queryReads :: BoundQuery -> [(String, Maybe [String])]
+queryReads (BoundQuery _ dependencies _ _ plan) =
+    [(name, columns name) | name <- dependencies]
+  where
+    -- \| 合并同表的全部扫描需求
+    columns name = case scanReads plan of
+        Nothing -> Nothing
+        Just requirements -> case [cols | (table, cols) <- requirements, table == name] of
+            [] -> Nothing
+            values -> nub . concat <$> sequence values
+    -- \| 子查询表达式保持完整布局，其余沿算子树收集
+    scanReads op = case op of
+        Scan _ table cols -> Just [(table, cols)]
+        Lookup _ table _ _ -> Just [(table, Nothing)]
+        Range _ table _ _ _ -> Just [(table, Nothing)]
+        Compute items child | not (any (hasSubquery . snd) items) -> scanReads child
+        Filter expression child | not (hasSubquery expression) -> scanReads child
+        Project _ child -> scanReads child
+        Distinct child -> scanReads child
+        Limit _ child -> scanReads child
+        Derived _ child -> scanReads child
+        Sort _ child -> scanReads child
+        BoundSort items child | not (any (hasSubquery . fst) items) -> scanReads child
+        Aggregate _ items child | not (any (hasSubquery . snd) items) -> scanReads child
+        BoundAggregate keys items child | not (any (hasSubquery . snd) (keys ++ items)) -> scanReads child
+        Join _ left right condition | not (hasSubquery condition) -> (++) <$> scanReads left <*> scanReads right
+        Unit -> Just []
+        _ -> Nothing
 
 -- | 绑定 SQL 查询并优化确定的计划
 bindQuery :: Database -> Statement -> Either String BoundQuery
