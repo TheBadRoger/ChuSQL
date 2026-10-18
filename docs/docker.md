@@ -51,14 +51,6 @@
 | `CHUSQL_APT_BASE` | `https://repo.chunana.cn/api/packages/ChuNa7a/debian` | ChuSQL 的 apt 软件源 |
 | `CHUSQL_VERSION` | `26.10.2` | 安装的软件包版本，不带 `v` |
 
-例如换用官方 Debian 源和镜像仓库：
-
-```sh
-docker compose build \
-  --build-arg DEBIAN_MIRROR=http://deb.debian.org \
-  --build-arg BASE_REGISTRY=docker.io server
-```
-
 ## 启用 Web 管理端
 
 ```sh
@@ -97,7 +89,7 @@ CHUSQL_WEB_PORT=8080 docker compose --profile web up -d --wait
 
 容器内端口保持 7777 和 7778。修改宿主机发布地址可允许远程访问；TCP 和默认 HTTP 使用明文传输，远程接入须使用可信网络，或通过 SSH 隧道、VPN、HTTPS 反向代理。使用 HTTPS 时在 `docker/web.toml` 中把 `cookie_secure` 设为 `true`。
 
-启动配置分别在 `docker/server.toml` 和 `docker/web.toml`，由 Compose 只读挂载。数据库配置中的 `0.0.0.0` 是监听地址，Web 配置中的 `server` 是数据库连接地址。修改宿主文件后重新创建对应服务；其余参数见[配置选项](config.md)，已有数据的页大小和 B+Tree 阶数须保持原值。
+启动配置分别在 `docker/server.toml` 和 `docker/web.toml`，由 Compose 只读挂载。修改宿主文件后重新创建对应服务；其余参数见[配置选项](config.md)，已有数据的页大小和 B+Tree 阶数须保持原值。
 
 Compose 创建以下命名卷，实际名称带项目名前缀，默认是 `chusql_`：
 
@@ -116,25 +108,6 @@ docker compose run --rm -T --no-deps --user 0:0 --entrypoint chown server \
 
 每个服务默认限制为 1 核、512 MiB 内存和 128 个进程或线程。大数据量、长事务或大型查询可在 `compose.yaml` 中提高 `mem_limit` 和 `memswap_limit`；达到内存限制时容器被终止，重启后由 WAL 恢复已提交的数据。
 
-### 在 WSL 或内存受限的机器上构建
-
-镜像只需拉取基础镜像并运行 apt 安装。拉取失败时先为 Docker 配置国内镜像加速，或换用可访问的仓库：
-
-```sh
-docker compose build --build-arg BASE_REGISTRY=docker.io server
-```
-
-需要限制构建资源时，使用 Docker Buildx 的[受限容器构建器](https://docs.docker.com/build/builders/drivers/docker-container)：
-
-```sh
-docker buildx create --name chusql-limited --driver docker-container \
-  --driver-opt memory=1g,memory-swap=1g,cpu-period=100000,cpu-quota=100000
-docker buildx build --builder chusql-limited --load -t chusql:local .
-docker buildx stop chusql-limited
-```
-
-构建器限制为 1 核、1 GiB 内存。生成的标签与 Compose 一致，可直接执行 `docker compose up -d --wait server`。
-
 ## 验收与更新
 
 候选镜像先构建并验收，再投入运行。验收需要 Python 3，会使用独立的容器和数据卷，结束后自动清理：
@@ -149,15 +122,7 @@ docker compose --profile web up -d --wait --no-build
 
 `--seconds` 指定负载时长，回归验收默认 60 秒。把镜像 ID 与源码版本、部署配置和备份一起保留；发布到镜像仓库后可改用 `仓库名@sha256:摘要`。
 
-更新时改 `CHUSQL_VERSION` 构建候选镜像，重新验收后切换：
-
-```sh
-docker compose build --build-arg CHUSQL_VERSION=26.10.3 server
-docker tag chusql:local chusql:candidate
-python3 docker/test-runtime.py --image chusql:candidate --seconds 60
-export CHUSQL_IMAGE=$(docker image inspect chusql:candidate --format '{{.Id}}')
-docker compose --profile web up -d --wait --no-build
-```
+更新时指定新的 `CHUSQL_VERSION`，构建并验收后按上述方式切换镜像。
 
 命名卷保留数据，升级后的引导会保留已有口令。版本回退使用原镜像和升级前的备份。
 

@@ -2,23 +2,7 @@
 
 [← 返回 README](../README.md)
 
-本页帮助你安装、更新和卸载 ChuSQL，并说明软件包源和系统级安装。发行包内含编译后的程序，解压即可安装。
-
-项目仓库：[GitHub](https://github.com/TheBadRoger/ChuSQL) · [ChuRepo](https://repo.chunana.cn/ChuNa7a/ChuSQL)。使用容器部署时，按 [Docker 部署](docker.md) 创建口令文件并启动 Compose。
-
-本页内容：
-
-- [在线安装](#在线安装)
-- [apt 软件源](#apt-软件源)
-- [安装方式](#安装方式)
-- [通过软件包源下载](#通过软件包源下载)
-- [包内安装](#包内安装)
-- [常用安装选项](#常用安装选项)
-- [从源码安装](#从源码安装)
-- [安装完成后](#安装完成后)
-- [更新](#更新)
-- [卸载](#卸载)
-- [发布校验](#发布校验)
+普通用户选择发行包或 apt 安装；容器部署见 [Docker 部署](docker.md)。安装器提示设置管理员口令，并默认启动数据库。
 
 ## 在线安装
 
@@ -70,57 +54,11 @@ csql -u root
 
 ## 安装方式
 
-ChuSQL 支持五种安装方式：
-
-| 方式 | 适用场景 |
-| --- | --- |
-| apt 软件源 | Debian 或 Ubuntu，希望系统级安装并用 `apt` 升级 |
-| 在线安装 | 有网络，希望安装发行版本 |
-| 软件包源下载 | 需要固定版本或脚本化下载，或从 ChuRepo 获取 |
-| 包内安装 | 已下载发行包，或处于离线环境 |
-| 源码安装 | 当前平台没有发行包，或需要自行修改源码 |
-
-安装时选择组件。安装程序初始化系统目录，并为管理员账号设置口令；初始化完成后默认启动 `chusql-server`，需要稍后启动时用 `--no-start`（Windows 为 `-NoStart`）。
-
-Linux 以 root 运行安装脚本时采用系统级安装：程序在 `/usr/lib/chusql`，配置为 `/etc/chusql/settings.toml`，数据与日志在 `/var/lib/chusql`、`/var/log/chusql`，`csql`、`csql-web`、`chusql-server` 链接到 `/usr/bin`，并注册系统级 `chusql-server.service`。用 `sudo ./install.sh --system --component both` 显式指定；打包和测试时可加 `--prefix DIR`，把同一布局写入 `DIR`。
-
-普通用户安装注册 systemd 用户服务，安装器同时启用开机启动和 linger；需要时按提示执行 `sudo loginctl enable-linger "$(id -un)"`。常用命令：
-
-```sh
-systemctl --user status chusql-server.service
-systemctl --user restart chusql-server.service
-journalctl --user -u chusql-server.service
-```
-
-非 systemd 环境用 `--no-service` 跳过服务注册，数据库进程在后台启动。
+`--component web|cli|both` 选择组件。Linux root 安装使用系统服务，普通用户安装使用 systemd 用户服务；非 systemd 环境使用 `--no-service`。
 
 ## 通过软件包源下载
 
-ChuRepo 的通用软件包仓库长期保存每个发行版本的发行包，文件与 GitHub 发行包相同。索引见 [ChuRepo 软件包](https://repo.chunana.cn/ChuNa7a/-/packages/generic/chusql)。
-
-Linux：
-
-```sh
-VERSION=26.10.2
-BASE="https://repo.chunana.cn/api/packages/ChuNa7a/generic/chusql/$VERSION"
-curl -fL --compressed -O "$BASE/chusql-linux-x86_64.tar.gz"
-curl -fL --compressed -O "$BASE/chusql-linux-x86_64.tar.gz.sha256"
-sha256sum -c chusql-linux-x86_64.tar.gz.sha256
-tar -xzf chusql-linux-x86_64.tar.gz
-```
-
-Windows：
-
-```powershell
-$version = "26.10.2"
-$base = "https://repo.chunana.cn/api/packages/ChuNa7a/generic/chusql/$version"
-Invoke-WebRequest "$base/chusql-windows-x86_64.zip" -OutFile chusql-windows-x86_64.zip
-Invoke-WebRequest "$base/chusql-windows-x86_64.zip.sha256" -OutFile chusql-windows-x86_64.zip.sha256
-(Get-FileHash chusql-windows-x86_64.zip -Algorithm SHA256).Hash
-Expand-Archive chusql-windows-x86_64.zip
-```
-
-`VERSION` 和 `$version` 是不带 `v` 的版本号，例如 `26.10.2`。先比对校验值，再解压；解压后按[包内安装](#包内安装)运行安装器。
+固定版本可从 [ChuRepo 软件包](https://repo.chunana.cn/ChuNa7a/-/packages/generic/chusql) 下载发行包和 SHA256 文件，校验后按包内安装步骤执行。
 
 ## 包内安装
 
@@ -149,9 +87,7 @@ Windows：
 | `--no-start` | `-NoStart` | 安装后不自动启动服务 |
 | `--no-service` | — | 跳过 Linux 服务注册和开机启动 |
 | `--system` | — | 系统级安装（Linux，root 默认启用） |
-| `--prefix DIR` | — | 把系统级布局写入 DIR，跳过服务账户与 systemd |
 | `--version TAG` | `-Version` | 指定发行版本 |
-| `--list-versions` | `-ListVersions` | 列出可安装版本 |
 | `--from-source` | — | 从源码构建并安装 |
 | `--low-performance-adapted` | `-LowPerformanceAdapted` | 低性能机器沿用较小并发参数，见[配置](config.md#修改配置) |
 
@@ -164,10 +100,7 @@ Windows：
 选择一个源码地址克隆：
 
 ```sh
-# GitHub
 git clone https://github.com/TheBadRoger/ChuSQL.git
-# 或 ChuRepo
-git clone https://repo.chunana.cn/ChuNa7a/ChuSQL.git
 ```
 
 Linux 进入仓库后使用本地源码构建：
@@ -201,7 +134,7 @@ sh scripts/install.sh --component web --from-source --source-dir .
 
 ## 卸载
 
-在安装目录执行卸载脚本：
+卸载脚本默认删除数据；需要保留时加 `--keep-data`（Windows 为 `-KeepData`）。在安装目录执行：
 
 ```sh
 ./uninstall.sh --yes

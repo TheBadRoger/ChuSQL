@@ -1,191 +1,49 @@
-# ChuSQL 已完成事项
+# ChuSQL 当前进度与验收
 更新：2026-10-18
 
-本文件是当前完成状态及最新验收的唯一来源，等价于 project-plan.txt；不保留历史批次、提交记录或修改流水。
-设计见 design-decisions.txt，未解决限制见 known-issues.txt，后续计划见 side-branch-plan.txt。
+本文件是完成状态与验收的唯一来源。设计见 design-decisions.txt，限制见 known-issues.txt，任务顺序见 side-branch-plan.txt。
 
-近期第一阶段“数据库可靠性与部署验收”、第二阶段“博客业务持久化与驱动联调”及第三阶段“存储并发与恢复扩展”已完成数据库侧本地验收。第三阶段包括持久化行版本、行与唯一键锁、死锁与锁等待取消、同库并行数据准备、在线文件代次迁移，以及页 LSN / 全页镜像恢复。表行物化、串行最终提交和切换窗口的成本见 known-issues.txt。ChuBlog 实际业务接入、生产文件迁移、长期运行及真实断电仍保留配套边界。
+## 已完成能力
 
-## SQL 与查询执行
+- SQL：增删改查、约束、索引、连接、聚合、HAVING、排序、DISTINCT、子查询和非递归 CTE。
+- 优化：过滤与投影下推、常量折叠、索引成本选择、连接重排、子查询复用、半连接、保序并行扫描和稳定 Top-K。
+- 类型：基础与复合类型、函数、复合值比较/排序/哈希、DOMAIN 约束及变更、命名 ENUM 与枚举索引。
+- 绑定：查询、写入与约束按表结构绑定，执行前和存储操作锁内复查对象、结构版本及类型依赖。
+- 存储：页与 B+ 树、catalog、WAL、检查点、提交前容量与冲突检查、页镜像恢复、在线空间整理。
+- 事务：持久化行版本、按表和列延迟加载、行锁与唯一键锁、死锁与超时、保存点、快照隔离及 SERIALIZABLE。
+- 权限：用户与角色、对象所有权、转授权、级联撤销、会话失效、受限目录管理和默认关闭的本机 sudo 认证。
+- 客户端：CLI、Web 编辑事务、只读范式分析、敏感 SQL 历史与诊断脱敏。
+- 安装发行：Windows/Linux 包、用户级与系统级安装、deb、ChuRepo 软件包源、低性能配置和基于 deb 的 Docker 镜像。
 
-- 实现 CRUD、表列约束、索引、INNER / LEFT JOIN、聚合、GROUP BY、HAVING、ORDER BY、LIMIT、投影别名、DISTINCT / ALL；排序支持输出序号、表达式、函数、聚合及子查询。
-- 实现标量及相关子查询、派生表、非递归 CTE、IN / EXISTS、比较与 ANY / ALL；保持 NULL 三值逻辑、重复列、稳定排序、空输入聚合及空集成员比较语义；HAVING 覆盖整体组与未投影聚合，新子句参与依赖守卫和表权限检查。
-- 实现谓词 / 投影下推、常量折叠、点查 / 范围成本选择、贪心内连接重排、16 桶直方图及保序并行扫描；子查询按定义和外层值在查询内物化、跨子句复用，相同 CTE / 派生执行子树共享结果；独立 IN / NOT IN 和简单等值相关 EXISTS / NOT EXISTS 使用哈希半连接 / 反连接。
+数据库可靠性、博客业务驱动联调及存储并发恢复已完成数据库侧本地验收。ChuBlog 应用接入与生产迁移、长期运行和真实断电验证仍需配套完成。
 
-- 哈希连接按线性累积构建重复键桶并保持行序；无子查询的投影和过滤直接求值，LIMIT 下按原计划检查错误并限制保留的输出行。
-- 会话复用最近一条查询的绑定计划，以结构身份和列定义失效，不缓存行数据或权限；同次 CONNECT 与表权限检查共享目录，事务对象编号通过一次 catalog 读取复查。
+## 验收结果
 
-## 类型与绑定
+各项记录对应不同验证范围，局部结果不替代全量门禁：
 
-### 类型表示与 DOMAIN
+| 范围 | 结果 | 证据或边界 |
+| --- | --- | --- |
+| 最近记录的全量门禁 | Rust 227 / Engine 631 / Server 178 / Web 82 / CLI 21 / Bootstrap 9，零失败 | logs/query-efficiency-final-gate.log；动态库、Clippy、HLint、Fourmolu、注释及差异检查通过 |
+| 后续查询与安装配置 | Engine 632 例通过，HLint 与注释检查通过 | 平台模板、低性能参数合并及稳定 Top-K 已验证 |
+| 后续系统级安装与 deb | Server 184、Bootstrap 9、CLI 与 HLint 通过；Web 83 例中 2 例失败 | Web 失败项为缺少 Node.js 的环境用例；dpkg 安装、登录查询和 purge 已实测 |
+| 最新安装与文档检查 | Documentation 2 例、Installer scripts 12 例通过 | 注释检查 118 文件、2210 条函数注释、问题 0；shell/Python 语法及链接检查通过 |
 
-- 建立固定类型 / 函数编号、TypeId / TypeExpr / Kind、逻辑与物理类型、版本化复合值编码；支持 Int / Double / Bool / String / List / Maybe / Tuple、length / not，接入 SQL、存储、CLI 和 Web。
-- 内建类型描述提供 Eq / Ord / Hash 能力，List / Maybe / Tuple 根据参数递归派生，DOMAIN 沿用基础能力。复合值支持结构比较、排序、JOIN、IN / ANY / ALL、分组、去重及 MIN / MAX；完整身份不隐式转换，保留 SQL NULL / Nothing、稳定排序及正负零的相等哈希一致性。索引与唯一键边界见 known-issues.txt。
-- 实现 CREATE / ALTER / DROP / SHOW DOMAIN、库内嵌套定义、列引用、依赖与循环校验及持久化；支持领域 DEFAULT / NOT NULL / 多条具名或匿名 CHECK、约束继承、默认值优先级与旧数据校验，查询输出保留 DOMAIN 身份。
+### 关键回归
 
-### 命名枚举 ENUM
+- 存储校验：超页行、超长键、重复 id、非法字段名和结构版本耗尽均在提交前拒绝；失败后文件、重启及后续读写行为已验证。
+- 查询与类型：覆盖快照延迟读取、列补齐、计划失效、错误顺序、DOMAIN 继承和变更、复合值运算、ENUM 的实际 FFI 与驱动读取。
+- 事务与恢复：覆盖并发合并、最终约束、SERIALIZABLE 读依赖、锁等待/取消/死锁、快照回收、页撕裂修复、重复恢复及在线整理切换。
+- 关键日志：logs/enum-final-gate.log、logs/enum-driver.log、logs/mvcc-stage-gate-final.log、logs/mvcc-lifecycle.log、logs/mvcc-driver-final.log。
 
-- 支持 CREATE TYPE ... AS ENUM、列引用和 DROP TYPE，复用库内类型目录、对象身份守卫和依赖删除保护。标签按大小写与空白精确匹配，非空集合、重复标签、63 个 UTF-8 字节及 NUL 边界统一校验；默认值、插入、更新及现存文本列转换均按类型校验。
-- 核心行为参照 PostgreSQL：比较、排序、MIN / MAX 按声明顺序，不同命名枚举及枚举列 / 文本列禁止隐式混用，字符串字面量按上下文绑定为枚举；NULL 保留独立语义。验证 IN / ANY、分组、去重、唯一键和原生 Bool 运算。
-- 版本 1 的 __chusql_enum_v1 保存类型名、标签集合与值；索引复用声明序号的保序整数键，实际 FFI 验证点查、范围查与重启。客户端结果仍为字符串标签，CLI / Web 的显示与编辑沿用文字输入并校验标签。引导保留 18 个原生类型与别名，不新增 BoolText、YesNo 或 OnOff。
+### 驱动与容器
 
-### 查询与写入绑定
+- ChuBlog 固定 Rust 驱动通过 2 项单元测试与 4 项协议测试，并完成业务数据、账户哈希、并发注册、互动计数、重启和停机备份恢复验证。生产账户迁移与博客 HTTP/SSH 授权另由 ChuBlog 实现。
+- 旧源码镜像完成 300 秒并发负载：1696 次成功提交、2415 次明确冲突；SIGKILL 恢复后核对 1701 个关联事务，检查点 ENOSPC 与冷备份恢复通过。证据见 logs/docker-runtime-acceptance.log 等日志。
+- 当前 deb 镜像实测构建、非 root 运行、CLI/Web 健康检查、15 秒负载、冲突、SIGKILL、ENOSPC、幂等引导及冷备份恢复通过，镜像约 51 MiB。验收结论限于对应镜像。
+- 业务驱动日志见 logs/blog-driver-tests.log、logs/blog-business-driver.log。样例位于 examples/blog，使用构造副本，未迁移生产账户。
 
-- 查询使用 BoundQuery；表达式、投影、连接、排序和分组按 schema 槽位绑定，存储返回行按布局整理，缺列和位置失配明确失败。
-- 相关列按最近到最远的独立词法作用域解析，局部 / 外层槽位分离；重绑定保留有效位置，失配仅允许唯一同名列重定位。子查询取值与缓存共享槽位绑定。
-- DML 使用可复用 BoundWrite，预绑定 INSERT 输入、UPDATE 目标、DELETE 布局及 CHECK / 非空 / 唯一性约束；保留默认值、自增、逐项赋值和未命中行不求值，唯一性按最终行集判断，失败不发布修改。
+### 发布状态
 
-### 依赖复查与约束发布
-
-- 查询与已有表写计划保存对象身份、schema 版本、列定义及传递 DOMAIN 依赖；执行前及实际存储操作锁内复查。写前握手拒绝不支持守卫的存储，跨库按名称排序取门；数据、统计和无关结构变化不使计划失效。
-- ALTER DOMAIN 校验一致整库快照，并在存储写门内复查库身份和提交点后通过既有结构 WAL 发布；并发提交返回 serialization_failure。依赖领域的建表及领域创建使用结构守卫，事务提交复查修改表及传递领域依赖。
-- CHECK 定义与执行共用类型及槽位绑定；建表、加列和结构变更校验条件、默认值与键能力，空表不跳过，失效引用明确拒绝。
-
-## 存储与事务
-
-- SQL 查询与数据写语句使用存储事务；同库不同行可以并行准备，行锁等待不占库提交门。最终权限 / 对象 / 约束校验与 WAL 发布仍串行；权限与 DDL 全局独占。真实 TCP 验证不同行合并提交、旧快照读取、死锁返回和断线释放行锁。
-
-- 实现页、堆表、B+Tree、catalog、WAL、LSN 检查点、已提交组幂等恢复及页内 compact；持久化对象编号、高水位和 schema 版本，失败进入 recovery_required。
-- 实现按连接隔离工作库、持久化行版本快照、行级写写冲突检查、保存点和合并提交；权限及对象身份在事务提交时复查。COMMIT 在发布前复用引擎规则校验合并最终行集，拒绝不同整数主键形成的 UNIQUE 冲突，失败不发布其他表修改。
-- 支持 BEGIN [TRANSACTION] ISOLATION LEVEL SERIALIZABLE 及 START TRANSACTION ISOLATION LEVEL SERIALIZABLE，写事务提交按表复查全部读依赖的 schema 和数据，包含子查询和幻行；保存点回退恢复读依赖，只读快照可完成，默认 BEGIN 保留不同行合并行为。
-
-- BEGIN 仅传输一致结构并固定版本引用，按语句涉及的表和扫描列延迟加载原始快照；扩列或写入时补齐完整行和保存点。提交预检仅传输修改表及类型依赖，保留最终约束校验。
-- 普通版本发布只扫描受影响表，未改表共享历史；mvcc.json 格式 2 与带校验和的 mvcc.delta 保存快照与变化行链，并定期归并。读取兼容旧格式 1；保留 WAL、页、版本和检查点发布顺序，数据提交不重复刷无关表。
-
-### 提交前校验
-
-- 普通 WAL 提交组在落盘前复用堆行与索引键编码检查行大小及有效索引键长度，覆盖单行 / 批量插入、整表替换、事务、结构替换及整理；超限输入不改变数据、索引、catalog、WAL 或检查点，不触发 recovery_required。
-
-  建索引先校验已有值，结构替换按实际保留的索引校验；堆表直接写入与整表替换也在修改前拒绝超限键。
-- 新插入 id 的冲突在普通 WAL 提交前按操作顺序预检，覆盖单行、批量及跨表事务；复用实际键编码，按需点查并缓存键计数，支持先删除再插入及整表替换。保留 NULL / 缺失 id、旧重复 id 与重复删除键只删除首行一次的兼容行为。
-- 普通写入可能扩列时，在提交前按操作顺序复用 catalog 规则预演列推导和 schema 版本递增；结构替换及整理的载荷行参与预演。版本耗尽不发布数据或日志修改；同一行多列只递增一次，未定型 NULL 不扩列，版本上限不阻断无需结构变化的数据写入。
-- 存储协议的表名、列定义及写入行顶层字段名共用名称规则；单行、批量、整表替换、结构替换和事务载荷在处理请求时拒绝非法字段名。值内部键和文本不受字段名校验影响，旧数据扫描与已提交旧 WAL 重放保持兼容。
-
-### Web 编辑事务
-
-- Web 编辑使用独立连接与页面绑定，支持跨表原子提交、保存点重放、提交去重、冲突重载、SQL 标签隔离及退出清理。
-
-## 身份、工具与发行
-
-- 用户与角色统一名称空间，支持 LOGIN / SUPERUSER / ENABLED、稳定编号、角色继承、迁移及删除清理；权限变更使受影响会话失效。
-- 实现对象所有权、grant option、DATABASE CONNECT / CREATE、表级数据权限及 PUBLIC、SHOW GRANTS、REVOKE GRANT OPTION FOR 和失效授权级联清理。
-
-### 认证、工具与发行
-
-- 实现默认关闭的本机 sudo 身份映射、受保护凭据、回环校验与一次性 HMAC 挑战；已验证 Windows 非提升拒绝及 Debian/WSL root 凭据安全边界。
-- 范式检查通过 Haskell / TCP / CLI / Web 提供只读分析，依据 schema 与声明检查 1NF / 2NF / 3NF / BCNF，输出违反依赖、一次无损分解及依赖保持结果。
-- 引导初始化 system、默认 root 与 18 个内置类型，重复引导保留口令并拒绝冲突；实现 system_catalog_manager 及 bootstrap repair / recover / reset。
-- 统一监听、数据 / 日志目录与配置模板；完成 Windows 分组件打包安装冒烟、管道口令兼容、敏感 SQL 诊断 / 历史脱敏及 UTF-8 构建。发行与平台未验收事项见 known-issues.txt。
-
-## 容器部署
-
-- 提供多阶段 Dockerfile、默认数据库与可选 Web 的 Compose 配置、非 root 服务、文件口令、幂等引导、数据 / 日志 / Web 偏好卷、协议健康检查和停机备份说明。
-- 构建按单任务执行，GHC 构建堆上限 1536 MiB；运行服务各限制 1 核和 512 MiB，文档提供 3 GiB 上限的 Buildx 构建器及异机构建导入方式。
-
-## 最新验证
-
-### 门禁结果
-
-- 全量门禁通过：Rust 227 / Engine 631 / Server 178 / Web 82 / CLI 21 / Bootstrap 9，均零失败；release 动态库重建、Clippy、注释检查及 git diff --check 通过。
-
-  受影响 Haskell 源码与测试 HLint 无建议；Fourmolu 格式及幂等检查通过。
-
-### 查询执行资源验收
-
-- 全量日志为 logs/query-efficiency-final-gate.log；受影响 Haskell HLint 无建议，Fourmolu、Clippy、注释及 git diff --check 通过。
-- 回归覆盖列投影、旧快照延迟读取、列补齐后的保存点回退、重复查询读取复用、结构变化后计划失效，以及 LIMIT 包裹投影或过滤时的错误传播与行序。
-- 存储回归覆盖变化表发布、未改表保留、旧格式读取、增量重开、完整帧损坏拒绝、撕裂尾部清理、归并中断重复打开，以及增量写入失败后的封闭与重复重启恢复。
-- 按要求未运行基准测试，未量化性能收益，未部署生产实例或重建容器。
-
-### ENUM 验收
-
-- 全量日志为 logs/enum-final-gate.log；实际 ChuBlog 固定驱动通过命名声明、默认值、声明顺序比较、不同枚举类型拒绝、标签输入与依赖保护，并保持博客业务、强杀恢复及备份恢复通过，日志为 logs/enum-driver.log。未修改 ChuBlog 实现，未重建 Docker 镜像。
-- 受影响源码 Fourmolu 检查通过，核心与客户端 HLint 无建议，驱动 Clippy 通过。CLI 门禁先刷新共享 model / engine / interface，避免旧缓存遗漏新增值构造器；未跳过检查。
-
-### 存储回归
-
-- 回归验证超页行与超长索引键在提交前拒绝，失败后文件不变且可继续读写和重启；覆盖 UTF-8 字节边界、NULL、建索引失败与移除索引后的结构替换。真实 TCP 验证超限 SQL 写入后仍可查询与写入。
-- 重复 id 回归验证单行 / 批内 / 跨操作冲突均不改变持久文件，事务早先的跨表修改不发布；合法删除再插入可提交并重启点查。验证整值浮点等键、NULL / 缺失 id 及旧重复 id 的删除顺序；真实 TCP 验证重复 id SQL 插入报错后仍可查询和合法写入。
-- 扩列回归验证单行、批量、整表替换、结构替换及事务在 schema 版本耗尽前拒绝，失败后持久文件不变，原表可读、合法写入及重启正常；同一行多列与未定型 NULL 的版本行为保持一致。
-- 非法字段名回归覆盖六种写入路径，空名、路径字符、点号、空白、非 ASCII 字符和 NUL 均在写入前拒绝且文件不变；合法文本及嵌套对象可重启读取，旧式字段名的已提交日志仍可重放并继续合法写入。
-- 验收入口：gate-check/run-gate.ps1；最新日志：logs/query-efficiency-final-gate.log，真实 TCP 日志：logs/id-preflight-tcp.log。当前工作区改动未提交。
-
-### DOMAIN 回归
-
-- DOMAIN 回归覆盖继承默认值、显式 NULL、UNKNOWN、非空、多条约束及命名、空表定义校验、加列 / 改类型、旧行与依赖默认值拒绝、绑定失效、真实 FFI 重启与并发插入冲突；Rust 验证发布失败不改持久文件、结构版本递增及已提交日志重复恢复，Server 验证管理员权限、事务 DDL 禁止和领域变更后的旧事务提交拒绝。
-
-### 复合值运算回归
-
-- 覆盖数字与前缀排序、可选值和元组顺序、嵌套 Eq / Ord / Hash 一致性、NULL / Nothing、空容器身份、非有限数拒绝、分组 / 去重 / 极值、连接 / 成员 / 相关存在与量词比较；真实 FFI 验证重启后的复合 DOMAIN、隐式 id 索引回退、修改和删除，Web 经 HTTP / TCP 验证结构值比较、排序和分组。值与类型编码保持版本 1。
-
-### Docker 验证
-
-- 完整多阶段源码镜像构建通过，Rust / Haskell / 运行阶段均为固定 digest 的 Bookworm 镜像；本地验收镜像为 chusql:local，ID / 仓库摘要为 sha256:4b22ced1f95c80c6904a5c794acac02d141b3e1dc91a619692c07dc020fcc720。构建器限制 1 核 / 3 GiB、无额外交换空间，GHC 堆上限 1536 MiB；构建完成后已停止构建器。
-- 默认与 Web profile 的 Compose 配置、TOML、脚本语法、入口与健康检查错误分支通过；独立 Compose 项目验证固定镜像、首次引导、非 root 卷权限、TCP / HTTP 健康检查、CLI、Web 登录、1 核 / 512 MiB / 128 进程限制及无额外交换空间。
-- docker/test-runtime.py 在真实源码镜像上完成 300 秒、三个会话并发负载：1696 次成功提交、2415 次明确冲突；SIGKILL 恢复后 1701 个关联事务完整，全部已确认提交保留，未提交数据丢弃。
-- 用容器内 16 MiB 临时文件系统制造检查点 ENOSPC，验证 WAL 已提交后的错误、业务请求封闭、日志保留、重启幂等重放及恢复后写入；不填满宿主磁盘。验证重复引导不覆盖原口令，停机备份恢复到空卷后业务行、账号和只读授权保留。
-- 本机已有 ChuBlog 镜像 sha256:afd2394af5606169b7dbf5b08f4e30fe0521fe47b0b6fbd7c53a67154388c354 的测试数据，在停机并将卷所有者从 10003 调整为 10001 后，可用本次镜像打开、保留原口令并继续写入；不据此承诺任意版本升级兼容。
-- ChuBlog 当前固定 Rust 驱动的 2 项单元测试与 4 项协议测试通过，覆盖错误码、断线、超时、取消及响应大小；真实 TCP 示例完成 Unicode / 布尔值 CRUD 与结果映射。博客业务数据库侧验收见下节；ChuBlog 生产文件迁移仍需配套实现。
-- 日志为 logs/docker-source-build.log、logs/docker-runtime-acceptance.log、logs/docker-integration-check.log、logs/docker-upgrade-check.log 和 logs/blog-driver-tests.log。全部测试容器、网络及测试卷已清理；本次未改动 ChuBlog 源码。
-
-### 博客业务与驱动验收
-
-- examples/blog/schema.sql 与 acceptance.rs 提供账户、完整 Argon2id PHC、角色 CHECK、发布路径 / SSH 公钥、文章权威状态、评论、互动、计数、审计及迁移标记的模型和实际 Rust 驱动验收；正文不入库，可重建索引独立。
-- 实际驱动验证旧 reader / publisher / admin 及禁用账号映射，完整 PHC 原样保存、参数与盐保留且可验证原口令；独立盐产生不同哈希，错误口令拒绝。迁移输入缺失授权时拒绝，同一来源重复迁移不重复写入。该验收使用构造的旧文件副本，不读取或迁移生产账户。
-- 验证不同主键并发注册仍只有一个用户名、跨表失败不部分发布、撤权后的旧读事务拒绝、文章删除与并发评论冲突、点赞 / 收藏并发计数、去重与重复取消、负数拒绝、匿名 / 登录评论关联、同时间游标分页、可见评论聚合 / 重算及超页评论拒绝后继续读写。
-- 验证文章查阅口令完整 PHC、撤销版本及管理审计持久化，文章索引重建不覆盖隐藏 / 删除 / 精华等权威状态；仅获文章索引表权限的数据库账号不能读口令哈希或改管理状态，关闭连接后的查询明确失败。HTTP / SSH / 文件访问授权仍由博客实现。
-- 标量索引键默认支持 128 字节，实际上限按页容量及分支数计算；真实驱动验证 113 字节文章键，Rust 回归覆盖 128 字节键跨页 / 重启、旧 64 字节头无写打开及首次长键升级、密集旧配置边界与超限写前拒绝。无正文或长行存储改动。
-- examples/blog/test-business.py 以真实本机服务和 ChuBlog 固定 Rust 驱动完成 seed、重启 verify 及停机备份副本 verify，账户哈希、授权版本、评论、互动计数及审计均保留；临时业务目录和副本自动清理。日志为 logs/blog-business-driver.log。
-- Dockerfile 的 Debian 源改为 http://mirrors.tencentyun.com，按用户要求未验证或重建镜像；既有 Docker 验收结果只适用于上节固定镜像。博客业务接入文档已按用户要求删除。
-
-### 行版本、并发与在线迁移
-
-- 持久化 mvcc.json 记录格式版本、提交序号、不复用行编号、可见起止序号、内容版本与逻辑行序。默认快照隔离与自身修改可见，SERIALIZABLE 写事务按表复查读依赖；旧目录首次事务或写入前导入，原堆页格式不变。堆 / 索引同步后原子发布版本目录，再推进检查点；重启重放幂等发布，版本超前于可恢复 WAL 时拒绝打开。
-- 行锁和旧 / 新唯一值锁跨请求持有，唯一值锁仅覆盖非 NULL 值。等待图检测环、5 秒总等待超时、显式取消与存储恢复封闭均可释放或唤醒等待者；deadlock_detected、lock_timeout 和 serialization_failure 保留结构化错误码。保存点回滚同步最终计划与读依赖，锁保留到事务结束；断线和重新认证清理旧事务。
-- 同库数据准备共享执行门，最终校验和 WAL 发布使用短提交门；其他库可独立推进。内部行编号用于合并与冲突，内容版本避免其他行位置移动造成伪冲突；整数 id 可增量物理写入，其余情况保留整表写入兼容。事务结束回收内存旧版本，后续发布回收磁盘版本；原始管理员写入通过发布版本参与冲突检查。
-- database_snapshot 保留完整结构 / 数据与提交点返回、相同令牌 snapshot_unchanged 及最近一个库的缓存；SQL 事务另行登记快照存活期，不依赖缓存保留旧版本。工作行集仍整库物化，不宣称按需版本索引扫描或增量版本日志。
-- 页与索引页写入前同步 CPW1 全页镜像，数据同步后发布版本 1 的 .pages 元数据，再清理 .page-wal。页 LSN 关联逻辑 WAL 提交点，独立写序号区分同一提交内多次页写；旧无元数据页文件按既有格式打开，首次写入建立元数据。
-- 回归验证撕裂数据页修复、重复打开幂等、未完整尾帧丢弃、完整镜像校验失败保留材料、截断后旧页不复活、镜像 I/O 失败后禁止继续刷新，以及小缓存淘汰时镜像量不随缓存页数重复放大。页大小、堆和索引页内布局未变；备份须保留整个目录，新版写入后不得降级旧二进制。
-- 逻辑恢复在重放已提交组前重建受影响的派生索引，整表日志直接重写，残缺索引根不再阻断恢复。账号初始化与变更也使用带提交标记、检查点和页 LSN 的普通提交组；旧账号 WAL 仍可恢复。文件删除和改名同步处理页元数据与镜像，并传播发布路径 I/O 错误。
-- 显式 compact 在线复制影子堆与全部索引，最终写门内追平并发修改，经 Migrate WAL 切换 catalog.file_generation，逻辑对象与结构版本保持不变。旧快照保留退役文件，结束后回收；重启恢复后清理孤立代次。固定并发窗口验证复制期间删除、更新、新增和行序保持；验证提交切换日志后、发布 catalog 前的中断可幂等恢复。启动隐藏列整理保留离线兼容路径。
-- 版本与锁专项验证不同行合并、等待后旧版本拒绝、死锁中止、锁超时、等待取消、旧版本引用回收、SERIALIZABLE 幻行拒绝和重启读取。在线整理回归验证文件缩小、隐藏字节回收、旧快照结束前旧文件保留及重启索引点查。
-- 实际 ChuBlog Rust 驱动业务验收后连续提交关联明细与计数，收到十次回执后强杀一次性服务；重启保留全部十次已确认提交，明细 / 计数一致，停机备份副本再次通过。日志为 logs/mvcc-driver-final.log；不据此承诺真实断电或任意介质损坏恢复。
-- 本阶段源码动态库、全量门禁、补充 Rust 回归、实际驱动业务 / 并发 / 强杀恢复、HLint、Fourmolu 与差异空白检查通过；日志为 logs/mvcc-stage-gate-final.log、logs/mvcc-lifecycle.log、logs/mvcc-hlint.log。未重建 Docker 镜像，ChuBlog 实现未修改。
-
-### 安装配置与查询优化
-
-- 安装器不再从 storage 目录读取示例配置：删除 `chusql-core/storage/chusql-core-storage.toml.example`，默认配置来自 `resources/settings.toml.linux|windows`，安装时按平台把 `@DATA_DIR@`、`@LOG_DIR@` 换成实际路径后写入新配置；已经存在的 `settings.toml` 不改写。选择低性能适配时，安装器把 `resources/settings.low-performance.toml` 的整数参数覆盖进新写的配置，覆盖前备份为 `settings.toml.before-low-performance`；重复合并保持相同结果。
-- 验证覆盖 Linux 与 PowerShell 两条安装路径、模板与内置默认值一致、低性能参数合并与幂等，具体为 `scripts/test-release-fallback.py` 相关用例、`chusql-web` 平台模板测试与 `cargo test` 配置测试；命令行选项在 `docs/install.md`，配置说明在 `docs/config.md`。
-- 索引 / Top-K / 并行扫描 / 子查询物化 / 批量写入的启用条件由代码按查询形状、统计信息和运行时容量自动决定，不新增配置开关；可配置项只保留资源预算（线程数、连接池等）。Top-K 以分块排序加有界归并实现，稳定顺序与全排序前缀一致，`LIMIT` 远小于输入行数时不再全量排序；结果缓存仍不跨查询保留。
-- engine 全量测试 632 例通过，HLint 与注释检查无提示。
-
-### 发布与 ChuRepo 软件包源
-
-- GitHub 发布 v26.10.2 后，`v26.10.1` 与 `v26.10.2` 两个标签、发行版及发行包已同步到 ChuRepo（Gitea 28.1.0）。发行版各含 Linux tar.gz、Windows zip 与两份 SHA256，匿名可下载。
-- ChuRepo 通用软件包仓库上线 `chusql`，版本 `26.10.1`、`26.10.2` 各保存上述四个文件；下载地址为 `https://repo.chunana.cn/api/packages/ChuNa7a/generic/chusql/<版本>/<文件名>`，匿名下载与 SHA256 校验通过。
-- ChuRepo 关闭 Actions，构建与测试以 GitHub Actions 结果为准，发行说明注明该来源；本地 `scripts/publish-gitea.sh` 负责发行版、资产与软件包的幂等发布。
-- `docs/install.md` 新增“通过软件包源下载”，安装方式表增加对应一行；发布说明统一放在 `docs/releases/`，`v26.10.1` 由 git 历史还原。
-
-### 系统级安装与 deb 打包
-
-- Linux 安装新增系统级布局：root 默认采用（也可显式 `--system`），程序在 `/usr/lib/chusql`，配置 `/etc/chusql/settings.toml`，数据与日志在 `/var/lib/chusql`、`/var/log/chusql`，创建 `chusql` 服务账户与系统级 `chusql-server.service`，命令入口链接到 `/usr/bin`；非 root 用 `--system --prefix DIR` 把同一布局放进临时根，跳过账户与 systemd。卸载脚本对称支持 `--system` 与 `--prefix`。
-- 默认配置查找改为优先 `/etc/chusql/settings.toml`，不存在时回落原 XDG 路径；`chusql-server`、`chusql-web`、`csql-bootstrap` 的用法文本同时说明系统级位置。
-- 新增 `scripts/package-deb.sh`，用 `dpkg-deb` 从发行包或目录装配 `.deb`：控制字段与 `Depends` 按实测动态库填写，`/etc/chusql/settings.toml` 为 conffile，postinst 建账户与目录并在首次安装生成随机管理员口令（`/etc/chusql/admin-password`，0600），prerm 停服务，postrm purge 清理数据、日志、配置与账户。
-- 本机实测 `dpkg -i` 后服务 active、`csql` 用 `/etc/chusql/admin-password` 登录并建库建表查询通过，`apt purge` 后目录与账户全部清除。`release.yml` 的 Linux 作业新增 deb 构建、校验与 artifact，`linux.yml` 测试阶段新增 `scripts/test-deb-package.py`；`scripts/publish-gitea.sh` 增加 deb 发布到 Gitea Debian registry（`stable`/`main`，409 先删后传）。
-- `scripts/test-linux-lifecycle.py` 新增系统级暂存安装与卸载用例；文档新增 `docs/install.md` 的 apt 软件源、系统级安装与卸载说明，以及 `docs/config.md` 的系统级路径与权限。web 测试 83 例 2 失败均为缺少 Node.js 的环境用例；server 184 例、bootstrap 9 例、cli 测试与 HLint 通过。
-
-### Docker 镜像改用 deb 与安装文档整理
-
-- 容器镜像由源码多阶段构建改为 `debian:bookworm-slim` 单阶段：从 ChuRepo Debian registry 用 `apt-get install chusql` 安装，构建参数 `BASE_REGISTRY`（默认 `docker.m.daocloud.io`）、`DEBIAN_MIRROR`（默认 `http://mirrors.aliyun.com`）、`CHUSQL_APT_BASE`、`CHUSQL_VERSION` 控制来源与版本；预建 uid/gid 10001 的 `chusql` 用户，安装后清空数据目录与口令文件，命名卷仍是首次启动时初始化。
-- deb 增加 `/usr/bin/{csql,csql-bootstrap,csql-web,chusql-server,chusql-web}` 入口，容器 entrypoint 直接调用这些命令；`scripts/test-deb-package.py` 同步断言。
-- 镜像实测构建成功，`Config.User` 为 10001:10001，服务 healthy，`csql` 查询与 Web 健康检查通过；`docker/test-runtime.py` 的冲突事务、15 秒负载、SIGKILL 恢复、ENOSPC、幂等引导、冷备份恢复全部通过，镜像约 51 MiB。
-- 运行验收把行锁等待超时与序列化失败都视为可重试冲突：引擎等待 5 秒后中止事务，这是既有的 MVCC 语义，本地非镜像构建同样复现。
-- `docs/docker.md` 按 deb 镜像重写；README 快速开始新增 Debian/Ubuntu 的 apt 安装并去掉博客接入段落与导航行；`docs/install.md` 安装方式改为五种并列出 apt 软件源；按用户要求删除 `docs/blog-database.md`，上下文中的引用一并更正。
-- 校验：Documentation 2 例、Installer scripts 12 例通过，注释门禁 118 文件、2210 条函数注释、问题 0，shell 与 Python 语法检查通过；测试镜像与构建缓存已清理。
-
-### 文档整理与发布说明简化
-
-- README、`docs/install.md`、`docs/docker.md` 重写：快速开始只保留一种最快安装方式，删掉测试与验证结果叙述，约束改为正面描述。
-- 发布说明归入 `docs/releases/`，去掉与发布页标题重复的一级标题；`v26.10.1` 从 tag 历史还原。
-- 重写 `docs/config.md`、`bootstrap.md`、`commands.md`、`users-and-roles.md`、`types.md`、`syntax.md`、`performance.md`、`architecture.md`，保留既有锚点与事实表格。
-- 链接与锚点检查覆盖 13 个 Markdown 文件 0 问题；Documentation 门禁 2 例通过。
+- v26.10.1、v26.10.2 的发行包、校验值与通用软件包已同步至 ChuRepo，匿名下载及 SHA256 校验通过。构建与测试以 GitHub Actions 为准。
+- deb 已接入发行流程和 Gitea Debian registry（stable/main）；安装文档与发布说明已整理。
+- 当前查询资源优化尚未运行基准量化，也未部署生产实例；各平台待验收事项见 known-issues.txt。

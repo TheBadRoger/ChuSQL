@@ -65,8 +65,8 @@ csql-web
 | 修改端口、路径等设置 | [配置选项](docs/config.md) |
 | 查找客户端命令和启动参数 | [命令与选项](docs/commands.md) |
 | 编写查询和修改数据 | [SQL 语法](docs/syntax.md) |
-| 选择数据类型、定义 ENUM 或 DOMAIN | [类型与类型目录](docs/types.md) |
-| 管理账号和访问权限 | [用户、角色与属性](docs/users-and-roles.md) |
+| 选择数据类型、定义 ENUM 或 DOMAIN | [数据类型](docs/types.md) |
+| 管理账号和访问权限 | [用户与角色](docs/users-and-roles.md) |
 | 初始化或离线修复数据库 | [系统引导与恢复](docs/bootstrap.md) |
 | 理解组件、查询执行和存储机制 | [架构与组件](docs/architecture.md) |
 | 查看性能测量及瓶颈 | [性能基准与瓶颈分析](docs/performance.md) |

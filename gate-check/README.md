@@ -24,10 +24,6 @@ pwsh -NoProfile -File gate-check/run-gate.ps1 -Only stack  # 只跑 Haskell 车�
 | stack | engine → server → web → cli → bootstrap 的 `stack test <pkg> --fast` | 串行使用 Stack 与快照目录 |
 | comments | `comment-check.ps1`、`comment-purity.ps1` | 注释长度与注释纯度 |
 
-`build` 车道先跑完，再并行启动其余三条，Haskell 测试使用刷新完成的动态库。
-
-Server、CLI 和 Bootstrap 步骤先刷新各自工程里的 model、engine 与 interface 本地依赖；Web 步骤还刷新 server，再运行对应模块测试，确保使用最新注册库。依赖刷新成功后才运行对应测试。
-
 ## 退出码与日志
 
 - 每步打印一行 `STEP_EXIT <步骤> <码>`；任一非零则 `GATE_EXIT=1`，否则 `GATE_EXIT=0`。
@@ -35,18 +31,7 @@ Server、CLI 和 Bootstrap 步骤先刷新各自工程里的 model、engine 与 
 - 日志在仓库根的 `logs/<车道>.log`（stderr 在 `.err.log`），终端实时转发同一份内容；日志作为本地产物保存。
 - `comment-check.ps1` 有问题数时退出 1；`comment-purity.ps1` 只报告差异，恒退出 0。
 
-## 清理与局部检查
-
-按需要选择运行范围和清理程度：
-
-| 选项 | 行为 |
-| --- | --- |
-| 不带清理选项 | 复用现有构建工件 |
-| `-Clean` | 清理各项目自己的构建工件 |
-| `-Full` | 连依赖副本一起清理，怀疑复用旧产物时使用 |
-| `-Only cargo\|stack\|comments` | 运行指定任务组，全量验收仍须运行规定门禁 |
-
-脚本也提供 `-NoLint` 跳过 Clippy；使用该选项的结果仅覆盖实际执行的检查；完整验收须包含 Clippy。输出逐行实时转发，可即时查看进度。
+`-Clean` 清理本项目工件，`-Full` 连依赖一起清理，`-Only` 用于局部检查。完整验收包含 Clippy。
 
 ## 约定
 
