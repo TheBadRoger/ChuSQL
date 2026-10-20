@@ -627,10 +627,10 @@ memoryAccounts db stamp req = do
                     ReqAccountCreate name _ -> Just name
                     ReqAccountReset name _ -> Just name
                     ReqAccountDrop name -> Just name
-                    ReqIdentityAlter name _ Nothing _ Nothing Nothing -> Just name
+                    ReqIdentityAlter name _ Nothing _ Nothing -> Just name
                     _ -> Nothing
-                allowed = case command of ReqAccountsList -> True; ReqAccountCreate{} -> True; ReqAccountReset{} -> True; ReqAccountDrop{} -> True; ReqIdentityAlter _ _ Nothing _ Nothing Nothing -> True; _ -> False
-            if not allowed || any (\a -> target == Just (accountUser a) && (accountIsSuperuser a || accountSystemCatalogManager a || accountAllowSudoAuth a)) accounts
+                allowed = case command of ReqAccountsList -> True; ReqAccountCreate{} -> True; ReqAccountReset{} -> True; ReqAccountDrop{} -> True; ReqIdentityAlter _ _ Nothing _ Nothing -> True; _ -> False
+            if not allowed || any (\a -> target == Just (accountUser a) && (accountIsSuperuser a || accountSystemCatalogManager a)) accounts
                 then Left "superuser required to manage privileged identities"
                 else memoryAccounts db stamp command
         ReqAccountsList -> Right accounts
@@ -639,12 +639,12 @@ memoryAccounts db stamp req = do
             | otherwise ->
                 Right
                     ( [if legacyIdentity a && accountUser a == T.toLower admin then a{accountIsSuperuser = True} else a | a <- accounts]
-                        ++ [Account (highWater + offset) role "" 1 stamp Nothing False False True False False | (offset, role) <- zip [1 ..] legacyNames]
+                        ++ [Account (highWater + offset) role "" 1 stamp Nothing False False True False | (offset, role) <- zip [1 ..] legacyNames]
                     )
         ReqRoleCreate u
             | any ((== T.toLower u) . accountUser) accounts -> Left "identity already exists"
-            | otherwise -> Right (accounts ++ [Account (highWater + 1) (T.toLower u) "" 1 stamp Nothing False False True False False])
-        ReqIdentityAlter u login super enabled manager sudo -> case filter ((== T.toLower u) . accountUser) accounts of
+            | otherwise -> Right (accounts ++ [Account (highWater + 1) (T.toLower u) "" 1 stamp Nothing False False True False])
+        ReqIdentityAlter u login super enabled manager -> case filter ((== T.toLower u) . accountUser) accounts of
             [_] ->
                 preserveSuper
                     [ if accountUser a == T.toLower u
@@ -654,7 +654,6 @@ memoryAccounts db stamp req = do
                                 , accountIsSuperuser = fromMaybe (accountIsSuperuser a) super
                                 , accountEnabled = fromMaybe (accountEnabled a) enabled
                                 , accountSystemCatalogManager = fromMaybe (accountSystemCatalogManager a) manager
-                                , accountAllowSudoAuth = fromMaybe (accountAllowSudoAuth a) sudo
                                 , accountRevision = accountRevision a + 1
                                 }
                         else a
@@ -664,7 +663,7 @@ memoryAccounts db stamp req = do
             _ -> Left "unknown account"
         ReqAccountCreate u h
             | any ((== T.toLower u) . accountUser) accounts -> Left "account already exists"
-            | otherwise -> Right (accounts ++ [Account (highWater + 1) (T.toLower u) h 1 stamp Nothing True False True False False])
+            | otherwise -> Right (accounts ++ [Account (highWater + 1) (T.toLower u) h 1 stamp Nothing True False True False])
         ReqAccountReset u h -> case filter ((== T.toLower u) . accountUser) accounts of
             [_] -> Right [if accountUser x == T.toLower u then x{accountHash = h, accountRevision = accountRevision x + 1} else x | x <- accounts]
             _ -> Left "unknown account"

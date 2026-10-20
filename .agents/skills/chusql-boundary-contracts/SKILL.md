@@ -11,13 +11,12 @@ description: 修改 ChuSQL Rust/Haskell FFI、客户端与 Server 协议、跨�
 
 ## 模块与调用路径
 
-- CLI / Web 后端通过 `chusql-interface/src/ChuSQL/Interface/Link.hs` 连接 Server TCP；`Protocol.hs` 定义网络消息，`Session.hs` 提供客户端会话操作。
+- CLI 通过远程 `chusql-haskell-driver` 的 `ChuSQL.Driver.Link` 连接 Server TCP；驱动独立定义协议数据结构，服务端使用 `ChuSQL.Server.Protocol` 编码内核结果，`ChuSQL.Driver.Session` 提供客户端会话操作。源码在独立 ChuSQL-HaskellDriver 仓库，本项目通过 main 分支的远程源码归档引用驱动。
 - `chusql-server/src/ChuSQL/Server/TCP.hs` 分派消息，`Session.hs` 管登录 / 鉴权，`Backend.hs` 调引擎。
 
-  浏览器通过 `chusql-web/src/ChuSQL/Web/API.hs` 的 HTTP API 访问 Web 后端，不直接访问 Rust。
 - `chusql-core/engine/src/ChuSQL/Core/Engine/Storage/IPC.hs` 将 MonadStorage 操作编码为 JSON，经 localStorageLink 调 FFI；IPC 名称不表示当前另起存储进程或 Socket 服务。
 - FFI 两端是 `chusql-core/engine/src/ChuSQL/Core/Engine/Storage/FFI.hs` 与 `chusql-core/storage/src/ffi.rs`，方向 Haskell → Rust，没有回调 ABI。
-- 存储 JSON 定义于 `chusql-core/model/src/ChuSQL/Core/Protocol.hs` 与 `chusql-core/storage/src/protocol.rs`；它与 Interface TCP 属于不同协议。
+- 存储 JSON 定义于 `chusql-core/model/src/ChuSQL/Core/Protocol.hs` 与 `chusql-core/storage/src/protocol.rs`；它与 Server TCP 属于不同协议。
 
 ## ABI 与所有权
 
@@ -55,11 +54,11 @@ description: 修改 ChuSQL Rust/Haskell FFI、客户端与 Server 协议、跨�
 
 ### 消息与消费者
 
-- Interface TCP 是一行 UTF-8 JSON，Hello 校验 protocolVersion=1；同一 Client 的 MVar 串行化请求 / 响应。Server 每连接建 Session 并限制行长度，客户端锁不是全局数据库锁。
+- Server TCP 是一行 UTF-8 JSON，Hello 校验 protocolVersion=1；同一 Client 的 MVar 串行化请求 / 响应。Server 每连接建 Session 并限制行长度，客户端锁不是全局数据库锁。
 - SchemaColumn 字段、method / status 标签、缺省字段、错误码及 QueryResult columns / rows 的位置关系是消费者契约，不用自动派生构造器名替代稳定标签。
-- 复合值标签为 __chusql_runtime_v1，由 Core.Runtime 编解码；Rust 行仍是通用 JSON。封装变化检查 CLI / Web / 存储重载，Web 数值受 JavaScript 安全整数限制。
-- ENUM 的 __chusql_enum_v1 是存储 / FFI 值编码，保存类型名、标签集合和值；公开查询结果通过 queryResultJson 输出标签字符串。不能直接复用存储编码给客户端，CLI / Web 编辑须复用类型校验及转义。
-- 原始存储透传仍经过 Server 会话鉴权；新入口核对 TCP 分派、会话策略与 Web 消费者，不绕过对象权限或业务错误。
+- 复合值标签为 __chusql_runtime_v1，由 Core.Runtime 编解码；Rust 行仍是通用 JSON。封装变化检查 CLI / 驱动 / 存储重载，驱动使用原始 JSON 保留数值精度与未知类型封装。
+- ENUM 的 __chusql_enum_v1 是存储 / FFI 值编码，保存类型名、标签集合和值；公开查询结果通过 queryResultJson 输出标签字符串。不能直接复用存储编码给客户端，CLI须复用类型校验及转义。
+- 原始存储透传仍经过 Server 会话鉴权；新入口核对 TCP 分派、会话策略与驱动消费者，不绕过对象权限或业务错误。
 
 ## 实现取舍与边界
 
@@ -70,9 +69,9 @@ Rust panic、Haskell IO 失败与业务错误按边界转成明确失败；当�
 
 - ABI / ownership 变更验证 `chusql-core/storage/tests/ffi_test.rs` 的成功、错误、长度、编码和释放路径；必要时用可用 Miri，工具安装按实际验证需要决定。
 - 存储协议变化测试相关 Rust 模块并重建实际 cdylib，再串行验证受影响 Haskell 模块；真实 FFI 可用性须通过实际动态库验证。
-- TCP 改动验证 Hello、错误响应和真实消费者，复用 `chusql-server/test/Spec.hs`、`chusql-web/test/Spec.hs`、`chusql-cli/test/Spec.hs` 中相关行为。
+- TCP 改动验证 Hello、错误响应和真实消费者，复用 `chusql-server/test/Spec.hs`、`chusql-cli/test/Spec.hs` 中相关行为。
 - 入口见 `gate-check/run-step.ps1`，测试范围按风险决定，不自动运行所有者全量门禁。
 
 ## 相关资料
 
-Web 值展示 / SQL 生成消费者见 `chusql-web/static/core.js`；总体路径见 `docs/architecture.md`。核对协议时读两端编码 / 解码和调用者，不依赖绝对行号。
+CLI 值展示见 `chusql-cli/src/ChuSQL/CLI/Format.hs`；总体路径见 `docs/architecture.md`。核对协议时读两端编码 / 解码和调用者，不依赖绝对行号。

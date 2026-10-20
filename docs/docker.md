@@ -2,9 +2,9 @@
 
 [← 返回 README](../README.md)
 
-本页帮助你在 Linux 容器中启动数据库和可选的 Web 管理端，并完成备份与升级。需要 Docker Engine 或启用 Linux 容器的 Docker Desktop，以及 Docker Compose v2。
+本页帮助你在 Linux 容器中启动数据库，并完成备份与升级。需要 Docker Engine 或启用 Linux 容器的 Docker Desktop，以及 Docker Compose v2。
 
-镜像基于 `debian:bookworm-slim`，用 apt 从 ChuRepo 的 [Debian 软件源](install.md#apt-软件源)安装发行包。默认基础镜像、系统软件源和 ChuSQL 软件源都指向国内地址，可在构建时覆盖。服务以 UID/GID 10001 运行，Web 通过 TCP 访问数据库。
+镜像基于 `debian:bookworm-slim`，用 apt 从 ChuRepo 的 [Debian 软件源](install.md#apt-软件源)安装发行包。默认基础镜像、系统软件源和 ChuSQL 软件源都指向国内地址，可在构建时覆盖。服务以 UID/GID 10001 运行。
 
 以下命令在 Linux 或 WSL 的 Bash 中执行；默认只向宿主机 127.0.0.1 发布端口。
 
@@ -51,21 +51,7 @@
 | `CHUSQL_APT_BASE` | `https://repo.chunana.cn/api/packages/ChuNa7a/debian` | ChuSQL 的 apt 软件源 |
 | `CHUSQL_VERSION` | `26.10.2` | 安装的软件包版本，不带 `v` |
 
-## 启用 Web 管理端
-
-```sh
-docker compose --profile web up -d --wait
-```
-
-浏览器打开 <http://127.0.0.1:7778>，用数据库账号登录。
-
-停止全部服务并保留数据：
-
-```sh
-docker compose --profile web down
-```
-
-`down -v` 同时删除本部署的命名卷和数据库，用于清理部署。
+停止数据库时运行 `docker compose down`，数据卷会保留。`down -v` 同时删除命名卷和数据库。
 
 ## 配置端口、目录与资源
 
@@ -79,17 +65,10 @@ docker compose --profile web down
 | `CHUSQL_ADMIN_PASSWORD_PATH` | `./secrets/admin_password` | 宿主机口令文件路径 |
 | `CHUSQL_BIND_ADDRESS` | `127.0.0.1` | 宿主机发布地址 |
 | `CHUSQL_TCP_PORT` | `7777` | 宿主机 TCP 端口 |
-| `CHUSQL_WEB_PORT` | `7778` | 宿主机 HTTP 端口 |
 
-例如把 HTTP 端口改为 8080：
+容器内 TCP 端口保持 7777。远程接入使用可信网络、SSH 隧道或 VPN。
 
-```sh
-CHUSQL_WEB_PORT=8080 docker compose --profile web up -d --wait
-```
-
-容器内端口保持 7777 和 7778。修改宿主机发布地址可允许远程访问；TCP 和默认 HTTP 使用明文传输，远程接入须使用可信网络，或通过 SSH 隧道、VPN、HTTPS 反向代理。使用 HTTPS 时在 `docker/web.toml` 中把 `cookie_secure` 设为 `true`。
-
-启动配置分别在 `docker/server.toml` 和 `docker/web.toml`，由 Compose 只读挂载。修改宿主文件后重新创建对应服务；其余参数见[配置选项](config.md)，已有数据的页大小和 B+Tree 阶数须保持原值。
+启动配置在 `docker/server.toml`，由 Compose 只读挂载。修改宿主文件后重新创建服务；其余参数见[配置选项](config.md)，已有数据的页大小和 B+Tree 阶数保持原值。
 
 Compose 创建以下命名卷，实际名称带项目名前缀，默认是 `chusql_`：
 
@@ -97,7 +76,6 @@ Compose 创建以下命名卷，实际名称带项目名前缀，默认是 `chus
 | --- | --- | --- |
 | `data` | `/var/lib/chusql` | 系统目录、业务库、索引、WAL 与检查点 |
 | `logs` | `/var/log/chusql` | 存储诊断日志 |
-| `web_settings` | `/opt/chusql/resources` | Web 编辑器偏好 |
 
 使用宿主目录绑定卷时，先为 UID/GID 10001 设置写权限。从运行 UID 不同的旧镜像迁移卷时，停止服务并完成备份后调整所有者：
 
@@ -117,7 +95,7 @@ docker compose build server
 sh docker/test-entrypoint.sh
 python3 docker/test-runtime.py --image chusql:local --seconds 60
 export CHUSQL_IMAGE=$(docker image inspect chusql:local --format '{{.Id}}')
-docker compose --profile web up -d --wait --no-build
+docker compose up -d --wait --no-build
 ```
 
 `--seconds` 指定负载时长，回归验收默认 60 秒。把镜像 ID 与源码版本、部署配置和备份一起保留；发布到镜像仓库后可改用 `仓库名@sha256:摘要`。
@@ -131,11 +109,11 @@ docker compose --profile web up -d --wait --no-build
 先停止全部服务并确认数据库进程退出，再归档数据卷：
 
 ```sh
-docker compose --profile web stop
+docker compose stop
 docker compose ps --status running
 docker compose run --rm -T --no-deps --entrypoint tar server \
   -C /var/lib/chusql -czf - . > chusql-data.tar.gz
-docker compose --profile web up -d --wait
+docker compose up -d --wait
 ```
 
 备份时同时保留当前镜像、部署配置和管理员口令。数据库使用 WAL 和检查点，一致备份在停机后复制完整数据目录。

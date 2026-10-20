@@ -106,7 +106,7 @@ SHOW ROLES;
 SHOW GRANTS;
 ```
 
-用户默认可登录，角色默认 NOLOGIN，两者默认启用且使用 NOSUPERUSER。身份属性及本机 sudo 登录见[用户与角色](users-and-roles.md)。
+用户默认可登录，角色默认 NOLOGIN，两者默认启用且使用 NOSUPERUSER。身份属性见[用户与角色](users-and-roles.md)。
 
 ### 对象授权
 

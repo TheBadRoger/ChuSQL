@@ -21,7 +21,7 @@ pwsh -NoProfile -File gate-check/run-gate.ps1 -Only stack  # 只跑 Haskell 车�
 | --- | --- | --- |
 | build | `cargo build --release` | 先单独跑：Haskell 测试要从 `chusql-core/storage/target/release` 加载动态库 |
 | cargo | `cargo test --release`、`cargo clippy --all-targets -- -D warnings` | `-NoLint` 跳过 clippy |
-| stack | engine → server → web → cli → bootstrap 的 `stack test <pkg> --fast` | 串行使用 Stack 与快照目录 |
+| stack | engine → server → cli → bootstrap 的 `stack test <pkg> --fast` | 串行使用 Stack 与快照目录 |
 | comments | `comment-check.ps1`、`comment-purity.ps1` | 注释长度与注释纯度 |
 
 ## 退出码与日志

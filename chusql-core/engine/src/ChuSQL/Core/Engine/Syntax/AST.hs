@@ -138,6 +138,7 @@ data Expr
     | Construct TypeExpr [Expr]
     | BoundConstruct TypeId [Expr]
     | EnumLiteral ColumnType String
+    | TypedLiteral ColumnType String
     | RuntimeLiteral TypeId RuntimeValue
     | LitNull
     | LitInt Int

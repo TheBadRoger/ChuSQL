@@ -22,6 +22,7 @@ evalExpr (FunctionCall name _) _ = Left ("unbound function call: " ++ name)
 evalExpr (Construct _ _) _ = Left "unbound runtime constructor"
 evalExpr (BoundConstruct tid arguments) row = mapM (`evalExpr` row) arguments >>= constructSQLValue tid
 evalExpr (EnumLiteral ty label) _ = coerceValue ty (VStr label)
+evalExpr (TypedLiteral ty text) _ = coerceValue ty (VStr text)
 evalExpr (RuntimeLiteral tid value) _ = coerceValue (CRuntime tid) (VRuntime tid value)
 evalExpr (BoundFunction fid tid arguments) row =
     mapM (`evalExpr` row) arguments >>= invokeSQLFunction fid tid

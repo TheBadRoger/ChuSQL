@@ -94,6 +94,7 @@ bindQuery catalog statement = do
     bindingType CDate = Right (CompatibilityType CDate)
     bindingType CTimestamp = Right (CompatibilityType CTimestamp)
     bindingType CBlob = Right (CompatibilityType CBlob)
+    bindingType ty@CScalar{} = Right (CompatibilityType ty)
     bindingType ty = RuntimeType <$> sqlType ty
 
 -- | 执行绑定查询并校验输出类型

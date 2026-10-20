@@ -4,15 +4,13 @@ name:           chusql-cli
 version:        1.0.0
 synopsis:       ChuSQL command-line client for the database server
 description:    Provides a command-line interface for SQL and database sessions
-                through the chusql-server TCP endpoint. Shares accounts and
-                permissions with the web interface while keeping query execution
-                and storage in the database server process.
+                through the chusql-server TCP endpoint. Query execution and storage remain
+                in the database server process.
 build-type:     Simple
 
 library
     hs-source-dirs:   src
     exposed-modules:  ChuSQL.CLI.Format
-                      ChuSQL.CLI.Normalization
                       ChuSQL.CLI.History
                       ChuSQL.CLI.Password
                       ChuSQL.CLI.Script
@@ -20,7 +18,7 @@ library
                     , aeson
                     , bytestring
                     , chusql-core-model
-                    , chusql-interface
+                    , chusql-haskell-driver
                     , haskeline
                     , text
     default-language: Haskell2010
@@ -33,7 +31,8 @@ executable csql
     build-depends:    base
                     , chusql-cli
                     , chusql-core-model
-                    , chusql-interface
+                    , chusql-server
+                    , chusql-haskell-driver
                     , containers
                     , directory
                     , filepath
@@ -56,7 +55,7 @@ test-suite chusql-cli-test
                     , directory
                     , aeson
                     , bytestring
-                    , chusql-interface
+                    , chusql-haskell-driver
                     , chusql-cli
                     , chusql-core-model
                     , hspec

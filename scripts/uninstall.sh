@@ -139,7 +139,7 @@ fi
 case "$install_dir" in /|"$HOME") fail 'refusing to remove the root or home directory' ;; esac
 case "$data_dir" in /|"$HOME") fail 'refusing to remove the root or home data directory' ;; esac
 case "$install_dir" in "$data_dir"|"$data_dir"/*) fail 'data directory must not contain the installation' ;; esac
-for entry in bin static csql csql-web csql-web.sh uninstall.sh; do
+for entry in bin csql uninstall.sh; do
     case "$data_dir" in "$install_dir/$entry"|"$install_dir/$entry"/*) fail 'data directory overlaps installed program files' ;; esac
 done
 profile="$HOME/.profile"
@@ -176,13 +176,12 @@ elif [ "$(uname -s)" = 'Linux' ] && [ -f "$service_file" ]; then
     systemctl --user daemon-reload || fail 'cannot reload systemd units'
 fi
 stop_by_path "$install_dir/bin/chusql-server"
-stop_by_path "$install_dir/bin/chusql-web"
 
 step 'Removing files'
 if [ ! -d "$install_dir" ]; then
     note "not found: $install_dir"
 elif [ "$keep_data" = 'yes' ]; then
-    for entry in "$install_dir"/bin "$install_dir"/static "$install_dir"/csql "$install_dir"/csql-web "$install_dir"/csql-web.sh "$install_dir"/uninstall.sh; do
+    for entry in "$install_dir"/bin "$install_dir"/csql "$install_dir"/uninstall.sh; do
         [ -e "$entry" ] || continue
         rm -rf "$entry"
     done
@@ -193,7 +192,7 @@ else
 fi
 if [ "$keep_data" = 'no' ] && [ -d "$data_dir" ]; then rm -rf "$data_dir"; fi
 if [ "$system_mode" = 'yes' ]; then
-    for command_link in csql csql-web chusql-server; do
+    for command_link in csql chusql-server; do
         rm -f "$prefix/usr/bin/$command_link"
     done
     if [ -d "$log_dir" ]; then rm -rf "$log_dir"; fi

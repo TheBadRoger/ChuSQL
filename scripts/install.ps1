@@ -16,7 +16,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# Windows 安装脚本：装 cli/web、写全局配置、改用户 PATH、
+# Windows 安装脚本：装 CLI、写全局配置、改用户 PATH、
 # 跑 csql-bootstrap 建系统目录、最后拉起服务。
 
 $script:tempDir = ''
@@ -159,7 +159,7 @@ if ($ListVersions) {
     exit 0
 }
 
-if ($Component -notin @('web', 'cli', 'both', '')) { Fail "pass -Component web, cli or both (got: $Component)" }
+if ($Component -notin @('cli', '')) { Fail "pass -Component cli (got: $Component)" }
 
 # ---- 交互：控制台里直接问答；-Interactive 时没有终端也从 stdin 逐行读（自动化用）----
 $askFromStdin = $false
@@ -203,24 +203,7 @@ function Ask-Secret([string]$prompt) {
     finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
 }
 
-$wantWeb = $false
-$wantCli = $false
-if ($Component -eq 'web') { $wantWeb = $true }
-if ($Component -eq 'cli') { $wantCli = $true }
-if ($Component -eq 'both') { $wantWeb = $true; $wantCli = $true }
-
-if (-not $Component) {
-    if (-not $canPrompt) {
-        Fail '-Component is required (web, cli or both) when there is no terminal to ask on'
-    }
-    Write-Host ''
-    Write-Host 'ChuSQL installer: which parts do you want?'
-    $wantCli = Ask-YesNo 'Install the command line client (csql)? [Y/n]' $true
-    $wantWeb = Ask-YesNo 'Install the web front end (browser UI)? [y/N]' $false
-    if (-not $wantWeb -and -not $wantCli) {
-        Say '  neither selected: only the storage library and the server get installed'
-    }
-}
+$wantCli = $true
 
 # 管理员口令是装机必答项：交互时当场设，非交互时给 -Password 或
 # CHUSQL_ADMIN_PASSWORD。口令只经 stdin 传给 csql-bootstrap，不落 settings.toml。
@@ -250,7 +233,6 @@ if ($adminPassword.Length -eq 0) {
 
 $wanted = @()
 if ($wantCli) { $wanted += 'cli' }
-if ($wantWeb) { $wanted += 'web' }
 $componentLabel = ($wanted -join '+')
 if (-not $componentLabel) { $componentLabel = 'none (storage only)' }
 
@@ -286,7 +268,6 @@ if (-not (Test-Path (Join-Path $pack 'bin\chusql_core_storage.dll'))) {
     $script:tempDir = $tempDir
     New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
 
-    # 一个平台一个包：web 和 cli 都在里面，装哪几个由上面的选择决定
     Step "Looking for a chusql package for windows-$arch"
     $zip = Join-Path $tempDir 'chusql.zip'
     $asset = ''
@@ -354,10 +335,6 @@ $storageLib = Join-Path $pack 'bin\chusql_core_storage.dll'
 if (-not (Test-Path $storageLib)) { Fail "package is incomplete: bin\chusql_core_storage.dll not found in $pack" }
 if (-not (Test-Path (Join-Path $pack 'bin\chusql-server.exe'))) { Fail 'package is incomplete: bin\chusql-server.exe not found' }
 if (-not (Test-Path (Join-Path $pack 'bin\csql-bootstrap.exe'))) { Fail 'package is incomplete: bin\csql-bootstrap.exe not found' }
-if ($wantWeb) {
-    if (-not (Test-Path (Join-Path $pack 'bin\chusql-web.exe'))) { Fail 'package is incomplete: bin\chusql-web.exe not found' }
-    if (-not (Test-Path (Join-Path $pack 'static'))) { Fail 'package is incomplete: static\ not found' }
-}
 if ($wantCli) {
     if (-not (Test-Path (Join-Path $pack 'bin\csql.exe'))) { Fail 'package is incomplete: bin\csql.exe not found' }
 }
@@ -375,7 +352,6 @@ Say ("  data dir   {0}" -f $DataDir)
 Say ("  root user  {0} (password asked above, kept out of settings.toml)" -f $RootUser)
 
 # ---- 释放文件 ----
-# 包是合在一起的（web 和 cli 都在），这里按这次的选择逐个释放：没选的组件不落地
 Step 'Installing files'
 New-Item -ItemType Directory -Force -Path (Join-Path $InstallDir 'bin'), $LogDir, $DataDir | Out-Null
 Copy-Item $storageLib (Join-Path $InstallDir 'bin') -Force
@@ -385,17 +361,6 @@ Get-ChildItem (Join-Path $pack 'bin') -Filter '*.dll' -File -ErrorAction Silentl
     ForEach-Object { Copy-Item $_.FullName (Join-Path $InstallDir 'bin') -Force }
 if ($wantCli) {
     Copy-Item (Join-Path $pack 'bin\csql.exe') (Join-Path $InstallDir 'bin') -Force
-}
-if ($wantWeb) {
-    Copy-Item (Join-Path $pack 'bin\chusql-web.exe') (Join-Path $InstallDir 'bin') -Force
-    New-Item -ItemType Directory -Force -Path (Join-Path $InstallDir 'static') | Out-Null
-    Copy-Item (Join-Path $pack 'static\*') (Join-Path $InstallDir 'static') -Recurse -Force
-    $launcher = Join-Path $pack 'csql-web.ps1'
-    if (Test-Path $launcher) {
-        Copy-Item $launcher $InstallDir -Force
-    } else {
-        Say '  note: csql-web.ps1 is not bundled yet; until it is, start bin\chusql-web.exe yourself'
-    }
 }
 
 # ---- 写全局配置 ----
@@ -435,12 +400,6 @@ if ($LASTEXITCODE -ne 0) {
 
 # ---- 命令入口 ----
 Step 'Creating commands'
-if ($wantWeb) {
-    Set-Content -Path (Join-Path $InstallDir 'csql-web.cmd') -Encoding ASCII -Value @'
-@echo off
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0csql-web.ps1" %*
-'@
-}
 if ($wantCli) {
     Set-Content -Path (Join-Path $InstallDir 'csql.cmd') -Encoding ASCII -Value @'
 @echo off
@@ -506,7 +465,6 @@ Step 'Done'
 Say ("  settings.toml  {0}" -f $configFile)
 Say ("  data         {0}" -f $DataDir)
 $startWith = @()
-if ($wantWeb) { $startWith += 'csql-web' }
 if ($wantCli) { $startWith += 'csql' }
 Say ("  start with   {0}" -f ($startWith -join ', '))
 Say ("  tcp server   {0} (listens on [server] listen_host/port, defaults 127.0.0.1:7777)" -f $serverPath)

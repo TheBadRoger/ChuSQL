@@ -73,8 +73,8 @@ else
     tar -xzf "$package_path" -C "$work/stage" || Fail 'cannot unpack the package archive'
     stage="$work/stage"
 fi
-for required in bin/chusql-server bin/csql-bootstrap bin/csql bin/chusql-web \
-    static/index.html csql-web.sh resources/settings.toml.linux resources/settings.low-performance.toml; do
+for required in bin/chusql-server bin/csql-bootstrap bin/csql \
+    resources/settings.toml.linux resources/settings.low-performance.toml; do
     [ -e "$stage/$required" ] || Fail "package is incomplete: $required"
 done
 ls "$stage/bin/"libchusql_core_storage.* >/dev/null 2>&1 || Fail 'package is incomplete: bin/libchusql_core_storage.*'
@@ -82,22 +82,17 @@ ls "$stage/bin/"libchusql_core_storage.* >/dev/null 2>&1 || Fail 'package is inc
 Step "Staging the system layout (chusql_${deb_version}_${arch})"
 root="$work/root"
 bin_dir="$root/usr/lib/chusql/bin"
-mkdir -p "$root/DEBIAN" "$bin_dir" "$root/usr/lib/chusql/static" \
+mkdir -p "$root/DEBIAN" "$bin_dir" \
     "$root/etc/chusql" "$root/usr/lib/systemd/system" "$root/usr/share/doc/chusql" "$root/usr/share/chusql"
-cp "$stage/bin/chusql-server" "$stage/bin/csql" "$stage/bin/chusql-web" "$stage/bin/csql-bootstrap" "$bin_dir/"
+cp "$stage/bin/chusql-server" "$stage/bin/csql" "$stage/bin/csql-bootstrap" "$bin_dir/"
 for lib in "$stage/bin/"libchusql_core_storage.*; do
     [ -f "$lib" ] && cp "$lib" "$bin_dir/"
 done
 chmod 0755 "$bin_dir/"*
-cp -R "$stage/static/." "$root/usr/lib/chusql/static/"
-cp "$stage/csql-web.sh" "$root/usr/lib/chusql/csql-web.sh"
-chmod 0755 "$root/usr/lib/chusql/csql-web.sh"
 mkdir -p "$root/usr/bin"
 ln -s ../lib/chusql/bin/csql "$root/usr/bin/csql"
 ln -s ../lib/chusql/bin/csql-bootstrap "$root/usr/bin/csql-bootstrap"
 ln -s ../lib/chusql/bin/chusql-server "$root/usr/bin/chusql-server"
-ln -s ../lib/chusql/bin/chusql-web "$root/usr/bin/chusql-web"
-ln -s ../lib/chusql/csql-web.sh "$root/usr/bin/csql-web"
 sed -e 's|@DATA_DIR@|/var/lib/chusql|g' -e 's|@LOG_DIR@|/var/log/chusql|g' \
     "$stage/resources/settings.toml.linux" > "$root/etc/chusql/settings.toml"
 chmod 0644 "$root/etc/chusql/settings.toml"
@@ -145,7 +140,7 @@ Maintainer: $maintainer
 Homepage: https://github.com/TheBadRoger/ChuSQL
 Description: SQL database with a Haskell query engine and a Rust storage layer
  ChuSQL is a relational database whose main interface is SQL. This package
- installs the command line client, the TCP server and the web front end
+ installs the command line client, the TCP server
  system-wide. Data lives in /var/lib/chusql, logs in /var/log/chusql and the
  editable settings in /etc/chusql/settings.toml.
 EOF

@@ -26,7 +26,7 @@ module ChuSQL.Server.Privileges (
 
 import ChuSQL.Core.Engine.Syntax.AST
 import ChuSQL.Core.Protocol (Account (..))
-import ChuSQL.Interface.Protocol (Grant (..), RoleView (..))
+import ChuSQL.Server.Protocol (Grant (..), RoleView (..))
 import ChuSQL.Server.Accounts (Principal, principalIsCatalogManager, principalIsRoot)
 import ChuSQL.Server.Backend (Backend (..), exprTables, statementTables, systemDatabaseName)
 import ChuSQL.Server.Catalog

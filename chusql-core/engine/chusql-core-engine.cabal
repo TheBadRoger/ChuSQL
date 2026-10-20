@@ -23,7 +23,6 @@ library
                       ChuSQL.Core.Engine.Error
                       ChuSQL.Core.Engine
                       ChuSQL.Core.Engine.Parallel
-                      ChuSQL.Core.Engine.Normalization
                       ChuSQL.Core.Engine.Runtime.Types
                       ChuSQL.Core.Engine.Runtime.Functions
                       ChuSQL.Core.Engine.Runtime.Binding
@@ -63,8 +62,8 @@ library
 test-suite chusql-core-engine-test
     type:             exitcode-stdio-1.0
     main-is:          Spec.hs
-    other-modules:    NormalizationSpec
-                      RuntimeSpec
+    other-modules:    RuntimeSpec
+                      ScalarSpec
     hs-source-dirs:   test
     build-depends:    base
                     , chusql-core-engine

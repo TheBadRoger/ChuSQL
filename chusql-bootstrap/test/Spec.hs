@@ -30,7 +30,7 @@ main = hspec $ do
         it "registers every builtin alias with its parser defaults" $ mapM_ checkDefinition preinstalledTypes
         it "initializes identities before installing types" $ do
             (send, requests) <- mock [Right ready, Right (identity True), Right installed]
-            runBootstrap send "root" "new-hash" `shouldReturn` Right 18
+            runBootstrap send "root" "new-hash" `shouldReturn` Right 38
             calls <- requests
             map (field "method") calls `shouldBe` map A.String ["bootstrap_system", "identity_initialize", "bootstrap_types"]
         mapM_
@@ -42,8 +42,8 @@ main = hspec $ do
             , ("refuses incomplete type registration", [Right ready, Right (identity True), Right (A.object ["status" A..= ("rows" :: Text), "rows" A..= ([] :: [A.Value])])], "preinstalled type verification failed")
             ]
     describe "bootstrap on real storage" $ do
-        it "creates root and eighteen types before any server starts" $ withStorage $ do
-            runBootstrap transport "root" "original-hash" `shouldReturn` Right 18
+        it "creates root and thirty-eight type names before any server starts" $ withStorage $ do
+            runBootstrap transport "root" "original-hash" `shouldReturn` Right 38
             result <- transport (A.object ["method" A..= ("accounts_list" :: Text)])
             case result of
                 Left err -> expectationFailure err
@@ -57,10 +57,36 @@ main = hspec $ do
                         accountHash account `shouldBe` "original-hash"
                     A.Success _ -> expectationFailure "unexpected identities"
         it "keeps the existing password and type definitions on rerun" $ withStorage $ do
-            runBootstrap transport "root" "original-hash" `shouldReturn` Right 18
+            runBootstrap transport "root" "original-hash" `shouldReturn` Right 38
             first <- transport (A.object ["method" A..= ("accounts_list" :: Text)])
-            runBootstrap transport "root" "replacement-hash" `shouldReturn` Right 18
+            runBootstrap transport "root" "replacement-hash" `shouldReturn` Right 38
             transport (A.object ["method" A..= ("accounts_list" :: Text)]) `shouldReturn` first
+        it "extends the old type directory without changing IDs and refuses conflicting definitions" $ withStorage $ do
+            _ <- transport (A.object ["method" A..= ("bootstrap_system" :: Text), "user" A..= ("root" :: Text), "password_hash" A..= ("original-hash" :: Text)])
+            _ <- transport (A.object ["method" A..= ("identity_initialize" :: Text), "administrator" A..= ("root" :: Text)])
+            legacy <- installTypes (take 18 preinstalledTypes)
+            runBootstrap transport "root" "replacement-hash" `shouldReturn` Right 38
+            expanded <- installTypes preinstalledTypes
+            case (field "rows" legacy, field "rows" expanded) of
+                (A.Array original, A.Array current) -> do
+                    length current `shouldBe` 38
+                    take 18 (foldr (:) [] current) `shouldBe` foldr (:) [] original
+                _ -> expectationFailure "missing type directory"
+            conflict <- installTypes (map conflictingUUID preinstalledTypes)
+            field "status" conflict `shouldBe` A.String "error"
+            installTypes preinstalledTypes `shouldReturn` expanded
+
+-- 直接请求真实存储安装指定类型集合。
+installTypes :: [A.Value] -> IO A.Value
+installTypes definitions = do
+    result <- transport (A.object ["method" A..= ("bootstrap_types" :: Text), "types" A..= definitions])
+    either fail pure result
+
+-- 构造同名 UUID 的基础定义冲突。
+conflictingUUID :: A.Value -> A.Value
+conflictingUUID (A.Object fields)
+    | KM.lookup "name" fields == Just (A.String "uuid") = A.Object (KM.insert "base_type" (A.String "str") fields)
+conflictingUUID value = value
 
 -- | 校验引导错误及停止请求的位置
 expectBootstrapFailure :: [Either String A.Value] -> String -> Expectation
@@ -83,7 +109,7 @@ ready = A.object ["status" A..= ("system" :: Text), "initialized" A..= True]
 
 -- | 带最高权限属性的身份响应
 identity :: Bool -> A.Value
-identity super = A.object ["status" A..= ("accounts" :: Text), "accounts" A..= [Account 1 "root" "existing-hash" 1 "" Nothing True super True False False]]
+identity super = A.object ["status" A..= ("accounts" :: Text), "accounts" A..= [Account 1 "root" "existing-hash" 1 "" Nothing True super True False]]
 
 -- | 已写入编号的类型响应
 installed :: A.Value

@@ -30,18 +30,17 @@ RUN apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 update \
     "chusql=$CHUSQL_VERSION" \
     && rm -rf /var/lib/apt/lists/* /var/lib/chusql/* /var/lib/chusql/.[!.]* /etc/chusql/admin-password
 
-# 启动目录 /opt/chusql 放配置与可写资源，静态文件复用包内副本。
-RUN install -d -o chusql -g chusql /opt/chusql/resources \
-    && ln -s /usr/lib/chusql/static /opt/chusql/static
+# 启动目录 /opt/chusql 放配置与可写资源。
+RUN install -d -o chusql -g chusql /opt/chusql/resources
 WORKDIR /opt/chusql
-COPY docker/server.toml docker/web.toml /etc/chusql/
+COPY docker/server.toml /etc/chusql/
 COPY --chmod=755 docker/entrypoint.sh docker/healthcheck.sh /usr/local/bin/
 ENV PATH=/usr/lib/chusql/bin:${PATH} \
     LD_LIBRARY_PATH=/usr/lib/chusql/bin \
     LANG=C.UTF-8 \
     CHUSQL_ADMIN_USER=root
 USER 10001:10001
-EXPOSE 7777 7778
+EXPOSE 7777
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=5 \
     CMD ["healthcheck.sh", "server"]
 ENTRYPOINT ["entrypoint.sh"]

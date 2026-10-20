@@ -11,7 +11,6 @@ module ChuSQL.CLI.Script (
 ) where
 
 import ChuSQL.CLI.Format (OutputFormat (..), formatName, parseFormat)
-import ChuSQL.CLI.Normalization (normalizationArguments)
 import Data.Char (isSpace)
 import Data.Maybe (isJust)
 import Data.Text (Text)
@@ -25,7 +24,6 @@ data Meta
     | MetaDatabases
     | MetaTables
     | MetaDescribe Text
-    | MetaNormalize Text FilePath Bool
     | MetaRoles
     | MetaConnect Text
     | MetaSetFormat OutputFormat
@@ -54,7 +52,6 @@ parseMeta raw = do
             | otherwise -> MetaDescribe argument
         "dr" -> MetaRoles
         "roles" -> MetaRoles
-        "normalize" -> either (const (MetaUnknown "normalize")) (\(table, file, jsonOutput) -> MetaNormalize table file jsonOutput) (normalizationArguments argument)
         "c" -> connectTo argument
         "connect" -> connectTo argument
         "use" -> connectTo argument
@@ -123,7 +120,6 @@ metaHelp =
         , "  \\l, \\list           list databases"
         , "  \\dt, \\d             list tables"
         , "  \\d <table>          describe a table"
-        , "  \\normalize TABLE --declaration FILE [--format text|json]"
         , "  \\dr, \\roles         list roles with their grants and members"
         , "  \\c <database>       switch database"
         , "  \\f, \\format <fmt>   output format: " <> T.intercalate ", " (map formatName [FormatTable, FormatJson, FormatCsv])

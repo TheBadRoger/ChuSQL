@@ -6,7 +6,7 @@ module ChuSQL.Core.Engine.Syntax.Parser (parseStatement, parseExpression) where
 import ChuSQL.Core.Engine.Builtin (Builtin (..), builtinName, builtinNames, builtinNode, compareNode)
 import ChuSQL.Core.Engine.Runtime.Types
 import ChuSQL.Core.Engine.Syntax.AST
-import ChuSQL.Core.Model (Column (..), ColumnType (..), Value (..), plainColumn, validEnumLabels)
+import ChuSQL.Core.Model (Column (..), ColumnType (..), ScalarType (..), Value (..), parseColumnType, plainColumn, scalarTypes, validEnumLabels)
 import Control.Monad (void)
 import Control.Monad.Combinators.Expr (Operator (..), makeExprParser)
 import Data.Char (isAlpha, isAlphaNum, isHexDigit, isSpace, toLower, toUpper)
@@ -166,6 +166,7 @@ atom =
         , LitBool False <$ keyword "FALSE"
         , try (LitDate <$> (keyword "date" *> stringLit))
         , try (LitTimestamp <$> (keyword "timestamp" *> stringLit))
+        , try (do kind <- choice [keyword name $> kind | (name, kind) <- scalarTypes]; TypedLiteral (CScalar kind) <$> stringLit)
         , try (LitBlob <$> blobLit)
         , LitFloat <$> try floatLit
         , LitInt <$> integer
@@ -524,9 +525,7 @@ alterUserStatement = do
 identityAttribute :: Parser (String, Bool)
 identityAttribute =
     choice
-        [ ("allow_sudo_auth", True) <$ keyword "allow_sudo_auth"
-        , ("allow_sudo_auth", False) <$ keyword "noallow_sudo_auth"
-        , ("system_catalog_manager", True) <$ keyword "system_catalog_manager"
+        [ ("system_catalog_manager", True) <$ keyword "system_catalog_manager"
         , ("system_catalog_manager", False) <$ keyword "nosystem_catalog_manager"
         , ("login", True) <$ keyword "login"
         , ("login", False) <$ keyword "nologin"
@@ -750,9 +749,13 @@ columnTypeP =
         , keyword "decimal" >> decimalType
         , keyword "numeric" >> decimalType
         , keyword "date" >> pure CDate
+        , try (keyword "timestamp" *> keyword "with" *> keyword "time" *> keyword "zone") $> CScalar ScalarTimestampTZ
+        , try (keyword "timestamp" *> keyword "without" *> keyword "time" *> keyword "zone") $> CTimestamp
         , keyword "timestamp" >> pure CTimestamp
+        , try (keyword "time" *> keyword "with" *> keyword "time" *> keyword "zone") $> CScalar ScalarTimeTZ
+        , try (keyword "time" *> keyword "without" *> keyword "time" *> keyword "zone") $> CScalar ScalarTime
         , keyword "blob" >> pure CBlob
-        , (\name -> CDomain (map toLower name) CStr) <$> identifier
+        , (\name -> fromMaybe (CDomain (map toLower name) CStr) (parseColumnType name)) <$> identifier
         ]
 
 -- | 解析复合列的稳定类型身份

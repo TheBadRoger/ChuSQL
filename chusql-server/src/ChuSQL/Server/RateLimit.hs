@@ -1,4 +1,4 @@
-module ChuSQL.Interface.RateLimit (
+module ChuSQL.Server.RateLimit (
     RateLimiter,
     newRateLimiter,
     setRateLimit,

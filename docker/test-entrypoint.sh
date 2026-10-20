@@ -24,10 +24,6 @@ cat >"$work/bin/chusql-server" <<'STUB'
 #!/bin/sh
 printf 'server %s\n' "$*" >> "$TEST_CALLS"
 STUB
-cat >"$work/bin/chusql-web" <<'STUB'
-#!/bin/sh
-printf 'web %s\n' "$*" >> "$TEST_CALLS"
-STUB
 chmod +x "$work/bin/"*
 
 # 缺失或空白口令应在启动程序前拒绝。
@@ -53,29 +49,21 @@ grep -Fq "bootstrap --config $CHUSQL_CONFIG --user operator --password-stdin" "$
 grep -Fq "server --config $CHUSQL_CONFIG --user operator --max-rows 42" "$TEST_CALLS"
 test "$(wc -l <"$TEST_CALLS")" -eq 2
 
-# 引导失败必须阻止启动，Web 不读取口令。
+# 引导失败必须阻止启动。
 rm "$TEST_CALLS"
 if TEST_BOOTSTRAP_EXIT=7 sh "$repo/docker/entrypoint.sh" server; then exit 1; fi
 test "$(wc -l <"$TEST_CALLS")" -eq 1
 rm "$CHUSQL_ADMIN_PASSWORD_FILE" "$TEST_CALLS"
-sh "$repo/docker/entrypoint.sh" web
-grep -Fq "web --config $CHUSQL_CONFIG --user operator" "$TEST_CALLS"
 test "$(sh "$repo/docker/entrypoint.sh" printf passthrough)" = passthrough
-# 健康检查必须识别协议状态和 HTTP 失败。
+# 健康检查必须识别协议状态和连接失败。
 cat >"$work/bin/nc" <<'STUB'
 #!/bin/sh
 cat > /dev/null
 printf '%s\n' "$TEST_TCP_RESPONSE"
 exit "${TEST_NC_EXIT:-0}"
 STUB
-cat >"$work/bin/curl" <<'STUB'
-#!/bin/sh
-exit "${TEST_CURL_EXIT:-0}"
-STUB
-chmod +x "$work/bin/nc" "$work/bin/curl"
+chmod +x "$work/bin/nc"
 TEST_TCP_RESPONSE='{"status":"pong"}' sh "$repo/docker/healthcheck.sh" server
 if TEST_TCP_RESPONSE='{"status":"error"}' sh "$repo/docker/healthcheck.sh" server; then exit 1; fi
 if TEST_TCP_RESPONSE='{"status":"pong"}' TEST_NC_EXIT=1 sh "$repo/docker/healthcheck.sh" server; then exit 1; fi
-sh "$repo/docker/healthcheck.sh" web
-if TEST_CURL_EXIT=22 sh "$repo/docker/healthcheck.sh" web; then exit 1; fi
 echo "entrypoint and healthcheck checks passed"

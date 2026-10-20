@@ -1,5 +1,8 @@
 resolver: lts-24.59
 
+extra-deps:
+    - archive: https://repo.chunana.cn/ChuNa7a/ChuSQL-HaskellDriver/archive/main.tar.gz
+
 extra-lib-dirs:
     - ../chusql-core/storage/target/release
 
@@ -7,6 +10,5 @@ packages:
     - .
     - ../chusql-core/engine
     - ../chusql-core/model
-    - ../chusql-interface
     - ../chusql-server
     - ../chusql-bootstrap

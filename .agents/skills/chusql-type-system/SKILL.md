@@ -12,6 +12,7 @@ description: 修改 ChuSQL SQL 类型、值表示、赋值转换、类型推导�
 ## 模块与调用路径
 
 - `chusql-core/model/src/ChuSQL/Core/Model.hs`：`ColumnType`、列约束、`Value`；集中提供 `assignable`、`comparableTypes`、`valueFits`、`coerceValue`、相等与哈希语义。
+- `chusql-core/model/src/ChuSQL/Core/Scalar.hs`：常用业务标量的格式校验、规范文本、别名和排序能力；CScalar 使用独立类型身份与现有文本值编码，引导通过 scalarTypes 登记系统目录。
 - `chusql-core/model/src/ChuSQL/Core/Runtime.hs`：`TypeExpr` / `TypeId`、`Kind`、独立 `PhysicalType`、`RuntimeValue`、注册表和版本化编码；Engine 的 `Runtime/Types.hs` 只是重新导出。
 - `chusql-core/engine/src/ChuSQL/Core/Engine/Syntax/Parser.hs` 与 `Syntax/AST.hs` 解析声明和构造表达式；`Semantic.hs` 根据 schema 解析 DOMAIN、推导表达式并绑定身份。
 - `chusql-core/engine/src/ChuSQL/Core/Engine/Runtime/Functions.hs` 定义固定 FunctionId 与签名，现有函数 length / not；`Runtime/SQL.hs` 连接 SQL 标量和运行时值。
@@ -31,7 +32,7 @@ description: 修改 ChuSQL SQL 类型、值表示、赋值转换、类型推导�
 
 ### 转换与数值语义
 
-- 赋值兼容和比较兼容分别使用 Model 入口。coerceValue 负责值收敛；整值浮点转整数、字符串长度、日期格式、DECIMAL 舍入沿现有规则处理，Parser / Eval / Web 复用该转换入口。
+- 赋值兼容和比较兼容分别使用 Model 入口。coerceValue 负责值收敛；整值浮点转整数、字符串长度、日期格式、DECIMAL 舍入沿现有规则处理，Parser / Eval / CLI 复用该转换入口。
 - 整数与可规范化整值浮点保持相等 / 哈希一致。内建运行时类型的 Eq / Ord / Hash 由 TypeDescriptor 按参数递归派生，排序和哈希按结构实现；索引键编码仍独立，不能因已有查询能力放开索引或唯一键声明。
 
 ### 领域与兼容表示
@@ -42,8 +43,8 @@ description: 修改 ChuSQL SQL 类型、值表示、赋值转换、类型推导�
 
 ### 编码与错误传播
 
-- 类型 / 值编码版本为 1；身份、类型名、封装或值结构变化可能影响 catalog、WAL、FFI、TCP 和 Web，组合相关 Skills 核对消费者。
-- 枚举使用版本 1 的 __chusql_enum_v1 编码，存储保留类型名、标签集合和值，TCP / Web / CLI 结果输出字符串标签。Rust heap::enum_rank 统一为枚举索引计算声明序号；更新编码同时验证索引与实际动态库。
+- 类型 / 值编码版本为 1；身份、类型名、封装或值结构变化可能影响 catalog、WAL、FFI、TCP 和驱动，组合相关 Skills 核对消费者。
+- 枚举使用版本 1 的 __chusql_enum_v1 编码，存储保留类型名、标签集合和值，TCP / CLI 结果输出字符串标签。Rust heap::enum_rank 统一为枚举索引计算声明序号；更新编码同时验证索引与实际动态库。
 - Rust 当前保存通用 JSON，只做局部校验，包括隐藏列、DOMAIN 依赖和 DECIMAL 规范化。完整 SQL 类型校验由 Haskell 引擎的 validateValue 等入口负责。
 - 错误沿 Either String 返回；`chusql-core/engine/src/ChuSQL/Core/Engine/Error.hs` 用消息规则映射类别 / 协议码。修改错误文字须检查分类，失败沿原错误路径返回。
 
@@ -56,7 +57,7 @@ DECIMAL 是有限浮点表示，采用 ties-to-even 舍入与舍入后溢出检�
 
 - 语义改动验证解析 → schema 绑定 → 执行，关注 NULL、边界值、明确错误与输出位置；说明修正只需核对源码。
 - 复用 `chusql-core/engine/test/RuntimeSpec.hs`、`chusql-core/engine/test/Spec.hs`，按需覆盖固定编码、错误身份和嵌套值。
-- 持久化类型变更验证 Rust 写入 / 重载与实际协议消费者；Web 值展示 / SQL 生成参考 `chusql-web/test/runtime-values.mjs`。
+- 持久化类型变更验证 Rust 写入 / 重载与实际协议消费者；客户端读取行为参考独立 Haskell 驱动测试。
 - 测试入口见 `gate-check/run-step.ps1`，验证范围按变更风险选择。
 
 ## 相关资料

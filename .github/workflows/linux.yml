@@ -87,7 +87,6 @@ jobs:
             chusql-core/engine/.stack-work
             chusql-bootstrap/.stack-work
             chusql-server/.stack-work
-            chusql-web/.stack-work
             chusql-cli/.stack-work
             benchmark/.stack-work
           key: ${{ runner.os }}-stack-${{ hashFiles('**/stack.yaml', '**/stack.yaml.lock') }}
@@ -118,11 +117,6 @@ jobs:
       - name: server tests
         if: inputs.phase != 'build' && inputs.phase != 'gate'
         working-directory: chusql-server
-        run: stack test --fast
-
-      - name: web tests
-        if: inputs.phase != 'build' && inputs.phase != 'gate'
-        working-directory: chusql-web
         run: stack test --fast
 
       - name: cli tests

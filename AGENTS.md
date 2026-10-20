@@ -58,6 +58,6 @@
 ## 协作规则
 - 全量门禁入口：`gate-check/run-gate.ps1`（三条车道并行，日志写仓库根的 `logs/`）。
 - 局部改动运行受影响模块的规定测试；较大改动由 agent 执行全量门禁，通过后再提交。
-- engine / web / storage 使用规定测试入口。
+- engine / cli / storage 使用规定测试入口。
 - 规定入口见 `gate-check/run-step.ps1`；Haskell 构建串行，存储协议改动须重建实际动态库。
 - 改动说明只在交流中记录。

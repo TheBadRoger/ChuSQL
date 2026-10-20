@@ -4,13 +4,12 @@ module Main (main) where
 
 import ChuSQL.CLI.Format (OutputFormat (..), displayValue, parseFormat, renderCsv, renderJson, renderTable)
 import ChuSQL.CLI.History (historySettings, rememberStatement)
-import ChuSQL.CLI.Normalization
 import ChuSQL.CLI.Password (readPasswordInput)
 import ChuSQL.CLI.Script (Meta (..), errorHint, parseMeta, statementComplete, stripTerminator, takeStatement)
 import ChuSQL.Core.Model (Value (..))
-import ChuSQL.Core.Protocol (QueryResult (..), queryResultJson)
+import ChuSQL.Core.Protocol (valueToJSON)
+import ChuSQL.Driver.Result (QueryResult (..))
 import ChuSQL.Core.Runtime
-import ChuSQL.Interface.Normalization
 import Control.Exception (bracket, finally)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (decode)
@@ -33,13 +32,12 @@ main = hspec spec
 -- | 全部测试用例
 spec :: Spec
 spec = do
-    normalizationSpec
     it "renders enum labels without exposing storage encoding" $ do
-        displayValue (VEnum "role" ["reader", "作者"] "作者") `shouldBe` "作者"
+        displayValue (valueToJSON (VEnum "role" ["reader", "作者"] "作者")) `shouldBe` "作者"
     it "renders typed compound values without losing their wire identity" $ do
         case resolveType builtinTypes (listType intType) of
             Left err -> expectationFailure err
-            Right descriptor -> displayValue (VRuntime (descriptorId descriptor) (RList [RInt 1, RInt 2])) `shouldBe` "[1, 2]"
+            Right descriptor -> displayValue (valueToJSON (VRuntime (descriptorId descriptor) (RList [RInt 1, RInt 2]))) `shouldBe` "[1, 2]"
     formatSpec
     scriptSpec
     passwordSpec
@@ -126,6 +124,8 @@ passwordSpec = describe "CLI: password input" $ do
 -- | 输出格式的用例
 formatSpec :: Spec
 formatSpec = describe "CLI: output formats" $ do
+    it "preserves integers larger than a machine word" $
+        displayValue (A.Number 18446744073709551616) `shouldBe` "18446744073709551616"
     it "renders a boxed table and marks NULL" $
         renderTable sampleResult
             `shouldBe` T.unlines
@@ -141,7 +141,7 @@ formatSpec = describe "CLI: output formats" $ do
         renderCsv
             QueryResult
                 { qrColumns = ["id", "name"]
-                , qrRows = [[VInt 1, VStr "a,b"], [VNull, VStr "say \"hi\""]]
+                , qrRows = [[A.Number 1, A.String "a,b"], [A.Null, A.String "say \"hi\""]]
                 , qrRowCount = 2
                 , qrTruncated = False
                 , qrDatabase = Nothing
@@ -149,7 +149,7 @@ formatSpec = describe "CLI: output formats" $ do
             `shouldBe` "id,name\n1,\"a,b\"\n,\"say \"\"hi\"\"\"\n"
     it "renders JSON that parses back to the same result" $
         (decode (BL.fromStrict (encodeUtf8 (renderJson sampleResult))) :: Maybe A.Value)
-            `shouldBe` Just (queryResultJson sampleResult)
+            `shouldBe` Just (A.toJSON sampleResult)
     it "accepts table/json/csv in any case and rejects anything else" $ do
         parseFormat "TABLE" `shouldBe` Just FormatTable
         parseFormat " json " `shouldBe` Just FormatJson
@@ -199,30 +199,8 @@ sampleResult :: QueryResult
 sampleResult =
     QueryResult
         { qrColumns = ["id", "name"]
-        , qrRows = [[VInt 1, VStr "Alice"], [VInt 2, VNull]]
+        , qrRows = [[A.Number 1, A.String "Alice"], [A.Number 2, A.Null]]
         , qrRowCount = 2
         , qrTruncated = False
         , qrDatabase = Nothing
         }
-
--- 范式元命令、严格文件与显示格式回归。
-normalizationSpec :: Spec
-normalizationSpec = describe "CLI: normalization" $ do
-    it "parses quoted paths without interpreting Windows backslashes" $ do
-        normalizationArguments "users --declaration \"C:\\My Data\\fd.json\" --format json" `shouldBe` Right ("users", "C:\\My Data\\fd.json", True)
-        parseMeta "\\normalize users --declaration deps.json --format text" `shouldBe` Just (MetaNormalize "users" "deps.json" False)
-        normalizationArguments "users --declaration deps.json --format csv" `shouldSatisfy` either (const True) (const False)
-    it "keeps the same report fields in text and JSON output" $ do
-        let report = A.object ["candidate_keys" A..= ([["id"]] :: [[T.Text]]), "conditional" A..= True, "findings" A..= [A.object ["normal_form" A..= ("bcnf" :: T.Text), "verdict" A..= ("insufficient" :: T.Text)]]]
-        A.eitherDecodeStrict (encodeUtf8 (renderNormalization True report)) `shouldBe` Right report
-        renderNormalization False report `shouldSatisfy` T.isInfixOf "candidate_keys"
-        renderNormalization False report `shouldSatisfy` T.isInfixOf "insufficient"
-    it "loads defaults and refuses duplicate JSON fields in declaration files" $ do
-        directory <- getTemporaryDirectory
-        bracket (openTempFile directory "normalization-declaration") (\(path, _) -> removeFile path) $ \(path, handle) -> do
-            hPutStr handle "{}"
-            hClose handle
-            loadNormalizationDeclaration path `shouldReturn` Right (NormalizationDeclaration [] [] False Nothing)
-            BL.writeFile path "{\"atomic_attributes\":true,\"atomic_attributes\":false}"
-            result <- loadNormalizationDeclaration path
-            result `shouldSatisfy` either (T.isInfixOf "duplicate") (const False)

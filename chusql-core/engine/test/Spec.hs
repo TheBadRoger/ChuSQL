@@ -37,8 +37,8 @@ import Data.Hashable (hash)
 import Data.List (isInfixOf, sortOn)
 import Data.Unique (hashUnique, newUnique)
 import GHC.IO.Encoding (getForeignEncoding, latin1, setForeignEncoding)
-import qualified NormalizationSpec
 import qualified RuntimeSpec
+import qualified ScalarSpec
 import System.CPUTime (getCPUTime)
 import System.Directory (createDirectoryIfMissing, getTemporaryDirectory, removePathForcibly, renameFile)
 import System.FilePath ((</>))
@@ -344,12 +344,24 @@ main = hspec $ do
                 timeout 1000000 closeConnection `shouldReturn` Just ()
                 readMVar closed `shouldReturn` ()
 
-    NormalizationSpec.spec
     RuntimeSpec.spec
+    ScalarSpec.spec
+    describe "persisted business scalars" $ do
+        it "keeps canonical values, schema and indexed UUID equality after reopening" $ withTestSession $ \srv -> do
+            withServerEnv srv $ do
+                mapM_
+                    (\source -> ipcDomainSql source `shouldReturn` Right [])
+                    [ "CREATE TABLE scalar_values (uid UUID PRIMARY KEY, created TIMESTAMPTZ, payload JSONB, ip INET)"
+                    , "INSERT INTO scalar_values (uid, created, payload, ip) VALUES ('550E8400-E29B-41D4-A716-446655440000', '2026-01-01T00:00:00+08:00', '{\"b\":2,\"a\":1}', '2001:DB8::1')"
+                    , "CREATE INDEX ON scalar_values (uid)"
+                    ]
+                ipcDomainSql "UPDATE scalar_values SET created = '2026-02-29T00:00:00Z'" >>= (`shouldSatisfy` isLeft)
+            closeConnection
+            openSessionIn (dataDir srv)
+            withServerEnv srv $
+                ipcDomainSql "SELECT created, payload, ip FROM scalar_values WHERE uid = '550E8400-E29B-41D4-A716-446655440000'"
+                    `shouldReturn` Right [[("created", VStr "2025-12-31T16:00:00.000000Z"), ("payload", VStr "{\"a\":1,\"b\":2}"), ("ip", VStr "2001:0db8:0000:0000:0000:0000:0000:0001")]]
     describe "identity syntax" $ do
-        it "parses independent sudo authentication switches" $ do
-            parseStatement "ALTER USER worker ALLOW_SUDO_AUTH" `shouldBe` Right (AlterIdentity "worker" [("allow_sudo_auth", True)])
-            parseStatement "ALTER ROLE worker NOALLOW_SUDO_AUTH" `shouldBe` Right (AlterIdentity "worker" [("allow_sudo_auth", False)])
         it "parses role and user attributes with their aliases" $ do
             parseStatement "ALTER ROLE worker LOGIN SUPERUSER ENABLED" `shouldBe` Right (AlterIdentity "worker" [("login", True), ("superuser", True), ("enabled", True)])
             parseStatement "ALTER USER worker NOLOGIN NOSUPERUSER DISABLED" `shouldBe` Right (AlterIdentity "worker" [("login", False), ("superuser", False), ("enabled", False)])
@@ -1582,7 +1594,7 @@ main = hspec $ do
             (parseStatement "REVOKE analyst FROM alice" >>= prepare testDB)
                 `shouldBe` Right (RevokeRole "analyst" ["alice"])
 
-        it "refuses to invent roles in the query engine (the web services own them)" $ do
+        it "refuses to invent roles in the query engine (the server owns them)" $ do
             (parseStatement "CREATE ROLE analyst" >>= runStatement testDB) `shouldSatisfy` isLeft
             (parseStatement "DROP ROLE analyst" >>= runStatement testDB) `shouldSatisfy` isLeft
             (parseStatement "GRANT SELECT ON users TO analyst" >>= runStatement testDB) `shouldSatisfy` isLeft

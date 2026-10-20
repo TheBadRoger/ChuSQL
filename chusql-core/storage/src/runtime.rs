@@ -2105,7 +2105,6 @@ impl Server {
                         user,
                         is_superuser: None,
                         system_catalog_manager: None,
-                        allow_sudo_auth: None,
                         ..
                     } => Some(account_name(user)?),
                     Request::AccountsList => None,
@@ -2117,7 +2116,7 @@ impl Server {
                 };
                 if accounts.iter().any(|a| {
                     target.as_ref() == Some(&a.user)
-                        && (a.is_superuser || a.system_catalog_manager || a.allow_sudo_auth)
+                        && (a.is_superuser || a.system_catalog_manager)
                 }) {
                     return Err(Error::other(
                         "superuser required to manage privileged identities",
@@ -2202,27 +2201,19 @@ impl Server {
                         accounts.push(role);
                     }
                 }
-                let unified = self
-                    .catalog
-                    .lock()
-                    .map_err(|_| Error::other("catalog lock poisoned"))?
-                    .describe(IDENTITIES_TABLE)
-                    .is_some();
                 if !accounts.is_empty() {
                     require_superuser(&accounts)?;
                 }
-                let sudo_column = self
-                    .catalog
-                    .lock()
-                    .map_err(|_| Error::other("catalog lock poisoned"))?
-                    .describe(IDENTITIES_TABLE)
-                    .is_some_and(|schema| {
-                        schema
-                            .columns
-                            .iter()
-                            .any(|column| column.name == "allow_sudo_auth")
-                    });
-                if unified && sudo_column && previous == accounts {
+                let schema_ready = {
+                    let catalog = self
+                        .catalog
+                        .lock()
+                        .map_err(|_| Error::other("catalog lock poisoned"))?;
+                    catalog
+                        .describe(IDENTITIES_TABLE)
+                        .is_some_and(|schema| schema.columns == identity_columns())
+                };
+                if schema_ready && previous == accounts {
                     return Ok(accounts);
                 }
             }
@@ -2289,7 +2280,6 @@ impl Server {
                 is_superuser,
                 enabled,
                 system_catalog_manager,
-                allow_sudo_auth,
             } => {
                 let name = account_name(&user)?;
                 let account = accounts
@@ -2301,7 +2291,6 @@ impl Server {
                 account.enabled = enabled.unwrap_or(account.enabled);
                 account.system_catalog_manager =
                     system_catalog_manager.unwrap_or(account.system_catalog_manager);
-                account.allow_sudo_auth = allow_sudo_auth.unwrap_or(account.allow_sudo_auth);
                 account.revision = account
                     .revision
                     .checked_add(1)
@@ -3423,10 +3412,6 @@ fn identity_rows(accounts: &[Account]) -> std::io::Result<Vec<Row>> {
                     "system_catalog_manager".into(),
                     serde_json::json!(a.system_catalog_manager),
                 ),
-                (
-                    "allow_sudo_auth".into(),
-                    serde_json::json!(a.allow_sudo_auth),
-                ),
                 ("enabled".into(), serde_json::json!(a.enabled)),
                 (
                     "identity_version".into(),
@@ -3500,12 +3485,6 @@ fn identity_columns() -> Vec<SchemaColumn> {
         },
         SchemaColumn {
             name: "system_catalog_manager".into(),
-            ty: "bool".into(),
-            nullable: false,
-            ..Default::default()
-        },
-        SchemaColumn {
-            name: "allow_sudo_auth".into(),
             ty: "bool".into(),
             nullable: false,
             ..Default::default()
@@ -3598,12 +3577,6 @@ fn decode_account_row(row: &Row) -> std::io::Result<Account> {
             .get("system_catalog_manager")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
-        allow_sudo_auth: match row.get("allow_sudo_auth") {
-            None => false,
-            Some(value) => value
-                .as_bool()
-                .ok_or_else(|| std::io::Error::other("invalid sudo authentication attribute"))?,
-        },
         enabled: row
             .get("enabled")
             .and_then(serde_json::Value::as_bool)
@@ -3695,7 +3668,6 @@ fn new_account(id: i64, user: &str, password_hash: String) -> std::io::Result<Ac
         can_login: true,
         is_superuser: false,
         system_catalog_manager: false,
-        allow_sudo_auth: false,
         enabled: true,
         identity_version: 1,
     })

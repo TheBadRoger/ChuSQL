@@ -18,7 +18,6 @@
 | `SUPERUSER / NOSUPERUSER` | 开启或关闭最高权限 |
 | `ENABLED / DISABLED` | 启用或禁用身份 |
 | `SYSTEM_CATALOG_MANAGER / NOSYSTEM_CATALOG_MANAGER` | 管理普通身份的系统目录权限 |
-| `ALLOW_SUDO_AUTH / NOALLOW_SUDO_AUTH` | 允许或关闭本机 sudo 登录 |
 
 新用户和角色默认启用、使用 NOSUPERUSER；角色默认 NOLOGIN。目录管理者只管理普通身份，业务数据仍需另行授权。
 
@@ -34,28 +33,6 @@ PUBLIC 默认提供业务库 CONNECT。表创建者拥有表所有权；数据�
 
 角色成员继承业务权限，SUPERUSER 等特权属性不继承。`WITH GRANT OPTION` 允许转授权；撤销时会清理失去来源的下游授权，独立授权来源保留。
 
-## 本机 sudo 认证
-
-该入口默认关闭，仅供本机提升后的操作系统管理员使用。先创建一个启用且可登录的目标身份，由 SUPERUSER 执行：
-
-```sql
-ALTER USER local_operator ALLOW_SUDO_AUTH;
-```
-
-在服务端和 CLI 使用的配置中设置：
-
-```toml
-[server]
-sudo_auth_user = "local_operator"
-```
-
-用 Unix root 或 Windows 提升后的管理员重启服务，再以相同身份运行客户端。Unix 示例，配置路径按实际位置替换：
-
-```sh
-sudo csql --config /absolute/path/settings.toml --sudo -e "SELECT 1"
-```
-
-登录只获得目标数据库身份原有的权限。异常退出后若提示凭据目录已存在，先确认服务停止，再由提升身份清理对应目录。
 
 ## 属性、授权与会话的关系
 

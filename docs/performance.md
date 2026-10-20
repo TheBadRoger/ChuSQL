@@ -22,7 +22,7 @@ $env:TEMP = $benchmarkTemp
 $env:TMP = $benchmarkTemp
 $env:PATH = (Join-Path $repoRoot 'chusql-core/storage/target/release') + ';' + $env:PATH
 $env:GHC_CHARENC = 'UTF-8'
-stack build chusql-core-model chusql-core-engine chusql-interface chusql-server chusql-bootstrap benchmark4csql --force-dirty --ghc-options=-O2
+stack build chusql-core-model chusql-core-engine chusql-server chusql-bootstrap benchmark4csql --force-dirty --ghc-options=-O2
 stack exec -- benchmark4csql 10000 50000
 ```
 

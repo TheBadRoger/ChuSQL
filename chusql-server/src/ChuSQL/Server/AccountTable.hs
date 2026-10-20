@@ -1,6 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module ChuSQL.Interface.AccountTable (
+module ChuSQL.Server.AccountTable (
     accountTableName,
     isAccountTable,
     passwordColumn,
@@ -12,7 +12,7 @@ import ChuSQL.Core.Protocol (SchemaColumn (..), TableInfo (..))
 import Data.Text (Text)
 import qualified Data.Text as T
 
--- 账号表（系统表 __system_users）的结构定义，SQL 会话与 Web 管理端共用。
+-- 系统账号表 __system_users 的结构定义。
 
 -- | 账号表的名字：网页里像普通表一样浏览与编辑，但写入走账号命令
 accountTableName :: String

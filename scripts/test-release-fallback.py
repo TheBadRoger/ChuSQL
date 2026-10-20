@@ -205,7 +205,7 @@ $tempDir = '{self.root}'
 """
         if download:
             text = source.read_text()
-            script += text[text.index('    # 一个平台一个包：'):text.index("    Step 'Unpacking the package'")]
+            script += text[text.index('    Step "Looking for a chusql package for windows-$arch"'):text.index("    Step 'Unpacking the package'")]
         script += "\n" + command
         self.root.mkdir(exist_ok=True)
         path = self.root / "test.ps1"

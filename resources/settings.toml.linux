@@ -27,6 +27,11 @@ data_dir = "@DATA_DIR@"
 log_files = "@LOG_DIR@"
 
 [server]
+# Authentication policy and failed-login window.
+login_max_attempts = 5
+login_window = 300
+password_min_length = 12
+password_classes = 2
 # TCP address to bind; 127.0.0.1 accepts local connections only.
 listen_host = "127.0.0.1"
 # TCP database port; choose an unused port from 1 to 65535.
@@ -35,9 +40,6 @@ port = 7777
 max_message = 1048576
 # Maximum number of rows returned by a query through the database server.
 max_rows = 1000
-# Local elevated OS identity mapping; empty disables sudo authentication.
-# Requires ALLOW_SUDO_AUTH on the identity and an elevated server process.
-sudo_auth_user = ""
 
 # Maximum Haskell execution threads, bounded by detected processors (1 to 256).
 # Parallel page scans retain their existing per-scan ceiling of 8 workers.
@@ -57,33 +59,3 @@ transaction_max = 0
 [log]
 # Diagnostic verbosity: off, error, warn, info or debug.
 level = "info"
-
-[web]
-# HTTP address to bind; use an external address to expose the web interface.
-listen_host = "127.0.0.1"
-# HTTP port; choose an unused port from 1 to 65535, different from the TCP port.
-port = 7778
-# Send session cookies over HTTPS only; enable behind an HTTPS endpoint.
-cookie_secure = false
-# Session inactivity timeout in seconds.
-session_idle = 28800
-# Maximum total session lifetime in seconds, regardless of activity.
-session_max = 86400
-# Maximum failed login attempts allowed within the login window.
-login_max_attempts = 5
-# Login rate-limit window in seconds.
-login_window = 300
-# Maximum HTTP request body size in bytes.
-body_limit = 65536
-# Default number of rows displayed per results page.
-rows_per_page = 25
-# Maximum page size accepted by the web interface.
-max_page_size = 500
-# Maximum number of query result rows retained by the web interface.
-max_rows = 1000
-# Maximum SQL input length in characters accepted by the web interface.
-max_sql_length = 20000
-# Minimum password length for ordinary accounts, in characters.
-password_min_length = 12
-# Minimum character classes required: lowercase, uppercase, digits and symbols.
-password_classes = 2

@@ -6,15 +6,24 @@ synopsis:       ChuSQL database server with TCP endpoints and SQL sessions
 description:    Provides the ChuSQL TCP server and newline-delimited JSON protocol,
                 authentication, rate limiting, and SQL sessions. SQL is executed by
                 chusql-core-engine with the in-process chusql_core_storage library.
-                Web and command-line clients access the database through TCP.
+                Command-line clients and drivers access the database through TCP.
 build-type:     Simple
+
+
 
 library
     hs-source-dirs:   src
-    exposed-modules:  ChuSQL.Server.Accounts
+    exposed-modules:  ChuSQL.Server.Config
+                      ChuSQL.Server.TOML
+                      ChuSQL.Server.Auth
+                      ChuSQL.Server.Accounts
+                      ChuSQL.Server.AccountTable
+                      ChuSQL.Server.PasswordPolicy
+                      ChuSQL.Server.Settings
+                      ChuSQL.Server.RateLimit
                       ChuSQL.Server.Backend
                       ChuSQL.Server.Catalog
-                      ChuSQL.Server.Normalization
+                      ChuSQL.Server.Protocol
                       ChuSQL.Server.Policy
                       ChuSQL.Server.Privileges
                       ChuSQL.Server.ObjectACL
@@ -26,7 +35,6 @@ library
                     , bytestring
                     , chusql-core-engine
                     , chusql-core-model
-                    , chusql-interface
                     , containers
                     , crypton
                     , directory
@@ -47,7 +55,6 @@ executable chusql-server
                     , aeson
                     , chusql-core-engine
                     , chusql-core-model
-                    , chusql-interface
                     , chusql-server
                     , containers
                     , filepath
@@ -70,7 +77,7 @@ test-suite chusql-server-test
                     , bytestring
                     , chusql-core-engine
                     , chusql-core-model
-                    , chusql-interface
+                    , chusql-haskell-driver
                     , chusql-server
                     , containers
                     , directory

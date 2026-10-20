@@ -2,7 +2,7 @@
 # 有问题的文件不静默：问题数大于 0 时退出码为 1
 param([string]$Root = (Split-Path -Parent $PSScriptRoot), [string[]]$Only)
 
-$codeDirs = @('chusql-core','chusql-server','chusql-web','chusql-cli','chusql-bootstrap','chusql-interface','benchmark','scripts','gate-check')
+$codeDirs = @('chusql-core','chusql-server','chusql-cli','chusql-bootstrap','benchmark','scripts','gate-check')
 $files = @()
 foreach ($d in $codeDirs) {
     $p = Join-Path $Root $d

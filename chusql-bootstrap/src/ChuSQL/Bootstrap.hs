@@ -2,7 +2,7 @@
 
 module ChuSQL.Bootstrap (preinstalledTypes, runBootstrap) where
 
-import ChuSQL.Core.Model (ColumnType (..), typeName)
+import ChuSQL.Core.Model (ColumnType (..), scalarTypes, typeName)
 import ChuSQL.Core.Protocol (Account (..))
 import qualified Data.Aeson as A
 import qualified Data.Aeson.KeyMap as KM
@@ -17,7 +17,7 @@ preinstalledTypes :: [A.Value]
 preinstalledTypes =
     map
         definition
-        [ ("int", CInt, False)
+        ( [ ("int", CInt, False)
         , ("integer", CInt, False)
         , ("bigint", CBigInt, False)
         , ("smallint", CSmallInt, False)
@@ -35,7 +35,18 @@ preinstalledTypes =
         , ("date", CDate, False)
         , ("timestamp", CTimestamp, False)
         , ("blob", CBlob, False)
+        , ("int2", CSmallInt, False)
+        , ("int4", CInt, False)
+        , ("int8", CBigInt, False)
+        , ("float4", CFloat, False)
+        , ("float8", CDouble, False)
+        , ("datetime", CTimestamp, False)
+        , ("bytea", CBlob, False)
+        , ("binary", CBlob, False)
+        , ("varbinary", CBlob, False)
         ]
+            ++ [(T.pack name, CScalar kind, False) | (name, kind) <- scalarTypes]
+        )
   where
     -- \| 编码类型的名称与基础表示
     definition :: (Text, ColumnType, Bool) -> A.Value

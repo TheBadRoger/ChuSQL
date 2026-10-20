@@ -146,6 +146,7 @@ inferExpr _ _ _ LitNull = Right InferNull
 inferExpr _ _ _ (LitInt _) = Right (InferType CInt)
 inferExpr _ _ _ (LitFloat _) = Right (InferType CFloat)
 inferExpr _ _ _ (EnumLiteral ty label) = coerceValue ty (VStr label) >> Right (InferType ty)
+inferExpr _ _ _ (TypedLiteral ty text) = coerceValue ty (VStr text) >> Right (InferType ty)
 inferExpr _ _ _ (LitStr _) = Right (InferType CStr)
 inferExpr _ _ _ (LitBool _) = Right (InferType CBool)
 inferExpr _ _ _ (LitDate _) = Right (InferType CDate)
@@ -809,7 +810,7 @@ resolveExpr db env outer f e = case e of
     InSub a sq negated -> enumSub (\left query -> InSub left query negated) a sq
     InList a es negated -> do
         values <- mapM (resolveExpr db env outer f) (a : es)
-        let expected = [ty | Right (InferType ty) <- map infer values, Just _ <- [enumDefinition ty]]
+        let expected = [ty | Right (InferType ty) <- map infer values, typeClassOf ty `elem` [EnumClass, ScalarClass]]
         converted <- case expected of
             ty : _ -> mapM (contextualEnum ty) values
             [] -> Right values
@@ -844,6 +845,9 @@ resolveExpr db env outer f e = case e of
 -- 把有枚举上下文的字符串常量类型化。
 contextualEnum :: ColumnType -> Expr -> Either String Expr
 contextualEnum ty (LitStr label)
+    | Just kind <- scalarDefinition ty = do
+        _ <- coerceValue (CScalar kind) (VStr label)
+        Right (TypedLiteral (CScalar kind) label)
     | Just (name, labels) <- enumDefinition ty = do
         _ <- coerceValue (CEnum name labels) (VStr label)
         Right (EnumLiteral (CEnum name labels) label)

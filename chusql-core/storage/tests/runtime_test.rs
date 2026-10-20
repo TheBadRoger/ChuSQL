@@ -1085,73 +1085,9 @@ fn account_response(
     Ok(response)
 }
 
-/// 本机认证开关独立持久化并推进会话版本
+/// 旧身份目录多余的认证列会被删除
 #[test]
-fn sudo_auth_is_independent_revocable_and_persistent() -> Result<(), Box<dyn std::error::Error>> {
-    let (server, data) = start_server();
-    let mut c = connect()?;
-    let original = account_response(
-        &mut c,
-        serde_json::json!({"method":"account_create","user":"local_user","password_hash":"hash"}),
-    )?;
-    let created = original["accounts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|a| a["user"] == "local_user")
-        .unwrap();
-    assert_eq!(created["allow_sudo_auth"], false);
-    let changed = account_response(
-        &mut c,
-        serde_json::json!({"method":"identity_alter","user":"local_user","allow_sudo_auth":true}),
-    )?;
-    let local = changed["accounts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|a| a["user"] == "local_user")
-        .unwrap();
-    assert_eq!(local["allow_sudo_auth"], true);
-    assert_eq!(local["is_superuser"], false);
-    assert_eq!(local["system_catalog_manager"], false);
-    assert_eq!(local["revision"], 2);
-    for command in [
-        serde_json::json!({"method":"identity_alter","user":"local_user","allow_sudo_auth":false}),
-        serde_json::json!({"method":"account_reset","user":"local_user","password_hash":"other"}),
-        serde_json::json!({"method":"identity_alter","user":"root","allow_sudo_auth":true}),
-    ] {
-        let denied = send(
-            &mut c,
-            &serde_json::json!({"method":"catalog_manage","command":command}).to_string(),
-        );
-        assert!(denied.contains("superuser required"), "{denied}");
-    }
-    drop(c);
-    drop(server);
-    let _restarted = restart_at(data.path())?;
-    let mut c = connect()?;
-    assert_eq!(
-        account_response(&mut c, serde_json::json!({"method":"accounts_list"}))?,
-        changed
-    );
-    let revoked = account_response(
-        &mut c,
-        serde_json::json!({"method":"identity_alter","user":"local_user","allow_sudo_auth":false}),
-    )?;
-    let local = revoked["accounts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|a| a["user"] == "local_user")
-        .unwrap();
-    assert_eq!(local["allow_sudo_auth"], false);
-    assert_eq!(local["revision"], 3);
-    Ok(())
-}
-
-/// 升级缺失本机认证列的旧目录
-#[test]
-fn sudo_auth_upgrades_old_identity_schema() -> Result<(), Box<dyn std::error::Error>> {
+fn legacy_identity_schema_columns_are_dropped() -> Result<(), Box<dyn std::error::Error>> {
     let (server, data) = start_server();
     drop(server);
     CURRENT.with(|slot| *slot.borrow_mut() = None);
@@ -1160,7 +1096,7 @@ fn sudo_auth_upgrades_old_identity_schema() -> Result<(), Box<dyn std::error::Er
     catalog["tables"]["__system_identities"]["columns"]
         .as_array_mut()
         .unwrap()
-        .retain(|column| column["name"] != "allow_sudo_auth");
+        .push(serde_json::json!({"name":"allow_sudo_auth","ty":"bool","nullable":false}));
     std::fs::write(&path, serde_json::to_vec(&catalog)?)?;
     let _restarted = restart_at(data.path())?;
     let mut c = connect()?;
@@ -1173,7 +1109,7 @@ fn sudo_auth_upgrades_old_identity_schema() -> Result<(), Box<dyn std::error::Er
             .as_array()
             .unwrap()
             .iter()
-            .all(|a| a["allow_sudo_auth"] == false)
+            .all(|a| a.get("allow_sudo_auth").is_none())
     );
     let catalog: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
     assert!(
@@ -1181,7 +1117,7 @@ fn sudo_auth_upgrades_old_identity_schema() -> Result<(), Box<dyn std::error::Er
             .as_array()
             .unwrap()
             .iter()
-            .any(|column| column["name"] == "allow_sudo_auth")
+            .all(|column| column["name"] != "allow_sudo_auth")
     );
     Ok(())
 }
@@ -5032,7 +4968,6 @@ fn account_table_uses_typed_columns_and_stamps_login() -> Result<(), Box<dyn std
             "can_login",
             "is_superuser",
             "system_catalog_manager",
-            "allow_sudo_auth",
             "enabled",
             "identity_version",
             "registered_at",
@@ -5049,7 +4984,6 @@ fn account_table_uses_typed_columns_and_stamps_login() -> Result<(), Box<dyn std
         vec![
             "int",
             "varchar(64)",
-            "bool",
             "bool",
             "bool",
             "bool",

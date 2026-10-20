@@ -4,8 +4,8 @@ module ChuSQL.Server.Policy (
     passwordKeys,
 ) where
 
-import ChuSQL.Interface.Policy (defaultPasswordPolicy, passwordKeys, policyFromValues)
-import ChuSQL.Interface.Settings (applySettings, defaultOf, readSettingsFile)
+import ChuSQL.Server.PasswordPolicy (defaultPasswordPolicy, passwordKeys, policyFromValues)
+import ChuSQL.Server.Settings (applySettings, defaultOf, readSettingsFile)
 import ChuSQL.Server.Accounts (Accounts, setAccountsPolicy)
 import qualified Data.Map.Strict as Map
 

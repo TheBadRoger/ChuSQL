@@ -82,7 +82,7 @@ data Request
     | ReqIdentityInitialize T.Text
     | ReqRoleCreate T.Text
     | ReqCatalogManage Request
-    | ReqIdentityAlter T.Text (Maybe Bool) (Maybe Bool) (Maybe Bool) (Maybe Bool) (Maybe Bool)
+    | ReqIdentityAlter T.Text (Maybe Bool) (Maybe Bool) (Maybe Bool) (Maybe Bool)
     | ReqAccountCreate T.Text T.Text
     | ReqAccountReset T.Text T.Text
     | ReqAccountLogin T.Text (Maybe T.Text)
@@ -158,7 +158,7 @@ instance ToJSON Request where
     toJSON ReqAccountsList = object ["method" .= ("accounts_list" :: T.Text)]
     toJSON (ReqIdentityInitialize u) = object ["method" .= ("identity_initialize" :: T.Text), "administrator" .= u]
     toJSON (ReqRoleCreate u) = object ["method" .= ("role_create" :: T.Text), "user" .= u]
-    toJSON (ReqIdentityAlter u login super enabled manager sudo) =
+    toJSON (ReqIdentityAlter u login super enabled manager) =
         object
             [ "method" .= ("identity_alter" :: T.Text)
             , "user" .= u
@@ -166,7 +166,6 @@ instance ToJSON Request where
             , "is_superuser" .= super
             , "enabled" .= enabled
             , "system_catalog_manager" .= manager
-            , "allow_sudo_auth" .= sudo
             ]
     toJSON (ReqAccountCreate u h) = object ["method" .= ("account_create" :: T.Text), "user" .= u, "password_hash" .= h]
     toJSON (ReqAccountReset u h) = object ["method" .= ("account_reset" :: T.Text), "user" .= u, "password_hash" .= h]
@@ -386,7 +385,6 @@ data Account = Account
     , accountIsSuperuser :: Bool
     , accountEnabled :: Bool
     , accountSystemCatalogManager :: Bool
-    , accountAllowSudoAuth :: Bool
     }
     deriving (Eq)
 
@@ -408,7 +406,6 @@ instance FromJSON Account where
             <*> o .:? "is_superuser" .!= False
             <*> o .:? "enabled" .!= True
             <*> o .:? "system_catalog_manager" .!= False
-            <*> o .:? "allow_sudo_auth" .!= False
 
 -- | 账号编码成 JSON
 instance ToJSON Account where
@@ -424,7 +421,6 @@ instance ToJSON Account where
             , "is_superuser" .= accountIsSuperuser a
             , "enabled" .= accountEnabled a
             , "system_catalog_manager" .= accountSystemCatalogManager a
-            , "allow_sudo_auth" .= accountAllowSudoAuth a
             ]
 
 -- | 存储层响应

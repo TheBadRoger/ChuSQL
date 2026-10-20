@@ -13,7 +13,9 @@ module ChuSQL.CLI.Format (
 ) where
 
 import ChuSQL.Core.Model (Value (..))
-import ChuSQL.Core.Protocol (QueryResult (..), queryResultJson)
+import ChuSQL.Core.Protocol (valueFromJSON)
+import ChuSQL.Driver.Result (QueryResult (..))
+import Data.Aeson.Types (parseEither)
 import ChuSQL.Core.Runtime (renderRuntimeValue)
 import qualified Data.Aeson as A
 import qualified Data.ByteString.Lazy as BL
@@ -48,7 +50,7 @@ renderResult FormatCsv = renderCsv
 
 -- | 紧凑 JSON，方便管道里再用
 renderJson :: QueryResult -> Text
-renderJson = decodeUtf8 . BL.toStrict . A.encode . queryResultJson
+renderJson = decodeUtf8 . BL.toStrict . A.encode
 
 -- | 渲染成 CSV
 renderCsv :: QueryResult -> Text
@@ -59,8 +61,8 @@ renderCsv result = T.unlines (header : map rowLine (qrRows result))
     rowLine row = T.intercalate "," (map (csvField . csvCell) row)
 
 -- | CSV 里的空值就是空字段
-csvCell :: Value -> Text
-csvCell VNull = ""
+csvCell :: A.Value -> Text
+csvCell A.Null = ""
 csvCell value = displayValue value
 
 -- | 按 RFC 4180 给需要的字段加引号
@@ -103,12 +105,23 @@ pad width text = clipped <> T.replicate (width - T.length clipped) " "
         | otherwise = T.take (width - 3) text <> "..."
 
 -- | 把值转成可显示的文本
-displayValue :: Value -> Text
-displayValue VNull = "NULL"
-displayValue (VInt n) = T.pack (show n)
-displayValue (VFloat d) = T.pack (show d)
-displayValue (VStr s) = T.pack s
-displayValue (VEnum _ _ label) = T.pack label
-displayValue (VBool True) = "true"
-displayValue (VBool False) = "false"
-displayValue (VRuntime _ value) = T.pack (renderRuntimeValue value)
+displayValue :: A.Value -> Text
+displayValue A.Null = "NULL"
+displayValue (A.String value) = value
+displayValue (A.Bool True) = "true"
+displayValue (A.Bool False) = "false"
+displayValue value@(A.Number _) = decodeUtf8 (BL.toStrict (A.encode value))
+displayValue value = case parseEither valueFromJSON value of
+    Right decoded -> displayCoreValue decoded
+    Left _ -> decodeUtf8 (BL.toStrict (A.encode value))
+
+-- 使用已有格式展示可识别的内核值。
+displayCoreValue :: Value -> Text
+displayCoreValue VNull = "NULL"
+displayCoreValue (VInt n) = T.pack (show n)
+displayCoreValue (VFloat d) = T.pack (show d)
+displayCoreValue (VStr s) = T.pack s
+displayCoreValue (VEnum _ _ label) = T.pack label
+displayCoreValue (VBool True) = "true"
+displayCoreValue (VBool False) = "false"
+displayCoreValue (VRuntime _ value) = T.pack (renderRuntimeValue value)

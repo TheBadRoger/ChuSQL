@@ -24,11 +24,6 @@ case "${1:-server}" in
         unset password
         exec chusql-server --config "$config" --user "${CHUSQL_ADMIN_USER:-root}" "$@"
         ;;
-    web)
-        shift
-        exec chusql-web --config "${CHUSQL_CONFIG:-/etc/chusql/web.toml}" \
-            --user "${CHUSQL_ADMIN_USER:-root}" "$@"
-        ;;
     *)
         exec "$@"
         ;;

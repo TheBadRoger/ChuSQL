@@ -11,7 +11,3 @@ max_connections = 32
 connection_idle = 300
 transaction_idle = 60
 transaction_max = 300
-
-[web]
-session_idle = 1800
-session_max = 7200

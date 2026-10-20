@@ -15,8 +15,8 @@ executable benchmark4csql
     build-tool-depends: chusql-server:chusql-server
                       , chusql-bootstrap:csql-bootstrap
     build-depends:    base >= 4.14 && < 5
-                    , chusql-core-model
-                    , chusql-interface
+                    , aeson
+                    , chusql-haskell-driver
                     , directory
                     , filepath
                     , process

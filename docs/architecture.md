@@ -9,8 +9,6 @@ ChuSQL 由 Haskell SQL 引擎和 Rust 存储层组成。客户端通过服务端
 ```mermaid
 flowchart LR
     CLI[命令行客户端] -->|TCP| Server[chusql-server]
-    Browser[浏览器] -->|HTTP| Web[chusql-web]
-    Web -->|TCP| Server
     Server --> Engine[Haskell SQL 引擎]
     Engine --> Storage[Rust 存储层]
     Storage --> Disk[(磁盘)]
@@ -19,10 +17,15 @@ flowchart LR
 | 组件 | 职责 |
 | --- | --- |
 | `chusql-server` | 登录、权限、会话和事务 |
-| `chusql-web` / `csql` | Web 管理端和命令行客户端 |
+| `csql` | 命令行客户端 |
 | `chusql-core/engine` | SQL 解析、检查、优化和执行 |
 | `chusql-core/storage` | 数据页、索引、系统目录和持久化 |
 | `csql-bootstrap` | 初始化与离线系统目录修复 |
+| `chusql-haskell-driver` | 独立仓库中的 TCP 连接、会话和协议编解码 |
+
+Haskell 客户端从远程 [Haskell 驱动仓库](https://repo.chunana.cn/ChuNa7a/ChuSQL-HaskellDriver)获取 `main` 分支源码归档。驱动自行定义协议数据结构，查询值保留为 JSON，不依赖主项目的内核模型、查询引擎或存储动态库。配置、TOML、口令哈希与认证会话位于服务端源码目录，CLI 和引导程序引用对应的公开模块。
+
+服务端在 `ChuSQL.Server.Protocol` 中编码内核结果，两端通过版本化 TCP 协议保持兼容；接入方法见[驱动参考文档](https://repo.chunana.cn/ChuNa7a/ChuSQL-HaskellDriver#参考文档)。
 
 ## SQL 查询处理
 
@@ -34,7 +37,7 @@ SQL 写法见[语法参考](syntax.md)，类型规则见[类型说明](types.md)
 
 ## 会话与并发
 
-每条连接拥有独立会话和当前数据库。Web 表格编辑与 SQL 控制台使用独立连接；表格修改在提交时统一保存。
+每条连接拥有独立会话和当前数据库。客户端在连接中执行 SQL，并显式提交或回滚事务。
 
 不同记录可并行准备修改，同一数据库的最终校验与提交按顺序执行。权限和结构变更与数据操作协调，事务提交时再次检查权限。
 

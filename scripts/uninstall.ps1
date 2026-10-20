@@ -42,7 +42,7 @@ if (-not $Yes) {
 }
 
 Step 'Stopping the service'
-$running = @(Get-Process -Name 'chusql-server', 'chusql-web' -ErrorAction SilentlyContinue |
+$running = @(Get-Process -Name 'chusql-server' -ErrorAction SilentlyContinue |
     Where-Object {
         try { $_.Path -and $_.Path.StartsWith($InstallDir, [StringComparison]::OrdinalIgnoreCase) }
         catch { $false }

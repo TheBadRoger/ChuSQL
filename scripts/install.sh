@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-# ChuSQL 安装脚本（Linux/macOS）：装 cli/web、写全局配置、
+# ChuSQL 安装脚本（Linux/macOS）：装 CLI、写全局配置、
 # 改 PATH、初始化系统目录，Linux 注册开机启动服务。
 
 default_repo='TheBadRoger/ChuSQL'
@@ -24,14 +24,11 @@ churepo_repo='ChuNa7a/ChuSQL'
 # 打印用法、选项与环境变量说明。
 usage() {
     cat <<'EOF'
-usage: ./install.sh [--component web|cli|both] [options]
+usage: ./install.sh [--component cli] [options]
 
-  --component web|cli|both
-                          which parts to install. Leave it out and the installer
-                          asks (English, y/n), command line client first:
-                            command line client (csql)?   default yes [Y/n]
-                            web front end (browser UI)?   default no  [y/N]
-                          it then asks for the administrator password; it goes into the
+  --component cli
+                          install the command line client and database server (default).
+                          the installer asks for the administrator password; it goes into the
                           system catalog and is never written to settings.toml
 
   --interactive           ask even when there is no terminal; the answers are
@@ -96,7 +93,6 @@ list_versions='no'
 interactive_flag='no'
 system_mode='no'
 prefix=''
-want_web='no'
 want_cli='no'
 
 while [ $# -gt 0 ]; do
@@ -172,11 +168,9 @@ apply_performance_profile() {
 # --list-versions 只问仓库有什么版本，不需要 --component
 if [ "$list_versions" = 'no' ]; then
     case "$component" in
-        web)  want_web='yes' ;;
         cli)  want_cli='yes' ;;
-        both) want_web='yes'; want_cli='yes' ;;
-        '')   : ;;   # 没给就交互询问（下面），问不了才报错
-        *) fail "--component must be web, cli or both, got: $component" ;;
+        '')   want_cli='yes' ;;
+        *) fail "--component must be cli, got: $component" ;;
     esac
 fi
 
@@ -285,20 +279,6 @@ read_secret() {
     return 0
 }
 
-if [ "$component" = '' ] && [ "$list_versions" = 'no' ]; then
-    if [ "$can_prompt" = 'no' ]; then
-        fail '--component is required (web, cli or both) when there is no terminal to ask on'
-    fi
-    echo
-    echo 'ChuSQL installer: which parts do you want?'
-    ask_yes_no 'Install the command line client (csql)? [Y/n]' yes
-    want_cli="$reply"
-    ask_yes_no 'Install the web front end (browser UI)? [y/N]' no
-    want_web="$reply"
-    if [ "$want_web" = 'no' ] && [ "$want_cli" = 'no' ]; then
-        echo '  neither selected: only the storage library and the server get installed' >&2
-    fi
-fi
 
 # 管理员口令是装机必答项：交互时当场设，非交互时给 --password 或
 # CHUSQL_ADMIN_PASSWORD。口令只经 stdin 传给 csql-bootstrap，不落 settings.toml。
@@ -332,12 +312,8 @@ if [ "$list_versions" = 'no' ]; then
     fi
 fi
 
-# 选中的组件：空格分隔的清单，外加一个显示名（cli 或 web，两个就是 cli+web）
 wanted=''
 if [ "$want_cli" = 'yes' ]; then wanted='cli'; fi
-if [ "$want_web" = 'yes' ]; then
-    if [ -n "$wanted" ]; then wanted="$wanted web"; else wanted='web'; fi
-fi
 component_label=''
 for comp in $wanted; do
     if [ -n "$component_label" ]; then component_label="$component_label+$comp"; else component_label="$comp"; fi
@@ -643,11 +619,7 @@ if [ "$from_source" = 'yes' ]; then
     cp "$src/resources/settings.toml.linux" "$src/resources/settings.low-performance.toml" "$pack/resources/"
     cp "$src/scripts/install.sh" "$src/scripts/uninstall.sh" "$pack/"
     for comp in $wanted; do
-        if [ "$comp" = 'web' ]; then
-            comp_dir='chusql-web'; front_name='chusql-web'
-        else
-            comp_dir='chusql-cli'; front_name='csql'
-        fi
+        comp_dir='chusql-cli'; front_name='csql'
         step "Building the Haskell binaries (stack build --fast in $comp_dir)"
         note 'the first build downloads the Hackage index (about 139 MB)'
         ( cd "$src/$comp_dir" && stack build --fast ) || fail "stack build failed in $comp_dir"
@@ -659,12 +631,6 @@ if [ "$from_source" = 'yes' ]; then
         for extra in "$stack_root/bin/"*.so "$stack_root/bin/"*.dll; do
             if [ -f "$extra" ]; then cp "$extra" "$pack/bin/"; fi
         done
-        if [ "$comp" = 'web' ]; then
-            [ -d "$src/chusql-web/static" ] || fail "static assets not found: $src/chusql-web/static"
-            mkdir -p "$pack/static"
-            cp -R "$src/chusql-web/static/." "$pack/static/"
-            cp "$src/scripts/csql-web.sh" "$pack/"
-        fi
     done
 
     # TCP 数据库服务必装，跟组件选择无关：它住在 chusql-server 这个 stack 工程里
@@ -732,10 +698,6 @@ fi
 ls "$pack/bin/"libchusql_core_storage.* >/dev/null 2>&1 || fail "package is incomplete: bin/libchusql_core_storage.* not found in $pack"
 [ -f "$pack/bin/chusql-server" ] || fail "package is incomplete: bin/chusql-server not found in $pack"
 [ -f "$pack/bin/csql-bootstrap" ] || fail "package is incomplete: bin/csql-bootstrap not found in $pack"
-if [ "$want_web" = 'yes' ]; then
-    [ -f "$pack/bin/chusql-web" ] || fail 'package is incomplete: bin/chusql-web not found'
-    [ -d "$pack/static" ] || fail 'package is incomplete: static/ not found'
-fi
 if [ "$want_cli" = 'yes' ]; then
     [ -f "$pack/bin/csql" ] || fail 'package is incomplete: bin/csql not found'
 fi
@@ -752,7 +714,6 @@ echo "  data dir   $data_dir"
 echo "  root user  $root_user (password asked above, kept out of settings.toml)"
 
 # ---- 释放文件 ----
-# 包是合在一起的（web 和 cli 都在），这里按这次的选择逐个释放：没选的组件不落地
 use_service='no'
 ctl='systemctl'
 if [ "$system_mode" = 'yes' ]; then
@@ -783,7 +744,7 @@ elif [ "$(uname -s)" = 'Linux' ] && [ "$no_service" = 'no' ]; then
 fi
 # 停止安装目录中的进程，避免更新运行中的文件。
 stop_installed() {
-    for executable in chusql-web chusql-server; do
+    for executable in chusql-server; do
         for process in /proc/[0-9]*/exe; do
             target=$(readlink "$process" 2>/dev/null) || continue
             [ "$target" = "$install_dir/bin/$executable" ] || continue
@@ -823,15 +784,6 @@ for lib in "$pack/bin/"*.so "$pack/bin/"*.dylib "$pack/bin/"*.dll; do
 done
 if [ "$want_cli" = 'yes' ]; then
     cp "$pack/bin/csql" "$install_dir/bin/"
-fi
-if [ "$want_web" = 'yes' ]; then
-    cp "$pack/bin/chusql-web" "$install_dir/bin/"
-    mkdir -p "$install_dir/static"
-    cp -R "$pack/static/." "$install_dir/static/"
-    if [ -f "$pack/csql-web.sh" ]; then
-        cp "$pack/csql-web.sh" "$install_dir/"
-        chmod +x "$install_dir/csql-web.sh"
-    fi
 fi
 chmod +x "$install_dir/bin/"*
 if [ -f "$pack/uninstall.sh" ]; then
@@ -879,13 +831,6 @@ fi
 
 # ---- 命令入口 ----
 step 'Creating commands'
-if [ "$want_web" = 'yes' ]; then
-    cat > "$install_dir/csql-web" <<'EOF'
-#!/bin/sh
-exec "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/csql-web.sh" "$@"
-EOF
-    chmod +x "$install_dir/csql-web"
-fi
 if [ "$want_cli" = 'yes' ]; then
     cat > "$install_dir/csql" <<'EOF'
 #!/bin/sh
@@ -896,7 +841,6 @@ fi
 
 if [ "$system_mode" = 'yes' ]; then
     if [ "$want_cli" = 'yes' ]; then ln -sf "$install_dir/bin/csql" "$prefix/usr/bin/csql"; else rm -f "$prefix/usr/bin/csql"; fi
-    if [ "$want_web" = 'yes' ]; then ln -sf "$install_dir/csql-web.sh" "$prefix/usr/bin/csql-web"; else rm -f "$prefix/usr/bin/csql-web"; fi
     ln -sf "$install_dir/bin/chusql-server" "$prefix/usr/bin/chusql-server"
 fi
 
@@ -905,7 +849,6 @@ if [ "$system_mode" = 'yes' ]; then
     step 'Linking commands'
     system_commands='chusql-server'
     if [ "$want_cli" = 'yes' ]; then system_commands="csql $system_commands"; fi
-    if [ "$want_web" = 'yes' ]; then system_commands="csql-web $system_commands"; fi
     note "commands: $system_commands (in $prefix/usr/bin)"
 else
 step 'Updating PATH'
@@ -1013,7 +956,6 @@ step 'Done'
 echo "  settings.toml  $config_file"
 echo "  data         $data_dir"
 start_with=''
-if [ "$want_web" = 'yes' ]; then start_with='csql-web'; fi
 if [ "$want_cli" = 'yes' ]; then
     if [ -n "$start_with" ]; then start_with="$start_with, csql"; else start_with='csql'; fi
 fi

@@ -5,9 +5,9 @@ module Main (main) where
 import ChuSQL.Bootstrap (preinstalledTypes, runBootstrap)
 import ChuSQL.Core.Engine.Storage.FFI (maintainStorage)
 import ChuSQL.Core.Engine.Storage.IPC (closeConnection, localStorageLink, sendRawRequest, setStorageLink)
-import ChuSQL.Interface.Auth (hashPassword)
-import ChuSQL.Interface.Config (loadWebConfigAt, rootUserName)
-import ChuSQL.Interface.TOML (resolveConfigPath)
+import ChuSQL.Server.Auth (hashPassword)
+import ChuSQL.Server.Config (loadRuntimeConfigAt, rootUserName)
+import ChuSQL.Server.TOML (resolveConfigPath)
 import Control.Exception (finally)
 import qualified Data.Aeson as A
 import qualified Data.ByteString.Lazy.Char8 as BL
@@ -101,7 +101,7 @@ run :: Options -> IO ()
 run opts | Just mode <- optMode opts = runMaintenance opts mode
 run opts = do
     configPath <- resolveConfigPath (optConfig opts)
-    base <- loadWebConfigAt configPath
+    base <- loadRuntimeConfigAt configPath
     let name = maybe (rootUserName base) T.pack (optUser opts)
     chosen <- readPassword opts
     case chosen of

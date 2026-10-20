@@ -206,7 +206,7 @@ fn load_without_explicit_path_uses_builtin_defaults() {
 #[test]
 fn server_section_belongs_to_another_layer() {
     let _guard = env_guard();
-    let db_server = "[page]\nsize = 8192\n[storage]\ndata_dir = \"../data\"\n[server]\nlisten_host = \"0.0.0.0\"\nport = 7778\nmax_rows = 10\n[web]\nport = 7778\n";
+    let db_server = "[page]\nsize = 8192\n[storage]\ndata_dir = \"../data\"\n[server]\nlisten_host = \"0.0.0.0\"\nport = 7778\nmax_rows = 10\n[unrelated]\nport = 7778\n";
     let loaded = config::resolve(Some(db_server), None).unwrap();
     assert_eq!(loaded.config.page_size, 8192);
     assert_eq!(loaded.config.data_dir, PathBuf::from("../data"));

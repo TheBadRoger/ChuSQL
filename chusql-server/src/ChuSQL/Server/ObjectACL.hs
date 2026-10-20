@@ -19,7 +19,7 @@ module ChuSQL.Server.ObjectACL (
 ) where
 
 import ChuSQL.Core.Protocol (Account (..), TableInfo (..))
-import ChuSQL.Interface.Protocol (Grant (..))
+import ChuSQL.Server.Protocol (Grant (..))
 import ChuSQL.Server.Accounts (Principal, principalIsRoot, principalName)
 import ChuSQL.Server.Backend (Backend (..))
 import ChuSQL.Server.Catalog (Catalog, readGrantOptions, readGrants, readIdentities, readMembers)

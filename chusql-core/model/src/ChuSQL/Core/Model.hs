@@ -2,6 +2,9 @@
 
 module ChuSQL.Core.Model (
     ColumnType (..),
+    ScalarType (..),
+    scalarTypes,
+    scalarDefinition,
     Column (..),
     pattern TInt,
     pattern TStr,
@@ -49,6 +52,7 @@ module ChuSQL.Core.Model (
 ) where
 
 import ChuSQL.Core.Runtime
+import ChuSQL.Core.Scalar
 import qualified Data.Aeson as A
 import qualified Data.ByteString.Lazy.Char8 as BS
 import Data.Char (isDigit, isSpace, toLower)
@@ -79,6 +83,7 @@ data ColumnType
     | CDate
     | CTimestamp
     | CBlob
+    | CScalar ScalarType
     | CNull
     | CDomain String ColumnType
     | CRuntime TypeId
@@ -134,6 +139,7 @@ typeLabel (CDecimal p s) = "TDecimal " ++ show p ++ " " ++ show s
 typeLabel CDate = "TDate"
 typeLabel CTimestamp = "TTimestamp"
 typeLabel CBlob = "TBlob"
+typeLabel (CScalar kind) = scalarName kind
 typeLabel CNull = "NULL"
 typeLabel (CDomain name _) = name
 typeLabel (CRuntime tid) = renderTypeExpr (typeExpression tid)
@@ -154,6 +160,7 @@ typeName (CDecimal p s) = "decimal(" ++ show p ++ "," ++ show s ++ ")"
 typeName CDate = "date"
 typeName CTimestamp = "timestamp"
 typeName CBlob = "blob"
+typeName (CScalar kind) = scalarName kind
 typeName CNull = "null"
 typeName (CDomain name base) = "domain(" ++ name ++ "," ++ typeName base ++ ")"
 typeName (CRuntime tid) = "runtime(" ++ BS.unpack (encodeType tid) ++ ")"
@@ -185,6 +192,9 @@ parseColumnType raw
         ("integer", []) -> Just CInt
         ("bigint", []) -> Just CBigInt
         ("smallint", []) -> Just CSmallInt
+        ("int2", []) -> Just CSmallInt
+        ("int4", []) -> Just CInt
+        ("int8", []) -> Just CBigInt
         ("str", []) -> Just CStr
         ("text", []) -> Just CStr
         ("varchar", []) -> Just CStr
@@ -195,6 +205,8 @@ parseColumnType raw
         ("boolean", []) -> Just CBool
         ("float", []) -> Just CFloat
         ("real", []) -> Just CFloat
+        ("float4", []) -> Just CFloat
+        ("float8", []) -> Just CDouble
         ("double", []) -> Just CDouble
         ("decimal", []) -> Just (CDecimal 10 0)
         ("numeric", []) -> Just (CDecimal 10 0)
@@ -204,7 +216,12 @@ parseColumnType raw
         ("numeric", [p, s]) -> CDecimal <$> positive p <*> plain s
         ("date", []) -> Just CDate
         ("timestamp", []) -> Just CTimestamp
+        ("datetime", []) -> Just CTimestamp
         ("blob", []) -> Just CBlob
+        ("bytea", []) -> Just CBlob
+        ("binary", []) -> Just CBlob
+        ("varbinary", []) -> Just CBlob
+        (name, []) | Just kind <- lookup name scalarTypes -> Just (CScalar kind)
         _ -> either (const Nothing) (Just . CRuntime . descriptorId) (parseTypeExpr raw >>= resolveType builtinTypes)
   where
     -- \| 去掉空白的类型名
@@ -228,6 +245,12 @@ enumDefinition :: ColumnType -> Maybe (String, [String])
 enumDefinition (CDomain _ base) = enumDefinition base
 enumDefinition (CEnum name labels) = Just (name, labels)
 enumDefinition _ = Nothing
+
+-- 取得领域包装后的业务标量类型。
+scalarDefinition :: ColumnType -> Maybe ScalarType
+scalarDefinition (CDomain _ base) = scalarDefinition base
+scalarDefinition (CScalar kind) = Just kind
+scalarDefinition _ = Nothing
 
 -- | 去掉结尾
 stripSuffixMaybe :: String -> String -> Maybe String
@@ -271,6 +294,7 @@ data TypeClass
     | NullClass
     | RuntimeClass
     | EnumClass
+    | ScalarClass
     deriving (Show, Eq)
 
 -- | 整型大类判断
@@ -288,6 +312,7 @@ typeClassOf CChar{} = TextClass
 typeClassOf CBlob = TextClass
 typeClassOf CDate = TemporalClass
 typeClassOf CTimestamp = TemporalClass
+typeClassOf CScalar{} = ScalarClass
 typeClassOf CBool = BooleanClass
 typeClassOf CNull = NullClass
 typeClassOf (CDomain _ base) = typeClassOf base
@@ -300,6 +325,8 @@ assignable target (CDomain _ base) = assignable target base
 assignable target source
     | source == CNull = True
     | target == source = True
+    | typeClassOf target == ScalarClass || typeClassOf source == ScalarClass =
+        typeClassOf target == ScalarClass && typeClassOf source == TextClass
     | typeClassOf target == EnumClass || typeClassOf source == EnumClass = False
     | CRuntime tid <- target = Just (typeExpression tid) == scalarTypeExpression source
     | typeClassOf target == RuntimeClass || typeClassOf source == RuntimeClass = False
@@ -321,6 +348,7 @@ comparableTypes (CDomain _ base) other = comparableTypes base other
 comparableTypes other (CDomain _ base) = comparableTypes other base
 comparableTypes a b
     | a == CNull || b == CNull = True
+    | typeClassOf a == ScalarClass || typeClassOf b == ScalarClass = a == b
     | typeClassOf a == EnumClass || typeClassOf b == EnumClass = a == b
     | typeClassOf a == RuntimeClass || typeClassOf b == RuntimeClass = a == b && hasTypeCapability EqCapability a
     | otherwise = a == CNull || b == CNull || sameClass || crossTemporal
@@ -337,6 +365,7 @@ comparableTypes a b
 -- | 领域沿用基础类型的已注册值运算能力
 hasTypeCapability :: TypeCapability -> ColumnType -> Bool
 hasTypeCapability capability (CDomain _ base) = hasTypeCapability capability base
+hasTypeCapability OrdCapability (CScalar kind) = scalarOrdering kind
 hasTypeCapability capability (CRuntime tid) =
     either (const False) (elem capability . descriptorCapabilities) (describeType builtinTypes tid)
 hasTypeCapability _ _ = True
@@ -370,6 +399,7 @@ valueFits CBool (VBool _) = True
 valueFits CDate (VStr _) = True
 valueFits CTimestamp (VStr _) = True
 valueFits CBlob (VStr _) = True
+valueFits (CScalar kind) (VStr text) = either (const False) (const True) (normalizeScalar kind text)
 valueFits _ _ = False
 
 -- | 把值收进列类型：NULL 原样通过，类型不符报错
@@ -393,6 +423,9 @@ coerceValue t v = case t of
     CDate -> toDate v
     CTimestamp -> toTimestamp v
     CBlob -> toText t v
+    CScalar kind -> case v of
+        VStr text -> VStr <$> normalizeScalar kind text
+        _ -> Left (scalarName kind ++ " must be a string")
     CNull -> Left "a NULL output cannot contain a non-NULL value"
     CDomain _ base -> coerceValue base v
     CRuntime expected -> case v of

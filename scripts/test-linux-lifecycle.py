@@ -63,10 +63,10 @@ def test_system_layout(repo, archive, root, env):
     stage = root / "sys-stage"
     env = dict(env, CHUSQL_ADMIN_PASSWORD="Lifecycle-test-123!")
     run(["sh", str(repo / "scripts/install.sh"), "--url", archive, "--system",
-         "--prefix", str(stage), "--component", "both", "--no-service", "--no-start"], env)
+         "--prefix", str(stage), "--component", "cli", "--no-service", "--no-start"], env)
     binary = stage / "usr/lib/chusql/bin/chusql-server"
     assert binary.is_file(), "system layout: missing the server binary"
-    for name in ("csql", "csql-web", "chusql-server"):
+    for name in ("csql", "chusql-server"):
         link = stage / "usr/bin" / name
         assert link.is_symlink(), f"system layout: {name} is not a link"
         assert link.resolve().is_file(), f"system layout: {name} points nowhere"
@@ -114,7 +114,7 @@ exec "{systemctl}" "$@"
     wrapper.chmod(0o755)
     env.update(PATH=str(bridge) + ":" + env["PATH"], CHUSQL_TEST_UNIT=str(unit))
     installer = ["sh", str(repo / "scripts/install.sh"), "--url", archive,
-                 "--component", "both", "--install-dir", str(install)]
+                 "--component", "cli", "--install-dir", str(install)]
     try:
         run(installer + ["--data-dir", str(root / "service-data"), "--no-start"], env)
         config = home / ".config/ChuSQL/settings.toml"
@@ -162,7 +162,7 @@ def test_online(repo, archive, root, env):
         output = run(installer + ["--component", "cli", "--install-dir", str(install),
                                   "--data-dir", str(root / "online-data"), "--no-service", "--no-start"], env)
         assert "checksum" in output and "(ok)" in output
-        assert (install / "bin/csql").exists() and not (install / "bin/chusql-web").exists()
+        assert (install / "bin/csql").exists()
         run(["sh", str(install / "uninstall.sh"), "--install-dir", str(install), "--yes"], env)
         assert not (root / "online-data").exists()
         print("PASS release API, latest version selection, HTTP download and checksum (local fixture)", flush=True)
@@ -191,7 +191,7 @@ def main():
         data = install / "custom/nested/data"
         config = home / ".config/ChuSQL/settings.toml"
         installer = ["sh", str(repo / "scripts/install.sh"), "--url", archive,
-                     "--install-dir", str(install), "--component", "both", "--no-service", "--no-start"]
+                     "--install-dir", str(install), "--component", "cli", "--no-service", "--no-start"]
         run(installer + ["--data-dir", str(data)], env)
         assert (data / "system/catalog.json").is_file()
         assert (install / "uninstall.sh").is_file()

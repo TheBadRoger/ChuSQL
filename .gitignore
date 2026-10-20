@@ -2,7 +2,6 @@
 # ChuSQL 单仓库 .gitignore
 #   chusql-core/engine/   Haskell (Stack + Cabal)
 #   chusql-core/storage/  Rust (Cargo)
-#   chusql-web/      前端 (手写 HTML / CSS / JS，无 Node 工具链)
 # ============================================================
 
 # ------------------------------------------------------------
@@ -44,16 +43,7 @@ logs/
 # 本机打出来的发行包（scripts/package.sh / package.ps1 的产物），不入库
 /releases/
 
-# 前端 IDE 设置（字体等，由 /api/ui-settings 读写），本机专用，不入库；resources/ 不参与打包
-resources/chusql.ui.settings.json
-
 # Cargo.lock 要入库（本项目是要产出可执行程序的 crate，不是纯库）
-
-# ------------------------------------------------------------
-# 前端 —— chusql-web/static 是手写的源文件，必须入库
-# ------------------------------------------------------------
-# 这里曾经放着 node_modules / .vite / *.tsbuildinfo 等 Node 工具链规则；
-# 前端已改为纯 HTML + CSS + JS 静态资源，不再需要它们。
 
 # 环境变量：只提交 .env.example，本地实际配置不入库
 .env
@@ -110,3 +100,9 @@ learning
 /.env.*
 
 examples
+
+# 远程驱动跟随 main，应用锁文件仅作本地缓存。
+/chusql-cli/stack.yaml.lock
+/chusql-server/stack.yaml.lock
+/chusql-bootstrap/stack.yaml.lock
+/benchmark/stack.yaml.lock

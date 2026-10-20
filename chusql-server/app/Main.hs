@@ -4,15 +4,14 @@ module Main (main) where
 
 import ChuSQL.Core.Engine.Storage.FFI (storageVersion)
 import ChuSQL.Core.Engine.Storage.IPC (closeConnection, localStorageLink, setStorageLink)
-import ChuSQL.Interface.Config (
-    WebConfig (..),
+import ChuSQL.Server.Config (
+    RuntimeConfig (..),
     defaultUser,
-    legacyPasswordKey,
-    loadWebConfigAt,
+    loadRuntimeConfigAt,
     rootUserName,
  )
-import ChuSQL.Interface.RateLimit (newRateLimiter)
-import ChuSQL.Interface.TOML (resolveConfigPath)
+import ChuSQL.Server.RateLimit (newRateLimiter)
+import ChuSQL.Server.TOML (resolveConfigPath)
 import ChuSQL.Server.Accounts (administratorPasswordless)
 import ChuSQL.Server.Backend (Backend (..), ipcBackend)
 import ChuSQL.Server.TCP (
@@ -90,7 +89,7 @@ usage = do
     putStrLn "        Windows: %APPDATA%\\ChuSQL\\settings.toml"
     putStrLn "        other:   $XDG_CONFIG_HOME/ChuSQL/settings.toml (or ~/.config/ChuSQL/settings.toml)"
     putStrLn "        [storage] data_dir/log_files; [server] listen_host/port/max_message/max_rows;"
-    putStrLn "        [web] listen_host/port and the limits; the administrator name only comes from --user"
+    putStrLn "        authentication limits and password policy also live in [server]; --user selects the administrator"
     putStrLn ""
     putStrLn "  --config FILE          read that config file instead"
     putStrLn "  --listen-host H        listen address              ([server] listen_host, default 127.0.0.1)"
@@ -101,7 +100,7 @@ usage = do
     putStrLn ""
     putStrLn "protocol: one JSON object per line; hello / login / query / storage / ping / quit"
     putStrLn "  {\"method\":\"login\",\"user\":\"root\",\"password\":\"...\"} then {\"method\":\"query\",\"sql\":\"SELECT 1\"}"
-    putStrLn "  {\"method\":\"storage\",\"request\":{...}} forwards one storage request (Web and the CLI use this)"
+    putStrLn "  {\"method\":\"storage\",\"request\":{...}} forwards one authorized storage request"
     putStrLn ""
     putStrLn "storage: this process loads the chusql_core_storage library in-process and owns the data directory"
     putStrLn ""
@@ -112,10 +111,10 @@ usage = do
     putStrLn "  {\"method\":\"system_status\"} tells whether that happened; without it the server stops"
 
 -- | 命令行覆盖管理员
-applyWebOptions :: WebConfig -> Options -> WebConfig
-applyWebOptions cfg opts =
+applyRuntimeOptions :: RuntimeConfig -> Options -> RuntimeConfig
+applyRuntimeOptions cfg opts =
     cfg
-        { wcUser = orElse (optUser opts) (wcUser cfg)
+        { rcUser = orElse (optUser opts) (rcUser cfg)
         }
 
 -- | 命令行覆盖监听配置
@@ -151,9 +150,8 @@ main = do
 run :: Options -> IO ()
 run opts = do
     configPath <- resolveConfigPath (optConfig opts)
-    base <- loadWebConfigAt configPath
-    let cfg = applyWebOptions base opts
-    legacy <- legacyPasswordKey configPath
+    base <- loadRuntimeConfigAt configPath
+    let cfg = applyRuntimeOptions base opts
     let rootName = rootUserName cfg
     config <- applyServerOptions <$> loadServerConfigAt configPath <*> pure opts
     caps <- getNumProcessors
@@ -171,12 +169,12 @@ run opts = do
             printBanner cfg config configPath
             checkStorage backend
             checkInitialized backend
-            reportCredential backend rootName legacy
+            reportCredential backend rootName
             limiter <-
                 newRateLimiter
                     getCurrentTime
-                    (wcLoginMaxAttempts cfg)
-                    (fromIntegral (wcLoginWindow cfg))
+                    (rcLoginMaxAttempts cfg)
+                    (fromIntegral (rcLoginWindow cfg))
             env <- newServerEnv backend rootName configPath config limiter
             let announce port = putStrLn ("listening:    tcp://" ++ scHost config ++ ":" ++ show port)
             bracket_
@@ -213,22 +211,16 @@ checkInitialized backend = do
     statusInitialized _ = False
 
 -- | 报告管理员账号状态：配置里还留着明文口令、或还没设口令都提醒
-reportCredential :: Backend -> Text -> Bool -> IO ()
-reportCredential backend rootName legacy = do
+reportCredential :: Backend -> Text -> IO ()
+reportCredential backend rootName = do
     putStrLn ("administrator: " ++ T.unpack rootName)
-    when legacy $
-        do
-            putStrLn
-                "  !! the [web] section still carries a plaintext password key; it is ignored now"
-            putStrLn
-                "  !! remove it: the administrator password lives in the __system_users system table"
     passwordless <- administratorPasswordless backend rootName
     when passwordless $
         do
             putStrLn
                 "  !! the administrator has no password yet: sign in with an empty password, then set one"
             putStrLn
-                "  !!   ALTER USER root IDENTIFIED BY '...'   (or use the account page in the Web UI)"
+                "  !!   ALTER USER root IDENTIFIED BY '...'"
 
 -- | 探测存储是否可用，答不上 ping 就退出
 checkStorage :: Backend -> IO ()
@@ -241,7 +233,7 @@ checkStorage backend = do
             exitFailure
 
 -- | 启动横幅
-printBanner :: WebConfig -> ServerConfig -> FilePath -> IO ()
+printBanner :: RuntimeConfig -> ServerConfig -> FilePath -> IO ()
 printBanner cfg config configPath = do
     version <- storageVersion
     putStrLn "================== ChuSQL Server ==================="
@@ -254,5 +246,5 @@ printBanner cfg config configPath = do
             ++ show (scMaxRows config)
         )
     putStrLn ("storage:      chusql_core_storage library " ++ version)
-    putStrLn ("data dir:     " ++ orElse (wcDataDir cfg) "(from the config file, else the default)")
-    putStrLn ("log files:    " ++ wcLogFiles cfg)
+    putStrLn ("data dir:     " ++ orElse (rcDataDir cfg) "(from the config file, else the default)")
+    putStrLn ("log files:    " ++ rcLogFiles cfg)

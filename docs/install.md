@@ -13,7 +13,7 @@ Linux / macOS：
   https://raw.githubusercontent.com/TheBadRoger/ChuSQL/main/scripts/install.sh -o install.sh ||
  curl -fsSL --connect-timeout 10 \
   https://repo.chunana.cn/ChuNa7a/ChuSQL/raw/branch/main/scripts/install.sh -o install.sh) &&
-sh install.sh --component both
+sh install.sh --component cli
 ```
 
 Windows PowerShell：
@@ -24,10 +24,10 @@ try {
 } catch {
     irm https://repo.chunana.cn/ChuNa7a/ChuSQL/raw/branch/main/scripts/install.ps1 -OutFile "$env:TEMP\install.ps1" -TimeoutSec 60 -ErrorAction Stop
 }
-& "$env:TEMP\install.ps1" -Component both
+& "$env:TEMP\install.ps1" -Component cli
 ```
 
-命令先请求 GitHub，失败时改用 ChuRepo；安装和更新时下载发行包同样回退。`--component` 选择安装内容：`web` 安装 Web 管理端，`cli` 安装命令行客户端，`both` 同时安装。安装过程提示设置管理员口令。
+命令先请求 GitHub，失败时改用 ChuRepo；安装和更新时下载发行包同样回退。安装内容为数据库服务端、命令行客户端与引导程序，`--component cli` 可省略。安装过程提示设置管理员口令。
 
 ## apt 软件源
 
@@ -54,7 +54,7 @@ csql -u root
 
 ## 安装方式
 
-`--component web|cli|both` 选择组件。Linux root 安装使用系统服务，普通用户安装使用 systemd 用户服务；非 systemd 环境使用 `--no-service`。
+安装器默认安装 CLI 与数据库服务。Linux root 安装使用系统服务，普通用户安装使用 systemd 用户服务；非 systemd 环境使用 `--no-service`。
 
 ## 通过软件包源下载
 
@@ -67,20 +67,20 @@ csql -u root
 下载并解压对应平台的发行包后，在包根目录执行：
 
 ```sh
-./install.sh --component web
+./install.sh --component cli
 ```
 
 Windows：
 
 ```powershell
-.\install.ps1 -Component web
+.\install.ps1 -Component cli
 ```
 
 ## 常用安装选项
 
 | Linux / macOS | Windows | 说明 |
 | --- | --- | --- |
-| `--component web\|cli\|both` | `-Component` | 选择安装组件 |
+| `--component cli` | `-Component` | 安装命令行客户端（默认） |
 | `--install-dir DIR` | `-InstallDir` | 指定安装目录 |
 | `--data-dir DIR` | `-DataDir` | 指定数据目录 |
 | `--user NAME` | `-RootUser` | 指定管理员账号名 |
@@ -97,6 +97,10 @@ Windows：
 
 源码安装需要 `git`、`cargo`、`stack` 和 `ghc`；部分 Linux 环境还需要 zlib 开发包。
 
+Stack 会从 [Haskell 驱动仓库](https://repo.chunana.cn/ChuNa7a/ChuSQL-HaskellDriver)下载 `main` 分支源码归档。首次构建需要访问该仓库。
+
+Stack 会[缓存远程归档](https://docs.haskellstack.org/en/stable/topics/package_location/#local-or-remote-archives-such-as-github-archives)。手动更新时，在四个应用 Stack 配置的归档地址末尾统一添加或更换 `?refresh=新的日期`，删除相应的本地锁文件后重新构建。
+
 选择一个源码地址克隆：
 
 ```sh
@@ -107,16 +111,16 @@ Linux 进入仓库后使用本地源码构建：
 
 ```sh
 cd ChuSQL
-sh scripts/install.sh --component web --from-source --source-dir .
+sh scripts/install.sh --component cli --from-source --source-dir .
 ```
 
 `--from-source` 面向 Linux；其他平台使用发行包。
 
 ## 安装完成后
 
-安装器按所选组件安装 `chusql-server`、`csql`、`chusql-web`、`csql-bootstrap`，并生成 `settings.toml`、数据目录和日志目录。
+安装器安装 `chusql-server`、`csql`、`csql-bootstrap`，并生成 `settings.toml`、数据目录和日志目录。
 
-安装完成后数据库已启动。选择 `cli` 或 `both` 时运行 `csql` 登录；选择 `web` 或 `both` 时运行 `csql-web`，浏览器打开 <http://127.0.0.1:7778>。完整的第一条查询见 [README 的启动步骤](../README.md#启动并验证)。
+安装完成后数据库已启动，运行 `csql` 登录。完整的第一条查询见 [README 的启动步骤](../README.md#启动并验证)。
 
 服务未运行时，Linux 用户服务用 `systemctl --user start chusql-server.service`，系统级安装用 `sudo systemctl start chusql-server.service`，未注册服务的环境直接运行 `chusql-server`。同一数据目录由一个服务进程使用。
 
@@ -127,10 +131,10 @@ sh scripts/install.sh --component web --from-source --source-dir .
 重新运行安装脚本，指定相同的安装目录和组件；用 `--version TAG` 选择版本：
 
 ```sh
-./install.sh --component both --install-dir "$HOME/.local/share/chusql" --version TAG
+./install.sh --component cli --install-dir "$HOME/.local/share/chusql" --version TAG
 ```
 
-安装器先停止该安装目录中的 Web 和数据库进程，保留 `settings.toml`、数据库和管理员口令，再检查系统目录并重启数据库。数据目录变更需编辑配置并迁移数据。
+安装器先停止该安装目录中的 数据库进程，保留 `settings.toml`、数据库和管理员口令，再检查系统目录并重启数据库。数据目录变更需编辑配置并迁移数据。
 
 ## 卸载
 

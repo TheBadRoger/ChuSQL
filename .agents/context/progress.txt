@@ -1,5 +1,5 @@
 # ChuSQL 当前进度与验收
-更新：2026-10-18
+更新：2026-10-20
 
 本文件是完成状态与验收的唯一来源。设计见 design-decisions.txt，限制见 known-issues.txt，任务顺序见 side-branch-plan.txt。
 
@@ -11,8 +11,9 @@
 - 绑定：查询、写入与约束按表结构绑定，执行前和存储操作锁内复查对象、结构版本及类型依赖。
 - 存储：页与 B+ 树、catalog、WAL、检查点、提交前容量与冲突检查、页镜像恢复、在线空间整理。
 - 事务：持久化行版本、按表和列延迟加载、行锁与唯一键锁、死锁与超时、保存点、快照隔离及 SERIALIZABLE。
-- 权限：用户与角色、对象所有权、转授权、级联撤销、会话失效、受限目录管理和默认关闭的本机 sudo 认证。
-- 客户端：CLI、Web 编辑事务、只读范式分析、敏感 SQL 历史与诊断脱敏。
+- 权限：用户与角色、对象所有权、转授权、级联撤销、会话失效和受限目录管理。
+- 客户端：CLI、敏感 SQL 历史与诊断脱敏。
+- 组件：服务端提供配置、认证会话、限流、账号表和口令策略模块，客户端通过远程驱动访问数据库。
 - 安装发行：Windows/Linux 包、用户级与系统级安装、deb、ChuRepo 软件包源、低性能配置和基于 deb 的 Docker 镜像。
 
 数据库可靠性、博客业务驱动联调及存储并发恢复已完成数据库侧本地验收。ChuBlog 应用接入与生产迁移、长期运行和真实断电验证仍需配套完成。
@@ -23,10 +24,9 @@
 
 | 范围 | 结果 | 证据或边界 |
 | --- | --- | --- |
-| 最近记录的全量门禁 | Rust 227 / Engine 631 / Server 178 / Web 82 / CLI 21 / Bootstrap 9，零失败 | logs/query-efficiency-final-gate.log；动态库、Clippy、HLint、Fourmolu、注释及差异检查通过 |
-| 后续查询与安装配置 | Engine 632 例通过，HLint 与注释检查通过 | 平台模板、低性能参数合并及稳定 Top-K 已验证 |
-| 后续系统级安装与 deb | Server 184、Bootstrap 9、CLI 与 HLint 通过；Web 83 例中 2 例失败 | Web 失败项为缺少 Node.js 的环境用例；dpkg 安装、登录查询和 purge 已实测 |
-| 最新安装与文档检查 | Documentation 2 例、Installer scripts 12 例通过 | 注释检查 118 文件、2210 条函数注释、问题 0；shell/Python 语法及链接检查通过 |
+| 当前全量门禁 | Rust 226 / Engine 631 / Server 167 / CLI 19 / Bootstrap 10，零失败 | logs/sudo-removal-final-gate.log；动态库、Clippy 和注释检查通过 |
+| 源码与文档 | HLint 无提示，基准程序构建通过，15 个 Markdown 文件的本地链接有效 | logs/current-layout-hlint.log、logs/current-layout-benchmark.log；Haskell 格式与差异检查通过 |
+| 安装与发行 | 安装脚本 10 例、deb 布局 4 例、安装生命周期 7 项通过；发行包安装与容器入口检查通过 | logs/current-layout-installer.log、logs/current-layout-deb.log、logs/current-layout-lifecycle.log、logs/current-layout-package.log、logs/current-layout-entrypoint.log |
 
 ### 关键回归
 
@@ -35,11 +35,12 @@
 - 事务与恢复：覆盖并发合并、最终约束、SERIALIZABLE 读依赖、锁等待/取消/死锁、快照回收、页撕裂修复、重复恢复及在线整理切换。
 - 关键日志：logs/enum-final-gate.log、logs/enum-driver.log、logs/mvcc-stage-gate-final.log、logs/mvcc-lifecycle.log、logs/mvcc-driver-final.log。
 
-### 驱动与容器
+### 客户端与容器
 
+- Haskell 客户端使用远程 ChuSQL-HaskellDriver，协议数据由驱动自行定义，查询值保留原始 JSON。
+- 引导幂等登记 38 个预设类型名和别名，新增 RFC 3339 时间、UUID、JSON、网络地址与 ISO 时长等业务类型。
 - ChuBlog 固定 Rust 驱动通过 2 项单元测试与 4 项协议测试，并完成业务数据、账户哈希、并发注册、互动计数、重启和停机备份恢复验证。生产账户迁移与博客 HTTP/SSH 授权另由 ChuBlog 实现。
 - 旧源码镜像完成 300 秒并发负载：1696 次成功提交、2415 次明确冲突；SIGKILL 恢复后核对 1701 个关联事务，检查点 ENOSPC 与冷备份恢复通过。证据见 logs/docker-runtime-acceptance.log 等日志。
-- 当前 deb 镜像实测构建、非 root 运行、CLI/Web 健康检查、15 秒负载、冲突、SIGKILL、ENOSPC、幂等引导及冷备份恢复通过，镜像约 51 MiB。验收结论限于对应镜像。
 - 业务驱动日志见 logs/blog-driver-tests.log、logs/blog-business-driver.log。样例位于 examples/blog，使用构造副本，未迁移生产账户。
 
 ### 发布状态

@@ -25,8 +25,6 @@ pub struct Account {
     pub is_superuser: bool,
     #[serde(default)]
     pub system_catalog_manager: bool,
-    #[serde(default)]
-    pub allow_sudo_auth: bool,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
@@ -110,7 +108,6 @@ pub enum Request {
         is_superuser: Option<bool>,
         enabled: Option<bool>,
         system_catalog_manager: Option<bool>,
-        allow_sudo_auth: Option<bool>,
     },
     AccountCreate {
         user: String,

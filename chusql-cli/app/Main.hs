@@ -3,23 +3,20 @@
 module Main (main) where
 
 import ChuSQL.CLI.Format (OutputFormat (..), formatName, parseFormat)
-import ChuSQL.CLI.Normalization (runNormalizationOnce)
 import ChuSQL.CLI.Password (readPasswordInput)
 import ChuSQL.CLI.Script (stripTerminator)
-import ChuSQL.Interface.Config (ServerConfig (..), loadServerConfigAt, loadWebConfigAt, rootUserName)
-import ChuSQL.Interface.Link (Client, closeClient, connectClient)
-import ChuSQL.Interface.Session (
+import ChuSQL.Server.Config (ServerConfig (..), loadServerConfigAt, loadRuntimeConfigAt, rootUserName)
+import ChuSQL.Driver.Link (Client, closeClient, connectClient)
+import ChuSQL.Driver.Session (
     Session,
     authenticateSession,
-    authenticateSudoSession,
     isPlainIdentifier,
     newSession,
     switchDatabase,
  )
-import ChuSQL.Interface.Sudo (SudoCredential, readSudoCredential)
-import ChuSQL.Interface.TOML (resolveConfigPath)
+import ChuSQL.Server.TOML (resolveConfigPath)
 import Control.Exception (finally)
-import Control.Monad (unless, when)
+import Control.Monad (unless)
 import Data.IORef (IORef, newIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
@@ -32,7 +29,7 @@ import System.Exit (exitFailure)
 import System.FilePath ((</>))
 import System.IO (hFlush, hIsTerminalDevice, hPutStr, hSetEncoding, stderr, stdin, stdout, utf8)
 
--- chusql-cli：与 Web 管理端并列的前端，接到拥有存储的 server 上跑 SQL，账号与 Web 共用。
+-- 命令行客户端通过独立驱动连接数据库服务。
 
 data Options = Options
     { optUser :: Maybe Text
@@ -41,9 +38,6 @@ data Options = Options
     , optExecute :: Maybe Text
     , optHistory :: Maybe FilePath
     , optConfig :: Maybe FilePath
-    , optNormalize :: Maybe Text
-    , optDeclaration :: Maybe FilePath
-    , optSudo :: Bool
     }
 
 -- | 命令行参数解析器
@@ -72,9 +66,6 @@ optionsParser =
         <*> optional (T.pack <$> strOption (long "execute" <> short 'e' <> metavar "SQL" <> help "Run one statement and exit"))
         <*> optional (strOption (long "history" <> metavar "FILE" <> help "SQL history file (default ~/.chusql_history)"))
         <*> optional (strOption (long "config" <> metavar "FILE" <> help "Config file to read (default: the fixed settings.toml under the system config directory)"))
-        <*> optional (T.pack <$> strOption (long "normalize" <> metavar "TABLE" <> help "Analyze normalization using explicit declarations"))
-        <*> optional (strOption (long "declaration" <> metavar "FILE" <> help "UTF-8 JSON normalization declaration"))
-        <*> switch (long "sudo" <> help "Authenticate using the local root or elevated administrator identity")
 
 -- | 把 --format 的取值解析成格式
 formatReader :: String -> Either String OutputFormat
@@ -97,40 +88,24 @@ main = do
     hSetEncoding stdout utf8
     hSetEncoding stderr utf8
     options <- execParser parserInfo
-    case (optNormalize options, optDeclaration options, optExecute options, optFormat options) of
-        (Nothing, Nothing, _, _) -> pure ()
-        (Just _, Just _, Nothing, format) | format /= FormatCsv -> pure ()
-        _ -> reportError "--normalize requires --declaration, text/json format and cannot be combined with --execute" >> exitFailure
     configPath <- resolveConfigPath (optConfig options)
-    base <- loadWebConfigAt configPath
+    base <- loadRuntimeConfigAt configPath
     config <- loadServerConfigAt configPath
     let rootName = rootUserName base
-        userName = fromMaybe (if optSudo options then scSudoUser config else rootName) (optUser options)
-    credential <-
-        if optSudo options
-            then do
-                when (T.null userName) $
-                    reportError "sudo_auth_user is not configured" >> exitFailure
-                local <- readSudoCredential (scPort config)
-                case local of
-                    Left message -> reportError message >> exitFailure
-                    Right proof -> pure (Just proof)
-            else pure Nothing
-    password <- if optSudo options then pure "" else promptPassword userName
+        userName = fromMaybe rootName (optUser options)
+    password <- promptPassword userName
     connected <- connectClient (T.pack (scHost config)) (scPort config)
     case connected of
         Left message -> reportError message >> exitFailure
         Right client ->
-            connect options client userName password credential
+            connect options client userName password
                 `finally` closeClient client
 
 -- | 连 server、登录，之后转入会话
-connect :: Options -> Client -> Text -> Text -> Maybe SudoCredential -> IO ()
-connect options client userName password credential = do
+connect :: Options -> Client -> Text -> Text -> IO ()
+connect options client userName password = do
     session <- newSession client
-    signedIn <- case credential of
-        Just proof -> authenticateSudoSession session proof userName
-        Nothing -> authenticateSession session userName password
+    signedIn <- authenticateSession session userName password
     case signedIn of
         Left message -> reportError message >> exitFailure
         Right () -> runSession options session
@@ -142,9 +117,7 @@ runSession options session = do
     ready <- selectDatabase session (T.strip (optDatabase options))
     if not ready
         then exitFailure
-        else case (optNormalize options, optDeclaration options) of
-            (Just table, Just file) -> runNormalizationOnce session table file (optFormat options == FormatJson) >>= \ok -> unless ok exitFailure
-            _ -> runSqlSession options session formatRef
+        else runSqlSession options session formatRef
 
 -- 执行 SQL 或进入交互循环。
 runSqlSession :: Options -> Session -> IORef OutputFormat -> IO ()

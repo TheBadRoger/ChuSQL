@@ -1,7 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module ChuSQL.Interface.Auth (
-    Credential (..),
+module ChuSQL.Server.Auth (
     defaultIterations,
     hashPassword,
     hashPasswordWith,
@@ -19,15 +18,6 @@ module ChuSQL.Interface.Auth (
     lookupSession,
     deleteSession,
     sessionToken,
-    PayloadStore,
-    newPayloadStore,
-    payloadPolicy,
-    setPayloadPolicy,
-    createPayloadSession,
-    lookupPayload,
-    putPayload,
-    dropPayload,
-    sweepPayloads,
 ) where
 
 import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar)
@@ -46,14 +36,7 @@ import qualified Data.Text.Encoding as TE
 import Data.Time.Clock (NominalDiffTime, UTCTime, diffUTCTime)
 import Text.Read (readMaybe)
 
--- 口令哈希与会话仓库，服务端与 Web 管理端共用。
-
--- | 一条账号凭据：账号名 + 编码串
-data Credential = Credential
-    { credUser :: Text
-    , credEncoded :: Text
-    }
-    deriving (Show, Eq)
+-- 口令哈希与服务端认证会话仓库。
 
 -- | 默认迭代次数（10 万次）
 defaultIterations :: Int
@@ -211,95 +194,3 @@ lookupVersionedSession store token = do
 -- | 删掉一条会话（退出登录）
 deleteSession :: SessionStore -> Text -> IO ()
 deleteSession store token = modifyMVar_ (storeMap store) (pure . Map.delete token)
-
--- | 一条带载荷的会话：账号、时间与载荷
-data StoredSession a = StoredSession
-    { psUser :: Text
-    , psCreated :: UTCTime
-    , psSeen :: UTCTime
-    , psPayload :: a
-    }
-
--- | 带载荷的会话仓库：令牌表、时钟与策略
-data PayloadStore a = PayloadStore
-    { psStoreMap :: MVar (Map.Map Text (StoredSession a))
-    , psClock :: IO UTCTime
-    , psPolicy :: IORef SessionPolicy
-    }
-
--- | 造一个空的带载荷仓库
-newPayloadStore :: IO UTCTime -> SessionPolicy -> IO (PayloadStore a)
-newPayloadStore clock policy = do
-    ref <- newMVar Map.empty
-    policyRef <- newIORef policy
-    pure (PayloadStore ref clock policyRef)
-
--- | 现在用的是哪套过期策略
-payloadPolicy :: PayloadStore a -> IO SessionPolicy
-payloadPolicy = readIORef . psPolicy
-
--- | 换一套过期策略
-setPayloadPolicy :: PayloadStore a -> SessionPolicy -> IO ()
-setPayloadPolicy store = writeIORef (psPolicy store)
-
--- | 这条带载荷的会话过期了吗
-payloadExpired :: UTCTime -> SessionPolicy -> StoredSession a -> Bool
-payloadExpired now pol s =
-    diffUTCTime now (psSeen s) > spIdleSeconds pol
-        || diffUTCTime now (psCreated s) > spAbsoluteSeconds pol
-
--- | 清掉过期的带载荷会话
-prunePayloads :: UTCTime -> SessionPolicy -> Map.Map Text (StoredSession a) -> Map.Map Text (StoredSession a)
-prunePayloads now pol = Map.filter (not . payloadExpired now pol)
-
--- | 上线一条带载荷的会话，返回令牌
-createPayloadSession :: PayloadStore a -> Text -> a -> IO Text
-createPayloadSession store user payload = do
-    token <- sessionToken
-    now <- psClock store
-    pol <- payloadPolicy store
-    modifyMVar_ (psStoreMap store) $ \m ->
-        pure (Map.insert token (StoredSession user now now payload) (prunePayloads now pol m))
-    pure token
-
--- | 查令牌并刷新最后活动时间，拿回账号名与载荷
-lookupPayload :: PayloadStore a -> Text -> IO (Maybe (Text, a))
-lookupPayload store token = do
-    now <- psClock store
-    pol <- payloadPolicy store
-    modifyMVar (psStoreMap store) $ \m -> do
-        let kept = prunePayloads now pol m
-        pure $ case Map.lookup token kept of
-            Nothing -> (kept, Nothing)
-            Just s -> (Map.insert token s{psSeen = now} kept, Just (psUser s, psPayload s))
-
--- | 换掉载荷；会话已没了就返回 False
-putPayload :: PayloadStore a -> Text -> a -> IO Bool
-putPayload store token payload = do
-    now <- psClock store
-    pol <- payloadPolicy store
-    modifyMVar (psStoreMap store) $ \m -> do
-        let kept = prunePayloads now pol m
-        pure $ case Map.lookup token kept of
-            Nothing -> (kept, False)
-            Just s -> (Map.insert token s{psSeen = now, psPayload = payload} kept, True)
-
--- | 摘掉会话并把载荷交还
-dropPayload :: PayloadStore a -> Text -> IO (Maybe a)
-dropPayload store token = do
-    now <- psClock store
-    pol <- payloadPolicy store
-    modifyMVar (psStoreMap store) $ \m -> do
-        let kept = prunePayloads now pol m
-        pure $ case Map.lookup token kept of
-            Nothing -> (kept, Nothing)
-            Just s -> (Map.delete token kept, Just (psPayload s))
-
--- | 清掉过期会话并把它们的载荷交还；调用者负责关掉这些载荷
-sweepPayloads :: PayloadStore a -> IO [a]
-sweepPayloads store = do
-    now <- psClock store
-    pol <- payloadPolicy store
-    modifyMVar (psStoreMap store) $ \m -> do
-        let (gone, kept) = Map.partition (payloadExpired now pol) m
-        pure (kept, map psPayload (Map.elems gone))

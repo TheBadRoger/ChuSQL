@@ -52,11 +52,8 @@ function Assert-Stage([string]$stage) {
     $must = @(
         'bin\chusql_core_storage.dll',
         'bin\csql.exe',
-        'bin\chusql-web.exe',
         'bin\chusql-server.exe',
         'bin\csql-bootstrap.exe',
-        'static\index.html',
-        'csql-web.ps1',
         'resources\settings.toml.windows',
         'resources\settings.low-performance.toml',
         'install.ps1',
@@ -70,7 +67,7 @@ function Assert-Stage([string]$stage) {
         }
     }
     # bin 里带 chusql 名字的文件只能是已知产物；改名前的残留或别的垃圾都算装配错误
-    $known = @('chusql_core_storage.dll', 'chusql-server.exe', 'chusql-web.exe', 'csql-bootstrap.exe')
+    $known = @('chusql_core_storage.dll', 'chusql-server.exe', 'csql-bootstrap.exe')
     $unknown = @(Get-ChildItem (Join-Path $stage 'bin') -Filter 'chusql*' -File -ErrorAction SilentlyContinue |
         Where-Object { $known -notcontains $_.Name })
     if ($unknown.Count -gt 0) {
@@ -116,26 +113,12 @@ function Test-Installed([string]$name, [string]$comp) {
             (Join-Path $data 'system\__system_types.db'),
             (Join-Path $appdata 'ChuSQL\settings.toml')
         )
+        $checks += @((Join-Path $opt 'bin\csql.exe'), (Join-Path $opt 'csql.cmd'))
         $forbidden = @()
-        if ($comp -eq 'web') {
-            $checks += @(
-                (Join-Path $opt 'bin\chusql-web.exe'),
-                (Join-Path $opt 'static\index.html'),
-                (Join-Path $opt 'csql-web.ps1'),
-                (Join-Path $opt 'csql-web.cmd')
-            )
-            $forbidden = @((Join-Path $opt 'bin\csql.exe'), (Join-Path $opt 'csql.cmd'))
-        } else {
-            $checks += @(
-                (Join-Path $opt 'bin\csql.exe'),
-                (Join-Path $opt 'csql.cmd')
-            )
-            $forbidden = @((Join-Path $opt 'bin\chusql-web.exe'), (Join-Path $opt 'static'), (Join-Path $opt 'csql-web.cmd'))
-        }
         foreach ($f in $checks) { if (-not (Test-Path $f)) { $ok = $false; Write-Host "  missing: $f" } }
         foreach ($f in $forbidden) { if (Test-Path $f) { $ok = $false; Write-Host "  should not be there: $f" } }
         $systemCatalog = Get-Content -LiteralPath (Join-Path $data 'system\catalog.json') -Raw | ConvertFrom-Json
-        if (-not $systemCatalog.tables.__system_types.system -or $systemCatalog.tables.__system_types.row_count -lt 18) {
+        if (-not $systemCatalog.tables.__system_types.system -or $systemCatalog.tables.__system_types.row_count -lt 38) {
             Fail "$name`: preinstalled types were not initialized during installation"
         }
         $config = Join-Path $appdata 'ChuSQL\settings.toml'
@@ -171,7 +154,7 @@ if (-not $NoBuild) {
         if ($LASTEXITCODE -ne 0) { Fail 'cargo build --release failed' }
     } finally { Pop-Location }
 
-    foreach ($target in @('chusql-web:exe:chusql-web', 'chusql-cli:exe:csql', 'chusql-server:exe:chusql-server')) {
+    foreach ($target in @('chusql-cli:exe:csql', 'chusql-server:exe:chusql-server')) {
         Step "Building $target (Haskell)"
         Push-Location (Join-Path $repoRoot 'chusql-cli')
         try {
@@ -207,10 +190,10 @@ try {
     # 从真正用于构建的工程目录取安装根（package.sh 同样锚在 chusql-cli），别靠调用者的当前目录
     Push-Location (Join-Path $repoRoot 'chusql-cli')
     try { $stackRoot = (& stack path --local-install-root | Select-Object -Last 1).Trim() } finally { Pop-Location }
-    foreach ($frontName in @('chusql-web.exe', 'chusql-server.exe', 'csql.exe')) {
+    foreach ($frontName in @('chusql-server.exe', 'csql.exe')) {
         $front = Join-Path $stackRoot "bin/$frontName"
         if (-not (Test-Path $front)) {
-            $front = Get-ChildItem -Path (Join-Path $repoRoot 'chusql-web\.stack-work'), (Join-Path $repoRoot 'chusql-cli\.stack-work'), (Join-Path $repoRoot 'chusql-server\.stack-work') `
+            $front = Get-ChildItem -Path (Join-Path $repoRoot 'chusql-cli\.stack-work'), (Join-Path $repoRoot 'chusql-server\.stack-work') `
                 -Recurse -Filter $frontName -File -ErrorAction SilentlyContinue |
                 Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
         }
@@ -239,11 +222,6 @@ try {
     Copy-Item (Join-Path $repoRoot 'resources\settings.low-performance.toml') (Join-Path $stage 'resources')
     Copy-Item (Join-Path $repoRoot 'scripts\install.ps1'), (Join-Path $repoRoot 'scripts\install.sh') $stage
     Copy-Item (Join-Path $repoRoot 'scripts\uninstall.ps1'), (Join-Path $repoRoot 'scripts\uninstall.sh') $stage
-    New-Item -ItemType Directory -Force -Path (Join-Path $stage 'static') | Out-Null
-    Copy-Item (Join-Path $repoRoot 'chusql-web\static\*') (Join-Path $stage 'static') -Recurse
-    Copy-Item (Join-Path $repoRoot 'scripts\csql-web.sh') $stage
-    $webPs1 = Join-Path $repoRoot 'scripts\csql-web.ps1'
-    if (Test-Path $webPs1) { Copy-Item $webPs1 $stage }
 
     Assert-Stage $stage
 
@@ -259,7 +237,6 @@ try {
 
     if (-not $NoVerify) {
         Test-Installed $name 'cli'
-        Test-Installed $name 'web'
     }
 } finally {
     if (Test-Path $stageRoot) { Remove-Item -Recurse -Force $stageRoot }

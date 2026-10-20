@@ -15,25 +15,12 @@ import ChuSQL.Core.Engine.Syntax.AST (Statement)
 import ChuSQL.Core.Engine.Syntax.Parser (parseStatement)
 import ChuSQL.Core.Model (Database, Histogram (..), Row, Table (..), TableIdentity (..), Value (..), pattern TInt, pattern TStr)
 import ChuSQL.Core.Protocol (SchemaColumn (..), TxnOp (..))
-import ChuSQL.Interface.Auth (hashPasswordWith)
-import ChuSQL.Interface.Link (clientQuery, clientSudoLogin, closeClient, connectClient)
-import ChuSQL.Interface.Normalization
-import ChuSQL.Interface.Protocol (ClientRequest (..), Grant (..), RoleView (..), ServerResponse (..), decodeRequest, decodeResponse, encodeRequest, encodeResponse)
-import ChuSQL.Interface.RateLimit (newRateLimiter)
-import ChuSQL.Interface.Sudo (
-    SudoCredential,
-    createSudoCredential,
-    newSudoCredential,
-    readSudoCredential,
-    removeSudoCredential,
-    sudoPrivileged,
-    sudoProof,
-    validSudoChallenge,
-    verifySudoProof,
- )
+import qualified ChuSQL.Driver.Protocol as Driver
+import qualified ChuSQL.Driver.Result as DriverResult
 import ChuSQL.Server.Accounts (Principal (..), ensureRootAccount)
+import ChuSQL.Server.Auth (hashPasswordWith)
 import ChuSQL.Server.Backend (Backend (..), StatementResult (..), applyTransactionMemory, ipcBackend, memoryBackend)
-import ChuSQL.Server.Normalization (normalizationBudget, normalizationReport, schemaFingerprint)
+import qualified ChuSQL.Server.Config as Config
 import ChuSQL.Server.Privileges (
     PrivilegeCommand (..),
     PrivilegeError (..),
@@ -48,20 +35,22 @@ import ChuSQL.Server.Privileges (
     prepareObject,
     runPrivilegeCommand,
  )
+import ChuSQL.Server.Protocol (ClientRequest (..), Grant (..), RoleView (..), ServerResponse (..), decodeRequest, encodeResponse)
+import ChuSQL.Server.RateLimit (newRateLimiter)
 import ChuSQL.Server.Security (databaseSecurity, writeSecurity)
 import ChuSQL.Server.Session (QueryResult (..), Session, SessionError (..), authenticateSessionCoded, newSession, runStatementCoded, runStorageCoded)
+import qualified ChuSQL.Server.Settings as Settings
 import ChuSQL.Server.TCP (
     ServerConfig (..),
     ServerEnv (..),
     ServerHandle (..),
     defaultServerConfig,
-    isLocalPeer,
     loadServerConfigAt,
     newServerEnv,
     startServer,
  )
 import Control.Concurrent (forkFinally, forkIO, killThread, threadDelay)
-import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, readMVar, takeMVar)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, putMVar, readMVar, takeMVar)
 import Control.Concurrent.QSem (signalQSem, waitQSem)
 import Control.Exception (IOException, bracket, bracket_, evaluate, finally, try)
 import Control.Monad (forM_, replicateM_, void, when, (>=>))
@@ -75,14 +64,14 @@ import qualified Data.ByteString.Lazy as BL
 import Data.Either (lefts)
 import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (sort)
+import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
-import Data.Time.Clock (addUTCTime, diffUTCTime, getCurrentTime)
+import Data.Time.Clock (getCurrentTime)
 import qualified Data.Vector as V
 import Network.Socket (
     AddrInfo (..),
-    SockAddr (..),
     SocketType (Stream),
     addrAddress,
     addrFamily,
@@ -92,8 +81,6 @@ import Network.Socket (
     getAddrInfo,
     socket,
     socketToHandle,
-    tupleToHostAddress,
-    tupleToHostAddress6,
     withSocketsDo,
  )
 import System.Directory (createDirectoryIfMissing, doesFileExist, getTemporaryDirectory, removeFile, removePathForcibly)
@@ -122,121 +109,17 @@ main = hspec spec
 -- | 全部用例
 spec :: Spec
 spec = do
-    normalizationSpec
-    describe "sudo authentication" $ do
-        it "defaults to disabled and rejects unconfigured TCP authentication" $
-            withTcpServer defaultServerConfig $ \_ handle -> withConnection handle $ \client -> do
-                scSudoUser defaultServerConfig `shouldBe` ""
-                challenge <- tcpTalk client "{\"method\":\"sudo_challenge\"}"
-                at "code" challenge `shouldBe` A.String "forbidden"
-                denied <- tcpTalk client "{\"method\":\"sudo_login\",\"user\":\"admin\",\"proof\":\"fake\"}"
-                at "code" denied `shouldBe` A.String "unauthorized"
-        it "loads an explicit normalized local identity mapping" $ do
-            path <- tempSettingsPath "sudo-config"
-            writeFile path (unlines ["[server]", "sudo_auth_user = " ++ show ("Local_User" :: String)])
-            config <- loadServerConfigAt path `finally` removeIfExists path
-            scSudoUser config `shouldBe` "local_user"
-        it "supports the client challenge and login exchange" $
-            withTestSudo $ \_ handle credential -> do
-                connected <- connectClient "127.0.0.1" (shPort handle)
-                case connected of
-                    Left message -> expectationFailure (T.unpack message)
-                    Right client ->
-                        ( do
-                            clientSudoLogin client credential "local_user" >>= (`shouldBe` Right False)
-                            result <- clientQuery client "select 1"
-                            result `shouldSatisfy` isRightResult
-                        )
-                            `finally` closeClient client
-        it "only treats kernel loopback addresses as local" $ do
-            isLocalPeer (SockAddrInet 7777 (tupleToHostAddress (127, 0, 0, 1))) `shouldBe` True
-            isLocalPeer (SockAddrInet 7777 (tupleToHostAddress (192, 168, 1, 2))) `shouldBe` False
-            isLocalPeer (SockAddrInet6 7777 0 (tupleToHostAddress6 (0, 0, 0, 0, 0, 0, 0, 1)) 0) `shouldBe` True
-            isLocalPeer (SockAddrInet6 7777 0 (tupleToHostAddress6 (0, 0, 0, 0, 0, 65535, 32512, 1)) 0) `shouldBe` True
-            isLocalPeer (SockAddrInet6 7777 0 (tupleToHostAddress6 (0, 0, 0, 0, 0, 65535, 49320, 1)) 0) `shouldBe` False
-        it "binds proofs to the instance, challenge, account and expiration" $ do
-            credential <- newSudoCredential
-            other <- newSudoCredential
-            now <- getCurrentTime
-            let proof = sudoProof credential "nonce" "local_user"
-            verifySudoProof credential "nonce" "LOCAL_USER" proof `shouldBe` True
-            verifySudoProof other "nonce" "local_user" proof `shouldBe` False
-            verifySudoProof credential "other" "local_user" proof `shouldBe` False
-            verifySudoProof credential "nonce" "admin" proof `shouldBe` False
-            validSudoChallenge credential now (Just ("nonce", addUTCTime (-61) now)) "local_user" proof `shouldBe` False
-            validSudoChallenge credential now (Just ("nonce", addUTCTime 1 now)) "local_user" proof `shouldBe` False
-            validSudoChallenge credential now Nothing "local_user" proof `shouldBe` False
-        it "requires an OS elevated identity to provision or read credentials" $ do
-            privileged <- sudoPrivileged
-            if privileged
-                then do
-                    bracket (createSudoCredential 65534) (const (removeSudoCredential 65534)) $ \credential -> do
-                        stored <- readSudoCredential 65534
-                        case stored of
-                            Left message -> expectationFailure (T.unpack message)
-                            Right restored -> sudoProof restored "native" "local_user" `shouldBe` sudoProof credential "native" "local_user"
-                        duplicate <- try (createSudoCredential 65534) :: IO (Either IOException SudoCredential)
-                        duplicate `shouldSatisfy` isLeftResult
-                else do
-                    created <- try (createSudoCredential 65534) :: IO (Either IOException SudoCredential)
-                    created `shouldSatisfy` isLeftResult
-                    readSudoCredential 65534 >>= (`shouldSatisfy` isLeftResult)
-        it "logs in an ordinary mapped identity without elevating its privileges" $
-            withTestSudo $ \_ handle credential -> withConnection handle $ \client -> do
-                answer <- tcpSudo client credential "local_user"
-                at "status" answer `shouldBe` A.String "ok"
-                at "admin" answer `shouldBe` A.Bool False
-                denied <- tcpQuery client "create database forbidden"
-                at "code" denied `shouldBe` A.String "forbidden"
-        it "rejects a forged proof and consumes its challenge" $
-            withTestSudo $ \_ handle credential -> withConnection handle $ \client -> do
-                nonce <- tcpTalk client "{\"method\":\"sudo_challenge\"}"
-                denied <- tcpTalk client "{\"method\":\"sudo_login\",\"user\":\"local_user\",\"proof\":\"forged\"}"
-                at "code" denied `shouldBe` A.String "unauthorized"
-                replay <- tcpSudoProof client "local_user" (sudoProof credential (asText (at "challenge" nonce)) "local_user")
-                at "code" replay `shouldBe` A.String "unauthorized"
-        it "rejects proof reuse on another connection and account mapping" $
-            withTestSudo $ \_ handle credential -> withConnection handle $ \first -> withConnection handle $ \second -> do
-                nonce <- tcpTalk first "{\"method\":\"sudo_challenge\"}"
-                let proof = sudoProof credential (asText (at "challenge" nonce)) "local_user"
-                replay <- tcpSudoProof second "local_user" proof
-                at "code" replay `shouldBe` A.String "unauthorized"
-                mismatch <- tcpSudo first credential "admin"
-                at "code" mismatch `shouldBe` A.String "unauthorized"
-        it "revokes the attribute and drops existing sudo sessions" $
-            withTestSudo $ \_ handle credential -> withConnection handle $ \admin -> withConnection handle $ \client -> do
-                _ <- tcpLogin admin testRootName testRootPassword
-                _ <- tcpSudo client credential "local_user"
-                changed <- tcpQuery admin "alter user local_user noallow_sudo_auth"
-                at "status" changed `shouldBe` A.String "result"
-                expired <- tcpQuery client "select 1"
-                at "code" expired `shouldBe` A.String "unauthorized"
-                tcpClosed client
-                withConnection handle $ \fresh -> do
-                    denied <- tcpSudo fresh credential "local_user"
-                    at "code" denied `shouldBe` A.String "unauthorized"
-        it "rejects disabled and NOLOGIN identities" $
-            withTestSudo $ \_ handle credential -> withConnection handle $ \admin -> do
-                _ <- tcpLogin admin testRootName testRootPassword
-                mapM_
-                    (checkSudoDisabled admin handle credential)
-                    ["alter user local_user disabled", "alter user local_user enabled nologin"]
-        it "does not inherit sudo authentication from a role" $
-            withTestSudo $ \_ handle credential -> withConnection handle $ \admin -> do
-                _ <- tcpLogin admin testRootName testRootPassword
-                _ <- tcpQuery admin "create role sudo_role"
-                _ <- tcpQuery admin "alter role sudo_role allow_sudo_auth"
-                _ <- tcpQuery admin "grant sudo_role to local_user"
-                _ <- tcpQuery admin "alter user local_user noallow_sudo_auth"
-                withConnection handle $ \client -> do
-                    denied <- tcpSudo client credential "local_user"
-                    at "code" denied `shouldBe` A.String "unauthorized"
-        it "keeps password login independent of the sudo attribute" $
-            withTestSudo $ \_ handle _ -> withConnection handle $ \client -> do
-                denied <- tcpLogin client "local_user" ""
-                at "code" denied `shouldBe` A.String "unauthorized"
-                accepted <- tcpLogin client "local_user" "Local-Pass123!"
-                at "status" accepted `shouldBe` A.String "ok"
+    describe "independent driver wire compatibility" $ do
+        it "decodes core results without a shared model" $ do
+            let result = QueryResult ["large", "label"] [[VInt 9007199254740993, VStr "中文"]] 1 True (Just "demo")
+            Driver.decodeResponse (encodeResponse (RespResult result))
+                `shouldBe` Right (Driver.RespResult (DriverResult.QueryResult ["large", "label"] [[A.Number 9007199254740993, A.String "中文"]] 1 True (Just "demo")))
+        it "preserves catalog identities and opaque defaults" $ do
+            let column = SchemaColumn "id" "int" False (Just (VInt 1)) False True True Nothing
+                info = TableInfo "demo" [column] 0 ["id"] [] [] (Just (TableIdentity 9007199254740993 2)) (Just 3)
+            case Driver.decodeResponse (encodeResponse (RespCatalog [info])) of
+                Right (Driver.RespCatalog [decoded]) -> A.toJSON decoded `shouldBe` A.toJSON info
+                other -> expectationFailure (show other)
     tcpSpec
     tcpServerSpec
     privilegeSpec
@@ -267,7 +150,7 @@ identitySpec = describe "unified identities" $ do
                 ( tcpQuery manager
                     >=> (\reply -> asText (at "code" reply) `shouldBe` "forbidden")
                 )
-                ["alter user manager superuser", "alter user managed system_catalog_manager", "alter user managed allow_sudo_auth", "alter user admin identified by 'Another-Pass123!'", "create database forbidden"]
+                ["alter user manager superuser", "alter user managed system_catalog_manager", "alter user admin identified by 'Another-Pass123!'", "create database forbidden"]
     it "does not inherit catalog management through role membership" $ withTcpServer defaultServerConfig $ \_ handle ->
         withConnection handle $ \admin -> withConnection handle $ \worker -> do
             _ <- tcpLogin admin "admin" "s3cret"
@@ -288,7 +171,7 @@ identitySpec = describe "unified identities" $ do
             other <- tcpQuery h "create role alice"
             asText (at "code" other) `shouldBe` "conflict"
             shown <- tcpQuery h "show roles"
-            map asText (items (at "columns" shown)) `shouldBe` ["id", "name", "can_login", "is_superuser", "enabled", "system_catalog_manager", "allow_sudo_auth", "created_at"]
+            map asText (items (at "columns" shown)) `shouldBe` ["id", "name", "can_login", "is_superuser", "enabled", "system_catalog_manager", "created_at"]
             asInt (at "rowCount" shown) `shouldBe` 3
             reader <- tcpQuery h "alter role reader login nologin"
             asText (at "code" reader) `shouldBe` "bad_request"
@@ -394,7 +277,7 @@ identitySpec = describe "unified identities" $ do
                 denied <- tcpQuery alice "select * from users"
                 asText (at "code" denied) `shouldBe` "forbidden"
 
--- 夹具：内存后端装在 MVar 里，跟 Web 测试同一套表
+-- 夹具：内存后端装在 MVar 里
 
 -- | 夹具库名
 testDatabaseName :: String
@@ -627,6 +510,15 @@ tcpSpec = do
                         lookup "name" (tiHistograms info) `shouldBe` Nothing
 
     describe "server config ([server] in settings.toml)" $ do
+        it "reads authentication policy and limits from the server section" $ do
+            path <- tcpConfigPath "authentication-policy"
+            BS.writeFile path "[server]\nlogin_max_attempts = 4\nlogin_window = 99\npassword_min_length = 20\npassword_classes = 3\n"
+            config <- Config.loadRuntimeConfigAt path
+            Config.rcLoginMaxAttempts config `shouldBe` 4
+            Config.rcLoginWindow config `shouldBe` 99
+            settings <- Settings.readSettingsFile path
+            Map.lookup "password-min-length" settings `shouldBe` Just "20"
+            Map.lookup "password-classes" settings `shouldBe` Just "3"
         it "falls back to the defaults when the file has no server section" $ do
             path <- tcpConfigPath "server-default"
             removeIfExists path
@@ -639,9 +531,9 @@ tcpSpec = do
             scPort config `shouldBe` 7777
             scMaxMessage config `shouldBe` 4096
             scMaxRows config `shouldBe` 7
-        it "keeps the HTTP, storage and page keys out of the server config" $ do
+        it "keeps unrelated section keys out of the server config" $ do
             path <- tcpConfigPath "server-other-keys"
-            BS.writeFile path "[web]\nport = 8888\n\n[storage]\ndata_dir = \"/tmp/chusql\"\n\n[page]\nsize = 8192\n"
+            BS.writeFile path "[other]\nport = 8888\n\n[storage]\ndata_dir = \"/tmp/chusql\"\n\n[page]\nsize = 8192\n"
             config <- loadServerConfigAt path
             scPort config `shouldBe` scPort defaultServerConfig
             scMaxRows config `shouldBe` scMaxRows defaultServerConfig
@@ -820,6 +712,13 @@ tcpServerSpec = do
                     asBool (at "truncated" reply) `shouldBe` True
 
     describe "TCP server: framing and lifecycle" $ do
+        it "rejects unsupported analysis and local authentication methods" $
+            withTcpServer defaultServerConfig $ \_ handle -> withConnection handle $ \h -> do
+                forM_ ["sudo_challenge", "sudo_login", "normalization_analyze"] $ \method -> do
+                    reply <- tcpTalk h (BL.toStrict (A.encode (A.object ["method" A..= (method :: Text)])))
+                    asText (at "code" reply) `shouldBe` "bad_request"
+                pong <- tcpTalk h "{\"method\":\"ping\"}"
+                asText (at "status" pong) `shouldBe` "pong"
         it "a bad JSON line does not kill the connection" $
             withTcpServer defaultServerConfig $ \_ handle ->
                 withConnection handle $ \h -> do
@@ -940,7 +839,7 @@ tcpServerSpec = do
 
 -- | 一个普通账号
 testAccount :: Account
-testAccount = Account 0 "alice" "" 0 "" Nothing True False True False False
+testAccount = Account 0 "alice" "" 0 "" Nothing True False True False
 
 -- | 权限用例传的当前库名
 testDatabase :: Text
@@ -1257,7 +1156,7 @@ objectPrivilegeSpec = describe "stable object privileges" $ do
         after `shouldSatisfy` either (const False) (not . any ((== "test.users") . grantObject))
         _ <- beAccounts backend (ReqAccountReset "alice" (testPasswordHash "Alice-Secret-1234"))
         _ <- beAccounts backend (ReqAccountCreate testRootName (testPasswordHash testRootPassword))
-        _ <- beAccounts backend (ReqIdentityAlter testRootName Nothing (Just True) Nothing Nothing Nothing)
+        _ <- beAccounts backend (ReqIdentityAlter testRootName Nothing (Just True) Nothing Nothing)
         settings <- tempSettingsPath "self-grants"
         session <- newSession backend testRootName settings
         authenticateSessionCoded session "alice" "Alice-Secret-1234" `shouldReturn` Right ()
@@ -1310,7 +1209,7 @@ objectPrivilegeSpec = describe "stable object privileges" $ do
     it "holds authorization through a concurrent query and orders revocation after it" $ withObjectPrivileges $ \backend service root -> do
         runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "alice" False) `shouldReturn` Right ()
         _ <- beAccounts backend (ReqAccountCreate testRootName (testPasswordHash testRootPassword))
-        _ <- beAccounts backend (ReqIdentityAlter testRootName Nothing (Just True) Nothing Nothing Nothing)
+        _ <- beAccounts backend (ReqIdentityAlter testRootName Nothing (Just True) Nothing Nothing)
         _ <- beAccounts backend (ReqAccountReset "alice" (testPasswordHash "Alice-Secret-1234"))
         started <- newEmptyMVar
         release <- newEmptyMVar
@@ -1440,17 +1339,17 @@ objectPrivilegeSpec = describe "stable object privileges" $ do
     it "does not let disabled grantors keep downstream grants alive" $ withObjectPrivileges $ \backend service root -> do
         runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "alice" True) `shouldReturn` Right ()
         runPrivilegeCommand service (Ordinary testAccount) testDatabase (GrantPrivilegesCommand ["select"] "users" "bob" False) `shouldReturn` Right ()
-        changed <- beAccounts backend (ReqIdentityAlter "alice" Nothing Nothing (Just False) Nothing Nothing)
+        changed <- beAccounts backend (ReqIdentityAlter "alice" Nothing Nothing (Just False) Nothing)
         either expectationFailure (const (pure ())) changed
         authorizeSql service (Ordinary testAccount{accountUser = "bob"}) "SELECT * FROM users" `shouldReturn` Left (PrivilegeError "forbidden" "permission denied: SELECT ON users")
     it "preserves dormant direct grants and ownership across unrelated ACL writes" $ withObjectPrivileges $ \backend service root -> do
         runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "alice" False) `shouldReturn` Right ()
         mustRun (beStatement backend "CREATE TABLE owned (id INT)")
         claimObject service (Ordinary testAccount) testDatabase "owned" `shouldReturn` Right ()
-        changed <- beAccounts backend (ReqIdentityAlter "alice" Nothing Nothing (Just False) Nothing Nothing)
+        changed <- beAccounts backend (ReqIdentityAlter "alice" Nothing Nothing (Just False) Nothing)
         either expectationFailure (const (pure ())) changed
         runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "bob" False) `shouldReturn` Right ()
-        enabled <- beAccounts backend (ReqIdentityAlter "alice" Nothing Nothing (Just True) Nothing Nothing)
+        enabled <- beAccounts backend (ReqIdentityAlter "alice" Nothing Nothing (Just True) Nothing)
         either expectationFailure (const (pure ())) enabled
         authorizeSql service (Ordinary testAccount) "SELECT * FROM users" `shouldReturn` Right ()
         authorizeSql service (Ordinary testAccount) "DROP TABLE owned" `shouldReturn` Right ()
@@ -1513,7 +1412,7 @@ objectPrivilegeSpec = describe "stable object privileges" $ do
         _ <- beAccounts backend (ReqAccountReset "alice" (testPasswordHash "Alice-Secret-1234"))
         settings <- tempSettingsPath "object-transaction"
         _ <- beAccounts backend (ReqAccountCreate testRootName (testPasswordHash testRootPassword))
-        _ <- beAccounts backend (ReqIdentityAlter testRootName Nothing (Just True) Nothing Nothing Nothing)
+        _ <- beAccounts backend (ReqIdentityAlter testRootName Nothing (Just True) Nothing Nothing)
         session <- newSession backend testRootName settings
         authenticateSessionCoded session "alice" "Alice-Secret-1234" `shouldReturn` Right ()
         _ <- mustSql session "USE test"
@@ -1525,15 +1424,15 @@ objectPrivilegeSpec = describe "stable object privileges" $ do
         case result of Left err -> sessCode err `shouldBe` "forbidden"; Right _ -> expectationFailure "stale transaction committed"
     it "checks the current administrator identity before executing a raw storage request" $ withObjectPrivileges $ \backend _ _ -> do
         _ <- beAccounts backend (ReqAccountCreate testRootName (testPasswordHash testRootPassword))
-        _ <- beAccounts backend (ReqIdentityAlter testRootName Nothing (Just True) Nothing Nothing Nothing)
+        _ <- beAccounts backend (ReqIdentityAlter testRootName Nothing (Just True) Nothing Nothing)
         _ <- beAccounts backend (ReqAccountCreate "spare_admin" "hash")
-        _ <- beAccounts backend (ReqIdentityAlter "spare_admin" Nothing (Just True) Nothing Nothing Nothing)
+        _ <- beAccounts backend (ReqIdentityAlter "spare_admin" Nothing (Just True) Nothing Nothing)
         executed <- newIORef False
         let guarded = backend{beStorage = \_ -> writeIORef executed True >> pure (Right A.Null)}
         settings <- tempSettingsPath "raw-storage-identity"
         session <- newSession guarded testRootName settings
         authenticateSessionCoded session testRootName testRootPassword `shouldReturn` Right ()
-        changed <- beAccounts backend (ReqIdentityAlter testRootName Nothing (Just False) Nothing Nothing Nothing)
+        changed <- beAccounts backend (ReqIdentityAlter testRootName Nothing (Just False) Nothing Nothing)
         either expectationFailure (const (pure ())) changed
         result <- runStorageCoded session (A.object ["method" A..= ("ping" :: Text)])
         case result of Left err -> sessCode err `shouldBe` "unauthorized"; Right _ -> expectationFailure "stale administrator executed storage request"
@@ -2440,174 +2339,3 @@ ipcConcurrencySpec = describe "server backend on the real storage" $ do
 isLeftResult :: Either a b -> Bool
 isLeftResult (Left _) = True
 isLeftResult _ = False
-
--- 启动带独立本机认证凭据的测试会话。
-withTestSudo :: (ServerEnv -> ServerHandle -> SudoCredential -> IO a) -> IO a
-withTestSudo body = withTcpServer defaultServerConfig $ \env handle -> do
-    credential <- newSudoCredential
-    withConnection handle $ \admin -> do
-        _ <- tcpLogin admin testRootName testRootPassword
-        created <- tcpQuery admin "create user local_user identified by 'Local-Pass123!'"
-        at "status" created `shouldBe` A.String "result"
-        enabled <- tcpQuery admin "alter user local_user allow_sudo_auth"
-        at "status" enabled `shouldBe` A.String "result"
-    modifyMVar_ (srvSudo env) (const (pure (Just (0, "local_user", credential))))
-    body env handle credential `finally` modifyMVar_ (srvSudo env) (const (pure Nothing))
-
--- 交换本机挑战并提交账号绑定证明。
-tcpSudo :: Handle -> SudoCredential -> Text -> IO A.Value
-tcpSudo client credential user = do
-    challenge <- tcpTalk client "{\"method\":\"sudo_challenge\"}"
-    tcpSudoProof client user (sudoProof credential (asText (at "challenge" challenge)) user)
-
--- 发送本机认证证明。
-tcpSudoProof :: Handle -> Text -> Text -> IO A.Value
-tcpSudoProof client user proof =
-    tcpTalk
-        client
-        ( BL.toStrict
-            ( A.encode
-                ( A.object
-                    ["method" A..= ("sudo_login" :: Text), "user" A..= user, "proof" A..= proof]
-                )
-            )
-        )
-
--- 验证身份禁用或取消登录后拒绝本机认证。
-checkSudoDisabled :: Handle -> ServerHandle -> SudoCredential -> Text -> IO ()
-checkSudoDisabled admin handle credential sql = do
-    changed <- tcpQuery admin sql
-    at "status" changed `shouldBe` A.String "result"
-    withConnection handle $ \client -> do
-        denied <- tcpSudo client credential "local_user"
-        at "code" denied `shouldBe` A.String "unauthorized"
-
--- 判断明确成功返回。
-isRightResult :: Either a b -> Bool
-isRightResult (Right _) = True
-isRightResult _ = False
-
--- 专用范式协议、权限、快照与预算回归。
-normalizationSpec :: Spec
-normalizationSpec = describe "normalization endpoint" $ do
-    it "round-trips versioned requests and rejects unknown and duplicate fields" $ do
-        decodeRequest (BL.toStrict (encodeRequest (ReqNormalization normalizationPayload))) `shouldBe` Right (ReqNormalization normalizationPayload)
-        let large = ObjectIdentity 9007199254740993 18446744073709551615
-        A.fromJSON (A.toJSON large) `shouldBe` A.Success large
-        case A.eitherDecode "{\"database_id\":1e1000000000,\"object_id\":2}" :: Either String A.Value of
-            Left message -> expectationFailure message
-            Right value -> (A.fromJSON value :: A.Result ObjectIdentity) `shouldSatisfy` isJSONFailure
-
-        report <- either (fail . show) pure (normalizationReport (ObjectIdentity 1 2) [SchemaColumn name "int" True Nothing False False False Nothing | name <- ["id", "name", "age"]] "live_schema" normalizationPayload)
-        let response = RespNormalization report
-        decodeResponse (encodeResponse response) `shouldBe` Right response
-        decodeResponse (encodeResponse (RespNormalization (A.object ["conditional" A..= True]))) `shouldSatisfy` either (const True) (const False)
-        mapM_
-            (\raw -> decodeNormalizationJSON raw `shouldSatisfy` either (T.isInfixOf "duplicate") (const False))
-            ["{\"a\":1,\"a\":2}", "{\"a\":1,\"\\u0061\":2}", "{\"a\":[{\"b\":1,\"b\":2}]}"]
-        let unknown = A.object ["api_version" A..= (1 :: Int), "database" A..= ("test" :: Text), "table" A..= ("users" :: Text), "declaration" A..= nrDeclaration normalizationPayload, "ignored" A..= True]
-        (A.fromJSON unknown :: A.Result NormalizationRequest) `shouldSatisfy` isJSONFailure
-        decodeRequest (BL.toStrict (encodeRequest (ReqNormalization normalizationPayload{nrVersion = 2}))) `shouldSatisfy` either (const True) (const False)
-        decodeRequest (BL.toStrict (encodeRequest (ReqNormalization normalizationPayload{nrTable = "other.users"}))) `shouldSatisfy` either (const True) (const False)
-    it "does not infer completeness or atomicity and validates declaration budgets" $ do
-        (A.fromJSON (A.object []) :: A.Result NormalizationDeclaration) `shouldBe` A.Success (NormalizationDeclaration [] [] False Nothing)
-        let many = NormalizationDeclaration (replicate 257 ["id"]) [] True (Just True)
-        (A.fromJSON (A.toJSON many) :: A.Result NormalizationDeclaration) `shouldSatisfy` isJSONFailure
-        decodeNormalizationJSON (BL.replicate 65537 32) `shouldSatisfy` either (const True) (const False)
-        (A.fromJSON (A.object ["dependencies" A..= [A.object ["lhs" A..= (["id"] :: [Text]), "rhs" A..= ([] :: [Text])]]]) :: A.Result NormalizationDeclaration) `shouldSatisfy` isJSONFailure
-    it "authorizes ordinary SELECT users and refuses anonymous or system requests" $
-        withTcpServer defaultServerConfig $ \_ handle -> withConnection handle $ \admin -> do
-            anonymous <- tcpTalk admin (BL.toStrict (encodeRequest (ReqNormalization normalizationPayload)))
-            at "code" anonymous `shouldBe` A.String "unauthorized"
-            _ <- tcpLogin admin "admin" "s3cret"
-            _ <- tcpQuery admin "USE test"
-            _ <- tcpQuery admin "CREATE USER normalization_reader IDENTIFIED BY 'Reader-Secret-1234'"
-            withConnection handle $ \reader -> do
-                _ <- tcpLogin reader "normalization_reader" "Reader-Secret-1234"
-                _ <- tcpQuery reader "USE test"
-                denied <- tcpTalk reader (BL.toStrict (encodeRequest (ReqNormalization normalizationPayload)))
-                at "code" denied `shouldBe` A.String "forbidden"
-            _ <- tcpQuery admin "GRANT SELECT ON users TO normalization_reader"
-            withConnection handle $ \reader -> do
-                _ <- tcpLogin reader "normalization_reader" "Reader-Secret-1234"
-                _ <- tcpQuery reader "USE test"
-                reply <- tcpTalk reader (BL.toStrict (encodeRequest (ReqNormalization normalizationPayload)))
-                at "status" reply `shouldBe` A.String "normalization"
-                at "conditional" (at "analysis" reply) `shouldBe` A.Bool True
-                length (items (at "findings" (at "analysis" reply))) `shouldBe` 4
-                denied <- tcpTalk reader (BL.toStrict (encodeRequest (ReqNormalization normalizationPayload{nrTable = "__system_domain_secret"})))
-                at "code" denied `shouldBe` A.String "forbidden"
-    it "uses only the caller snapshot and refuses stable object replacement" $
-        withTcpServer defaultServerConfig $ \_ handle -> withConnection handle $ \first -> withConnection handle $ \second -> do
-            _ <- tcpLogin first "admin" "s3cret"
-            _ <- tcpLogin second "admin" "s3cret"
-            _ <- tcpQuery first "USE test"
-            _ <- tcpQuery second "USE test"
-            _ <- tcpQuery first "CREATE TABLE normalization_snapshot (id INT, value INT)"
-            _ <- tcpQuery first "BEGIN"
-            _ <- tcpQuery second "ALTER TABLE normalization_snapshot ADD COLUMN added INT"
-            let payload = normalizationPayload{nrTable = "normalization_snapshot", nrDeclaration = NormalizationDeclaration [] [] False Nothing}
-            old <- tcpTalk first (BL.toStrict (encodeRequest (ReqNormalization payload)))
-            current <- tcpTalk second (BL.toStrict (encodeRequest (ReqNormalization payload)))
-            at "view" (at "analysis" old) `shouldBe` A.String "transaction_snapshot"
-            length (items (at "schema" (at "analysis" old))) `shouldBe` 2
-            length (items (at "schema" (at "analysis" current))) `shouldBe` 3
-            at "schema_fingerprint" (at "analysis" old) `shouldNotBe` at "schema_fingerprint" (at "analysis" current)
-            _ <- tcpQuery second "DROP TABLE normalization_snapshot"
-            _ <- tcpQuery second "CREATE TABLE normalization_snapshot (id INT, value INT)"
-            stale <- tcpTalk first (BL.toStrict (encodeRequest (ReqNormalization payload)))
-            at "code" stale `shouldBe` A.String "conflict"
-            _ <- tcpQuery first "ROLLBACK"
-            pure ()
-    it "checks expected schema fingerprints and budgets the complete output" $ do
-        let columns = [SchemaColumn ("c" ++ show n) "int" True Nothing False False False Nothing | n <- [0 .. 9 :: Int]]
-            payload = normalizationPayload{nrDeclaration = NormalizationDeclaration [] [NormalizationDependency [] ["c9"]] True (Just True)}
-        schemaFingerprint (ObjectIdentity 1 2) columns `shouldNotBe` schemaFingerprint (ObjectIdentity 1 3) columns
-        normalizationReport (ObjectIdentity 1 2) columns "live_schema" payload{nrExpectedSchema = Just "outdated"}
-            `shouldBe` Left ("conflict", "normalization object or schema has changed")
-        result <- normalizationBudget (pure (normalizationReport (ObjectIdentity 1 2) columns "live_schema" payload))
-        result `shouldSatisfy` either ((== "too_large") . fst) (const False)
-    it "bounds the largest schema with maximum declared dependencies" $ do
-        let columns = [SchemaColumn ("c" ++ show n) "int" True Nothing False False False Nothing | n <- [0 .. 11 :: Int]]
-            payload = normalizationPayload{nrDeclaration = NormalizationDeclaration [] (replicate 256 (NormalizationDependency [] ["c11"])) True (Just True)}
-        started <- getCurrentTime
-        result <- normalizationBudget (pure (normalizationReport (ObjectIdentity 1 2) columns "live_schema" payload))
-        ended <- getCurrentTime
-        putStrLn ("normalization maximum input seconds: " ++ show (ended `diffUTCTime` started))
-        result `shouldSatisfy` either ((`elem` ["too_large", "timeout"]) . fst) (const False)
-        normalizationBudget (pure (Right A.Null)) `shouldReturn` Right A.Null
-    it "releases admission and execution slots after cancellation" $ do
-        started <- newEmptyMVar
-        blocker <- newEmptyMVar
-        done <- newEmptyMVar
-        worker <- forkFinally (normalizationBudget (putMVar started () >> takeMVar blocker >> pure (Right A.Null))) (putMVar done)
-        takeMVar started
-        killThread worker
-        takeMVar done >>= either (const (pure ())) (const (expectationFailure "cancelled analysis completed"))
-        ready <- newEmptyMVar
-        release <- newEmptyMVar
-        finished <- newEmptyMVar
-        replicateM_ 2 (void (forkFinally (normalizationBudget (putMVar ready () >> takeMVar release >> pure (Right A.Null))) (putMVar finished)))
-        mapM_ (\_ -> timeout 1000000 (takeMVar ready) >>= (`shouldBe` Just ())) [1, 2 :: Int]
-        replicateM_ 2 (putMVar release ())
-        replicateM_ 2 (takeMVar finished >>= either (expectationFailure . show) (`shouldBe` Right A.Null))
-    it "times out work and leaves the service usable" $ do
-        result <- normalizationBudget (threadDelay 6000000 >> pure (Right A.Null))
-        result `shouldSatisfy` either ((== "timeout") . fst) (const False)
-        normalizationBudget (pure (Right A.Null)) `shouldReturn` Right A.Null
-
--- 共用明确声明的用户表请求。
-normalizationPayload :: NormalizationRequest
-normalizationPayload =
-    NormalizationRequest
-        1
-        "test"
-        "users"
-        (NormalizationDeclaration [["id"]] [NormalizationDependency ["id"] ["name", "age"]] True (Just True))
-        Nothing
-        Nothing
-
--- 判断 JSON 类型校验失败。
-isJSONFailure :: A.Result a -> Bool
-isJSONFailure (A.Error _) = True
-isJSONFailure _ = False

@@ -1,20 +1,20 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module ChuSQL.Interface.Policy (
+module ChuSQL.Server.PasswordPolicy (
     PasswordPolicy (..),
     defaultPasswordPolicy,
     passwordKeys,
     policyFromValues,
 ) where
 
-import ChuSQL.Interface.Settings (defaultOf)
+import ChuSQL.Server.Settings (defaultOf)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Text.Read (readMaybe)
 
--- 口令策略值与策略计算，服务端与 Web 管理端共用。
+-- 口令策略值与策略计算，供服务端认证使用。
 
 -- | 口令策略：最短长度与至少几类字符
 data PasswordPolicy = PasswordPolicy

@@ -12,7 +12,7 @@
 
 系统级安装（deb 软件包或安装器 `--system`）使用 `/etc/chusql/settings.toml`；该文件存在时，程序和客户端优先读取它，其余情况读取 XDG 路径。
 
-`chusql-server`、`chusql-web` 和 `csql` 都可以用 `--config <path>` 临时指定其他配置文件。配置优先级为：**命令行参数 > 配置文件 > 内置默认值**。
+`chusql-server` 和 `csql` 都可以用 `--config <path>` 临时指定其他配置文件。配置优先级为：**命令行参数 > 配置文件 > 内置默认值**。
 
 ## 存储配置
 
@@ -27,51 +27,31 @@
 
 正常运行时数据目录由 `chusql-server` 访问，离线初始化与修复由 `csql-bootstrap` 访问。安装器写入绝对路径，启动器和安装脚本共用日志目录。
 
-## Web 配置
-
-以下配置项位于 `[web]` 节，例如 `port = 7778`。
-
-| 配置项 | 默认值 | 说明 |
-| --- | --- | --- |
-| `port` | `7778` | Web 服务端口 |
-| `listen_host` | `127.0.0.1` | Web 服务监听地址 |
-| `cookie_secure` | `false` | HTTPS 部署时设为 `true` |
-| `body_limit` | `65536` | 请求体大小上限（字节） |
-| `session_idle` | `28800` | 会话空闲超时（秒） |
-| `session_max` | `86400` | 会话最大存活时间（秒） |
-| `login_max_attempts` | `5` | 登录失败限制阈值 |
-| `login_window` | `300` | 登录限制统计窗口（秒） |
-| `rows_per_page` | `25` | 默认分页大小 |
-| `max_page_size` | `500` | 最大分页大小 |
-| `max_rows` | `1000` | 单次查询最大返回行数 |
-| `max_sql_length` | `20000` | SQL 最大字符数 |
-| `password_min_length` | `12` | 普通账号最短口令长度 |
-| `password_classes` | `2` | 口令至少包含的字符类别数 |
-
-静态资源目录是安装目录下的 `static`，管理员账号名由启动参数 `--user` 指定，默认为 `root`。
-
 ## Server 配置
 
-以下配置项位于 `[server]` 节，例如 `port = 7777`。Web 端口在独立的 `[web]` 节配置。
+以下配置项位于 `[server]` 节，例如 `port = 7777`。
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `port` | `7777` | 数据库服务端口 |
 | `listen_host` | `127.0.0.1` | 数据库服务监听地址 |
+| `login_max_attempts` | `5` | 登录失败限制阈值 |
+| `login_window` | `300` | 登录限制统计窗口（秒） |
+| `password_min_length` | `12` | 普通账号最短口令长度 |
+| `password_classes` | `2` | 口令至少包含的字符类别数 |
 | `max_message` | `1048576` | 单条请求最大大小（字节） |
 | `max_rows` | `1000` | 单次查询最大返回行数 |
 
-本机 sudo 认证使用 `[server] sudo_auth_user`，默认空字符串，表示关闭。把它设置为一个已启用 `ALLOW_SUDO_AUTH` 的数据库身份后，`chusql-server` 需要以 Unix root 或 Windows 提升后的管理员运行。这项映射独立于启动参数 `--user` 和最高权限属性，修改配置后重启服务生效。操作步骤见 [用户与角色](users-and-roles.md#本机-sudo-认证)。
 
 ## 账号与安全
 
-账号口令保存在系统数据库中。管理员口令在安装或系统引导时设置，之后通过 SQL 或 Web 管理界面修改。系统目录未初始化时，`chusql-server` 拒绝启动并提示运行 `csql-bootstrap`。
+账号口令保存在系统数据库中。管理员口令在安装或系统引导时设置，之后通过 SQL 修改。系统目录未初始化时，`chusql-server` 拒绝启动并提示运行 `csql-bootstrap`。
 
-对外部署时建议让数据库服务只监听受控网络接口，Web 服务通过 HTTPS 或反向代理提供，HTTPS 环境把 `cookie_secure` 设为 `true`。
+对外部署时让数据库服务只监听受控网络接口，远程访问使用可信网络、SSH 隧道或 VPN。
 
 ## 修改配置
 
-配置文件可以直接编辑，也可以通过 Web 设置页面修改。修改后重启对应服务，并检查监听地址、端口和登录结果。Docker 的启动配置只读挂载，修改宿主文件后重新创建服务，见 [Docker 配置](docker.md#配置端口目录与资源)。
+直接编辑配置文件。修改后重启对应服务，并检查监听地址、端口和登录结果。Docker 的启动配置只读挂载，修改宿主文件后重新创建服务，见 [Docker 配置](docker.md#配置端口目录与资源)。
 
 迁移数据目录时，先停止相关进程，再完整复制数据目录并更新 `data_dir`，保留原目录备份，启动后检查业务数据。已有数据的 `page.size` 和 `btree.order` 保持原值，磁盘格式转换使用专门的迁移流程。
 

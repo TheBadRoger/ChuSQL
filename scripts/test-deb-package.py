@@ -19,13 +19,10 @@ def run(args, cwd=None):
 # 生成满足打包脚本校验的最小包目录。
 def fake_package(root):
     payload = root / "payload"
-    for name in ("chusql-server", "csql", "chusql-web", "csql-bootstrap"):
+    for name in ("chusql-server", "csql", "csql-bootstrap"):
         (payload / "bin").mkdir(parents=True, exist_ok=True)
         (payload / "bin" / name).write_text("#!/bin/sh\nexit 0\n")
     (payload / "bin/libchusql_core_storage.so").write_text("")
-    (payload / "static").mkdir()
-    (payload / "static/index.html").write_text("<html></html>\n")
-    (payload / "csql-web.sh").write_text("#!/bin/sh\nexit 0\n")
     (payload / "resources").mkdir()
     (payload / "resources/settings.toml.linux").write_text(
         "[storage]\ndata_dir = \"@DATA_DIR@\"\nlog_files = \"@LOG_DIR@\"\n")
@@ -56,9 +53,9 @@ def main():
         run(["dpkg-deb", "-x", str(deb), str(root / "root")])
         tree = root / "root"
         assert (tree / "usr/lib/chusql/bin/chusql-server").is_file()
-        assert (tree / "usr/lib/chusql/csql-web.sh").is_file()
+        assert not (tree / "usr/lib/chusql/static").exists()
         assert os.access(tree / "usr/lib/chusql/bin/chusql-server", os.X_OK)
-        for name in ("csql", "csql-bootstrap", "csql-web", "chusql-server", "chusql-web"):
+        for name in ("csql", "csql-bootstrap", "chusql-server"):
             link = tree / "usr/bin" / name
             assert link.is_symlink(), f"missing /usr/bin/{name} link"
             assert link.resolve(strict=False).is_file(), f"broken /usr/bin/{name} link"
@@ -80,11 +77,11 @@ def main():
         assert "rm -rf /var/lib/chusql" in postrm and "deluser --system chusql" in postrm, postrm
         print("PASS package-deb maintainer scripts create and purge the system state", flush=True)
         broken = fake_package(root / "broken")
-        (broken / "csql-web.sh").unlink()
+        (broken / "bin/csql").unlink()
         result = subprocess.run(["sh", str(script), "--package", str(broken), "--version", "v9.9.9",
                                  "--out-dir", str(root / "broken-out")],
                                 text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        assert result.returncode != 0 and "csql-web.sh" in result.stdout, result.stdout
+        assert result.returncode != 0 and "bin/csql" in result.stdout, result.stdout
         print("PASS package-deb refuses an incomplete package", flush=True)
 
 

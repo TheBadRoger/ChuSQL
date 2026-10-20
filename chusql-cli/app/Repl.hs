@@ -8,11 +8,10 @@ module Repl (
 
 import ChuSQL.CLI.Format (OutputFormat, formatName, renderResult, renderRows)
 import ChuSQL.CLI.History (historySettings, rememberStatement)
-import ChuSQL.CLI.Normalization (runNormalizationOnce)
 import ChuSQL.CLI.Script (Meta (..), errorHint, metaHelp, parseMeta, takeStatement)
-import ChuSQL.Core.Protocol (SchemaColumn (..), TableInfo (..))
-import ChuSQL.Interface.Protocol (Grant (..), RoleView (..))
-import ChuSQL.Interface.Session (Session, catalog, databases, roleViews, runStatement, sessionDatabase, switchDatabase)
+import ChuSQL.Driver.Metadata (SchemaColumn (..), TableInfo (..))
+import ChuSQL.Driver.Protocol (Grant (..), RoleView (..))
+import ChuSQL.Driver.Session (Session, catalog, databases, roleViews, runStatement, sessionDatabase, switchDatabase)
 import Control.Monad (forM_, unless, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef (IORef, readIORef, writeIORef)
@@ -107,7 +106,6 @@ runMeta session formatRef meta = case meta of
     MetaDatabases -> listDatabases session >> pure True
     MetaTables -> listTables session >> pure True
     MetaDescribe name -> describeTable session name >> pure True
-    MetaNormalize table file jsonOutput -> liftIO (runNormalizationOnce session table file jsonOutput) >> pure True
     MetaRoles -> listRoles session >> pure True
     MetaConnect name -> do
         switched <- liftIO (switchDatabase session name)

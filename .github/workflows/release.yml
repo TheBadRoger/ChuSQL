@@ -3,18 +3,18 @@
 # 资源命名（install.sh / install.ps1 按 <os>-<arch> 挑资源，见 scripts/install.sh）：
 #   chusql-linux-x86_64.tar.gz     chusql-windows-x86_64.zip
 #
-# 一个平台一个包，里面 Web 前端与命令行客户端两部分都在；装哪几个由包内的安装脚本
+# 一个平台一个包，里面 命令行客户端与数据库服务端都在；装哪几个由包内的安装脚本
 # 当场问（非交互时用 --component / -Component 指定）。
 #
 # 装的人拿到的就是编好的二进制，不需要 GHC / Rust：
 #   curl -fsSL https://raw.githubusercontent.com/TheBadRoger/ChuSQL/main/scripts/install.sh \
-#       | sh -s -- --component web
+#       | sh -s -- --component cli
 # 也可下载 ChuRepo 脚本（发行包下载失败时自动回退）：
 #   curl -fsSL https://repo.chunana.cn/ChuNa7a/ChuSQL/raw/branch/main/scripts/install.sh -o install.sh
-#   sh install.sh --component web
+#   sh install.sh --component cli
 # 两站发行包与源码安装入口见 docs/install.md。
 # 没有对应平台的资源时，同一个脚本可以退回本地编译：
-#   sh scripts/install.sh --component web --from-source
+#   sh scripts/install.sh --component cli --from-source
 #
 name: release
 
@@ -85,7 +85,6 @@ jobs:
           path: |
             ~/.stack
             chusql-core/engine/.stack-work
-            chusql-web/.stack-work
             chusql-cli/.stack-work
           key: ${{ runner.os }}-${{ matrix.platform }}-stack-${{ hashFiles('**/stack.yaml', '**/stack.yaml.lock') }}
           restore-keys: ${{ runner.os }}-stack-
@@ -94,10 +93,6 @@ jobs:
       - name: build storage (Rust)
         working-directory: chusql-core/storage
         run: cargo build --release
-
-      - name: build web front end
-        working-directory: chusql-cli
-        run: stack build --fast chusql-web:exe:chusql-web
 
       - name: build cli
         working-directory: chusql-cli

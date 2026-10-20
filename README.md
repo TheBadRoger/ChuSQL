@@ -9,7 +9,7 @@
   <br>
 </p>
 
-ChuSQL 是一个用 Haskell 和 Rust 编写的数据库，提供命令行客户端和 Web 管理界面。本页帮助你完成安装、启动并执行第一条查询；SQL 语法和内部设计见文末的文档导航。
+ChuSQL 是一个用 Haskell 和 Rust 编写的数据库，提供命令行客户端。本页帮助你完成安装、启动并执行第一条查询；SQL 语法和内部设计见文末的文档导航。
 
 你可以用 SQL 查询和修改数据，通过事务提交或回滚修改，并管理用户与角色。数据库支持命名枚举（ENUM）和自定义类型（DOMAIN），并通过预写日志（WAL）在崩溃后恢复已提交的数据。
 
@@ -21,10 +21,10 @@ ChuSQL 是一个用 Haskell 和 Rust 编写的数据库，提供命令行客户�
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/TheBadRoger/ChuSQL/main/scripts/install.sh -o install.sh &&
-sh install.sh --component both
+sh install.sh --component cli
 ```
 
-脚本安装数据库、命令行客户端和 Web 管理端，中途提示设置管理员口令。Windows、apt 软件源、离线安装包和容器部署见[安装与卸载](docs/install.md)。
+脚本安装数据库和命令行客户端，中途提示设置管理员口令。Windows、apt 软件源、离线安装包和容器部署见[安装与卸载](docs/install.md)。
 
 ### 启动并验证
 
@@ -45,14 +45,6 @@ SELECT id, title FROM notes ORDER BY id;
 ```
 
 查询返回一行，`id` 为 `1`，`title` 为 `Hello ChuSQL`。示例库可以保留，也可以用 `DROP DATABASE chusql_demo;` 删除。
-
-安装 Web 管理端时，另开终端启动：
-
-```sh
-csql-web
-```
-
-浏览器打开 <http://127.0.0.1:7778>。监听地址和端口的修改方法见[配置选项](docs/config.md)。
 
 ## 文档导航
 

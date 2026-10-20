@@ -2,10 +2,11 @@
 
 module Main where
 
-import ChuSQL.Core.Model (Value (..))
-import ChuSQL.Core.Protocol (QueryResult (..), TableInfo (..))
-import ChuSQL.Interface.Link (Client, clientPing, closeClient, connectClient)
-import ChuSQL.Interface.Session (
+import ChuSQL.Driver.Result (QueryResult (..))
+import ChuSQL.Driver.Metadata (TableInfo (..))
+import qualified Data.Aeson as A
+import ChuSQL.Driver.Link (Client, clientPing, closeClient, connectClient)
+import ChuSQL.Driver.Session (
     Session,
     authenticateSession,
     catalog,
@@ -20,6 +21,7 @@ import Control.Monad (forM_, replicateM, unless, void, when)
 import Data.Either (lefts)
 import Data.List (intercalate, sort)
 import Data.Text (Text)
+import Data.Word (Word64)
 import qualified Data.Text as T
 import GHC.Clock (getMonotonicTime)
 import System.Directory (
@@ -70,24 +72,24 @@ runSql bench sql = do
         Right _ -> pure result
 
 -- | 量一次墙上耗时并强制求出行数
-timedQuery :: Bench -> String -> IO (Double, Either Text Int)
+timedQuery :: Bench -> String -> IO (Double, Either Text Word64)
 timedQuery bench sql = do
     t0 <- getMonotonicTime
     r <- runSql bench sql
     n <- case r of
-        Left _ -> pure (-1)
+        Left _ -> pure 0
         Right result -> evaluate (qrRowCount result)
     t1 <- getMonotonicTime
     pure (t1 - t0, const (Right n) =<< r)
 
 -- | 打印一行结果
-report :: String -> Either Text Int -> Double -> IO ()
+report :: String -> Either Text Word64 -> Double -> IO ()
 report label result dt = case result of
     Left e -> printf "%-38s %10s   !! %s\n" label ("FAILED" :: String) (T.unpack e)
     Right n -> printf "%-38s %8.1f ms %8d rows\n" label (dt * 1000) n
 
 -- | 单独量一条可重复的 SQL（先预热）
-benchSql :: Bench -> String -> String -> IO (Either Text Int)
+benchSql :: Bench -> String -> String -> IO (Either Text Word64)
 benchSql bench label sql = do
     _ <- runSql bench sql
     (dt, r) <- timedQuery bench sql
@@ -95,7 +97,7 @@ benchSql bench label sql = do
     pure r
 
 -- | 只跑一次的语句（重跑会报错）
-benchSqlOnce :: Bench -> String -> String -> IO (Either Text Int)
+benchSqlOnce :: Bench -> String -> String -> IO (Either Text Word64)
 benchSqlOnce bench label sql = do
     (dt, r) <- timedQuery bench sql
     report label r dt
@@ -528,7 +530,7 @@ checkCount :: Bench -> String -> Int -> IO ()
 checkCount bench table expected = do
     result <- runSql bench ("SELECT COUNT(*) FROM " ++ table)
     case result of
-        Right rows | qrRows rows == [[VInt expected]] -> pure ()
+        Right rows | qrRows rows == [[A.Number (fromIntegral expected)]] -> pure ()
         _ -> ioError (userError ("count mismatch in " ++ table ++ ": " ++ show result))
 
 -- | 用单调时钟测量动作耗时
@@ -556,7 +558,7 @@ sampleQuery bench label statement expected = do
     let action = do
             result <- runSql bench statement
             case result of
-                Right rows | qrRowCount rows == expected -> pure ()
+                Right rows | qrRowCount rows == fromIntegral expected -> pure ()
                 _ -> ioError (userError (label ++ ": result mismatch " ++ show result))
     _ <- action
     times <- replicateM 7 (fst <$> measure action)
@@ -602,7 +604,7 @@ pressureScenarios bench u o = do
     _ <- benchSqlOnce bench "transaction UPDATE (400 rows)" "UPDATE writes SET age = 0"
     _ <- benchSqlOnce bench "ROLLBACK 400 changed rows" "ROLLBACK"
     restored <- runSql bench "SELECT age FROM writes WHERE id = 1"
-    unless (fmap qrRows restored == Right [[VInt 2]]) (ioError (userError "rollback value mismatch"))
+    unless (fmap qrRows restored == Right [[A.Number 2]]) (ioError (userError "rollback value mismatch"))
     _ <- benchSqlOnce bench "DELETE writes (200 rows)" "DELETE FROM writes WHERE id > 200"
     checkCount bench "writes" 200
     putStrLn "PRESSURE_OK all result checks passed"
@@ -640,7 +642,7 @@ concurrentLookup bench workers = do
                                                         runStatement
                                                             session
                                                             "SELECT id FROM users WHERE id = 1"
-                                                    unless (fmap qrRows result == Right [[VInt 1]]) (ioError (userError "concurrent lookup mismatch"))
+                                                    unless (fmap qrRows result == Right [[A.Number 1]]) (ioError (userError "concurrent lookup mismatch"))
                                                 )
                                         )
                                 )

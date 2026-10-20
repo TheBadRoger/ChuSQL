@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedStrings #-}
+
 module ChuSQL.Server.Catalog (
     Catalog,
     newCatalog,
@@ -25,9 +27,8 @@ module ChuSQL.Server.Catalog (
 
 import ChuSQL.Core.Model (Row, Value (..))
 import ChuSQL.Core.Protocol (Account (..), Request (..))
-import ChuSQL.Interface.Actions (escapeStringLiteral)
-import ChuSQL.Interface.Protocol (Grant (..))
 import ChuSQL.Server.Backend (Backend (..), StatementResult (..), grantsTable, membersTable, optionsTable, rolesTable)
+import ChuSQL.Server.Protocol (Grant (..))
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Monad (void)
 import Data.List (intercalate, isInfixOf)
@@ -220,4 +221,4 @@ roleLiteral = literal . normalizeRole
 
 -- | 文本值的 SQL 字面量
 literal :: Text -> String
-literal text = "'" ++ escapeStringLiteral (T.unpack text) ++ "'"
+literal text = "'" ++ T.unpack (T.replace "'" "''" text) ++ "'"

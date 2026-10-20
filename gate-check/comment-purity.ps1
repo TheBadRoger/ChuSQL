@@ -3,7 +3,7 @@
 param([string]$Root = (Split-Path -Parent $PSScriptRoot))
 
 Set-Location $Root
-$dirs = @('chusql-core','chusql-server','chusql-web','chusql-cli','chusql-bootstrap','chusql-interface','benchmark','scripts','gate-check')
+$dirs = @('chusql-core','chusql-server','chusql-cli','chusql-bootstrap','benchmark','scripts','gate-check')
 $files = @()
 foreach ($d in $dirs) {
     $p = Join-Path $Root $d
