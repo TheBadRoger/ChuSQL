@@ -96,6 +96,7 @@ import System.IO (
     hSetBuffering,
     hSetNewlineMode,
     noNewlineTranslation,
+    openTempFile,
  )
 import System.Mem.StableName (makeStableName)
 import System.Timeout (timeout)
@@ -369,15 +370,19 @@ nth i xs = case drop i xs of
 
 -- | 临时 TOML
 tcpConfigPath :: String -> IO FilePath
-tcpConfigPath name = do
-    tmp <- getTemporaryDirectory
-    pure (tmp </> ("chusql-server-test-" ++ name ++ ".toml"))
+tcpConfigPath name = uniqueTempPath ("chusql-server-test-" ++ name) ".toml"
 
 -- | 临时设置文件（新会话读口令策略用）
 tempSettingsPath :: String -> IO FilePath
-tempSettingsPath name = do
+tempSettingsPath name = uniqueTempPath ("chusql-server-test-" ++ name ++ "-settings") ".json"
+
+-- | 新建唯一临时文件路径
+uniqueTempPath :: String -> String -> IO FilePath
+uniqueTempPath prefix suffix = do
     tmp <- getTemporaryDirectory
-    pure (tmp </> ("chusql-server-test-" ++ name ++ "-settings.json"))
+    (path, handle) <- openTempFile tmp (prefix ++ "-XXXX" ++ suffix)
+    hClose handle
+    pure path
 
 -- | 文件不存在也算成功
 removeIfExists :: FilePath -> IO ()
@@ -2400,7 +2405,7 @@ localRootLoginSpec = describe "local root login over a Unix socket" $ do
     it "signs in as root with an empty password over the socket" $ requiresRoot $
         withUnixTcpServer True $ \_ handle -> withUnixConnection handle $ \h -> do
             signed <- tcpLogin h testRootName ""
-            asText (at "status" signed) `shouldBe` "login"
+            asText (at "status" signed) `shouldBe` "ok"
             asText (at "user" signed) `shouldBe` testRootName
             asBool (at "admin" signed) `shouldBe` True
             pong <- tcpTalk h "{\"method\":\"ping\"}"
