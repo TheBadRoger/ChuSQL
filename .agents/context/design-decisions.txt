@@ -4,7 +4,7 @@
 
 ## 组件与接口
 
-- CLI 经 TCP 访问 Server，再由 Haskell 引擎通过 FFI 调 Rust 存储。Server 独占数据目录。
+- CLI 经 TCP（或 Linux 上的 Unix socket）访问 Server，再由 Haskell 引擎通过 FFI 调 Rust 存储。Server 独占数据目录。
 - Haskell 客户端从远程 ChuSQL-HaskellDriver 的 main 源码归档获取驱动。驱动自行定义协议数据，服务端使用 Server.Protocol 编码内核结果。配置、TOML、密码哈希、会话、限流、系统表与口令策略均位于服务端源码模块，CLI 和引导程序按需调用。
 - 表存在性以 catalog 为准；语义检查和优化只使用 schema，索引由存储管理。
 - 跨组件 JSON 使用稳定标签。FFI 响应由 Rust 分配、配套 free 归还；句柄关闭与请求串行，错误读取保持同一 OS 线程。
@@ -41,6 +41,7 @@
 - 系统目录分层保护。受限目录管理者只管理普通身份。
 - 初始化保留已有口令和属性。离线维护先在副本验证，保留备份再发布；repair 保持既有数据字节不变。
 - CLI 按完整语句记录历史，含 IDENTIFIED/PASSWORD 的输入整体排除并对诊断脱敏；外部日志采集另行配置。
+- 本机 root 免口令登录只随 Linux 构建。Server 监听 Unix socket 时用 SO_PEERCRED 校验对端 uid；仅在 local_root_login 打开、socket 已设置、请求账号为 root 且口令为空时放行。CLI 以有效 uid 0 判断是否走该通道，驱动提供 connectClientUnix。
 
 ## 安装、发行与协作
 

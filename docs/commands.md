@@ -28,6 +28,8 @@ csql -d sales -e "SELECT * FROM orders LIMIT 5"
 
 交互登录会提示输入口令，脚本模式从标准输入读取口令。CLI 历史按完整语句记录，含 IDENTIFIED 或 PASSWORD 的输入整体排除；已有历史由用户清理。
 
+在 Linux 上以 root 运行、且 server 打开 `local_root_login` 并设置 `socket` 时，`csql` 通过 Unix socket 自动以 root 免口令登录。`-u` 指定其他账号或未满足条件时仍提示口令。
+
 ### 交互模式
 
 SQL 语句以分号结束，可跨多行输入。

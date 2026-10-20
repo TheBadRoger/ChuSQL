@@ -8,7 +8,7 @@ ChuSQL 由 Haskell SQL 引擎和 Rust 存储层组成。客户端通过服务端
 
 ```mermaid
 flowchart LR
-    CLI[命令行客户端] -->|TCP| Server[chusql-server]
+    CLI[命令行客户端] -->|TCP / Unix socket| Server[chusql-server]
     Server --> Engine[Haskell SQL 引擎]
     Engine --> Storage[Rust 存储层]
     Storage --> Disk[(磁盘)]
@@ -26,6 +26,8 @@ flowchart LR
 Haskell 客户端从远程 [Haskell 驱动仓库](https://repo.chunana.cn/ChuNa7a/ChuSQL-HaskellDriver)获取 `main` 分支源码归档。驱动自行定义协议数据结构，查询值保留为 JSON，不依赖主项目的内核模型、查询引擎或存储动态库。配置、TOML、口令哈希与认证会话位于服务端源码目录，CLI 和引导程序引用对应的公开模块。
 
 服务端在 `ChuSQL.Server.Protocol` 中编码内核结果，两端通过版本化 TCP 协议保持兼容；接入方法见[驱动参考文档](https://repo.chunana.cn/ChuNa7a/ChuSQL-HaskellDriver#参考文档)。
+
+Linux 上本机 root 可经 Unix socket 免口令登录，服务端按对端 uid 认证。
 
 ## SQL 查询处理
 

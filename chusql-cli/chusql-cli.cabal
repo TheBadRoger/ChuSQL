@@ -43,6 +43,7 @@ executable csql
     ghc-options:      -Wall
     -- 运行期找 libchusql_core_storage.so：$ORIGIN 让二进制与动态库同目录即可
     if os(linux)
+        build-depends: unix
         ld-options: -Wl,-rpath,$ORIGIN
     if os(osx)
         ld-options: -Wl,-rpath,@loader_path

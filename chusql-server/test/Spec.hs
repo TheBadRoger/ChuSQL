@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternSynonyms #-}
 
@@ -98,6 +99,10 @@ import System.IO (
  )
 import System.Mem.StableName (makeStableName)
 import System.Timeout (timeout)
+#if defined(linux_HOST_OS)
+import Foreign.C.Types (CInt (..))
+import Network.Socket (Family (AF_UNIX), SockAddr (SockAddrUnix))
+#endif
 import Test.Hspec hiding (after, before)
 
 -- TCP 服务器测试：协议编解码、配置读取与真连服务器的端到端用例。
@@ -128,6 +133,9 @@ spec = do
     transactionSpec
     ipcConcurrencySpec
     identitySpec
+#if defined(linux_HOST_OS)
+    localRootLoginSpec
+#endif
 
 -- | 身份属性与权限边界的端到端测试
 identitySpec :: Spec
@@ -538,6 +546,16 @@ tcpSpec = do
             scPort config `shouldBe` scPort defaultServerConfig
             scMaxRows config `shouldBe` scMaxRows defaultServerConfig
 
+        it "reads the Unix socket path and the local root login switch" $ do
+            path <- tcpConfigPath "server-local-login"
+            BS.writeFile path "[server]\nsocket = \"/run/chusql/chusql.sock\"\nlocal_root_login = true\n"
+            config <- loadServerConfigAt path
+            scSocketPath config `shouldBe` Just "/run/chusql/chusql.sock"
+            scLocalRootLogin config `shouldBe` True
+        it "rejects local root login without a socket" $ do
+            path <- tcpConfigPath "server-local-login-bad"
+            BS.writeFile path "[server]\nlocal_root_login = true\n"
+            loadServerConfigAt path `shouldThrow` anyIOException
         it "reads resource limits and rejects malformed or out-of-range values" $ do
             path <- tcpConfigPath "server-resources"
             BS.writeFile path "[server]\nworker_threads=2\nmax_concurrent_queries=2\nmax_connections=32\nconnection_idle=300\ntransaction_idle=60\ntransaction_max=300\n"
@@ -2339,3 +2357,60 @@ ipcConcurrencySpec = describe "server backend on the real storage" $ do
 isLeftResult :: Either a b -> Bool
 isLeftResult (Left _) = True
 isLeftResult _ = False
+
+#if defined(linux_HOST_OS)
+-- | 起带 Unix socket 的测试服务器
+withUnixTcpServer :: Bool -> (ServerEnv -> ServerHandle -> IO a) -> IO a
+withUnixTcpServer enabled body = do
+    sockPath <- tempSettingsPath "login.sock"
+    removeIfExists sockPath
+    withTcpServerAs (Just testRootPassword) defaultServerConfig{scPort = 0, scSocketPath = Just sockPath, scLocalRootLogin = enabled} $ \env handle -> do
+        shSocketPath handle `shouldBe` Just sockPath
+        body env handle
+
+-- | 连 Unix socket 并配成行缓冲句柄
+withUnixConnection :: ServerHandle -> (Handle -> IO a) -> IO a
+withUnixConnection handle = bracket open closeQuietly
+  where
+    -- \| 关连接，忽略异常
+    closeQuietly h = void (try (hClose h) :: IO (Either IOException ()))
+    -- \| 建 Unix socket 连接
+    open = case shSocketPath handle of
+        Nothing -> ioError (userError "test server has no Unix socket")
+        Just path -> do
+            sock <- socket AF_UNIX Stream defaultProtocol
+            connect sock (SockAddrUnix path)
+            h <- socketToHandle sock ReadWriteMode
+            hSetBuffering h LineBuffering
+            hSetNewlineMode h noNewlineTranslation
+            pure h
+
+-- | 非 root 进程验证不了本机 root 身份，跳过
+requiresRoot :: IO () -> IO ()
+requiresRoot action = do
+    euid <- c_geteuid
+    if euid == 0 then action else pendingWith "requires root"
+
+foreign import ccall unsafe "geteuid"
+    c_geteuid :: IO CInt
+
+-- | 本机 root 免口令登录的用例
+localRootLoginSpec :: Spec
+localRootLoginSpec = describe "local root login over a Unix socket" $ do
+    it "signs in as root with an empty password over the socket" $ requiresRoot $
+        withUnixTcpServer True $ \_ handle -> withUnixConnection handle $ \h -> do
+            signed <- tcpLogin h testRootName ""
+            asText (at "status" signed) `shouldBe` "login"
+            asText (at "user" signed) `shouldBe` testRootName
+            asBool (at "admin" signed) `shouldBe` True
+            pong <- tcpTalk h "{\"method\":\"ping\"}"
+            asText (at "status" pong) `shouldBe` "pong"
+    it "does not apply the empty password to TCP" $ requiresRoot $
+        withUnixTcpServer True $ \_ handle -> withConnection handle $ \h -> do
+            refused <- tcpLogin h testRootName ""
+            asText (at "code" refused) `shouldBe` "unauthorized"
+    it "keeps the password required when the switch is off" $ requiresRoot $
+        withUnixTcpServer False $ \_ handle -> withUnixConnection handle $ \h -> do
+            refused <- tcpLogin h testRootName ""
+            asText (at "code" refused) `shouldBe` "unauthorized"
+#endif

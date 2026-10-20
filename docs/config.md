@@ -41,6 +41,8 @@
 | `password_classes` | `2` | 口令至少包含的字符类别数 |
 | `max_message` | `1048576` | 单条请求最大大小（字节） |
 | `max_rows` | `1000` | 单次查询最大返回行数 |
+| `socket` | 空 | 同时监听的 Unix socket 路径（Linux） |
+| `local_root_login` | `false` | 允许本机 root 经 Unix socket 免口令登录；须设置 `socket` |
 
 
 ## 账号与安全
@@ -48,6 +50,8 @@
 账号口令保存在系统数据库中。管理员口令在安装或系统引导时设置，之后通过 SQL 修改。系统目录未初始化时，`chusql-server` 拒绝启动并提示运行 `csql-bootstrap`。
 
 对外部署时让数据库服务只监听受控网络接口，远程访问使用可信网络、SSH 隧道或 VPN。
+
+打开 `local_root_login` 并设置 `socket` 后，以 root 运行的 `csql` 在 Linux 上通过 Unix socket 自动以 root 免口令登录。服务端用 `SO_PEERCRED` 确认连接方 uid 为 0；TCP 连接和其他账号仍要求口令。该功能只随 Linux 构建，其他平台忽略这两个配置项。
 
 ## 修改配置
 

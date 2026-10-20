@@ -13,7 +13,7 @@ module ChuSQL.Server.Config (
 
 import ChuSQL.Server.TOML (readSection)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isNothing)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Text.Read (readMaybe)
@@ -72,16 +72,18 @@ data ServerConfig = ServerConfig
     , scConnectionIdle :: Int
     , scTransactionIdle :: Int
     , scTransactionMax :: Int
+    , scSocketPath :: Maybe FilePath
+    , scLocalRootLogin :: Bool
     }
     deriving (Eq, Show)
 
--- | 默认本机 7777，行 1 MiB，最多 1000 行
+-- | 默认本机监听、1 MiB 消息、1000 行、无本机免密
 defaultServerConfig :: ServerConfig
-defaultServerConfig = ServerConfig "127.0.0.1" 7777 (1024 * 1024) 1000 8 0 0 0 0 0
+defaultServerConfig = ServerConfig "127.0.0.1" 7777 (1024 * 1024) 1000 8 0 0 0 0 0 Nothing False
 
 -- | 校验资源配置，零只在允许关闭限制时有效
 validateServerConfig :: ServerConfig -> Either String ()
-validateServerConfig config =
+validateServerConfig config = do
     mapM_
         check
         [ ("worker_threads", scWorkerThreads config, 1, 256)
@@ -91,6 +93,9 @@ validateServerConfig config =
         , ("transaction_idle", scTransactionIdle config, 0, 31536000)
         , ("transaction_max", scTransactionMax config, 0, 31536000)
         ]
+    if scLocalRootLogin config && isNothing (scSocketPath config)
+        then Left "server.local_root_login requires server.socket"
+        else Right ()
   where
     -- \| 拒绝越界配置，避免误关资源上限
     check (key, value, low, high)
@@ -108,11 +113,22 @@ loadServerConfigAt path = do
             _ -> fallback
         -- \| 取一个键的整数值
         intOf key fallback = fromMaybe fallback (Map.lookup key values >>= readMaybe . T.unpack . T.strip)
+        -- \| 取一个键的布尔值；只认 true 与 false
+        boolOf key = case fmap (T.toLower . T.strip) (Map.lookup key values) of
+            Nothing -> Right False
+            Just "true" -> Right True
+            Just "false" -> Right False
+            Just _ -> Left ("server." ++ T.unpack key ++ " needs true or false")
+        -- \| 取一个键的可选路径
+        pathOf key = case Map.lookup key values of
+            Just value | not (T.null (T.strip value)) -> Just (T.unpack (T.strip value))
+            _ -> Nothing
         -- \| 已填写的资源数值必须是有效整数
         resourceInt key fallback = case Map.lookup key values of
             Nothing -> Right fallback
             Just value -> maybe (Left ("server." ++ T.unpack key ++ " needs an integer")) Right (readMaybe (T.unpack (T.strip value)))
         config = do
+            localRoot <- boolOf "local_root_login"
             workers <- resourceInt "worker_threads" (scWorkerThreads defaultServerConfig)
             concurrent <- resourceInt "max_concurrent_queries" 0
             connections <- resourceInt "max_connections" 0
@@ -131,6 +147,8 @@ loadServerConfigAt path = do
                         , scConnectionIdle = idle
                         , scTransactionIdle = transactionIdle
                         , scTransactionMax = transactionMax
+                        , scSocketPath = pathOf "socket"
+                        , scLocalRootLogin = localRoot
                         }
             validateServerConfig result
             Right result

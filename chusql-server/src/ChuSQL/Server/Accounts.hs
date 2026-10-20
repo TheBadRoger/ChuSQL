@@ -17,6 +17,7 @@ module ChuSQL.Server.Accounts (
     principalIsRoot,
     principalIsCatalogManager,
     authenticate,
+    authenticateLocalRoot,
     currentPrincipal,
     listAccounts,
     findAccount,
@@ -230,6 +231,25 @@ authenticate service user password = withMVar (acLock service) $ \_ -> do
     signInOrdinary accounts = case filter ((== name) . accountUser) accounts of
         [a] | accountCanLogin a && accountEnabled a && not (T.null (accountHash a)) && verifyPassword (accountHash a) password -> issue a
         _ -> pure (Left unauthorized)
+    -- \| 记一次登录再发会话
+    issue a = do
+        stamp <- currentStamp
+        written <- beAccounts (acBackend service) (ReqAccountLogin (accountUser a) (Just stamp))
+        case written of
+            Left _ -> pure (Left storageFailure)
+            Right _ -> Right <$> createVersionedSession (acSessions service) (accountUser a) (Just (accountRevision a))
+
+-- | 本机 root 免口令登录：只接受启用的管理员账号
+authenticateLocalRoot :: Accounts -> Text -> IO (Either AccountError Text)
+authenticateLocalRoot service user = withMVar (acLock service) $ \_ -> do
+    initialized <- beAccounts (acBackend service) (ReqIdentityInitialize (rootName service))
+    case initialized of
+        Left _ -> pure (Left storageFailure)
+        Right accounts -> case filter ((== name) . accountUser) accounts of
+            [a] | accountIsSuperuser a && accountEnabled a && accountCanLogin a -> issue a
+            _ -> pure (Left unauthorized)
+  where
+    name = normalize user
     -- \| 记一次登录再发会话
     issue a = do
         stamp <- currentStamp

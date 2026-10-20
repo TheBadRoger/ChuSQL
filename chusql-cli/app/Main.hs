@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 module Main (main) where
@@ -6,7 +7,7 @@ import ChuSQL.CLI.Format (OutputFormat (..), formatName, parseFormat)
 import ChuSQL.CLI.Password (readPasswordInput)
 import ChuSQL.CLI.Script (stripTerminator)
 import ChuSQL.Server.Config (ServerConfig (..), loadServerConfigAt, loadRuntimeConfigAt, rootUserName)
-import ChuSQL.Driver.Link (Client, closeClient, connectClient)
+import ChuSQL.Driver.Link (Client, closeClient, connectClient, connectClientUnix)
 import ChuSQL.Driver.Session (
     Session,
     authenticateSession,
@@ -28,6 +29,9 @@ import System.Directory (getHomeDirectory)
 import System.Exit (exitFailure)
 import System.FilePath ((</>))
 import System.IO (hFlush, hIsTerminalDevice, hPutStr, hSetEncoding, stderr, stdin, stdout, utf8)
+#if defined(linux_HOST_OS)
+import System.Posix.User (getEffectiveUserID)
+#endif
 
 -- 命令行客户端通过独立驱动连接数据库服务。
 
@@ -93,13 +97,42 @@ main = do
     config <- loadServerConfigAt configPath
     let rootName = rootUserName base
         userName = fromMaybe rootName (optUser options)
-    password <- promptPassword userName
-    connected <- connectClient (T.pack (scHost config)) (scPort config)
-    case connected of
-        Left message -> reportError message >> exitFailure
-        Right client ->
-            connect options client userName password
-                `finally` closeClient client
+    localSocket <- localSocketFor config rootName userName
+    case localSocket of
+        Just path -> do
+            connected <- connectClientUnix path
+            case connected of
+                Left message -> reportError message >> exitFailure
+                Right client ->
+                    connect options client userName ""
+                        `finally` closeClient client
+        Nothing -> do
+            password <- promptPassword userName
+            connected <- connectClient (T.pack (scHost config)) (scPort config)
+            case connected of
+                Left message -> reportError message >> exitFailure
+                Right client ->
+                    connect options client userName password
+                        `finally` closeClient client
+
+-- | 返回本机 root 免密用的 Unix socket
+localSocketFor :: ServerConfig -> Text -> Text -> IO (Maybe FilePath)
+localSocketFor config rootName userName
+    | not (scLocalRootLogin config) = pure Nothing
+    | userName /= rootName = pure Nothing
+    | otherwise = do
+        root <- isRoot
+        pure (if root then scSocketPath config else Nothing)
+
+#if defined(linux_HOST_OS)
+-- | 当前进程是否以 root 运行
+isRoot :: IO Bool
+isRoot = (== 0) <$> getEffectiveUserID
+#else
+-- | 非 Linux 平台不做本机免密登录
+isRoot :: IO Bool
+isRoot = pure False
+#endif
 
 -- | 连 server、登录，之后转入会话
 connect :: Options -> Client -> Text -> Text -> IO ()

@@ -12,7 +12,7 @@
 - 存储：页与 B+ 树、catalog、WAL、检查点、提交前容量与冲突检查、页镜像恢复、在线空间整理。
 - 事务：持久化行版本、按表和列延迟加载、行锁与唯一键锁、死锁与超时、保存点、快照隔离及 SERIALIZABLE。
 - 权限：用户与角色、对象所有权、转授权、级联撤销、会话失效和受限目录管理。
-- 客户端：CLI、敏感 SQL 历史与诊断脱敏。
+- 客户端：CLI、本机 root 免口令登录、敏感 SQL 历史与诊断脱敏。
 - 组件：服务端提供配置、认证会话、限流、账号表和口令策略模块，客户端通过远程驱动访问数据库。
 - 安装发行：Windows/Linux 包、用户级与系统级安装、deb、ChuRepo 软件包源、低性能配置和基于 deb 的 Docker 镜像。
 
@@ -24,7 +24,7 @@
 
 | 范围 | 结果 | 证据或边界 |
 | --- | --- | --- |
-| 当前全量门禁 | Rust 226 / Engine 631 / Server 167 / CLI 19 / Bootstrap 10，零失败 | logs/sudo-removal-final-gate.log；动态库、Clippy 和注释检查通过 |
+| 当前全量门禁 | Rust 226 / Engine 631 / Server 172 / CLI 19 / Bootstrap 10，零失败；Server 3 个本机免密用例需 root，非 root 下 pending | logs/local-root-login-final-gate.log；动态库、Clippy 和注释检查通过 |
 | 源码与文档 | HLint 无提示，基准程序构建通过，15 个 Markdown 文件的本地链接有效 | logs/current-layout-hlint.log、logs/current-layout-benchmark.log；Haskell 格式与差异检查通过 |
 | 安装与发行 | 安装脚本 10 例、deb 布局 4 例、安装生命周期 7 项通过；发行包安装与容器入口检查通过 | logs/current-layout-installer.log、logs/current-layout-deb.log、logs/current-layout-lifecycle.log、logs/current-layout-package.log、logs/current-layout-entrypoint.log |
 
@@ -33,11 +33,13 @@
 - 存储校验：超页行、超长键、重复 id、非法字段名和结构版本耗尽均在提交前拒绝；失败后文件、重启及后续读写行为已验证。
 - 查询与类型：覆盖快照延迟读取、列补齐、计划失效、错误顺序、DOMAIN 继承和变更、复合值运算、ENUM 的实际 FFI 与驱动读取。
 - 事务与恢复：覆盖并发合并、最终约束、SERIALIZABLE 读依赖、锁等待/取消/死锁、快照回收、页撕裂修复、重复恢复及在线整理切换。
+- 本机免密：Unix socket 空口令登录成功、TCP 空口令拒绝、开关关闭拒绝；需 root 的用例在非 root 下 pending。
 - 关键日志：logs/enum-final-gate.log、logs/enum-driver.log、logs/mvcc-stage-gate-final.log、logs/mvcc-lifecycle.log、logs/mvcc-driver-final.log。
 
 ### 客户端与容器
 
 - Haskell 客户端使用远程 ChuSQL-HaskellDriver，协议数据由驱动自行定义，查询值保留原始 JSON。
+- 本机 root 免口令登录：Server 在 Linux 上监听可选 Unix socket，用 SO_PEERCRED 校验对端 uid；CLI 以 root 运行时自动走该通道，其他平台构建排除此功能。
 - 引导幂等登记 38 个预设类型名和别名，新增 RFC 3339 时间、UUID、JSON、网络地址与 ISO 时长等业务类型。
 - ChuBlog 固定 Rust 驱动通过 2 项单元测试与 4 项协议测试，并完成业务数据、账户哈希、并发注册、互动计数、重启和停机备份恢复验证。生产账户迁移与博客 HTTP/SSH 授权另由 ChuBlog 实现。
 - 旧源码镜像完成 300 秒并发负载：1696 次成功提交、2415 次明确冲突；SIGKILL 恢复后核对 1701 个关联事务，检查点 ENOSPC 与冷备份恢复通过。证据见 logs/docker-runtime-acceptance.log 等日志。

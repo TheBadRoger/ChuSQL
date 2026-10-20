@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 module ChuSQL.Server.TCP (
@@ -22,12 +23,12 @@ import ChuSQL.Server.Privileges (newPrivileges, reconcileObjects)
 import ChuSQL.Server.Protocol (ClientRequest (..), ServerResponse (..), decodeRequest, encodeResponse, protocolVersion)
 import ChuSQL.Server.RateLimit (RateLimiter, rateLimitBlock, rateLimitClear, rateLimitRecord)
 import ChuSQL.Server.Security (writeSecurity)
-import ChuSQL.Server.Session (QueryResult (..), Session, SessionError (..), accounts, authenticateSessionCoded, catalog, closeSession, databases, newSessionWith, policyOf, reloadPolicy, roleViews, runStatementAdmitted, runStorageCoded, sessionIsAdmin, sessionUser, transactionTimeout)
+import ChuSQL.Server.Session (QueryResult (..), Session, SessionError (..), accounts, authenticateLocalSessionCoded, authenticateSessionCoded, catalog, closeSession, databases, newSessionWith, policyOf, reloadPolicy, roleViews, runStatementAdmitted, runStorageCoded, sessionIsAdmin, sessionUser, transactionTimeout)
 import Control.Concurrent (forkFinally, forkIO)
 import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar, readMVar)
 import Control.Concurrent.QSem (QSem, newQSem, signalQSem, waitQSem)
 import Control.Exception (IOException, bracket, bracket_, finally, mask, onException, try)
-import Control.Monad (filterM, void, when)
+import Control.Monad (filterM, unless, void, when)
 import qualified Data.ByteString.Char8 as BSC
 import qualified Data.ByteString.Lazy.Char8 as BLC
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
@@ -59,6 +60,15 @@ import Network.Socket (
     socketToHandle,
  )
 import System.IO (BufferMode (LineBuffering), Handle, IOMode (ReadWriteMode), hClose, hFlush, hPutStrLn, hSetBuffering, hSetNewlineMode, noNewlineTranslation, stderr)
+#if defined(linux_HOST_OS)
+import Foreign.C.Types (CInt (..))
+import Foreign.Marshal.Alloc (alloca, allocaBytes)
+import Foreign.Ptr (Ptr, castPtr)
+import Foreign.Storable (peekElemOff, poke)
+import Network.Socket (Family (AF_UNIX), SockAddr (SockAddrUnix), connect, fdSocket)
+import System.Directory (doesPathExist, removeFile)
+import System.Posix.Files (ownerReadMode, ownerWriteMode, removeLink, setFileMode, unionFileModes)
+#endif
 import System.IO.Error (eofErrorType, isEOFError, mkIOError)
 import System.Timeout (timeout)
 
@@ -144,25 +154,67 @@ newServerEnv backend rootName settingsFile config limiter = do
 
 data ServerHandle = ServerHandle
     { shPort :: Int
+    , shSocketPath :: Maybe FilePath
     , shStop :: IO ()
     }
 
 -- | 起监听并在线程里收连接（测试与嵌入用）
 startServer :: ServerEnv -> IO ServerHandle
 startServer env = do
-    sock <- listenSocket (scHost (srvConfig env)) (scPort (srvConfig env))
-    port <- actualPort sock
-    stopped <- newMVar False
-    _ <- forkIO (acceptLoop env sock stopped)
-    pure (ServerHandle port (stopListening sock stopped))
+    (tcp, port, unix) <- bindListeners env
+    tcpStop <- newMVar False
+    _ <- forkIO (acceptLoop env tcp tcpStop)
+    unixStop <- case unix of
+        Nothing -> pure Nothing
+        Just (sock, path) -> do
+            stopped <- newMVar False
+            _ <- forkIO (acceptLoop env sock stopped)
+            pure (Just (sock, path, stopped))
+    pure (ServerHandle port (fmap (\(_, path, _) -> path) unixStop) (stopAll tcp tcpStop unixStop))
 
 -- | 在调用线程里收连接（可执行文件用）；绑好端口先回调一次
 runServer :: ServerEnv -> (Int -> IO ()) -> IO ()
-runServer env announce = bracket (listenSocket (scHost (srvConfig env)) (scPort (srvConfig env))) close $ \sock -> do
-    port <- actualPort sock
-    announce port
-    stopped <- newMVar False
-    acceptLoop env sock stopped
+runServer env announce = do
+    (tcp, port, unix) <- bindListeners env
+    let closeAll = do
+            void (try (close tcp) :: IO (Either IOException ()))
+            case unix of
+                Nothing -> pure ()
+                Just (sock, path) -> do
+                    void (try (close sock) :: IO (Either IOException ()))
+                    removeSocketFile path
+    bracket (pure ()) (const closeAll) $ \_ -> do
+        announce port
+        tcpStop <- newMVar False
+        case unix of
+            Nothing -> pure ()
+            Just (sock, _) -> do
+                stopped <- newMVar False
+                void (forkIO (acceptLoop env sock stopped))
+        acceptLoop env tcp tcpStop
+
+-- | 绑 TCP 与可选的 Unix socket
+bindListeners :: ServerEnv -> IO (Socket, Int, Maybe (Socket, FilePath))
+bindListeners env = do
+    let config = srvConfig env
+    tcp <- listenSocket (scHost config) (scPort config)
+    port <- actualPort tcp
+    unix <- case scSocketPath config of
+        Nothing -> pure Nothing
+        Just path -> do
+            sock <- listenUnixSocket path
+            pure (Just (sock, path))
+    pure (tcp, port, unix)
+
+-- | 停掉 TCP 与 Unix 监听，删除 socket 文件
+stopAll :: Socket -> MVar Bool -> Maybe (Socket, FilePath, MVar Bool) -> IO ()
+stopAll tcp tcpStop unix = do
+    stopListening tcp tcpStop
+    case unix of
+        Nothing -> pure ()
+        Just (sock, path, stopped) -> do
+            stopListening sock stopped
+            removeSocketFile path
 
 -- | 置停止标记并关掉监听套接字
 stopListening :: Socket -> MVar Bool -> IO ()
@@ -209,15 +261,16 @@ acceptLoop env sock stopped = loop
                     Left err -> do
                         stopping <- readMVar stopped
                         if stopping then pure () else hPutStrLn stderr ("accept failed: " ++ show err)
-                    Right (conn, _) -> do
+                    Right (conn, peer) -> do
                         mask $ \restore -> do
+                            localRoot <- peerIsRoot peer conn
                             admitted <- modifyMVar (srvConnectionCount env) $ \count ->
                                 if scMaxConnections (srvConfig env) > 0 && count >= scMaxConnections (srvConfig env)
                                     then pure (count, False)
                                     else pure (count + 1, True)
                             if admitted
                                 then
-                                    void (forkFinally (restore (reportConnection env conn)) (const (releaseConnection env)))
+                                    void (forkFinally (restore (reportConnection env conn localRoot)) (const (releaseConnection env)))
                                         `onException` (releaseConnection env `finally` close conn)
                                 else close conn
                         loop
@@ -233,44 +286,44 @@ withQuerySlot env action = case srvQuerySlots env of
     Just slots -> bracket_ (waitQSem slots) (signalQSem slots) action
 
 -- | 连接线程：异常写到 stderr
-reportConnection :: ServerEnv -> Socket -> IO ()
-reportConnection env conn = do
-    outcome <- try (serveConnection env conn) :: IO (Either IOException ())
+reportConnection :: ServerEnv -> Socket -> Bool -> IO ()
+reportConnection env conn localRoot = do
+    outcome <- try (serveConnection env conn localRoot) :: IO (Either IOException ())
     case outcome of
         Left err -> hPutStrLn stderr ("connection failed: " ++ show err)
         Right () -> pure ()
 
 -- | 一个连接一个会话：一行一条 JSON，读到 EOF 就收工
-serveConnection :: ServerEnv -> Socket -> IO ()
-serveConnection env conn = do
+serveConnection :: ServerEnv -> Socket -> Bool -> IO ()
+serveConnection env conn localRoot = do
     h <- socketToHandle conn ReadWriteMode
     hSetBuffering h LineBuffering
     hSetNewlineMode h noNewlineTranslation
     entry <- newLiveEntry
     unregister <- registerConnection (srvLive env) entry
     session <- newSessionWith (srvBackend env) (srvRootName env) (srvSettingsFile env) (void . dropConnectionsOf (srvLive env))
-    outcome <- try (loop h session entry BSC.empty `finally` (closeSession session `finally` unregister)) :: IO (Either IOException ())
+    outcome <- try (loop h session entry localRoot BSC.empty `finally` (closeSession session `finally` unregister)) :: IO (Either IOException ())
     case outcome of
         Left err | not (isEOFError err) -> hPutStrLn stderr ("connection error: " ++ show err)
         _ -> pure ()
     void (try (hClose h) :: IO (Either IOException ()))
   where
     -- \| 逐行读请求并应答
-    loop h session entry pending = do
+    loop h session entry localRoot pending = do
         frame <- readConnectionFrame env session h pending
         case frame of
             Left (code, message) -> send h (RespError code message)
             Right Nothing -> send h (RespError "too_large" "request line too large")
             Right (Just (cleaned, remaining)) -> case decodeRequest cleaned of
-                Left message -> send h (RespError "bad_request" message) >> loop h session entry remaining
+                Left message -> send h (RespError "bad_request" message) >> loop h session entry localRoot remaining
                 Right request -> do
                     expired <- readIORef (leDropped entry)
                     if expired
                         then send h (RespError "unauthorized" "session was dropped by an account change")
                         else do
-                            (response, keepGoing) <- dispatch env session entry request
+                            (response, keepGoing) <- dispatch env session entry localRoot request
                             send h response
-                            when keepGoing $ loop h session entry remaining
+                            when keepGoing $ loop h session entry localRoot remaining
     -- \| 发一条响应并冲缓冲
     send h response = do
         BLC.hPutStr h (encodeResponse response)
@@ -323,17 +376,19 @@ readRequestLine handle limit = collect [] 0
         pure (if BSC.length line > limit then Nothing else Just (line, remaining))
 
 -- | 一条请求一条响应，quit 后停连接
-dispatch :: ServerEnv -> Session -> LiveEntry -> ClientRequest -> IO (ServerResponse, Bool)
-dispatch env session entry request = case request of
+dispatch :: ServerEnv -> Session -> LiveEntry -> Bool -> ClientRequest -> IO (ServerResponse, Bool)
+dispatch env session entry localRoot request = case request of
     ReqHello version
         | version == protocolVersion -> pure (RespHello protocolVersion, True)
         | otherwise -> pure (RespError "bad_request" ("unsupported protocol version: " <> tshow version), True)
-    ReqLogin user password -> do
-        response <- login env session user password
-        case response of
-            RespLogin who _ -> writeIORef (leWho entry) (Just who)
-            _ -> pure ()
-        pure (response, True)
+    ReqLogin user password
+        | localRoot && scLocalRootLogin (srvConfig env) && T.null password -> localLogin user
+        | otherwise -> do
+            response <- login env session user password
+            case response of
+                RespLogin who _ -> writeIORef (leWho entry) (Just who)
+                _ -> pure ()
+            pure (response, True)
     ReqQuery sql -> do
         who <- sessionUser session
         response <- case who of
@@ -372,6 +427,21 @@ dispatch env session entry request = case request of
         pure (response, True)
     ReqPing -> pure (RespPong, True)
     ReqQuit -> pure (RespBye, False)
+  where
+    -- \| 本机 root 免密登录，仍按账号属性确认
+    localLogin user = do
+        result <- authenticateLocalSessionCoded session user
+        case result of
+            Left err -> do
+                hPutStrLn stderr ("local root login rejected for " ++ T.unpack user)
+                pure (RespError (sessCode err) (sessMessage err), True)
+            Right () -> do
+                who <- sessionUser session
+                admin <- sessionIsAdmin session
+                let name = fromMaybe user who
+                writeIORef (leWho entry) (Just name)
+                hPutStrLn stderr ("local root login for " ++ T.unpack name)
+                pure (RespLogin name admin, True)
 
 -- | 口令策略在线上只有两个数字：最短长度与至少几类字符
 policyResponse :: PasswordPolicy -> ServerResponse
@@ -421,3 +491,65 @@ trimResult limit result
 -- | show 成 Text
 tshow :: (Show a) => a -> Text
 tshow = T.pack . show
+
+#if defined(linux_HOST_OS)
+-- | 绑定 Unix socket，删除无进程使用的旧文件
+listenUnixSocket :: FilePath -> IO Socket
+listenUnixSocket path = do
+    exists <- doesPathExist path
+    when exists $ do
+        inUse <- socketInUse path
+        unless inUse (removeFile path)
+    sock <- socket AF_UNIX Stream defaultProtocol
+    bind sock (SockAddrUnix path)
+    setFileMode path (ownerReadMode `unionFileModes` ownerWriteMode)
+    listen sock 128
+    pure sock
+
+-- | 旧 socket 文件还有进程监听吗
+socketInUse :: FilePath -> IO Bool
+socketInUse path = do
+    sock <- socket AF_UNIX Stream defaultProtocol
+    outcome <- try (connect sock (SockAddrUnix path)) :: IO (Either IOException ())
+    close sock
+    pure (either (const False) (const True) outcome)
+
+-- | 删除 socket 文件，失败忽略
+removeSocketFile :: FilePath -> IO ()
+removeSocketFile path = void (try (removeLink path) :: IO (Either IOException ()))
+
+-- | 仅当对端与自己的 uid 都是 root 时算本机 root
+peerIsRoot :: SockAddr -> Socket -> IO Bool
+peerIsRoot peer sock = case peer of
+    SockAddrUnix _ -> do
+        uid <- peerUid sock
+        root <- c_geteuid
+        pure (uid == 0 && root == 0)
+    _ -> pure False
+
+-- | 读 SO_PEERCRED 里的 uid
+peerUid :: Socket -> IO Int
+peerUid sock = allocaBytes 12 $ \buf -> alloca $ \len -> do
+    fd <- fdSocket sock
+    poke len (12 :: CInt)
+    rc <- c_getsockopt fd 1 17 (castPtr buf) len
+    if rc /= 0 then pure (-1) else fromIntegral <$> peekElemOff (castPtr buf :: Ptr CInt) 1
+
+foreign import ccall unsafe "getsockopt"
+    c_getsockopt :: CInt -> CInt -> CInt -> Ptr CInt -> Ptr CInt -> IO CInt
+
+foreign import ccall unsafe "geteuid"
+    c_geteuid :: IO CInt
+#else
+-- | 非 Linux 平台不提供 Unix socket 免密登录
+listenUnixSocket :: FilePath -> IO Socket
+listenUnixSocket _ = ioError (userError "unix socket login requires Linux")
+
+-- | 非 Linux 平台没有 socket 文件
+removeSocketFile :: FilePath -> IO ()
+removeSocketFile _ = pure ()
+
+-- | 非 Linux 平台不提供本机 root 身份
+peerIsRoot :: SockAddr -> Socket -> IO Bool
+peerIsRoot _ _ = pure False
+#endif

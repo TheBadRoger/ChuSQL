@@ -40,6 +40,10 @@ port = 7777
 max_message = 1048576
 # Maximum number of rows returned by a query through the database server.
 max_rows = 1000
+# Unix socket path; set it to also accept local Unix socket connections.
+# socket = "/run/chusql/chusql.sock"
+# Allow local root to sign in without a password over the Unix socket.
+# local_root_login = false
 
 # Maximum Haskell execution threads, bounded by detected processors (1 to 256).
 # Parallel page scans retain their existing per-scan ceiling of 8 workers.

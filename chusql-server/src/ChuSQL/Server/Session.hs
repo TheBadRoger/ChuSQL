@@ -15,6 +15,7 @@ module ChuSQL.Server.Session (
     isPlainIdentifier,
     authenticateSession,
     authenticateSessionCoded,
+    authenticateLocalSessionCoded,
     switchDatabase,
     runStatement,
     runStatementCoded,
@@ -194,6 +195,18 @@ authenticateSession session user password =
 authenticateSessionCoded :: Session -> Text -> Text -> IO (Either SessionError ())
 authenticateSessionCoded session user password = readSecurity $ do
     result <- authenticate (ssAccounts session) user password
+    case result of
+        Left err -> pure (Left (accountErrorOf err))
+        Right token -> do
+            who <- currentPrincipal (ssAccounts session) token
+            case who of
+                Left err -> pure (Left (accountErrorOf err))
+                Right principal -> storePrincipal session principal
+
+-- | 本机 root 免口令登录会话
+authenticateLocalSessionCoded :: Session -> Text -> IO (Either SessionError ())
+authenticateLocalSessionCoded session user = readSecurity $ do
+    result <- authenticateLocalRoot (ssAccounts session) user
     case result of
         Left err -> pure (Left (accountErrorOf err))
         Right token -> do
