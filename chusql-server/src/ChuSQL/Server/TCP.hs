@@ -43,7 +43,7 @@ import Network.Socket (
     AddrInfoFlag (AI_PASSIVE),
     SockAddr (SockAddrInet, SockAddrInet6),
     Socket,
-    SocketOption (ReuseAddr),
+    SocketOption (NoDelay, ReuseAddr),
     SocketType (Stream),
     accept,
     addrAddress,
@@ -263,6 +263,7 @@ acceptLoop env sock stopped = loop
                         if stopping then pure () else hPutStrLn stderr ("accept failed: " ++ show err)
                     Right (conn, peer) -> do
                         mask $ \restore -> do
+                            configureConnection conn peer `onException` close conn
                             localRoot <- peerIsRoot peer conn
                             admitted <- modifyMVar (srvConnectionCount env) $ \count ->
                                 if scMaxConnections (srvConfig env) > 0 && count >= scMaxConnections (srvConfig env)
@@ -274,6 +275,13 @@ acceptLoop env sock stopped = loop
                                         `onException` (releaseConnection env `finally` close conn)
                                 else close conn
                         loop
+
+-- 关闭 TCP 小包等待，保留本地套接字配置。
+configureConnection :: Socket -> SockAddr -> IO ()
+configureConnection conn peer = case peer of
+    SockAddrInet{} -> setSocketOption conn NoDelay 1
+    SockAddrInet6{} -> setSocketOption conn NoDelay 1
+    _ -> pure ()
 
 -- | 连接结束或创建线程失败后归还名额
 releaseConnection :: ServerEnv -> IO ()
@@ -326,8 +334,7 @@ serveConnection env conn localRoot = do
                             when keepGoing $ loop h session entry localRoot remaining
     -- \| 发一条响应并冲缓冲
     send h response = do
-        BLC.hPutStr h (encodeResponse response)
-        BLC.hPutStr h "\n"
+        BLC.hPutStr h (encodeResponse response <> "\n")
         hFlush h
 
 -- | 在读取下一帧时执行连接和事务的空闲上限

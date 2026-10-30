@@ -7,6 +7,7 @@
 - CLI 经 TCP（或 Linux 上的 Unix socket）访问 Server，再由 Haskell 引擎通过 FFI 调 Rust 存储。Server 独占数据目录。
 - Haskell 客户端从远程 ChuSQL-HaskellDriver 的 main 源码归档获取驱动。驱动自行定义协议数据，服务端使用 Server.Protocol 编码内核结果。配置、TOML、密码哈希、会话、限流、系统表与口令策略均位于服务端源码模块，CLI 和引导程序按需调用。
 - 表存在性以 catalog 为准；语义检查和优化只使用 schema，索引由存储管理。
+- 权限表初始化只补建当前字典中缺失的表；鉴权枚举对象时复用同次字典读取的稳定编号，不跨请求缓存权限。缺少身份元数据的后端仍按名称解析。
 - 跨组件 JSON 使用稳定标签。FFI 响应由 Rust 分配、配套 free 归还；句柄关闭与请求串行，错误读取保持同一 OS 线程。
 - 类型和值规则集中于 Core.Model/Core.Runtime，函数与绑定集中于 Engine.Runtime，错误分类集中于 Engine.Error；消费者迁移完成后再收拢兼容表示。
 - 常用业务标量由 Core.Scalar 校验并生成规范文本，Core.Model 保留独立类型身份；沿用文本值编码及现有持久化顺序。引导向 __system_types 幂等登记 38 个类型名和别名，新增类型不改变已有编号。JSON、IP 与日历时长暂不开放顺序比较，时间限定已知偏移和微秒精度。

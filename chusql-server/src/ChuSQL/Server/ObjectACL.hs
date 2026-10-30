@@ -18,11 +18,12 @@ module ChuSQL.Server.ObjectACL (
     objectUsers,
 ) where
 
+import ChuSQL.Core.Model (TableIdentity (..))
 import ChuSQL.Core.Protocol (Account (..), TableInfo (..))
 import ChuSQL.Server.Protocol (Grant (..))
 import ChuSQL.Server.Accounts (Principal, principalIsRoot, principalName)
 import ChuSQL.Server.Backend (Backend (..))
-import ChuSQL.Server.Catalog (Catalog, readGrantOptions, readGrants, readIdentities, readMembers)
+import ChuSQL.Server.Catalog (Catalog, normalizeObject, readGrantOptions, readGrants, readIdentities, readMembers)
 import Control.Monad (void)
 import Data.Aeson (FromJSON, ToJSON)
 import qualified Data.Aeson as A
@@ -132,10 +133,14 @@ targets backend = do
         case catalog of
             Left err -> pure (Left err)
             Right infos -> do
-                tables <- mapM (resolve backend (T.pack name) . T.pack . tableNameOf) infos
+                tables <- mapM (tableTarget name database) infos
                 pure ((:) <$> database <*> sequence tables)
-    -- 取数据字典的表名。
-    tableNameOf = tiTable
+    -- 复用字典中的稳定身份，缺失时保留原查询。
+    tableTarget name database info = case (database, tiIdentity info) of
+        (Right owner, Just (TableIdentity dbId tableId))
+            | dbId > 0 && tableId > 0 && targetDatabase owner == T.pack (show dbId) ->
+                pure (Right (Target (targetDatabase owner) (Just (T.pack (show tableId))) "table" (normalizeObject (T.pack name) (T.pack (tiTable info)))))
+        _ -> resolve backend (T.pack name) (T.pack (tiTable info))
 
 -- 读取身份、成员边和对象字典。
 context :: Backend -> Catalog -> IO (Either String Context)

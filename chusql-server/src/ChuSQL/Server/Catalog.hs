@@ -26,7 +26,7 @@ module ChuSQL.Server.Catalog (
 ) where
 
 import ChuSQL.Core.Model (Row, Value (..))
-import ChuSQL.Core.Protocol (Account (..), Request (..))
+import ChuSQL.Core.Protocol (Account (..), Request (..), TableInfo (..))
 import ChuSQL.Server.Backend (Backend (..), StatementResult (..), grantsTable, membersTable, optionsTable, rolesTable)
 import ChuSQL.Server.Protocol (Grant (..))
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
@@ -74,9 +74,13 @@ withCatalog catalog action = withCatalogLock catalog $ do
         Left err -> pure (Left err)
         Right () -> action
 
--- | 确保三张系统表存在，已存在算成功
+-- 只创建目录中尚未登记的权限表。
 ensureCatalog :: Catalog -> IO (Either String ())
-ensureCatalog catalog = eachAction tableDefs (createTable catalog)
+ensureCatalog catalog = do
+    existing <- beCatalog (catBackend catalog)
+    case existing of
+        Left err -> pure (Left err)
+        Right tables -> eachAction [definition | definition@(name, _) <- tableDefs, name `notElem` map tiTable tables] (createTable catalog)
   where
     -- \| 三张系统表的定义
     tableDefs =

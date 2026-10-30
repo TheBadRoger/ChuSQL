@@ -21,6 +21,7 @@ import qualified ChuSQL.Driver.Result as DriverResult
 import ChuSQL.Server.Accounts (Principal (..), ensureRootAccount)
 import ChuSQL.Server.Auth (hashPasswordWith)
 import ChuSQL.Server.Backend (Backend (..), StatementResult (..), applyTransactionMemory, ipcBackend, memoryBackend)
+import qualified ChuSQL.Server.Catalog as Catalog
 import qualified ChuSQL.Server.Config as Config
 import ChuSQL.Server.Privileges (
     PrivilegeCommand (..),
@@ -1166,6 +1167,18 @@ withObjectPrivileges body = do
 -- 验证对象作用域、授权来源和外部入口。
 objectPrivilegeSpec :: Spec
 objectPrivilegeSpec = describe "stable object privileges" $ do
+    it "preserves grants when backend catalogs omit stable table identities" $ withObjectPrivileges $ \backend _ root -> do
+        let -- 为旧后端保留按名称解析身份的路径。
+            withoutIdentities current = current
+                { beCatalog = fmap (fmap (map (\info -> info{tiIdentity = Nothing}))) (beCatalog current)
+                , beWithDatabase = withoutIdentities . beWithDatabase current
+                }
+        service <- newPrivileges (withoutIdentities backend)
+        runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "alice" False) `shouldReturn` Right ()
+        authorizeSql service (Ordinary testAccount) "SELECT id FROM users" `shouldReturn` Right ()
+        runPrivilegeCommand service root testDatabase (RevokePrivilegesCommand ["select"] "users" "alice") `shouldReturn` Right ()
+        denied <- authorizeSql service (Ordinary testAccount) "SELECT id FROM users"
+        denied `shouldSatisfy` either (\(PrivilegeError code _) -> code == "forbidden") (const False)
     it "lists only the caller's effective grants including roles and PUBLIC" $ withObjectPrivileges $ \backend service root -> do
         runPrivilegeCommand service root testDatabase (CreateRoleCommand "self_reader") `shouldReturn` Right ()
         runPrivilegeCommand service root testDatabase (GrantPrivilegesCommand ["select"] "users" "self_reader" True) `shouldReturn` Right ()
@@ -2110,6 +2123,39 @@ writeRows session ids done = do
 -- | 同一进程里开两个库：会话之间不串数据，也不互相挡路
 ipcConcurrencySpec :: Spec
 ipcConcurrencySpec = describe "server backend on the real storage" $ do
+    it "creates only missing privilege tables using the current catalog" $ withIpcStorage $ do
+        base <- ipcBackend
+        attempts <- newIORef []
+        let internal = beWithDatabase base "system"
+            tracked = internal{beStatement = \sql -> modifyIORef' attempts (++ [sql]) >> beStatement internal sql}
+        directory <- Catalog.newCatalog tracked
+        Catalog.ensureCatalog directory `shouldReturn` Right ()
+        writeIORef attempts []
+        Catalog.ensureCatalog directory `shouldReturn` Right ()
+        readIORef attempts `shouldReturn` []
+        mustRun (beStatement internal "DROP TABLE __system_members")
+        Catalog.ensureCatalog directory `shouldReturn` Right ()
+        readIORef attempts `shouldReturn` ["CREATE TABLE __system_members (role VARCHAR(64), member VARCHAR(64))"]
+        broken <- Catalog.newCatalog tracked{beCatalog = pure (Left "catalog unavailable")}
+        writeIORef attempts []
+        Catalog.ensureCatalog broken `shouldReturn` Left "catalog unavailable"
+        readIORef attempts `shouldReturn` []
+    it "reuses catalog object identities while checking ordinary connections" $ withIpcStorage $ do
+        base <- ipcBackend
+        mustRun (beStatement base "CREATE DATABASE alpha")
+        let alpha = beWithDatabase base "alpha"
+        mustRun (beStatement alpha "CREATE TABLE first (id INT)")
+        mustRun (beStatement alpha "CREATE TABLE second (id INT)")
+        fmap void (beAccounts base (ReqAccountCreate "alice" "hash")) `shouldReturn` Right ()
+        lookups <- newIORef (0 :: Int)
+        let tracked = base{beStorage = \payload -> do
+                case payload of
+                    A.Object fields | KM.lookup "method" fields == Just (A.String "resolve_object") && KM.member "table" fields -> modifyIORef' lookups (+ 1)
+                    _ -> pure ()
+                beStorage base payload}
+        service <- newPrivileges tracked
+        authorizeConnect service (Ordinary testAccount) "alpha" `shouldReturn` Right ()
+        readIORef lookups `shouldReturn` 0
     it "resolves DDL qualifiers without crossing database boundaries" $ withIpcStorage $ do
         base <- ipcBackend
         mustRun (beStatement base "CREATE DATABASE alpha")
