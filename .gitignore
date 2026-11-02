@@ -39,6 +39,8 @@ chusql-core/storage/data/
 
 # 本地运行产物：一键启动的数据目录、门禁各车道日志与临时目录、打包产物，不入库
 logs/
+performance/
+progress.md
 
 # 本机打出来的发行包（scripts/package.sh / package.ps1 的产物），不入库
 /releases/
@@ -91,7 +93,7 @@ learning
 !/.agents/skills/chusql-boundary-contracts/
 !/.agents/skills/chusql-storage-integrity/
 !/.agents/skills/chusql-type-system/
-/.agents/context/prompt.txt
+/.agents/context/
 /skills-lock.json
 
 # Docker 部署口令仅保存在本机。

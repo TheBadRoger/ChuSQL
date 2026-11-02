@@ -1,8 +1,9 @@
 # AGENTS.md — ChuSQL 开发契约
 
-参考：
-- 唯一进度与验收来源：`.agents/context/progress.txt`（等价于 project-plan.txt）。
-- 限制与设计：`.agents/context/known-issues.txt`、`.agents/context/design-decisions.txt`。
+本机上下文（存在时可读取，保持忽略和未跟踪）：
+
+- 工作进度：`.agents/context/progress.txt`。
+- 限制与设计参考：`.agents/context/known-issues.txt`、`.agents/context/design-decisions.txt`。
 
 ## 核心约束
 - 完成规定检查，并确保测试通过。
@@ -25,7 +26,13 @@
   优先使用 `void`、`when/unless`、`fromMaybe`、`isJust/isNothing`、`maybeToList`、`zipWithM` 等惯用函数，清理冗余 lambda、括号、绑定、导入与 LANGUAGE pragma；涉及惰性、严格性或类型表示变化的建议须逐项核对语义后再采用。
 - 按实际风险和影响范围选择有行为验证价值的测试；数据库内核微改动也须验证关键行为。
 - 按任务需要选择 TDD、子代理或审查流程，精简读取、搜索、工具调用和输出。
-- 文档描述当前状态，改动说明在交流中记录；保持 Git 历史。兼容层须有实际消费者。
+- 文档描述当前状态，改动说明写入 Git 提交；保持 Git 历史。兼容层须有实际消费者。
+
+## 改动记录
+
+- 所有改动记录写入 Git 提交说明，正文包含行为变化、实现决策、验证结果和已知限制。
+- 不把变更日志、进度、性能报告或开发过程记录作为项目文件跟踪。本机工作记录保持忽略和未跟踪。
+- 项目文档只维护当前行为、架构、用法与必要限制，不追加按时间排列的改动记录。
 
 ## 文档编写
 
@@ -34,7 +41,7 @@
 - `technical-documentation`：先确定读者和阅读目的，再安排标题、操作步骤、示例与参考信息。入口为 `~/.codex/skills/technical-documentation/SKILL.md`。
 - `plain-writing`：用常用词解释行为，删除空话，拆开堆叠的术语与长句。入口为 `~/.codex/skills/plain-writing/SKILL.md`。
 
-涉及设计理由时，另用 `documentation-and-adrs`，沿用现有设计文件及唯一进度来源。全局目录以 `$CODEX_HOME/skills` 为准，未设置时使用 `~/.codex/skills`。
+设计变更的理由写入提交说明，架构文档只维护当前设计，不增设受跟踪的决策或进度日志。全局目录以 `$CODEX_HOME/skills` 为准，未设置时使用 `~/.codex/skills`。
 
 中文文档按中文表达习惯遵守以下约定：
 
@@ -60,4 +67,3 @@
 - 局部改动运行受影响模块的规定测试；较大改动由 agent 执行全量门禁，通过后再提交。
 - engine / cli / storage 使用规定测试入口。
 - 规定入口见 `gate-check/run-step.ps1`；Haskell 构建串行，存储协议改动须重建实际动态库。
-- 改动说明只在交流中记录。
