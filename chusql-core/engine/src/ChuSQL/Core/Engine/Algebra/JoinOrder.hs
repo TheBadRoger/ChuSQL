@@ -2,7 +2,7 @@ module ChuSQL.Core.Engine.Algebra.JoinOrder (reorderJoins) where
 
 import ChuSQL.Core.Engine.Algebra.Cost (pointRows, rangeRows, selectivityOf, tableMetaOf)
 import ChuSQL.Core.Engine.Algebra.Expr (colsInExpr, hasDivision, hasSubquery)
-import ChuSQL.Core.Engine.Algebra.Op (RelOp (..), relOpCols)
+import ChuSQL.Core.Engine.Algebra.Op (RelOp (..), hasBoundPlanColumns, relOpCols)
 import ChuSQL.Core.Engine.Syntax.AST (Expr (..), JoinKind (..))
 import ChuSQL.Core.Model
 import Data.List (partition)
@@ -12,7 +12,9 @@ import Data.Maybe (fromMaybe)
 
 -- | 重排入口：顶层行序可观察
 reorderJoins :: Database -> RelOp -> RelOp
-reorderJoins db = pass db False
+reorderJoins db op
+    | hasBoundPlanColumns op = op
+    | otherwise = pass db False op
 
 -- | 往下带“行序是否不可观察”，可观察时不动内连接
 pass :: Database -> Bool -> RelOp -> RelOp
@@ -28,7 +30,6 @@ pass db free (SemiJoin kind left right l r query) = SemiJoin kind left right (pa
 pass db free (Join kind l r c)
     | free
     , Just (leaves, conds) <- innerChain (Join kind l r c)
-    , length leaves > 1
     , Just order <- cheaperOrder db leaves conds =
         rebuildChain db (map (pass db free) order) conds
     | otherwise = Join kind (pass db free l) (pass db free r) c
@@ -76,12 +77,6 @@ scaleRows db p x rows = case p of
     Lt (Col k) (LitStr v) -> pick k Nothing (Just (VStr v, False))
     LtE (Col k) (LitInt v) -> pick k Nothing (Just (VInt v, True))
     LtE (Col k) (LitStr v) -> pick k Nothing (Just (VStr v, True))
-    Gt _ _ -> quarter
-    Lt _ _ -> quarter
-    GtE _ _ -> quarter
-    LtE _ _ -> quarter
-    NotEq _ _ -> quarter
-    QuantCmp{} -> quarter
     And a b -> max 1 (min (scaleRows db a x rows) (scaleRows db b x rows))
     _ -> quarter
   where
@@ -157,14 +152,10 @@ chainCost _ [] _ = 0
 growOrder :: Database -> [RelOp] -> [Expr] -> [Int] -> [Int] -> [Int]
 growOrder db leaves conds have rest = case rest of
     [] -> have
-    _ ->
-        let next = pick rest
+    i : is ->
+        let next = cheapestBy costOf i is
          in growOrder db leaves conds (have ++ [next]) (filter (/= next) rest)
   where
-    -- \| 候选里成本最低的那个，同价取序号小的
-    pick (i : is) = foldl cheaper i is
-    pick [] = 0
-    cheaper i j = if costOf j < costOf i then j else i
     -- \| 这个前缀的估算成本
     costOf i = chainCost db [leaves !! k | k <- have ++ [i]] conds
 
@@ -176,11 +167,19 @@ bestOrder db leaves conds = pick (map start [0 .. n - 1])
     -- \| 从第 i 张表开始的贪心顺序
     start i = [leaves !! k | k <- growOrder db leaves conds [i] (filter (/= i) [0 .. n - 1])]
     -- \| 成本最低的那个
-    pick (o : os) = foldl cheaper o os
+    pick (o : os) = cheapestBy cost o os
     pick [] = []
-    cheaper o o' = if cost o' < cost o then o' else o
     -- \| 一个顺序的估算成本
     cost o = chainCost db o conds
+
+-- | 缓存候选成本，成本相同时保留先出现者
+cheapestBy :: (a -> Int) -> a -> [a] -> a
+cheapestBy cost first rest = fst (foldl' cheaper (first, cost first) rest)
+  where
+    -- \| 只计算新候选的成本并保留较小者
+    cheaper best@(_, bestCost) candidate =
+        let candidateCost = cost candidate
+         in if candidateCost < bestCost then (candidate, candidateCost) else best
 
 -- | 统计齐全、没有除法且确实更省时给出新顺序
 cheaperOrder :: Database -> [RelOp] -> [Expr] -> Maybe [RelOp]

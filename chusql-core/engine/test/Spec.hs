@@ -7,6 +7,7 @@ import ChuSQL.Core.Engine
 import ChuSQL.Core.Engine.Algebra.Cost (rangeRows, selectivityOf)
 import ChuSQL.Core.Engine.Algebra.Eval (evalRelOp, evalRelOpM)
 import ChuSQL.Core.Engine.Algebra.Expr (colsInExpr, evalExpr)
+import ChuSQL.Core.Engine.Algebra.JoinOrder (reorderJoins)
 import ChuSQL.Core.Engine.Algebra.Op (RelOp (..), renderPlan)
 import ChuSQL.Core.Engine.Algebra.Optimize (optimize, pushProject)
 import ChuSQL.Core.Engine.Algebra.Planner (translate)
@@ -15,6 +16,7 @@ import ChuSQL.Core.Engine.Builtin
 import ChuSQL.Core.Engine.Error
 import ChuSQL.Core.Engine.Parallel (poolRun, workerPool)
 import qualified ChuSQL.Core.Engine.Runtime.Query as Bound
+import ChuSQL.Core.Engine.Runtime.Relation (bindOptimizedRelOp, bindRelOpIdentities)
 import ChuSQL.Core.Engine.Semantic (prepare)
 import ChuSQL.Core.Engine.Storage (IndexResult (..), MonadStorage (..))
 import ChuSQL.Core.Engine.Storage.FFI (closeStorage, maintainStorage, openStorage)
@@ -2689,6 +2691,20 @@ main = hspec $ do
                 Right q -> case translate q of
                     Left err -> expectationFailure err
                     Right relOp -> evalRelOp chainDB (optimize chainDB relOp) `shouldBe` evalRelOp chainDB relOp
+
+        it "preserves bound identities while the shared pipeline still reorders unbound joins" $ do
+            let source = "SELECT a.name FROM a JOIN b ON a.id = b.a_id JOIN c ON b.id = c.b_id ORDER BY a.name"
+            case parseStatement source >>= prepare chainDB >>= translate of
+                Left err -> expectationFailure err
+                Right plan -> do
+                    case bindRelOpIdentities chainDB [] plan of
+                        Left err -> expectationFailure err
+                        Right identified -> do
+                            optimize chainDB identified `shouldBe` identified
+                            reorderJoins chainDB identified `shouldBe` identified
+                            pushProject chainDB ["a.name"] identified `shouldBe` identified
+                    fmap planTables (bindOptimizedRelOp chainDB [] plan) `shouldBe` Right ["b", "c", "a"]
+                    (bindOptimizedRelOp chainDB [] plan >>= evalRelOp chainDB) `shouldBe` evalRelOp chainDB plan
 
         it "removes a filter whose predicate folds to true" $ do
             fmap anyFilter (optimizedPlan "SELECT name FROM users WHERE 1 = 1")

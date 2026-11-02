@@ -1,4 +1,4 @@
-module ChuSQL.Core.Engine.Algebra.Expr (evalExpr, evalCondForRow, colsInExpr, subqueryRefsIn, subquerySlotsIn, subqueryColumns, aggregatesIn, hasAggregate, bareColumns, hasSubquery, hasDivision, inValues, threeValuedNot, quantifiedCompare) where
+module ChuSQL.Core.Engine.Algebra.Expr (evalExpr, evalCondForRow, colsInExpr, hasBoundColumns, subqueryRefsIn, subquerySlotsIn, subqueryColumns, aggregatesIn, hasAggregate, bareColumns, hasSubquery, hasDivision, inValues, threeValuedNot, quantifiedCompare) where
 
 import ChuSQL.Core.Engine.Builtin (Operator (..), compareNode, executeOperator, inValues, threeValuedNot)
 import ChuSQL.Core.Engine.Runtime.SQL (constructSQLValue, invokeSQLFunction)
@@ -11,6 +11,8 @@ import ChuSQL.Core.Model
 evalExpr :: Expr -> Row -> Either String Value
 evalExpr (Col name) row =
     maybe (Left ("unknown column: " ++ name)) Right (lookup name row)
+evalExpr (ColumnRef _ name) _ = Left ("unbound column identity: " ++ name)
+evalExpr (OuterColumnRef _ name) _ = Left ("unbound outer column identity: " ++ name)
 evalExpr (ColumnSlot slot name) row = case drop slot row of
     (key, value) : _ | slot >= 0, key == name -> Right value
     [] -> Left ("missing bound column: " ++ name)
@@ -79,6 +81,8 @@ quantifiedCompare op lhs vs q = case vs of
 -- | 表达式用到了哪些列
 colsInExpr :: Expr -> [String]
 colsInExpr (Col c) = [c]
+colsInExpr (ColumnRef _ c) = [c]
+colsInExpr (OuterColumnRef _ c) = [c]
 colsInExpr (ColumnSlot _ c) = [c]
 colsInExpr (OuterColumnSlot _ _ c) = [c]
 colsInExpr (Construct _ arguments) = concatMap colsInExpr arguments
@@ -111,6 +115,49 @@ colsInExpr (InList a es _) = colsInExpr a ++ concatMap colsInExpr es
 colsInExpr (ExistsSub sq _) = subqueryRefs sq
 colsInExpr (QuantCmp _ a sq _) = colsInExpr a ++ subqueryRefs sq
 colsInExpr _ = []
+
+-- | 检查依赖固定布局的身份或槽位引用
+hasBoundColumns :: Expr -> Bool
+hasBoundColumns expression = case expression of
+    ColumnRef{} -> True
+    OuterColumnRef{} -> True
+    ColumnSlot{} -> True
+    OuterColumnSlot{} -> True
+    Construct _ arguments -> any hasBoundColumns arguments
+    BoundConstruct _ arguments -> any hasBoundColumns arguments
+    FunctionCall _ arguments -> any hasBoundColumns arguments
+    BoundFunction _ _ arguments -> any hasBoundColumns arguments
+    Add a b -> both a b
+    Sub a b -> both a b
+    Mul a b -> both a b
+    Div a b -> both a b
+    Neg a -> hasBoundColumns a
+    Gt a b -> both a b
+    Lt a b -> both a b
+    Eq a b -> both a b
+    GtE a b -> both a b
+    LtE a b -> both a b
+    NotEq a b -> both a b
+    And a b -> both a b
+    Or a b -> both a b
+    IsNull a -> hasBoundColumns a
+    IsNotNull a -> hasBoundColumns a
+    CountOf a -> hasBoundColumns a
+    SumOf a -> hasBoundColumns a
+    AvgOf a -> hasBoundColumns a
+    MinOf a -> hasBoundColumns a
+    MaxOf a -> hasBoundColumns a
+    InSub a query _ -> hasBoundColumns a || queryBound query
+    InList a values _ -> any hasBoundColumns (a : values)
+    QuantCmp _ a query _ -> hasBoundColumns a || queryBound query
+    ScalarSub query -> queryBound query
+    ExistsSub query _ -> queryBound query
+    _ -> False
+  where
+    -- \| 检查两个操作数的绑定状态
+    both a b = hasBoundColumns a || hasBoundColumns b
+    -- \| 子查询父行引用也依赖当前布局
+    queryBound = any (hasBoundColumns . snd) . subqueryColumns
 
 -- | 表达式里子查询引用的外层列
 subqueryRefsIn :: Expr -> [String]
@@ -275,6 +322,8 @@ bareColumns e = case e of
     FunctionCall _ arguments -> concatMap bareColumns arguments
     BoundFunction _ _ arguments -> concatMap bareColumns arguments
     Col c -> [c]
+    ColumnRef _ c -> [c]
+    OuterColumnRef _ c -> [c]
     ColumnSlot _ c -> [c]
     OuterColumnSlot _ _ c -> [c]
     Add a b -> both a b

@@ -5,7 +5,7 @@ import ChuSQL.Core.Engine.Algebra.Expr (evalCondForRow, evalExpr)
 import ChuSQL.Core.Engine.Domain
 import ChuSQL.Core.Engine.Runtime.Dependencies (domainDependencies, queryTables, typeDependencies, validateDependencies)
 import ChuSQL.Core.Engine.Runtime.Query (bindQuery, executeQueryM)
-import ChuSQL.Core.Engine.Runtime.Relation (bindWriteColumns, orderRow)
+import ChuSQL.Core.Engine.Runtime.Relation (bindWriteColumns, columnLayout, orderRow, resolveColumnSlot)
 import ChuSQL.Core.Engine.Semantic (prepare, prepareCheckExpression)
 import ChuSQL.Core.Engine.Storage (MonadStorage (..))
 import ChuSQL.Core.Engine.Storage.Memory (MemoryStorage (runMemoryStorage))
@@ -104,14 +104,16 @@ bindWriteAction catalog statement = case statement of
         declared <- lookupTable catalog target
         columnsEffective <- effectiveColumns catalog (tableCols declared)
         let table = declared{tableCols = columnsEffective}
+        targets <- bindInsertTargets (tableCols table) columns
         checks <- checkPlan catalog table
+        constraints <- constraintPlan (tableCols table)
         let plan =
                 InsertPlan
-                    (bindInsertTargets (tableCols table) columns)
+                    targets
                     (length columns)
                     (autoColumn table)
                     checks
-                    (constraintPlan (tableCols table))
+                    constraints
         Right (InsertAction target plan rows)
     Update target assignments condition -> do
         declared <- lookupTable catalog target
@@ -119,7 +121,8 @@ bindWriteAction catalog statement = case statement of
         let table = declared{tableCols = columnsEffective}
         bound <- bindUpdateTargets (tableCols table) assignments
         checks <- checkPlan catalog table
-        let plan = UpdatePlan (map fst (tableCols table)) bound condition checks (constraintPlan (tableCols table))
+        constraints <- constraintPlan (tableCols table)
+        let plan = UpdatePlan (map fst (tableCols table)) bound condition checks constraints
         Right (UpdateAction target plan)
     Delete target condition -> do
         table <- lookupTable catalog target
@@ -291,12 +294,14 @@ buildRows (InsertPlan layout width auto checks constraints) current rows = do
 -- | 保存输出列定义及可选 VALUES 槽位
 data BoundInsertColumn = BoundInsertColumn String Column (Maybe Int)
 
--- | 把已校验的目标清单绑定为输入槽位
-bindInsertTargets :: [(String, Column)] -> [String] -> [BoundInsertColumn]
-bindInsertTargets columns targets =
-    [BoundInsertColumn name column (lookup name positions) | (name, column) <- columns]
+-- | 按目标身份映射 VALUES 输入位置
+bindInsertTargets :: [(String, Column)] -> [String] -> Either String [BoundInsertColumn]
+bindInsertTargets columns targets = do
+    identities <- mapM (fmap fst . bindWriteTarget "INSERT" columns) targets
+    let positions = zip identities [0 ..]
+    Right [BoundInsertColumn name column (lookup cid positions) | ((cid, name), (_, column)) <- zip layout columns]
   where
-    positions = zip targets [0 ..]
+    layout = columnLayout (map fst columns)
 
 -- | 按绑定槽位和列定义补出一行
 buildRow :: [BoundInsertColumn] -> Maybe (String, Column) -> Int -> [Value] -> Either String (Row, Int)
@@ -385,7 +390,8 @@ validateTableRows db table = do
     let rows = tableRows table
     mapM_ (runChecks plan) rows
     ordered <- mapM (orderRow (map fst effective)) rows
-    enforceConstraints (constraintPlan effective) [] ordered
+    constraints <- constraintPlan effective
+    enforceConstraints constraints [] ordered
 
 -- | 只取第一行（报错提示用）
 firstLine :: String -> String
@@ -395,12 +401,18 @@ firstLine = takeWhile (/= '\n')
 data ConstraintPlan = ConstraintPlan [String] [(String, Expr)] [(String, Expr)]
 
 -- | 按 schema 一次绑定行集约束目标
-constraintPlan :: [(String, Column)] -> ConstraintPlan
-constraintPlan columns = ConstraintPlan (map fst columns) required unique
+constraintPlan :: [(String, Column)] -> Either String ConstraintPlan
+constraintPlan columns = do
+    targets <- mapM bindTarget (zip layout columns)
+    let required = [(name, reference) | (name, column, reference) <- targets, not (columnNullable column)]
+        unique = [(name, reference) | (name, column, reference) <- targets, columnUnique column || columnPrimaryKey column]
+    Right (ConstraintPlan (map fst columns) required unique)
   where
-    slots = [(name, column, ColumnSlot slot name) | (slot, (name, column)) <- zip [0 ..] columns]
-    required = [(name, reference) | (name, column, reference) <- slots, not (columnNullable column)]
-    unique = [(name, reference) | (name, column, reference) <- slots, columnUnique column || columnPrimaryKey column]
+    layout = columnLayout (map fst columns)
+    -- \| 按原始列身份生成约束读取槽位
+    bindTarget ((cid, name), (_, column)) = do
+        (slot, key) <- resolveColumnSlot layout cid name
+        Right (key, column, ColumnSlot slot key)
 
 -- | 检查新行非空及合并旧行后的唯一性
 enforceConstraints :: ConstraintPlan -> [Row] -> [Row] -> Either String ()
@@ -454,11 +466,21 @@ data BoundAssignment = BoundAssignment Int String Column Expr
 bindUpdateTargets :: [(String, Column)] -> [(String, Expr)] -> Either String [BoundAssignment]
 bindUpdateTargets columns = mapM bindTarget
   where
-    -- \| 只接受唯一目标并保留列定义
-    bindTarget (name, expression) = case [(slot, column) | (slot, (key, column)) <- zip [0 ..] columns, key == name] of
-        [(slot, column)] -> Right (BoundAssignment slot name column expression)
-        [] -> Left ("UPDATE: unknown target column: " ++ name)
-        _ -> Left ("UPDATE: ambiguous target column: " ++ name)
+    layout = columnLayout (map fst columns)
+    -- \| 按身份解析目标槽位并保留列定义
+    bindTarget (name, expression) = do
+        (cid, column) <- bindWriteTarget "UPDATE" columns name
+        (slot, key) <- resolveColumnSlot layout cid name
+        Right (BoundAssignment slot key column expression)
+
+-- | 只接受唯一写入目标并保留原始列身份
+bindWriteTarget :: String -> [(String, Column)] -> String -> Either String (ColumnId, Column)
+bindWriteTarget place columns name = case [(cid, column) | ((cid, key), (_, column)) <- zip layout columns, key == name] of
+    [target] -> Right target
+    [] -> Left (place ++ ": unknown target column: " ++ name)
+    _ -> Left (place ++ ": ambiguous target column: " ++ name)
+  where
+    layout = columnLayout (map fst columns)
 
 -- | 依次求值并按目标槽位收类型和覆盖
 applyUpdatesM :: (MonadStorage m) => Database -> [BoundAssignment] -> Row -> m (Either String Row)

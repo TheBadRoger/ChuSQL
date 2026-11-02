@@ -1,4 +1,4 @@
-module ChuSQL.Core.Engine.Syntax.AST (Statement (..), DomainDefinition (..), DomainAlter (..), FromClause (..), JoinKind (..), Expr (..), Subquery (..), Quantifier (..), CompareOp (..), SortDir (..), OrderKey (..), makeSelect, distinctOrdering, orderPosition, orderExpression, orderKeyExpression) where
+module ChuSQL.Core.Engine.Syntax.AST (Statement (..), DomainDefinition (..), DomainAlter (..), FromClause (..), JoinKind (..), SourceId (..), ColumnId (..), Expr (..), Subquery (..), Quantifier (..), CompareOp (..), SortDir (..), OrderKey (..), makeSelect, distinctOrdering, orderPosition, orderExpression, orderKeyExpression) where
 
 import ChuSQL.Core.Engine.Runtime.Functions (FunctionId)
 import ChuSQL.Core.Engine.Runtime.Types (RuntimeValue, TypeExpr, TypeId)
@@ -128,9 +128,17 @@ data CompareOp
     | CmpLtE
     deriving (Show, Eq)
 
--- | 条件表达式：列、字面量、算术、比较、逻辑、聚合与子查询
+-- | 标识单个查询计划中的来源实例
+newtype SourceId = SourceId [Int] deriving (Show, Eq)
+
+-- | 按来源和原始列序号标识列
+data ColumnId = ColumnId SourceId Int deriving (Show, Eq)
+
+-- | 条件表达式与执行前的列身份引用
 data Expr
     = Col String
+    | ColumnRef ColumnId String
+    | OuterColumnRef ColumnId String
     | ColumnSlot Int String
     | OuterColumnSlot Int Int String
     | FunctionCall String [Expr]

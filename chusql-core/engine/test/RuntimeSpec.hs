@@ -4,15 +4,16 @@ import ChuSQL.Core.Engine (bindWrite, executeWriteM, rowsOf, runStatement, runSt
 import ChuSQL.Core.Engine.Algebra.Eval (evalRelOp)
 import ChuSQL.Core.Engine.Algebra.Expr (evalExpr, subquerySlotsIn)
 import qualified ChuSQL.Core.Engine.Algebra.Op as Rel
+import ChuSQL.Core.Engine.Algebra.Optimize (optimize, pushProject)
 import ChuSQL.Core.Engine.Algebra.Sort (sortBoundRows)
 import ChuSQL.Core.Engine.Runtime.Binding
 import ChuSQL.Core.Engine.Runtime.Functions
 import qualified ChuSQL.Core.Engine.Runtime.Query as Query
-import ChuSQL.Core.Engine.Runtime.Relation (bindRelOpColumns, bindWriteColumns)
+import ChuSQL.Core.Engine.Runtime.Relation (bindRelOpColumns, bindRelOpIdentities, bindWriteColumns, bindWriteIdentities)
 import ChuSQL.Core.Engine.Runtime.Types
 import ChuSQL.Core.Engine.Semantic (prepare, prepareRowExpression)
 import ChuSQL.Core.Engine.Storage.Memory (runMemoryStorage)
-import ChuSQL.Core.Engine.Syntax.AST (Expr (..), FromClause (..), SortDir (..), Statement (..), Subquery (..))
+import ChuSQL.Core.Engine.Syntax.AST (ColumnId (..), Expr (..), FromClause (..), JoinKind (..), SortDir (..), SourceId (..), Statement (..), Subquery (..))
 import ChuSQL.Core.Engine.Syntax.Parser (parseStatement)
 import qualified ChuSQL.Core.Model as SQL
 import ChuSQL.Core.Protocol (TableInfo (..), valueFromJSON, valueToJSON)
@@ -361,6 +362,29 @@ spec = do
                         [("qty", Add (ColumnSlot 1 "qty") (ColumnSlot 0 "id"))]
                         (Just (Eq (ColumnSlot 0 "id") (LitInt 1)))
                     )
+        it "binds write expressions and correlated references to column identities" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE TABLE write_slots (id INT, qty INT)"]
+                    let query = Subquery (Select [("value", Col "parent.qty")] FromUnit Nothing [] Nothing [] Nothing) ["parent.qty"]
+                        statement = Update "write_slots" [("qty", Add (Col "qty") (ScalarSub query))] (Just (Eq (Col "id") (LitInt 1)))
+                        quantity = ColumnRef (ColumnId (SourceId []) 1) "qty"
+                        predicate = Eq (ColumnRef (ColumnId (SourceId []) 0) "id") (LitInt 1)
+                        identified = Update "write_slots" [("qty", Add quantity (ScalarSub (BoundSubquery (subqueryStatement query) ["parent.qty"] [("parent.qty", quantity)])))] (Just predicate)
+                    actual <- bindWriteIdentities db statement
+                    lowered <- bindWriteColumns db actual
+                    direct <- bindWriteColumns db statement
+                    Right (actual == identified, lowered == direct)
+            result `shouldBe` Right (True, True)
+        it "keeps DELETE identities and rejects a foreign source despite matching names" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE TABLE write_slots (id INT, qty INT)"]
+                    identified <- bindWriteIdentities db (Delete "write_slots" (Just (Eq (Col "qty") (LitInt 2))))
+                    let invalid = Delete "write_slots" (Just (ColumnRef (ColumnId (SourceId [9]) 1) "qty"))
+                    Right (identified, bindWriteColumns db invalid)
+            result `shouldBe` Right
+                ( Delete "write_slots" (Just (Eq (ColumnRef (ColumnId (SourceId []) 1) "qty") (LitInt 2)))
+                , Left "unknown column identity: qty"
+                )
         it "binds CHECK columns inside resolved function calls" $ do
             let columns = [("id", SQL.plainColumn SQL.CInt), ("name", SQL.plainColumn SQL.CStr)]
                 result = prepareRowExpression columns (Gt (FunctionCall "length" [Col "name"]) (LitInt 1))
@@ -709,6 +733,45 @@ spec = do
                             ]
                     fst <$> runMemoryStorage (Query.executeQueryM bound) current
             result `shouldBe` Right (Right [[("id", SQL.VInt 7)]])
+        it "keeps self-join source identities distinct after scan pruning" $ do
+            let result = do
+                    db <- sqlCatalog ["CREATE TABLE identity_items (id INT, qty INT)"]
+                    let left = Rel.Scan (Just "l") "identity_items" Nothing
+                        right = Rel.Scan (Just "r") "identity_items" Nothing
+                        full = Rel.Join InnerJoin left right (LitBool True)
+                        pruned = Rel.Join InnerJoin (Rel.Scan (Just "l") "identity_items" (Just ["qty"])) right (LitBool True)
+                        fullLayout = Rel.relOpLayout db [] full
+                        prunedLayout = Rel.relOpLayout db [] pruned
+                    Right (lookup (ColumnId (SourceId [0]) 1) fullLayout, lookup (ColumnId (SourceId [0]) 1) prunedLayout, lookup (ColumnId (SourceId [1]) 1) prunedLayout)
+            result `shouldBe` Right (Just "l.qty", Just "l.qty", Just "r.qty")
+        it "relocates identity references across renamed and reordered projections" $ do
+            let source = Rel.Compute [("first", LitInt 1), ("second", LitInt 9)] Rel.Unit
+                cid = ColumnId (SourceId [0]) 1
+                renamed = Rel.Compute [("renamed", Col "second"), ("first", Col "first")] source
+                plan = Rel.Filter (Eq (ColumnRef cid "second") (LitInt 9)) renamed
+            (bindRelOpColumns [] [] plan >>= evalRelOp [])
+                `shouldBe` Right [[("renamed", SQL.VInt 9), ("first", SQL.VInt 1)]]
+            Rel.relOpLayout [] [] renamed
+                `shouldBe` [(cid, "renamed"), (ColumnId (SourceId [0]) 0, "first")]
+        it "preserves bound identities when a projection is reordered and renamed" $ do
+            let source = Rel.Compute [("first", LitInt 1), ("second", LitInt 9)] Rel.Unit
+                projection = Rel.Compute [("a", Col "first"), ("b", Col "second")] source
+                plan = Rel.Filter (Eq (Col "b") (LitInt 9)) projection
+                changed = do
+                    identified <- bindRelOpIdentities [] [] plan
+                    case identified of
+                        Rel.Filter predicate (Rel.Compute [firstItem, (_, expression)] child) ->
+                            bindRelOpColumns [] [] (Rel.Filter predicate (Rel.Compute [("renamed", expression), firstItem] child))
+                        _ -> Left "unexpected identity plan"
+            (changed >>= evalRelOp [])
+                `shouldBe` Right [[("renamed", SQL.VInt 9), ("a", SQL.VInt 1)]]
+        it "rejects missing identities even when a diagnostic name matches" $ do
+            let source = Rel.Compute [("id", LitInt 1)] Rel.Unit
+                missing = ColumnRef (ColumnId (SourceId [9]) 0) "id"
+            bindRelOpColumns [] [] (Rel.Filter missing source)
+                `shouldBe` Left "unknown column identity: id"
+            evalExpr missing [("id", SQL.VInt 1)] `shouldBe` Left "unbound column identity: id"
+            prepareRowExpression [] missing `shouldBe` Left "execution column cannot be used in semantic input"
         it "binds grouping keys and then sorting to the grouped output" $ do
             let source = Rel.Compute [("first", LitInt 1), ("key", LitInt 2)] Rel.Unit
                 plan = Rel.Sort [("key", Desc)] (Rel.Aggregate ["key"] [("n", CountAll)] source)
@@ -871,6 +934,49 @@ spec = do
                     Rel.Unit
                 )
                 `shouldBe` Left "bound subquery references mismatch"
+        it "keeps outer identities separate when local columns acquire the same name" $ do
+            let identity = ColumnId (SourceId []) 0
+                plan = Rel.Compute [("value", Col "id")] Rel.Unit
+                identified = Rel.Compute [("value", OuterColumnRef identity "id")] Rel.Unit
+                source = Rel.Compute [("id", LitInt 1)] Rel.Unit
+                changed = Rel.Compute [("value", OuterColumnRef identity "id")] source
+            bindRelOpIdentities [] ["id"] plan `shouldBe` Right identified
+            bindRelOpColumns [] ["id"] changed
+                `shouldBe` Right (Rel.Compute [("value", OuterColumnSlot 1 0 "id")] source)
+            evalExpr (OuterColumnSlot 1 0 "id") [("id", SQL.VInt 1), ("id", SQL.VInt 9)]
+                `shouldBe` Right (SQL.VInt 9)
+            bindRelOpColumns [] [] changed `shouldBe` Left "unknown column identity: id"
+            evalExpr (OuterColumnRef identity "id") [("id", SQL.VInt 9)]
+                `shouldBe` Left "unbound outer column identity: id"
+            prepareRowExpression [] (OuterColumnRef identity "id")
+                `shouldBe` Left "execution column cannot be used in semantic input"
+        it "retains duplicate outer positions through identity binding" $ do
+            let identity = ColumnId (SourceId []) 1
+                plan = Rel.Compute [("value", OuterColumnSlot 0 1 "id")] Rel.Unit
+                identified = Rel.Compute [("value", OuterColumnRef identity "id")] Rel.Unit
+            bindRelOpIdentities [] ["id", "id"] plan `shouldBe` Right identified
+            (bindRelOpIdentities [] ["id", "id"] plan >>= bindRelOpColumns [] ["id", "id"])
+                `shouldBe` Right plan
+            bindRelOpColumns [] ["id"] identified `shouldBe` Left "unknown column identity: id"
+        it "evaluates nested correlated queries through both identity stages" $ do
+            let result = do
+                    db <- sqlCatalog
+                        [ "CREATE TABLE outer_identity_items (id INT)"
+                        , "INSERT INTO outer_identity_items (id) VALUES (1), (2)"
+                        ]
+                    statement <- parseStatement "SELECT o.id, (SELECT (SELECT o.id + i.id FROM outer_identity_items j WHERE j.id = i.id) FROM outer_identity_items i WHERE i.id = o.id) AS value FROM outer_identity_items o ORDER BY o.id"
+                    map (map snd) <$> rowsOf (runStatement db statement)
+            result `shouldBe` Right [[SQL.VInt 1, SQL.VInt 2], [SQL.VInt 2, SQL.VInt 4]]
+        it "keeps bound subquery references from crossing structural optimization" $ do
+            let statement = Select [("value", Col "parent.id")] FromUnit Nothing [] Nothing [] Nothing
+                identity = ColumnId (SourceId []) 0
+                query = BoundSubquery statement ["parent.id"] [("parent.id", OuterColumnRef identity "parent.id")]
+                source = Rel.Filter (LitBool True) Rel.Unit
+                plan = Rel.Compute [("value", ScalarSub query)] source
+                unbound = Rel.Compute [("value", ScalarSub (Subquery statement ["parent.id"]))] source
+            optimize [] plan `shouldBe` plan
+            pushProject [] ["value"] plan `shouldBe` plan
+            optimize [] unbound `shouldNotBe` unbound
         it "preserves outer scope identity when rebinding beside a local name" $ do
             let source = Rel.Compute [("id", LitInt 1)] Rel.Unit
                 expression = OuterColumnSlot 0 0 "id"

@@ -5,11 +5,10 @@ module ChuSQL.Core.Engine.Algebra.Eval (evalRelOp, evalRelOpM, evalExprM, evalCo
 import ChuSQL.Core.Engine.Algebra.Cost (tableMetaOf)
 import ChuSQL.Core.Engine.Algebra.Expr (evalCondForRow, evalExpr, hasSubquery, quantifiedCompare, subqueryColumns, subquerySlotsIn)
 import ChuSQL.Core.Engine.Algebra.Op
-import ChuSQL.Core.Engine.Algebra.Optimize (optimize)
 import ChuSQL.Core.Engine.Algebra.Planner (translate)
 import ChuSQL.Core.Engine.Algebra.Sort (sortBoundRows, sortRows, sortRowsTopK)
 import ChuSQL.Core.Engine.Builtin (aggregateArg, builtinOfExpr, inValues, invokeBuiltin, unsupportedAggregate)
-import ChuSQL.Core.Engine.Runtime.Relation (bindRelOpColumns, orderRow)
+import ChuSQL.Core.Engine.Runtime.Relation (bindOptimizedRelOp, orderRow)
 import ChuSQL.Core.Engine.Storage (IndexResult (..), MonadStorage (..))
 import ChuSQL.Core.Engine.Storage.Memory (runMemoryStorage)
 import ChuSQL.Core.Engine.Syntax.AST (Expr (..), JoinKind (..), Subquery (..))
@@ -552,7 +551,7 @@ runSubqueryRows db sq outer = case translate (subqueryStatement sq) of
     Left e -> pure (Left e)
     Right op -> case mapM bind (subqueryColumns sq) of
         Left err -> pure (Left err)
-        Right bindings -> case bindRelOpColumns db (map fst (bindings ++ outer)) (optimize db op) of
+        Right bindings -> case bindOptimizedRelOp db (map fst (bindings ++ outer)) op of
             Left err -> pure (Left err)
             Right bound ->
                 materialize

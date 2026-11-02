@@ -141,6 +141,8 @@ renderType (InferType t) = typeLabel t
 inferExpr :: Database -> String -> Scope -> Expr -> Either String InferredType
 inferExpr _ place env (Col c) = inferredColumnType . columnType . snd <$> scopeAt place env c
 inferExpr _ _ _ ColumnSlot{} = Left "execution column cannot be used in semantic input"
+inferExpr _ _ _ ColumnRef{} = Left "execution column cannot be used in semantic input"
+inferExpr _ _ _ OuterColumnRef{} = Left "execution column cannot be used in semantic input"
 inferExpr _ _ _ OuterColumnSlot{} = Left "execution column cannot be used in semantic input"
 inferExpr _ _ _ LitNull = Right InferNull
 inferExpr _ _ _ (LitInt _) = Right (InferType CInt)

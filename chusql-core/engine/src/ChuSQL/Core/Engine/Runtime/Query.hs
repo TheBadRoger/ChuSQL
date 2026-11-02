@@ -10,10 +10,9 @@ module ChuSQL.Core.Engine.Runtime.Query (
 import ChuSQL.Core.Engine.Algebra.Eval (evalRelOpM)
 import ChuSQL.Core.Engine.Algebra.Expr (hasSubquery)
 import ChuSQL.Core.Engine.Algebra.Op (RelOp (..))
-import ChuSQL.Core.Engine.Algebra.Optimize (optimize)
 import ChuSQL.Core.Engine.Algebra.Planner (translate)
 import ChuSQL.Core.Engine.Runtime.Dependencies (domainDependencies, queryTables, validateDependencies)
-import ChuSQL.Core.Engine.Runtime.Relation (bindRelOpColumns)
+import ChuSQL.Core.Engine.Runtime.Relation (bindOptimizedRelOp)
 import ChuSQL.Core.Engine.Runtime.SQL (sqlType)
 import ChuSQL.Core.Engine.Runtime.Types (TypeId)
 import ChuSQL.Core.Engine.Semantic (prepare, querySchema)
@@ -78,7 +77,7 @@ bindQuery catalog statement = do
     columns <- querySchema schemaOnly resolved
     plan <- translate resolved
     types <- mapM typeOf columns
-    bound <- bindRelOpColumns schemaOnly [] (optimize schemaOnly plan)
+    bound <- bindOptimizedRelOp schemaOnly [] plan
     let sources = queryTables resolved
         dependencies = sources ++ domainDependencies schemaOnly sources
     Right (BoundQuery schemaOnly dependencies columns types bound)

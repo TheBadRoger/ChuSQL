@@ -3,7 +3,7 @@ module ChuSQL.Core.Engine.Algebra.Optimize (optimize, pushProject) where
 import ChuSQL.Core.Engine.Algebra.Cost (indexCheaper, pointRows, rangeRows, tableMetaOf)
 import ChuSQL.Core.Engine.Algebra.Expr (colsInExpr, evalExpr, hasDivision)
 import ChuSQL.Core.Engine.Algebra.JoinOrder (reorderJoins)
-import ChuSQL.Core.Engine.Algebra.Op (RelOp (..), SemiKind (..), relOpCols)
+import ChuSQL.Core.Engine.Algebra.Op (RelOp (..), SemiKind (..), hasBoundPlanColumns, relOpCols)
 import ChuSQL.Core.Engine.Algebra.Planner (translate)
 import ChuSQL.Core.Engine.Syntax.AST (Expr (..), FromClause (..), JoinKind (..), Statement (..), Subquery (..))
 import ChuSQL.Core.Model
@@ -95,39 +95,45 @@ pushProjectLeaf db need leaf
     | all (`elem` need) (relOpCols db leaf) = leaf
     | otherwise = Project need leaf
 
--- | 把需要哪些列往下传
+-- | 仅对未绑定计划执行投影下推
 pushProject :: Database -> [String] -> RelOp -> RelOp
-pushProject _ _ Unit = Unit
-pushProject _ _ op@BoundSort{} = op
-pushProject _ _ op@BoundAggregate{} = op
-pushProject db _ (Compute items x) = Compute items (pushProject db (concatMap (colsInExpr . snd) items) x)
-pushProject db _ (Aggregate keys aggs x) =
-    Aggregate keys aggs (pushProject db (keys ++ concatMap (colsInExpr . snd) aggs) x)
-pushProject db _ (Project cols x) = case pushProject db cols x of
+pushProject db need op
+    | hasBoundPlanColumns op = op
+    | otherwise = pushProjectUnbound db need op
+
+-- | 在未绑定算子树中传递所需列
+pushProjectUnbound :: Database -> [String] -> RelOp -> RelOp
+pushProjectUnbound _ _ Unit = Unit
+pushProjectUnbound _ _ op@BoundSort{} = op
+pushProjectUnbound _ _ op@BoundAggregate{} = op
+pushProjectUnbound db _ (Compute items x) = Compute items (pushProjectUnbound db (concatMap (colsInExpr . snd) items) x)
+pushProjectUnbound db _ (Aggregate keys aggs x) =
+    Aggregate keys aggs (pushProjectUnbound db (keys ++ concatMap (colsInExpr . snd) aggs) x)
+pushProjectUnbound db _ (Project cols x) = case pushProjectUnbound db cols x of
     Project cols' y | cols' == cols -> Project cols y
     other -> Project cols other
-pushProject db need (Filter p x) = Filter p (pushProject db (need ++ colsInExpr p) x)
-pushProject db _ (Distinct x) = Distinct (pushProject db (relOpCols db x) x)
-pushProject db need (Sort spec x) = Sort spec (pushProject db (need ++ map fst spec) x)
-pushProject db need (Limit n x) = Limit n (pushProject db need x)
-pushProject db need (SemiJoin kind left right l r query) =
+pushProjectUnbound db need (Filter p x) = Filter p (pushProjectUnbound db (need ++ colsInExpr p) x)
+pushProjectUnbound db _ (Distinct x) = Distinct (pushProjectUnbound db (relOpCols db x) x)
+pushProjectUnbound db need (Sort spec x) = Sort spec (pushProjectUnbound db (need ++ map fst spec) x)
+pushProjectUnbound db need (Limit n x) = Limit n (pushProjectUnbound db need x)
+pushProjectUnbound db need (SemiJoin kind left right l r query) =
     SemiJoin
         kind
         left
         right
-        (pushProject db (need ++ colsInExpr left) l)
-        (pushProject db (colsInExpr right) r)
+        (pushProjectUnbound db (need ++ colsInExpr left) l)
+        (pushProjectUnbound db (colsInExpr right) r)
         query
-pushProject db need (Join kind l r c)
-    | needsAll need = Join kind (pushProject db need l) (pushProject db need r) c
+pushProjectUnbound db need (Join kind l r c)
+    | needsAll need = Join kind (pushProjectUnbound db need l) (pushProjectUnbound db need r) c
     | otherwise =
         let tot = need ++ colsInExpr c
             lCols = relOpCols db l
             rCols = relOpCols db r
             lNeed = if needsAll lCols then ["*"] else [x | x <- tot, x `elem` lCols]
             rNeed = if needsAll rCols then ["*"] else [x | x <- tot, x `elem` rCols]
-         in Join kind (pushProject db lNeed l) (pushProject db rNeed r) c
-pushProject db need leaf@(Scan a t _)
+         in Join kind (pushProjectUnbound db lNeed l) (pushProjectUnbound db rNeed r) c
+pushProjectUnbound db need leaf@(Scan a t _)
     | needsAll need = leaf
     | all (`elem` need) (relOpCols db leaf) = leaf
     | otherwise = Scan a t (Just (nub [column | requested <- need, let column = physicalColumn requested, column `elem` available]))
@@ -135,13 +141,13 @@ pushProject db need leaf@(Scan a t _)
     available = map (unqualify a) (relOpCols db (Scan a t Nothing))
     -- \| 把扫描限定列换成存储物理列名
     physicalColumn column = unqualify (Just (deriveQualifier a t)) (unqualify a column)
-pushProject db need (Derived a x)
-    | needsAll need || all (`elem` wanted) (relOpCols db x) = Derived a (pushProject db ["*"] x)
-    | otherwise = Derived a (Project wanted (pushProject db wanted x))
+pushProjectUnbound db need (Derived a x)
+    | needsAll need || all (`elem` wanted) (relOpCols db x) = Derived a (pushProjectUnbound db ["*"] x)
+    | otherwise = Derived a (Project wanted (pushProjectUnbound db wanted x))
   where
     wanted = nub (map (unqualify a) need)
-pushProject db need leaf@(Lookup{}) = pushProjectLeaf db need leaf
-pushProject db need leaf@(Range{}) = pushProjectLeaf db need leaf
+pushProjectUnbound db need leaf@(Lookup{}) = pushProjectLeaf db need leaf
+pushProjectUnbound db need leaf@(Range{}) = pushProjectLeaf db need leaf
 
 -- | 折一个表达式节点
 foldNode :: Expr -> Expr
@@ -336,4 +342,6 @@ optimizePredicates db op =
 
 -- | 优化总入口
 optimize :: Database -> RelOp -> RelOp
-optimize db op = pushProject db ["*"] (reorderJoins db (optimizePredicates db op))
+optimize db op
+    | hasBoundPlanColumns op = op
+    | otherwise = pushProject db ["*"] (reorderJoins db (optimizePredicates db op))
